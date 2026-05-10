@@ -1,31 +1,31 @@
 {
-  "model": "Qwen3.5-35B-A3B-4bit",
+  "model": "qwen3.5-35b-a3b-4bit",
   "quantization": "4bit",
   "parser": "hermes",
   "hardware": "Apple M3 Ultra (256GB)",
   "hardware_detail": {
     "chip": "Apple M3 Ultra",
     "memory_gb": 256,
-    "os": "macOS-26.3-arm64-arm-64bit"
+    "os": "macOS-26.3.1-arm64-arm-64bit"
   },
-  "date": "2026-03-04",
-  "timestamp": "2026-03-04T21:37:30Z",
-  "server": "http://localhost:8000",
-  "server_flags": "--enable-auto-tool-choice --tool-call-parser hermes",
-  "model_path": "mlx-community/Qwen3.5-35B-A3B-4bit",
-  "engine": "simple",
-  "notes": null,
+  "date": "2026-05-10",
+  "timestamp": "2026-05-10T04:00:09Z",
+  "server": "http://localhost:18001",
+  "server_flags": "--port 18001",
+  "model_path": null,
+  "engine": "batched",
+  "notes": "Tier-1 alias add via PR #348",
   "speed": {
-    "ttft_cold_s": 0.322,
-    "ttft_warm_s": 0.033,
-    "decode_short_tps": 31.7,
-    "decode_long_tps": 95.2,
-    "ram_active_gb": 19.6,
-    "ram_peak_gb": 19.6
+    "ttft_cold_s": 0.357,
+    "ttft_warm_s": 0.223,
+    "decode_short_tps": 18.0,
+    "decode_long_tps": 49.1,
+    "ram_active_gb": 20.1,
+    "ram_peak_gb": 20.1
   },
   "tool_calling": {
-    "score": 0.87,
-    "passed": 26,
+    "score": 0.97,
+    "passed": 29,
     "total": 30,
     "details": [
       {
@@ -37,7 +37,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 1.05,
+        "elapsed_s": 1.25,
         "fully_correct": true,
         "steps_passed": 1,
         "steps_total": 1
@@ -51,7 +51,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.61,
+        "elapsed_s": 1.58,
         "fully_correct": true,
         "steps_passed": 1,
         "steps_total": 1
@@ -65,7 +65,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.56,
+        "elapsed_s": 1.41,
         "fully_correct": true,
         "steps_passed": 1,
         "steps_total": 1
@@ -79,7 +79,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.74,
+        "elapsed_s": 1.75,
         "fully_correct": true,
         "steps_passed": 1,
         "steps_total": 1
@@ -93,7 +93,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 0.5,
-        "elapsed_s": 0.72,
+        "elapsed_s": 1.7,
         "fully_correct": true,
         "steps_passed": 1,
         "steps_total": 1
@@ -107,7 +107,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.5,
+        "elapsed_s": 1.33,
         "fully_correct": true,
         "steps_passed": 1,
         "steps_total": 1
@@ -121,7 +121,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.53,
+        "elapsed_s": 1.4,
         "fully_correct": true,
         "steps_passed": 1,
         "steps_total": 1
@@ -135,7 +135,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.73,
+        "elapsed_s": 1.74,
         "fully_correct": true,
         "steps_passed": 1,
         "steps_total": 1
@@ -149,7 +149,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.67,
+        "elapsed_s": 1.6,
         "fully_correct": true,
         "steps_passed": 1,
         "steps_total": 1
@@ -163,7 +163,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.69,
+        "elapsed_s": 1.72,
         "fully_correct": true,
         "steps_passed": 1,
         "steps_total": 1
@@ -177,7 +177,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.68,
+        "elapsed_s": 1.75,
         "fully_correct": true,
         "steps_passed": 1,
         "steps_total": 1
@@ -188,12 +188,12 @@
         "description": "Complex args — exec with piped command",
         "category": "complex_args",
         "tool_detected": true,
-        "correct_name": false,
+        "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.45,
-        "fully_correct": false,
-        "steps_passed": 0,
+        "elapsed_s": 1.32,
+        "fully_correct": true,
+        "steps_passed": 1,
         "steps_total": 1
       },
       {
@@ -205,7 +205,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.86,
+        "elapsed_s": 2.1,
         "fully_correct": true,
         "steps_passed": 1,
         "steps_total": 1
@@ -223,7 +223,7 @@
         "expected_count": 2,
         "actual_count": 2,
         "fully_correct": true,
-        "elapsed_s": 0.75
+        "elapsed_s": 1.94
       },
       {
         "id": "tc15",
@@ -238,7 +238,7 @@
         "expected_count": 3,
         "actual_count": 3,
         "fully_correct": true,
-        "elapsed_s": 1.31
+        "elapsed_s": 3.08
       },
       {
         "id": "tc16",
@@ -253,7 +253,7 @@
         "expected_count": 2,
         "actual_count": 2,
         "fully_correct": true,
-        "elapsed_s": 0.78
+        "elapsed_s": 2.38
       },
       {
         "id": "tc17",
@@ -268,7 +268,7 @@
         "expected_count": 2,
         "actual_count": 2,
         "fully_correct": true,
-        "elapsed_s": 0.71
+        "elapsed_s": 1.87
       },
       {
         "id": "tc18",
@@ -278,7 +278,7 @@
         "fully_correct": true,
         "no_tool_called": true,
         "has_content": true,
-        "elapsed_s": 0.27
+        "elapsed_s": 0.88
       },
       {
         "id": "tc19",
@@ -288,7 +288,7 @@
         "fully_correct": true,
         "no_tool_called": true,
         "has_content": true,
-        "elapsed_s": 0.92
+        "elapsed_s": 2.52
       },
       {
         "id": "tc20",
@@ -298,7 +298,7 @@
         "fully_correct": true,
         "no_tool_called": true,
         "has_content": true,
-        "elapsed_s": 0.31
+        "elapsed_s": 0.88
       },
       {
         "id": "tc21",
@@ -309,7 +309,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.5,
+        "elapsed_s": 1.32,
         "fully_correct": true,
         "steps_passed": 2,
         "steps_total": 2
@@ -323,7 +323,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.46,
+        "elapsed_s": 1.18,
         "fully_correct": true,
         "steps_passed": 2,
         "steps_total": 2
@@ -337,7 +337,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.47,
+        "elapsed_s": 1.26,
         "fully_correct": true,
         "steps_passed": 3,
         "steps_total": 3
@@ -351,7 +351,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.52,
+        "elapsed_s": 1.43,
         "fully_correct": true,
         "steps_passed": 3,
         "steps_total": 3
@@ -361,10 +361,10 @@
         "level": 3,
         "description": "Missing params — send_message with no recipient or text",
         "category": "missing_params",
-        "fully_correct": false,
-        "no_tool_called": false,
-        "has_content": false,
-        "elapsed_s": 0.55
+        "fully_correct": true,
+        "no_tool_called": true,
+        "has_content": true,
+        "elapsed_s": 1.67
       },
       {
         "id": "tc26",
@@ -374,7 +374,7 @@
         "fully_correct": true,
         "no_tool_called": true,
         "has_content": true,
-        "elapsed_s": 0.9
+        "elapsed_s": 1.29
       },
       {
         "id": "tc27",
@@ -385,7 +385,7 @@
         "correct_name": false,
         "valid_json_args": false,
         "arg_score": 0.0,
-        "elapsed_s": 1.16,
+        "elapsed_s": 3.31,
         "fully_correct": false
       },
       {
@@ -397,7 +397,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.49,
+        "elapsed_s": 1.44,
         "recovery_tool_called": false,
         "recovery_text": true,
         "fully_correct": true
@@ -411,7 +411,7 @@
         "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.44,
+        "elapsed_s": 1.33,
         "fully_correct": true,
         "steps_passed": 2,
         "steps_total": 2
@@ -422,226 +422,15 @@
         "description": "Nested dependent — exec output becomes memory_store value",
         "category": "nested_dependent",
         "tool_detected": true,
-        "correct_name": false,
+        "correct_name": true,
         "valid_json_args": true,
         "arg_score": 1.0,
-        "elapsed_s": 0.63,
-        "fully_correct": false,
-        "steps_passed": 0,
-        "steps_total": 1
+        "elapsed_s": 1.36,
+        "fully_correct": true,
+        "steps_passed": 2,
+        "steps_total": 2
       }
     ]
   },
-  "coding": {
-    "score": 0.9,
-    "passed": 9,
-    "total": 10,
-    "details": [
-      {
-        "id": "code01",
-        "description": "HE/93 — Encode message (swap case + vowel shift)",
-        "runs_without_error": true,
-        "correct_output": true,
-        "fully_correct": true
-      },
-      {
-        "id": "code02",
-        "description": "HE/94 — Largest prime factor digit sum",
-        "runs_without_error": false,
-        "correct_output": false,
-        "fully_correct": false
-      },
-      {
-        "id": "code03",
-        "description": "HE/116 — Sort by binary 1-count",
-        "runs_without_error": true,
-        "correct_output": true,
-        "fully_correct": true
-      },
-      {
-        "id": "code04",
-        "description": "HE/119 — Parentheses match (two strings)",
-        "runs_without_error": true,
-        "correct_output": true,
-        "fully_correct": true
-      },
-      {
-        "id": "code05",
-        "description": "HE/124 — Valid date mm-dd-yyyy",
-        "runs_without_error": true,
-        "correct_output": true,
-        "fully_correct": true
-      },
-      {
-        "id": "code06",
-        "description": "HE/130 — Custom tribonacci sequence",
-        "runs_without_error": true,
-        "correct_output": true,
-        "fully_correct": true
-      },
-      {
-        "id": "code07",
-        "description": "HE/141 — Filename validator",
-        "runs_without_error": true,
-        "correct_output": true,
-        "fully_correct": true
-      },
-      {
-        "id": "code08",
-        "description": "HE/145 — Order by digit sum (negative first digit)",
-        "runs_without_error": true,
-        "correct_output": true,
-        "fully_correct": true
-      },
-      {
-        "id": "code09",
-        "description": "HE/114 — Minimum subarray sum",
-        "runs_without_error": true,
-        "correct_output": true,
-        "fully_correct": true
-      },
-      {
-        "id": "code10",
-        "description": "HE/147 — Max triples divisible by 3",
-        "runs_without_error": true,
-        "correct_output": true,
-        "fully_correct": true
-      }
-    ]
-  },
-  "reasoning": {
-    "score": 0.5,
-    "passed": 5,
-    "total": 10,
-    "details": [
-      {
-        "id": "math01",
-        "expected": "3/2",
-        "got": "3/2",
-        "correct": true
-      },
-      {
-        "id": "math02",
-        "expected": "3",
-        "got": "3",
-        "correct": true
-      },
-      {
-        "id": "math03",
-        "expected": "14/3",
-        "got": "14/3",
-        "correct": true
-      },
-      {
-        "id": "math04",
-        "expected": "2220",
-        "got": "4",
-        "correct": false
-      },
-      {
-        "id": "math05",
-        "expected": "3",
-        "got": "1",
-        "correct": false
-      },
-      {
-        "id": "math06",
-        "expected": "9",
-        "got": "36",
-        "correct": false
-      },
-      {
-        "id": "math07",
-        "expected": "11/36",
-        "got": "11/36",
-        "correct": true
-      },
-      {
-        "id": "math08",
-        "expected": "121",
-        "got": "121",
-        "correct": true
-      },
-      {
-        "id": "math09",
-        "expected": "284",
-        "got": "4",
-        "correct": false
-      },
-      {
-        "id": "math10",
-        "expected": "144",
-        "got": "2",
-        "correct": false
-      }
-    ]
-  },
-  "general": {
-    "score": 0.7,
-    "passed": 7,
-    "total": 10,
-    "details": [
-      {
-        "id": "gen01",
-        "description": "MMLU-Pro CS — Boolean operator completeness",
-        "correct": true,
-        "reason": "ok"
-      },
-      {
-        "id": "gen02",
-        "description": "MMLU-Pro CS — Sorting algorithm complexity",
-        "correct": true,
-        "reason": "ok"
-      },
-      {
-        "id": "gen03",
-        "description": "MMLU-Pro CS — Two's complement overflow",
-        "correct": true,
-        "reason": "ok"
-      },
-      {
-        "id": "gen04",
-        "description": "MMLU-Pro Physics — Ideal gas law",
-        "correct": false,
-        "reason": "expected G, got C"
-      },
-      {
-        "id": "gen05",
-        "description": "MMLU-Pro Physics — Free fall in 2nd second",
-        "correct": true,
-        "reason": "ok"
-      },
-      {
-        "id": "gen06",
-        "description": "MMLU-Pro Math — Function composition",
-        "correct": false,
-        "reason": "expected E, got D"
-      },
-      {
-        "id": "gen07",
-        "description": "MMLU-Pro Chemistry — Conjugate acid",
-        "correct": false,
-        "reason": "expected I, got D"
-      },
-      {
-        "id": "gen08",
-        "description": "MMLU-Pro Chemistry — Zero-order reaction rate",
-        "correct": true,
-        "reason": "ok"
-      },
-      {
-        "id": "gen09",
-        "description": "MMLU-Pro History — Classical empire decline analogy",
-        "correct": true,
-        "reason": "ok"
-      },
-      {
-        "id": "gen10",
-        "description": "MMLU-Pro Engineering — Lamp illumination",
-        "correct": true,
-        "reason": "ok"
-      }
-    ]
-  },
-  "total_eval_time_s": 168.2
+  "total_eval_time_s": 72.4
 }
