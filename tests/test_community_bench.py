@@ -689,7 +689,9 @@ def test_ask_consent_yes() -> None:
     # should know git push runs first.
     text = stdout.getvalue()
     assert "git push" in text
+    assert "git fetch" in text
     assert "gh pr create" in text
+    assert "creating or reusing your fork" in text
 
 
 def test_ask_consent_default_no() -> None:
@@ -925,6 +927,250 @@ def test_origin_is_safe_github_rejects_malicious_pushurl(tmp_path) -> None:
     assert owner is None
 
 
+def test_origin_is_safe_github_allows_renamed_repo_for_metadata_check(
+    tmp_path,
+) -> None:
+    """Local safety accepts renamed repos; GitHub verifies fork parent later."""
+    from vllm_mlx.community_bench.submission import _origin_is_safe_github
+
+    subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/some-contributor/not-rapid-mlx.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    assert _origin_is_safe_github(tmp_path) == (True, "some-contributor")
+
+
+def test_origin_is_safe_github_rejects_invalid_owner(tmp_path) -> None:
+    """Remote URL owners must match GitHub's login grammar."""
+    from vllm_mlx.community_bench.submission import _origin_is_safe_github
+
+    subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/bad;owner/Rapid-MLX.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    assert _origin_is_safe_github(tmp_path) == (False, None)
+
+
+def test_origin_is_safe_github_accepts_upstream_fetch_with_fork_pushurl(
+    tmp_path,
+) -> None:
+    """The standard triangular workflow may fetch upstream and push a fork."""
+    from vllm_mlx.community_bench.submission import (
+        _find_contributor_push_target,
+        _origin_is_safe_github,
+    )
+
+    subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/raullenchai/Rapid-MLX.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            "https://github.com/some-contributor/Rapid-MLX.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    assert _origin_is_safe_github(tmp_path) == (True, "some-contributor")
+    assert _find_contributor_push_target(tmp_path) is None
+
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            "https://github.com/some-contributor/not-rapid-mlx.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    assert _origin_is_safe_github(tmp_path) == (True, "some-contributor")
+
+
+def test_find_fork_remote_rejects_same_owner_different_repo_pushurl(
+    tmp_path,
+) -> None:
+    """A fork fetch URL cannot bless a same-owner push to another repo."""
+    from vllm_mlx.community_bench.submission import _find_fork_remote
+
+    subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "add",
+            "community-bench-fork",
+            "https://github.com/some-contributor/Rapid-MLX.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "set-url",
+            "--push",
+            "community-bench-fork",
+            "https://github.com/some-contributor/not-rapid-mlx.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    assert _find_fork_remote(tmp_path, "some-contributor") is None
+
+
+def test_find_contributor_push_target_requires_metadata_for_renamed_origin(
+    tmp_path,
+) -> None:
+    """No-gh recovery does not guess whether a renamed origin is a fork."""
+    from vllm_mlx.community_bench.submission import (
+        _find_contributor_push_target,
+    )
+
+    subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/some-contributor/not-rapid-mlx.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    assert _find_contributor_push_target(tmp_path) is None
+
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/some-contributor/Rapid-MLX.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    assert _find_contributor_push_target(tmp_path) is None
+
+
+def test_find_contributor_push_target_prefers_origin_then_cli_remote(
+    tmp_path, monkeypatch
+) -> None:
+    """Recovery never selects an arbitrary collaborator's fork remote."""
+    from vllm_mlx.community_bench.submission import (
+        _find_contributor_push_target,
+    )
+
+    subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )
+    remotes = {
+        "aaa-collaborator": "https://github.com/collaborator/Rapid-MLX.git",
+        "community-bench-fork": "https://github.com/submitter/Rapid-MLX.git",
+        "origin": "https://github.com/origin-owner/Rapid-MLX.git",
+    }
+    for name, url in remotes.items():
+        subprocess.run(
+            ["git", "-C", str(tmp_path), "remote", "add", name, url],
+            check=True,
+            capture_output=True,
+        )
+
+    monkeypatch.setattr(
+        "vllm_mlx.community_bench.submission._github_repo_is_writable_upstream_fork",
+        lambda _repo, path: path in {"origin-owner/rapid-mlx", "submitter/rapid-mlx"},
+    )
+    assert _find_contributor_push_target(tmp_path, verify_fork=True) == (
+        "origin",
+        "origin-owner",
+    )
+
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/raullenchai/Rapid-MLX.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    assert _find_contributor_push_target(tmp_path, verify_fork=True) == (
+        "community-bench-fork",
+        "submitter",
+    )
+
+
 def test_make_pr_via_gh_branches_from_upstream_and_uses_owner_head(
     tmp_path, monkeypatch
 ) -> None:
@@ -936,7 +1182,7 @@ def test_make_pr_via_gh_branches_from_upstream_and_uses_owner_head(
 
     captured: list[list[str]] = []
 
-    def fake_run(cmd, capture_output, text, check, cwd):
+    def fake_run(cmd, **kwargs):
         captured.append(cmd)
 
         class _R:
@@ -944,7 +1190,14 @@ def test_make_pr_via_gh_branches_from_upstream_and_uses_owner_head(
             stdout = ""
             stderr = ""
 
-        return _R()
+        result = _R()
+        if cmd[3:8] == ["remote", "get-url", "--push", "--all", "origin"]:
+            result.stdout = "https://github.com/some-contributor/renamed-fork.git\n"
+        elif cmd[:3] == ["gh", "api", "repos/some-contributor/renamed-fork"]:
+            result.stdout = (
+                "true\traullenchai/Rapid-MLX\tintermediate/renamed-fork\ttrue\n"
+            )
+        return result
 
     monkeypatch.setattr(sub_mod.subprocess, "run", fake_run)
     monkeypatch.setattr(sub_mod.shutil, "which", lambda name: "/usr/local/bin/gh")
@@ -972,11 +1225,18 @@ def test_make_pr_via_gh_branches_from_upstream_and_uses_owner_head(
         origin_owner="some-contributor",
         upstream_remote="upstream",
     )
-    # First command must fetch upstream's main.
-    assert captured[0][:5] == ["git", "-C", str(tmp_path), "fetch", "--quiet"]
-    assert captured[0][5] == "upstream"
+    # The renamed origin is verified through GitHub parent metadata.
+    assert [
+        "gh",
+        "api",
+        "repos/some-contributor/renamed-fork",
+        "--jq",
+        "[.fork, .source.full_name, .parent.full_name, .permissions.push] | @tsv",
+    ] in captured
+    fetch = next(cmd for cmd in captured if cmd[3:5] == ["fetch", "--quiet"])
+    assert fetch[5] == "upstream"
     # Checkout must branch FROM FETCH_HEAD, not the local HEAD.
-    checkout = captured[1]
+    checkout = next(cmd for cmd in captured if cmd[3] == "checkout")
     assert checkout[-1] == "FETCH_HEAD", (
         f"checkout must branch from FETCH_HEAD, got cmd: {checkout}"
     )
@@ -984,6 +1244,128 @@ def test_make_pr_via_gh_branches_from_upstream_and_uses_owner_head(
     pr_create = captured[-1]
     head_idx = pr_create.index("--head")
     assert pr_create[head_idx + 1] == "some-contributor:community-bench/abcdef012345"
+    assert not any(cmd[:3] == ["gh", "repo", "fork"] for cmd in captured)
+
+
+def test_make_pr_via_gh_direct_clone_contributor_creates_fork(
+    tmp_path, monkeypatch
+) -> None:
+    """A contributor who cloned upstream directly cannot push ``origin``.
+
+    ``--submit`` must create (or reuse) their fork, add a dedicated remote,
+    push there, and open the PR with an owner-qualified head.  This is the
+    exact checkout shape reported in #1066.
+    """
+    from vllm_mlx.community_bench import submission as sub_mod
+
+    captured: list[list[str]] = []
+    fork_added = False
+    expected_fork_cmd = [
+        "gh",
+        "repo",
+        "fork",
+        "raullenchai/Rapid-MLX",
+        "--remote",
+        "--remote-name",
+        "community-bench-fork",
+        "--clone=false",
+    ]
+
+    def fake_run(cmd, **kwargs):
+        nonlocal fork_added
+        captured.append(cmd)
+
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        result = _R()
+        if cmd[:4] == ["gh", "api", "user", "--jq"]:
+            result.stdout = "some-contributor\n"
+        elif cmd[:3] == ["gh", "repo", "fork"]:
+            assert cmd == expected_fork_cmd
+            fork_added = True
+        elif cmd[:6] == [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "-v",
+        ]:
+            result.stdout = (
+                "origin\thttps://github.com/raullenchai/Rapid-MLX.git (fetch)\n"
+                "origin\thttps://github.com/raullenchai/Rapid-MLX.git (push)\n"
+            )
+            if fork_added:
+                result.stdout += (
+                    "community-bench-fork\t"
+                    "https://github.com/some-contributor/Rapid-MLX.git (fetch)\n"
+                    "community-bench-fork\t"
+                    "https://github.com/some-contributor/Rapid-MLX.git (push)\n"
+                )
+        elif cmd[3:8] == [
+            "remote",
+            "get-url",
+            "--push",
+            "--all",
+            "community-bench-fork",
+        ]:
+            result.stdout = "https://github.com/some-contributor/Rapid-MLX.git\n"
+        elif cmd[3:8] == [
+            "remote",
+            "get-url",
+            "--push",
+            "--all",
+            "origin",
+        ]:
+            result.stdout = "https://github.com/raullenchai/Rapid-MLX.git\n"
+        elif cmd[:3] == [
+            "gh",
+            "api",
+            "repos/some-contributor/rapid-mlx",
+        ]:
+            result.stdout = "true\traullenchai/Rapid-MLX\traullenchai/Rapid-MLX\ttrue\n"
+        return result
+
+    monkeypatch.setattr(sub_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(sub_mod.shutil, "which", lambda name: "/usr/local/bin/gh")
+    payload = {
+        "submission_id": "abcdef012345",
+        "submitted_at": "2026-06-15T10:30:00+00:00",
+        "model": {"alias": "qwen", "hf_path": "x/y"},
+        "hardware": {"chip": "Apple M4 Pro", "ram_gb": 24},
+        "software": {"rapid_mlx": "0.10.5", "mlx": "0.32.0"},
+        "config": {"sampling": "greedy"},
+        "buckets": {
+            "short": {"decode_tps": {"median": 40.0}},
+            "long": {"decode_tps": {"median": 40.0}},
+        },
+    }
+    sub_path = tmp_path / "submission.json"
+    sub_path.write_text("{}")
+
+    out = io.StringIO()
+    ok, _, _, _ = sub_mod._make_pr_via_gh(
+        tmp_path,
+        sub_path,
+        payload,
+        stdout=out,
+        origin_owner="raullenchai",
+        upstream_remote="origin",
+    )
+
+    assert ok is True, out.getvalue()
+    assert expected_fork_cmd in captured
+    push = next(cmd for cmd in captured if "push" in cmd[:5])
+    assert push[-2:] == ["community-bench-fork", "community-bench/abcdef012345"]
+    assert not any(
+        cmd[-2:] == ["origin", "community-bench/abcdef012345"] for cmd in captured
+    )
+    pr_create = next(cmd for cmd in captured if cmd[:3] == ["gh", "pr", "create"])
+    assert pr_create[pr_create.index("--head") + 1] == (
+        "some-contributor:community-bench/abcdef012345"
+    )
 
 
 def test_find_upstream_remote_rejects_evil_github_lookalike(
@@ -1122,16 +1504,21 @@ def test_submit_interactive_clean_tree_reaches_pr_step(
 
     def fake_pr(repo, path, payload, *, stdout, origin_owner, upstream_remote):
         pr_invoked.append(True)
-        # ``_make_pr_via_gh`` now returns (success, completed_steps);
-        # round-5 state-aware fallback needs the set on failure.
-        return True, {
-            "fetch_base",
-            "checkout",
-            "stage",
-            "commit",
-            "push",
-            "pr_create",
-        }
+        # State-aware fallback receives completed steps, head owner, and any
+        # failed push remote.
+        return (
+            True,
+            {
+                "fetch_base",
+                "checkout",
+                "stage",
+                "commit",
+                "push",
+                "pr_create",
+            },
+            "raullenchai",
+            None,
+        )
 
     monkeypatch.setattr(sub_mod, "_git_is_clean", fake_clean)
     monkeypatch.setattr(sub_mod, "_make_pr_via_gh", fake_pr)
@@ -1676,15 +2063,20 @@ def test_submission_make_pr_uses_repo_cwd(tmp_path, monkeypatch) -> None:
 
     calls: list[dict] = []
 
-    def fake_run(cmd, capture_output, text, check, cwd):
-        calls.append({"cmd": cmd, "cwd": cwd})
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": cmd, "cwd": kwargs.get("cwd")})
 
         class _R:
             returncode = 0
             stdout = ""
             stderr = ""
 
-        return _R()
+        result = _R()
+        if cmd[:3] == ["gh", "api", "user"]:
+            result.stdout = "raullenchai\n"
+        elif cmd[3:8] == ["remote", "get-url", "--push", "--all", "origin"]:
+            result.stdout = "https://github.com/raullenchai/Rapid-MLX.git\n"
+        return result
 
     monkeypatch.setattr(sub_mod.subprocess, "run", fake_run)
     monkeypatch.setattr(sub_mod.shutil, "which", lambda name: "/usr/local/bin/gh")
@@ -1717,13 +2109,24 @@ def test_submission_make_pr_uses_repo_cwd(tmp_path, monkeypatch) -> None:
     assert calls, "no subprocess calls captured"
     # Every step must run inside the resolved repo dir.
     for c in calls:
+        if c["cmd"][3:5] == ["remote", "get-url"]:
+            # _run_git uses -C and does not need a process cwd; mutation and
+            # gh steps still pin cwd explicitly below.
+            continue
         assert c["cwd"] == str(tmp_path), (
             f"step {c['cmd'][0]!r} ran with cwd={c['cwd']!r}, "
             f"expected {str(tmp_path)!r}"
         )
+    commands = [c["cmd"] for c in calls]
+    assert not any(cmd[:3] == ["gh", "repo", "fork"] for cmd in commands)
+    assert any(
+        cmd[-2:] == ["origin", "community-bench/abcdef012345"] for cmd in commands
+    )
 
 
-def test_state_aware_fallback_skips_already_completed_steps(tmp_path, capsys) -> None:
+def test_state_aware_fallback_skips_already_completed_steps(
+    tmp_path, monkeypatch
+) -> None:
     """Regression: when ``_make_pr_via_gh`` bails after ``push`` (e.g.
     ``gh pr create`` failed), the manual-fallback instructions must
     NOT tell the user to ``git checkout -b <branch>`` because the
@@ -1741,6 +2144,8 @@ def test_state_aware_fallback_skips_already_completed_steps(tmp_path, capsys) ->
     }
     sub_path = tmp_path / "submission.json"
     sub_path.write_text("{}")
+    monkeypatch.setattr(sub_mod.shutil, "which", lambda _: "/opt/homebrew/bin/gh")
+    monkeypatch.setattr(sub_mod, "_github_login", lambda _repo: ("raullenchai", None))
 
     completed = {"checkout", "stage", "commit", "push"}  # all but pr_create
     out = io.StringIO()
@@ -1758,6 +2163,86 @@ def test_state_aware_fallback_skips_already_completed_steps(tmp_path, capsys) ->
     assert "gh pr create" in text
     # Should explain what already happened.
     assert "Already completed" in text
+
+
+def test_state_aware_fallback_preserves_pushed_fork_head_owner(
+    tmp_path, monkeypatch
+) -> None:
+    """A post-push API outage cannot erase the selected fork PR head."""
+    from vllm_mlx.community_bench import submission as sub_mod
+
+    payload = {
+        "submission_id": "abcdef012345",
+        "model": {"alias": "x"},
+        "hardware": {"chip": "Apple M4 Pro"},
+    }
+    sub_path = tmp_path / "submission.json"
+    sub_path.write_text("{}")
+    monkeypatch.setattr(sub_mod.shutil, "which", lambda _: "/opt/homebrew/bin/gh")
+    monkeypatch.setattr(
+        sub_mod, "_github_login", lambda _repo: ("some-contributor", None)
+    )
+    monkeypatch.setattr(
+        sub_mod,
+        "_find_contributor_push_target",
+        lambda _repo, **_kwargs: None,
+    )
+
+    out = io.StringIO()
+    sub_mod._print_manual_fallback(
+        tmp_path,
+        sub_path,
+        payload,
+        stdout=out,
+        completed={"fetch_base", "checkout", "stage", "commit", "push"},
+        selected_head_owner="some-contributor",
+    )
+
+    text = out.getvalue()
+    assert (
+        "gh pr create --repo raullenchai/Rapid-MLX "
+        "--head some-contributor:community-bench/abcdef012345"
+    ) in text
+    assert "git push" not in text
+
+
+def test_state_aware_fallback_excludes_failed_push_remote(
+    tmp_path, monkeypatch
+) -> None:
+    """Recovery must not repeat a push to the remote that just failed."""
+    from vllm_mlx.community_bench import submission as sub_mod
+
+    payload = {
+        "submission_id": "abcdef012345",
+        "model": {"alias": "x"},
+        "hardware": {"chip": "Apple M4 Pro"},
+    }
+    sub_path = tmp_path / "submission.json"
+    sub_path.write_text("{}")
+    monkeypatch.setattr(sub_mod.shutil, "which", lambda _: "/opt/homebrew/bin/gh")
+    monkeypatch.setattr(
+        sub_mod, "_github_login", lambda _repo: ("some-contributor", None)
+    )
+
+    def fake_target(_repo, *, excluded_remote=None, **_kwargs):
+        return None if excluded_remote == "origin" else ("origin", "someone-else")
+
+    monkeypatch.setattr(sub_mod, "_find_contributor_push_target", fake_target)
+
+    out = io.StringIO()
+    sub_mod._print_manual_fallback(
+        tmp_path,
+        sub_path,
+        payload,
+        stdout=out,
+        completed={"fetch_base", "checkout", "stage", "commit"},
+        selected_head_owner="someone-else",
+        excluded_push_remote="origin",
+    )
+    text = out.getvalue()
+
+    assert "git push -u origin" not in text
+    assert "gh repo fork raullenchai/Rapid-MLX" in text
 
 
 def test_manual_fallback_without_gh_points_at_web_ui(tmp_path, monkeypatch) -> None:
@@ -1788,11 +2273,14 @@ def test_manual_fallback_without_gh_points_at_web_ui(tmp_path, monkeypatch) -> N
 
     # gh isn't installed — must NOT recommend gh pr create.
     assert "gh pr create" not in text
+    assert (
+        f"git fetch https://github.com/{sub_mod.UPSTREAM_REPO_FOR_GH}.git main" in text
+    )
     # Must surface the compare-page URL with the branch ref filled in.
     branch = f"community-bench/{payload['submission_id']}"
     assert (
         f"https://github.com/{sub_mod.UPSTREAM_REPO_FOR_GH}"
-        f"/compare/main...{branch}?expand=1"
+        f"/compare/main...YOUR_GITHUB_USERNAME:{branch}?expand=1"
     ) in text
     # Must also offer the paste-to-issue escape hatch so users with no
     # git fluency at all still have a way to land their numbers.
@@ -1809,14 +2297,10 @@ def test_manual_fallback_without_gh_points_at_web_ui(tmp_path, monkeypatch) -> N
     assert parsed["title"] == "community-bench: qwen3.5-9b-4bit on Apple M3 Ultra"
 
 
-def test_manual_fallback_without_gh_uses_fork_owner_when_origin_is_fork(
+def test_manual_fallback_without_gh_does_not_trust_unverified_fork_origin(
     tmp_path, monkeypatch
 ) -> None:
-    """Regression: when origin is a contributor's fork (the normal
-    contribution path), the compare URL must use ``main...<owner>:<branch>``
-    so GitHub can find the head branch on the fork — bare ``main...<branch>``
-    only resolves on the upstream repo. (Codex PR #600 round-1 BLOCKING.)
-    """
+    """Without GitHub metadata, even a fork-looking origin is not reused."""
     from vllm_mlx.community_bench import submission as sub_mod
 
     payload = {
@@ -1829,31 +2313,42 @@ def test_manual_fallback_without_gh_uses_fork_owner_when_origin_is_fork(
     sub_path = tmp_path / "submission.json"
     sub_path.write_text("{}")
 
-    monkeypatch.setattr(sub_mod.shutil, "which", lambda _: None)
-    # Mock origin → contributor's fork on github.com.
-    monkeypatch.setattr(
-        sub_mod,
-        "_origin_is_safe_github",
-        lambda _repo: (True, "some-contributor"),
+    subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
     )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/some-contributor/renamed-fork.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setattr(sub_mod.shutil, "which", lambda _: None)
     out = io.StringIO()
     sub_mod._print_manual_fallback(tmp_path, sub_path, payload, stdout=out)
     text = out.getvalue()
 
     branch = f"community-bench/{payload['submission_id']}"
-    # Cross-fork compare URL: head is owner-prefixed.
-    assert (f"compare/main...some-contributor:{branch}?expand=1") in text
-    # Must NOT print the bare same-repo form (would 404 for the user).
-    assert f"compare/main...{branch}?expand=1" not in text
+    assert "Maintainers only" not in text
+    assert "git push -u origin" not in text
+    assert f"compare/main...YOUR_GITHUB_USERNAME:{branch}?expand=1" in text
 
 
-def test_manual_fallback_without_gh_skips_owner_when_origin_is_upstream(
+def test_manual_fallback_without_gh_direct_clone_uses_fork_first(
     tmp_path, monkeypatch
 ) -> None:
-    """Counterpart to the fork case: when origin owner equals the
-    upstream owner (maintainer running locally), the URL must NOT
-    include the ``upstream:`` prefix — that would be redundant and
-    GitHub's compare page redirects it anyway.
+    """A direct upstream clone uses fork-first contributor instructions.
+
+    Without ``gh`` we cannot discover or create the contributor's fork, so
+    print a complete fork-first recovery flow with a username placeholder.
+    An explicitly labelled direct-push option remains available to maintainers.
+    This contributor path is the one that failed with 403 in #1066.
     """
     from vllm_mlx.community_bench import submission as sub_mod
 
@@ -1867,20 +2362,146 @@ def test_manual_fallback_without_gh_skips_owner_when_origin_is_upstream(
     sub_path = tmp_path / "submission.json"
     sub_path.write_text("{}")
 
-    upstream_owner = sub_mod.UPSTREAM_REPO_FOR_GH.split("/", 1)[0]
-    monkeypatch.setattr(sub_mod.shutil, "which", lambda _: None)
-    monkeypatch.setattr(
-        sub_mod,
-        "_origin_is_safe_github",
-        lambda _repo: (True, upstream_owner),
+    subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
     )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "add",
+            "origin",
+            f"https://github.com/{sub_mod.UPSTREAM_REPO_FOR_GH}.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setattr(sub_mod.shutil, "which", lambda _: None)
     out = io.StringIO()
     sub_mod._print_manual_fallback(tmp_path, sub_path, payload, stdout=out)
     text = out.getvalue()
 
     branch = f"community-bench/{payload['submission_id']}"
-    assert f"compare/main...{branch}?expand=1" in text
-    assert f"compare/main...{upstream_owner}:" not in text
+    assert (
+        f"git fetch https://github.com/{sub_mod.UPSTREAM_REPO_FOR_GH}.git main" in text
+    )
+    assert "Maintainers only" in text
+    assert f"git push -u origin {branch}" in text
+    assert f"https://github.com/{sub_mod.UPSTREAM_REPO_FOR_GH}/fork" in text
+    assert ("git remote add community-bench-fork YOUR_FORK_CLONE_URL") in text
+    assert f"git push -u community-bench-fork {branch}" in text
+    assert f"compare/main...YOUR_GITHUB_USERNAME:{branch}?expand=1" in text
+
+
+def test_manual_fallback_avoids_existing_fork_remote_name(
+    tmp_path, monkeypatch
+) -> None:
+    """Printed recovery commands must not overwrite an unrelated remote."""
+    from vllm_mlx.community_bench import submission as sub_mod
+
+    subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "add",
+            "origin",
+            f"https://github.com/{sub_mod.UPSTREAM_REPO_FOR_GH}.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "add",
+            "community-bench-fork",
+            "https://github.com/example/unrelated.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    payload = {
+        "submission_id": "abcdef012345",
+        "model": {"alias": "x"},
+        "hardware": {"chip": "Apple M4 Pro"},
+    }
+    sub_path = tmp_path / "submission.json"
+    sub_path.write_text("{}")
+    monkeypatch.setattr(sub_mod.shutil, "which", lambda _: None)
+
+    out = io.StringIO()
+    sub_mod._print_manual_fallback(tmp_path, sub_path, payload, stdout=out)
+    text = out.getvalue()
+
+    assert "git remote add community-bench-fork-2 " in text
+    assert ("git push -u community-bench-fork-2 community-bench/abcdef012345") in text
+
+
+def test_manual_fallback_does_not_print_repo_controlled_shell_args(
+    tmp_path, monkeypatch
+) -> None:
+    """Recovery commands use a fixed fetch URL and quote commit metadata."""
+    import shlex
+
+    from vllm_mlx.community_bench import submission as sub_mod
+
+    subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )
+    malicious_remote = "upstream;echo-PWNED"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "add",
+            malicious_remote,
+            f"https://github.com/{sub_mod.UPSTREAM_REPO_FOR_GH}.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    alias = "model'; echo PWNED; '"
+    chip = "Apple M4 Pro"
+    payload = {
+        "submission_id": "abcdef012345",
+        "model": {"alias": alias},
+        "hardware": {"chip": chip},
+    }
+    sub_path = tmp_path / "submission.json"
+    sub_path.write_text("{}")
+    monkeypatch.setattr(sub_mod.shutil, "which", lambda _: None)
+
+    out = io.StringIO()
+    sub_mod._print_manual_fallback(tmp_path, sub_path, payload, stdout=out)
+    text = out.getvalue()
+
+    assert malicious_remote not in text
+    assert (
+        f"git fetch https://github.com/{sub_mod.UPSTREAM_REPO_FOR_GH}.git main" in text
+    )
+    commit_line = next(
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith("git commit -m ")
+    )
+    assert shlex.split(commit_line) == [
+        "git",
+        "commit",
+        "-m",
+        f"community-bench: {alias} on {chip}",
+    ]
 
 
 def test_manual_fallback_compare_url_quotes_owner_and_branch(
@@ -1912,8 +2533,8 @@ def test_manual_fallback_compare_url_quotes_owner_and_branch(
     # layer to be load-bearing regardless.
     monkeypatch.setattr(
         sub_mod,
-        "_origin_is_safe_github",
-        lambda _repo: (True, "weird?owner#name%"),
+        "_find_contributor_push_target",
+        lambda _repo, **_kwargs: ("origin", "weird?owner#name%"),
     )
     out = io.StringIO()
     sub_mod._print_manual_fallback(tmp_path, sub_path, payload, stdout=out)
@@ -1991,6 +2612,9 @@ def test_manual_fallback_with_gh_keeps_gh_command(tmp_path, monkeypatch) -> None
     sub_path.write_text("{}")
 
     monkeypatch.setattr(sub_mod.shutil, "which", lambda name: "/opt/homebrew/bin/gh")
+    monkeypatch.setattr(
+        sub_mod, "_github_login", lambda _repo: ("some-contributor", None)
+    )
     out = io.StringIO()
     sub_mod._print_manual_fallback(tmp_path, sub_path, payload, stdout=out)
     text = out.getvalue()
@@ -1999,6 +2623,69 @@ def test_manual_fallback_with_gh_keeps_gh_command(tmp_path, monkeypatch) -> None
     # Web-UI fallback shouldn't appear when gh is available.
     assert "compare/main..." not in text
     assert "/issues/new" not in text
+
+
+def test_manual_fallback_with_unauthenticated_gh_uses_web(
+    tmp_path, monkeypatch
+) -> None:
+    """An installed but unusable gh binary must not block web recovery."""
+    from vllm_mlx.community_bench import submission as sub_mod
+
+    payload = {
+        "submission_id": "abcdef012345",
+        "model": {"alias": "x"},
+        "hardware": {"chip": "Apple M4 Pro"},
+    }
+    sub_path = tmp_path / "submission.json"
+    sub_path.write_text("{}")
+    monkeypatch.setattr(sub_mod.shutil, "which", lambda _: "/opt/homebrew/bin/gh")
+    monkeypatch.setattr(
+        sub_mod, "_github_login", lambda _repo: (None, "not authenticated")
+    )
+
+    out = io.StringIO()
+    sub_mod._print_manual_fallback(tmp_path, sub_path, payload, stdout=out)
+    text = out.getvalue()
+
+    assert "gh repo fork" not in text
+    assert "gh pr create" not in text
+    assert f"https://github.com/{sub_mod.UPSTREAM_REPO_FOR_GH}/fork" in text
+    assert "YOUR_FORK_CLONE_URL" in text
+
+
+def test_manual_fallback_with_gh_quotes_head_owner(tmp_path, monkeypatch) -> None:
+    """A repo-controlled owner cannot inject shell syntax via ``--head``."""
+    import shlex
+
+    from vllm_mlx.community_bench import submission as sub_mod
+
+    payload = {
+        "submission_id": "abcdef012345",
+        "model": {"alias": "x"},
+        "hardware": {"chip": "Apple M4 Pro"},
+    }
+    sub_path = tmp_path / "submission.json"
+    sub_path.write_text("{}")
+    malicious_owner = "owner;echo-PWNED"
+    monkeypatch.setattr(sub_mod.shutil, "which", lambda _: "/opt/homebrew/bin/gh")
+    monkeypatch.setattr(
+        sub_mod, "_github_login", lambda _repo: ("some-contributor", None)
+    )
+    monkeypatch.setattr(
+        sub_mod,
+        "_find_contributor_push_target",
+        lambda _repo, **_kwargs: ("origin", malicious_owner),
+    )
+
+    out = io.StringIO()
+    sub_mod._print_manual_fallback(tmp_path, sub_path, payload, stdout=out)
+    pr_line = next(
+        line.strip()
+        for line in out.getvalue().splitlines()
+        if line.strip().startswith("gh pr create ")
+    )
+    expected_head = f"{malicious_owner}:community-bench/abcdef012345"
+    assert f"--head {shlex.quote(expected_head)}" in pr_line
 
 
 def test_decode_tps_formula_uses_n_minus_one(monkeypatch) -> None:
