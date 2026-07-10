@@ -457,6 +457,24 @@ _GPTOSS_OPENHANDS_XFAIL_REASON = (
 # coverage for the family lives.
 
 _HY3_XFAIL_FAMILY = "hy3"  # matches the parametrize id
+
+# The integration-matrix modules whose ``family_alias``-parametrized cells
+# (ids ``[qwen36]`` / ``[gemma4]`` / ``[deepseek]`` / ``[gptoss]`` / ``[hy3]``)
+# are the ONLY items this hook is meant to mark. Any other collected test may
+# legitimately carry a ``[<family>]`` param id for an unrelated reason — e.g.
+# ``test_model_auto_config.py::TestHy3AutoDetectBoundary::
+# test_hy3_basename_is_detected[hy3]`` is an offline unit test whose raw
+# string param value happens to be ``"hy3"``. Gating on the matrix module
+# prevents the bare-substring match from bleeding onto those cells (which
+# would turn a legitimate PASS into an XPASS(strict) red under full-tree
+# ``pytest tests/``). The DeepSeek and gpt-oss blocks below already scope
+# themselves to these modules via their ``test_*_matrix.py::`` nodeid
+# prefixes; this makes the HY3 block follow the same convention.
+_INTEGRATION_MATRIX_MODULES = (
+    "test_agents_matrix.py",
+    "test_frameworks_matrix.py",
+)
+
 _HY3_XFAIL_REASON = (
     "hy3-preview-4bit 166 GB single-node — Ultra-only "
     "(min_memory_gb=192, ~156 GB peak), 295B/21B-active MoE. Like DeepSeek "
@@ -510,12 +528,18 @@ def pytest_collection_modifyitems(
                     strict=True,
                 )
             )
-        # Hy3 — every cell (all 14: 11 agents + 3 frameworks), 166 GB
-        # Ultra-only. The matrix parametrizes by a single ``family``
-        # argument, so every Hy3 nodeid ends in exactly ``[hy3]`` (never a
-        # combined id like ``[agent-hy3]``); the bare-token match below is
-        # the same pattern the merged DeepSeek/gpt-oss blocks use.
-        if f"[{_HY3_XFAIL_FAMILY}]" in item.nodeid:
+        # Hy3 — every matrix cell (all 14: 11 agents + 3 frameworks), 166 GB
+        # Ultra-only. The matrix parametrizes by a single ``family`` argument,
+        # so every Hy3 matrix nodeid ends in exactly ``[hy3]`` (never a
+        # combined id like ``[agent-hy3]``). The bare ``[hy3]`` token is NOT
+        # unique to the matrix, though: an unrelated offline unit test
+        # (``TestHy3AutoDetectBoundary::test_hy3_basename_is_detected[hy3]``)
+        # legitimately shares the id. Scope to the matrix modules — mirroring
+        # the ``test_*_matrix.py::`` prefixes the DeepSeek/gpt-oss blocks use
+        # — so the bare-token match cannot bleed onto those passing cells.
+        if f"[{_HY3_XFAIL_FAMILY}]" in item.nodeid and any(
+            module in item.nodeid for module in _INTEGRATION_MATRIX_MODULES
+        ):
             item.add_marker(
                 pytest.mark.xfail(
                     reason=_HY3_XFAIL_REASON,
