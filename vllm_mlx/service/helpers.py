@@ -17,6 +17,8 @@ import os
 import threading
 import uuid
 from collections.abc import AsyncIterator
+from functools import lru_cache
+from pathlib import Path
 
 from fastapi import HTTPException
 from starlette.requests import Request
@@ -3890,6 +3892,53 @@ async def _wait_with_disconnect(
 _FALLBACK_MAX_CONTEXT_TOKENS = 4_194_304
 
 
+@lru_cache(maxsize=32)
+def _read_local_config_max_context(config_path: str) -> int | None:
+    """Read a positive context limit from one local ``config.json``.
+
+    ``get_model_max_context`` runs on request admission, so cache the
+    immutable checkpoint metadata instead of reopening the file for every
+    request. The caller only passes paths that already exist locally; this
+    helper never resolves a Hub ID or performs network I/O.
+    """
+    try:
+        payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        logger.debug(
+            "get_model_max_context: could not read local %s",
+            config_path,
+            exc_info=True,
+        )
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    candidates = [payload.get("max_position_embeddings")]
+    text_config = payload.get("text_config")
+    if isinstance(text_config, dict):
+        candidates.append(text_config.get("max_position_embeddings"))
+    for value in candidates:
+        # JSON booleans are ``int`` subclasses in Python, and non-integral
+        # JSON numbers may decode to floats (including ``inf`` for a huge
+        # exponent). A context window is an integer schema field: accept an
+        # actual integer or decimal integer string and fail soft on every
+        # other shape.
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = int(value)
+            except ValueError:
+                continue
+        else:
+            continue
+        if parsed > 0:
+            return parsed
+    return None
+
+
 def get_model_max_context(engine) -> int:
     """Return the model's max prompt-token context window for ``engine``.
 
@@ -3900,10 +3949,12 @@ def get_model_max_context(engine) -> int:
          multimodal Qwen3.5 / Gemma 4 nest the text-config inside.
       3. ``engine._model.config.max_position_embeddings`` — older
          attribute style.
-      4. ``engine.tokenizer.model_max_length`` if not the HuggingFace
+      4. Local ``config.json`` beside ``tokenizer.name_or_path`` — some
+         mlx-lm dataclasses (notably GPT-OSS) drop the HF context field.
+      5. ``engine.tokenizer.model_max_length`` if not the HuggingFace
          "VERY_LARGE_INTEGER" sentinel (``1e30``). Some tokenizers
          report a useful cap here even when the model object doesn't.
-      5. ``_FALLBACK_MAX_CONTEXT_TOKENS`` — see module-level comment.
+      6. ``_FALLBACK_MAX_CONTEXT_TOKENS`` — see module-level comment.
 
     The function is intentionally permissive about missing fields: we'd
     rather pass through a request the model can handle than refuse a
@@ -3948,6 +3999,35 @@ def get_model_max_context(engine) -> int:
         engine, "_tokenizer", None
     )
     if tokenizer is not None:
+        # mlx-lm's GPT-OSS ModelArgs does not retain the checkpoint's
+        # ``max_position_embeddings`` field. Its tokenizer also reports
+        # Hugging Face's unknown-length sentinel, but ``name_or_path`` still
+        # points at the already-downloaded checkpoint. Read that local config
+        # before consulting the tokenizer sentinel. Wrapper tokenizers may
+        # keep the HF tokenizer under ``_tokenizer`` or ``tokenizer``.
+        seen_config_paths: set[str] = set()
+        tokenizer_candidates = (
+            tokenizer,
+            getattr(tokenizer, "_tokenizer", None),
+            getattr(tokenizer, "tokenizer", None),
+        )
+        for candidate in tokenizer_candidates:
+            if candidate is None:
+                continue
+            name_or_path = getattr(candidate, "name_or_path", None)
+            try:
+                checkpoint_path = Path(os.fspath(name_or_path)).expanduser()
+            except TypeError:
+                continue
+            config_path = checkpoint_path / "config.json"
+            config_key = os.fspath(config_path)
+            if config_key in seen_config_paths or not config_path.is_file():
+                continue
+            seen_config_paths.add(config_key)
+            local_max = _read_local_config_max_context(config_key)
+            if local_max is not None:
+                return local_max
+
         tok_max = getattr(tokenizer, "model_max_length", None)
         if tok_max is not None:
             # HuggingFace tokenizers report 1e30 ("no cap known") which

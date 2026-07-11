@@ -17,6 +17,8 @@ chat route is covered by ``test_chat_route_*`` smoke runs.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 # Helpers under test depend on the engine contract (``_model.args.*``,
@@ -45,9 +47,17 @@ class _StubTokenizer:
     (1 token per 4 characters) so the test can hit specific
     boundaries without depending on a real BPE."""
 
-    def __init__(self, model_max_length=None, bos_token=None, chars_per_token=4):
+    def __init__(
+        self,
+        model_max_length=None,
+        bos_token=None,
+        chars_per_token=4,
+        name_or_path=None,
+    ):
         if model_max_length is not None:
             self.model_max_length = model_max_length
+        if name_or_path is not None:
+            self.name_or_path = name_or_path
         self.bos_token = bos_token
         self._cpt = chars_per_token
 
@@ -104,6 +114,76 @@ def test_max_context_from_model_config_attribute():
     cfg = _StubArgs(max_position_embeddings=8192)
     eng = _StubEngine(model=_StubModel(config=cfg))
     assert get_model_max_context(eng) == 8192
+
+
+def test_max_context_from_local_tokenizer_config_for_gpt_oss(tmp_path):
+    """mlx-lm's GPT-OSS ModelArgs drops ``max_position_embeddings``.
+
+    The tokenizer then exposes Hugging Face's unknown-length sentinel,
+    but its local checkpoint still has the authoritative 128K limit in
+    ``config.json``. Resolve that local metadata before falling back to
+    the permissive DoS sentinel so over-context requests are rejected
+    before their expensive prefill (issue #1084).
+    """
+    from fastapi import HTTPException
+
+    from vllm_mlx.service.helpers import (
+        enforce_context_length,
+        get_model_max_context,
+    )
+
+    checkpoint = tmp_path / "gpt-oss-120b"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "gpt_oss",
+                "max_position_embeddings": 131_072,
+            }
+        )
+    )
+    tok = _StubTokenizer(
+        model_max_length=int(1e30),
+        name_or_path=str(checkpoint),
+    )
+    eng = _StubEngine(model=_StubModel(args=_StubArgs()), tokenizer=tok)
+
+    assert get_model_max_context(eng) == 131_072
+    with pytest.raises(HTTPException) as excinfo:
+        enforce_context_length(
+            eng,
+            prompt_tokens=116_650,
+            max_tokens=32_768,
+        )
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.detail["error"]["code"] == "context_length_exceeded"
+
+
+def test_max_context_ignores_malformed_local_tokenizer_config(tmp_path):
+    """A damaged sidecar must fall through, not turn admission into a 500."""
+    from vllm_mlx.service.helpers import get_model_max_context
+
+    checkpoint = tmp_path / "broken-checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{not-json")
+    tok = _StubTokenizer(model_max_length=4096, name_or_path=str(checkpoint))
+
+    assert get_model_max_context(_StubEngine(tokenizer=tok)) == 4096
+
+
+@pytest.mark.parametrize("invalid_value", ["true", "1e10000"])
+def test_max_context_rejects_invalid_local_config_values(tmp_path, invalid_value):
+    """Boolean and non-finite numeric JSON values must fail soft."""
+    from vllm_mlx.service.helpers import get_model_max_context
+
+    checkpoint = tmp_path / f"invalid-context-{invalid_value}"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        f'{{"max_position_embeddings": {invalid_value}}}'
+    )
+    tok = _StubTokenizer(model_max_length=4096, name_or_path=str(checkpoint))
+
+    assert get_model_max_context(_StubEngine(tokenizer=tok)) == 4096
 
 
 def test_max_context_from_tokenizer_when_model_silent():
