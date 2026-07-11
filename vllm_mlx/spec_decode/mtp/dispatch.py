@@ -51,6 +51,11 @@ _MTP_INJECT_DISPATCH: dict[str, tuple[str, str]] = {
         "vllm_mlx.spec_decode.mtp.qwen3_5_inject",
         "inject_mtp_support",
     ),
+    # HY3 (Tencent Hunyuan 3) native MTP head.
+    "hy_v3": (
+        "vllm_mlx.spec_decode.mtp.hy3_inject",
+        "inject_hy3_mtp_support",
+    ),
 }
 
 
@@ -65,6 +70,11 @@ _MTP_VALIDATE_DISPATCH: dict[str, tuple[str, str]] = {
     "qwen3_5_moe": (
         "vllm_mlx.spec_decode.mtp.qwen3_5_inject",
         "validate_mtp_support",
+    ),
+    # HY3 native MTP head.
+    "hy_v3": (
+        "vllm_mlx.spec_decode.mtp.hy3_inject",
+        "validate_hy3_mtp_support",
     ),
 }
 

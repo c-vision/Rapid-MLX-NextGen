@@ -1143,7 +1143,7 @@
     "reasoning_parser": "hy_v3",
     "is_hybrid": false,
     "is_moe": true,
-    "supports_spec_decode": false,
+    "supports_spec_decode": true,
     "min_memory_gb": 192
   },
   "qwen3-vl-8b-4bit": {

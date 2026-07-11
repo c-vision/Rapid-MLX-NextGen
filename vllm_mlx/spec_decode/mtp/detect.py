@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3.5 / Qwen3.6 MTP architecture detection (R15 task #302).
+"""Native-MTP architecture detection (R15 task #302).
+
+Covers the families whose model class ships a driveable MTP head: Qwen3.5 /
+Qwen3.6 (``mtp_num_hidden_layers``) and HY3 / Tencent Hunyuan 3
+(``num_nextn_predict_layers``).
 
 Detection lives off the loaded ``config.json`` dict rather than the
 ``aliases.json`` schema. Reasons:
@@ -70,6 +74,11 @@ _SUPPORTED_MODEL_TYPES: frozenset[str] = frozenset(
         # Qwen3.5 / Qwen3.6 (upstream PR #990)
         "qwen3_5",
         "qwen3_5_moe",
+        # HY3 (Tencent Hunyuan 3) — DeepSeek-V3-style native MTP head at
+        # layer ``num_hidden_layers``. Config advertises the count under
+        # ``num_nextn_predict_layers`` (not ``mtp_num_hidden_layers``); the
+        # per-family fallback in ``_mtp_num_hidden_layers`` handles that.
+        "hy_v3",
     }
 )
 
@@ -107,15 +116,30 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 
 def _mtp_num_hidden_layers(config: dict[str, Any]) -> int:
-    """Return MTP layer count from root or nested text_config metadata."""
+    """Return MTP layer count from root or nested text_config metadata.
 
-    root_layers = _safe_int(config.get("mtp_num_hidden_layers"), 0)
-    if root_layers > 0:
-        return root_layers
+    Per-family field name: Qwen3.5 / Qwen3.6 use ``mtp_num_hidden_layers``;
+    HY3 (``model_type == "hy_v3"``) uses ``num_nextn_predict_layers`` (the
+    DeepSeek-V3 convention). Both are checked at root and under
+    ``text_config``.
+    """
+
+    # Family-specific field keys, most-specific first.
+    keys = ("mtp_num_hidden_layers",)
+    if config.get("model_type") == "hy_v3":
+        keys = ("num_nextn_predict_layers", "mtp_num_hidden_layers")
+
+    for key in keys:
+        root_layers = _safe_int(config.get(key), 0)
+        if root_layers > 0:
+            return root_layers
     text_config = config.get("text_config")
     if isinstance(text_config, dict):
-        return _safe_int(text_config.get("mtp_num_hidden_layers"), 0)
-    return root_layers
+        for key in keys:
+            n = _safe_int(text_config.get(key), 0)
+            if n > 0:
+                return n
+    return 0
 
 
 def detect_mtp_eligibility(

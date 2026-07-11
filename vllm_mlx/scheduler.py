@@ -1810,7 +1810,7 @@ def _config_vetted_mtp_supports_spec_decode(model_type: str | None) -> bool:
     narrowly tied to the model families this MTP runtime supports.
     """
 
-    return model_type in {"qwen3_5", "qwen3_5_moe"}
+    return model_type in {"qwen3_5", "qwen3_5_moe", "hy_v3"}
 
 
 def _install_suffix_decoding(
