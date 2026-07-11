@@ -37,7 +37,11 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_mlx.engine.batched import BatchedEngine
+from vllm_mlx.engine.base import GenerationOutput
+from vllm_mlx.engine.batched import (
+    _HARMONY_NO_THINKING_SUFFIX_TOKENS,
+    BatchedEngine,
+)
 
 
 class _FakeTokenizer:
@@ -50,6 +54,22 @@ class _FakeTokenizer:
 
     def get_vocab(self) -> dict[str, int]:
         return self._vocab
+
+    def convert_tokens_to_ids(self, token: str):
+        return self._vocab.get(token)
+
+    def encode(self, text: str, add_special_tokens=True):  # noqa: ARG002
+        """Greedy literal-token encoder for prompt-prefix tests."""
+        tokens = sorted(self._vocab, key=len, reverse=True)
+        ids: list[int] = []
+        cursor = 0
+        while cursor < len(text):
+            token = next((t for t in tokens if text.startswith(t, cursor)), None)
+            if token is None:
+                raise ValueError(f"no fake token at offset {cursor}: {text!r}")
+            ids.append(self._vocab[token])
+            cursor += len(token)
+        return ids
 
     def decode(self, ids):
         return "".join(self._id_to_text.get(i, f"<UNK:{i}>") for i in ids)
@@ -86,6 +106,217 @@ def engine() -> BatchedEngine:
     eng._is_mllm = False
     eng._tokenizer = _FakeTokenizer(_HARMONY_VOCAB)
     return eng
+
+
+def test_harmony_no_thinking_builds_token_level_final_channel_prompt(engine):
+    prompt = "<|start|>assistant"
+    prepared, seed = engine._prepare_harmony_no_thinking_prompt(
+        prompt,
+        enable_thinking=False,
+        has_tools=False,
+        as_token_ids=True,
+    )
+
+    expected_seed = tuple(
+        _HARMONY_VOCAB[token] for token in _HARMONY_NO_THINKING_SUFFIX_TOKENS
+    )
+    assert seed == expected_seed
+    assert prepared == [
+        _HARMONY_VOCAB["<|start|>"],
+        _HARMONY_VOCAB["assistant"],
+        *expected_seed,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("enable_thinking", "has_tools"),
+    [(True, False), (None, False), (False, True)],
+)
+def test_harmony_no_thinking_preserves_ineligible_prompts(
+    engine, enable_thinking, has_tools
+):
+    prompt = "<|start|>assistant"
+    prepared, seed = engine._prepare_harmony_no_thinking_prompt(
+        prompt,
+        enable_thinking=enable_thinking,
+        has_tools=has_tools,
+        as_token_ids=True,
+    )
+    assert prepared == prompt
+    assert seed is None
+
+
+def test_harmony_no_thinking_preserves_noncanonical_template_boundary(engine):
+    prompt = "Plain"
+    prepared, seed = engine._prepare_harmony_no_thinking_prompt(
+        prompt,
+        enable_thinking=False,
+        has_tools=False,
+        as_token_ids=True,
+    )
+    assert prepared == prompt
+    assert seed is None
+
+
+def test_harmony_no_thinking_fails_closed_when_token_lookup_raises(engine, monkeypatch):
+    monkeypatch.setattr(
+        engine.tokenizer,
+        "convert_tokens_to_ids",
+        lambda _token: (_ for _ in ()).throw(ValueError("unsupported token")),
+    )
+    prompt = "<|start|>assistant"
+    prepared, seed = engine._prepare_harmony_no_thinking_prompt(
+        prompt,
+        enable_thinking=False,
+        has_tools=False,
+        as_token_ids=True,
+    )
+    assert prepared == prompt
+    assert seed is None
+
+
+def test_build_prompt_accounts_for_harmony_no_thinking_suffix(engine, monkeypatch):
+    monkeypatch.setattr(
+        engine,
+        "_apply_chat_template",
+        lambda *args, **kwargs: "<|start|>assistant",
+    )
+    prompt = engine.build_prompt(
+        [{"role": "user", "content": "hello"}],
+        enable_thinking=False,
+    )
+    assert prompt == "<|start|>assistant" + "".join(_HARMONY_NO_THINKING_SUFFIX_TOKENS)
+
+
+@pytest.mark.asyncio
+async def test_chat_forwards_token_prompt_and_router_seed(engine, monkeypatch):
+    monkeypatch.setattr(
+        engine,
+        "_apply_chat_template",
+        lambda *args, **kwargs: "<|start|>assistant",
+    )
+    captured = {}
+
+    async def _generate(**kwargs):
+        captured.update(kwargs)
+        return GenerationOutput(text="Plain", finish_reason="stop")
+
+    monkeypatch.setattr(engine, "generate", _generate)
+    await engine.chat(
+        [{"role": "user", "content": "hello"}],
+        enable_thinking=False,
+    )
+
+    expected_seed = tuple(
+        _HARMONY_VOCAB[token] for token in _HARMONY_NO_THINKING_SUFFIX_TOKENS
+    )
+    assert captured["prompt"][-len(expected_seed) :] == list(expected_seed)
+    assert captured["_output_router_seed_token_ids"] == expected_seed
+
+
+@pytest.mark.asyncio
+async def test_generate_recovers_router_seed_from_build_prompt(engine, monkeypatch):
+    expected_seed = tuple(
+        _HARMONY_VOCAB[token] for token in _HARMONY_NO_THINKING_SUFFIX_TOKENS
+    )
+
+    class _CoreOutput:
+        output_text = "Plain"
+        output_token_ids = [_HARMONY_VOCAB["Plain"]]
+        prompt_tokens = 1
+        completion_tokens = 1
+        cached_tokens = 0
+        finish_reason = "stop"
+
+    class _Core:
+        async def generate(self, **_kwargs):
+            return _CoreOutput()
+
+    captured = {}
+
+    def _route(token_ids, *, fallback_text, seed_token_ids=None):
+        captured["token_ids"] = token_ids
+        captured["fallback_text"] = fallback_text
+        captured["seed_token_ids"] = seed_token_ids
+        return "", fallback_text, None
+
+    engine._engine = _Core()
+    monkeypatch.setattr(engine, "_route_tokens_for_channels", _route)
+    prepared_prompt = "<|start|>assistant" + "".join(_HARMONY_NO_THINKING_SUFFIX_TOKENS)
+
+    output = await engine.generate(prepared_prompt)
+
+    assert output.text == "Plain"
+    assert captured["seed_token_ids"] == expected_seed
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_primes_router_for_prompt_opened_final_channel(
+    engine, monkeypatch
+):
+    monkeypatch.setattr(
+        engine,
+        "_apply_chat_template",
+        lambda *args, **kwargs: "<|start|>assistant",
+    )
+    captured = {}
+
+    async def _stream_generate(**kwargs):
+        captured.update(kwargs)
+        yield GenerationOutput(
+            text="Plain",
+            new_text="Plain",
+            tokens=[_HARMONY_VOCAB["Plain"]],
+            finished=True,
+            finish_reason="stop",
+        )
+
+    monkeypatch.setattr(engine, "stream_generate", _stream_generate)
+    outputs = [
+        output
+        async for output in engine.stream_chat(
+            [{"role": "user", "content": "hello"}],
+            enable_thinking=False,
+        )
+    ]
+
+    expected_seed = tuple(
+        _HARMONY_VOCAB[token] for token in _HARMONY_NO_THINKING_SUFFIX_TOKENS
+    )
+    assert captured["prompt"][-len(expected_seed) :] == list(expected_seed)
+    assert any(
+        output.channel == "content" and output.new_text == "Plain" for output in outputs
+    )
+
+
+def test_nonstream_router_is_primed_with_prompt_channel_state(engine, monkeypatch):
+    seed = (200005, 35644, 200008, 200007)
+
+    class _SeedRecordingRouter:
+        def __init__(self):
+            self.seen = []
+
+        def reset(self):
+            self.seen.clear()
+
+        def feed(self, token_id):
+            self.seen.append(token_id)
+            return None
+
+        def feed_sequence(self, token_ids):
+            assert self.seen == list(seed)
+            assert token_ids == [4]
+            return {"content": "Plain", "reasoning": None, "tool_calls": None}
+
+    monkeypatch.setattr(engine, "_create_output_router", _SeedRecordingRouter)
+    reasoning, content, tool_calls = engine._route_tokens_for_channels(
+        [4],
+        fallback_text="Plain",
+        seed_token_ids=seed,
+    )
+    assert reasoning == ""
+    assert content == "Plain"
+    assert tool_calls is None
 
 
 def test_truncated_analysis_drops_content_and_recovers_reasoning(engine):

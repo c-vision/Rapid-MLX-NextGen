@@ -27,6 +27,25 @@ from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
 
+# Harmony's chat template ends its generation prompt immediately after
+# ``<|start|>assistant`` and expects the model to choose a channel. When
+# thinking is disabled, seed an empty analysis message followed by an open
+# final message. These are resolved to token IDs from the loaded tokenizer;
+# they never pass through user-controlled message content or the template
+# sanitizer.
+_HARMONY_ASSISTANT_PREFIX_TOKENS = ("<|start|>", "assistant")
+_HARMONY_NO_THINKING_SUFFIX_TOKENS = (
+    "<|channel|>",
+    "analysis",
+    "<|message|>",
+    "<|end|>",
+    "<|start|>",
+    "assistant",
+    "<|channel|>",
+    "final",
+    "<|message|>",
+)
+
 
 def _resolve_hf_model_type(model_name: str) -> str | None:
     """Best-effort read of ``config.json::model_type`` for ``model_name``.
@@ -1273,6 +1292,92 @@ class BatchedEngine(BaseEngine):
         self._engine_started = False
         logger.info("BatchedEngine stopped")
 
+    def _prepare_harmony_no_thinking_prompt(
+        self,
+        prompt: str,
+        *,
+        enable_thinking: bool | None,
+        has_tools: bool,
+        as_token_ids: bool,
+    ) -> tuple[str | list[int], tuple[int, ...] | None]:
+        """Open Harmony's final channel when thinking is disabled.
+
+        GPT-OSS ignores the generic ``enable_thinking`` template kwarg. Its
+        protocol instead requires an empty analysis message followed by an
+        open final message. Build that continuation from tokenizer-owned IDs
+        after template rendering so Harmony control markers are structural
+        tokens, never user text.
+
+        Tool requests are excluded: Harmony tool calls are emitted through
+        the commentary channel and forcing final would make them impossible.
+        Non-Harmony or non-canonical templates fail closed to the unchanged
+        string prompt.
+
+        Returns the generation/accounting prompt and the suffix IDs used to
+        prime the output router into the same open-final state.
+        """
+        if enable_thinking is not False or has_tools or self._is_mllm:
+            return prompt, None
+
+        tokenizer = self.tokenizer
+        convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+        encode = getattr(tokenizer, "encode", None)
+        if not callable(convert) or not callable(encode):
+            return prompt, None
+
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+
+        def _ids_for(tokens: tuple[str, ...]) -> tuple[int, ...] | None:
+            ids: list[int] = []
+            for token in tokens:
+                try:
+                    token_id = convert(token)
+                except Exception:
+                    logger.debug(
+                        "Harmony no-thinking token lookup failed for %r",
+                        token,
+                        exc_info=True,
+                    )
+                    return None
+                if (
+                    not isinstance(token_id, int)
+                    or isinstance(token_id, bool)
+                    or token_id < 0
+                    or token_id == unk_id
+                ):
+                    return None
+                ids.append(token_id)
+            return tuple(ids)
+
+        assistant_prefix_ids = _ids_for(_HARMONY_ASSISTANT_PREFIX_TOKENS)
+        suffix_ids = _ids_for(_HARMONY_NO_THINKING_SUFFIX_TOKENS)
+        if assistant_prefix_ids is None or suffix_ids is None:
+            return prompt, None
+
+        bos = getattr(tokenizer, "bos_token", None)
+        add_special_tokens = bos is None or not prompt.startswith(bos)
+        try:
+            prompt_ids = list(encode(prompt, add_special_tokens=add_special_tokens))
+        except Exception:
+            logger.debug(
+                "Harmony no-thinking prompt tokenization failed",
+                exc_info=True,
+            )
+            return prompt, None
+
+        # Canonical GPT-OSS templates end at ``<|start|>assistant``. Refuse
+        # to inject into a custom template with a different boundary.
+        if tuple(prompt_ids[-len(assistant_prefix_ids) :]) != assistant_prefix_ids:
+            logger.debug(
+                "Harmony no-thinking skipped: generation prompt does not end "
+                "with <|start|>assistant"
+            )
+            return prompt, None
+
+        if as_token_ids:
+            return [*prompt_ids, *suffix_ids], suffix_ids
+        return prompt + "".join(_HARMONY_NO_THINKING_SUFFIX_TOKENS), suffix_ids
+
     def build_prompt(
         self,
         messages: list[dict[str, Any]],
@@ -1301,11 +1406,18 @@ class BatchedEngine(BaseEngine):
         if self._is_mllm:
             raise RuntimeError("build_prompt is not supported for MLLM models")
         template_tools = convert_tools_for_template(tools) if tools else None
-        return self._apply_chat_template(
+        prompt = self._apply_chat_template(
             messages,
             tools=template_tools,
             enable_thinking=enable_thinking,
         )
+        prepared, _ = self._prepare_harmony_no_thinking_prompt(
+            prompt,
+            enable_thinking=enable_thinking,
+            has_tools=bool(template_tools),
+            as_token_ids=False,
+        )
+        return prepared
 
     def estimate_new_tokens(self, prompt: str) -> tuple[int, int]:
         """Return ``(total_tokens, new_tokens)`` for ``prompt``.
@@ -1438,7 +1550,7 @@ class BatchedEngine(BaseEngine):
 
     async def generate(
         self,
-        prompt: str,
+        prompt: str | list[int],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -1569,6 +1681,24 @@ class BatchedEngine(BaseEngine):
         # the continuation, so we prepend the prefix to the response text
         # below before the tool parser scans it.
         assistant_text_prefix = kwargs.pop("_assistant_text_prefix", "") or ""
+        output_router_seed = kwargs.pop("_output_router_seed_token_ids", None)
+        if output_router_seed is None and isinstance(prompt, str):
+            # ``build_prompt(enable_thinking=False)`` is part of the public
+            # engine contract and returns the prepared Harmony string. A
+            # caller may feed that string back into ``generate()`` without
+            # going through ``chat()``, which is normally responsible for
+            # carrying the private router seed. Recover the seed from the
+            # exact prepared suffix so routing starts in the prompt-opened
+            # final channel on that composition path too.
+            suffix = "".join(_HARMONY_NO_THINKING_SUFFIX_TOKENS)
+            if prompt.endswith(suffix):
+                base_prompt = prompt[: -len(suffix)]
+                _, output_router_seed = self._prepare_harmony_no_thinking_prompt(
+                    base_prompt,
+                    enable_thinking=False,
+                    has_tools=False,
+                    as_token_ids=False,
+                )
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
@@ -1598,7 +1728,9 @@ class BatchedEngine(BaseEngine):
         # terminators so it also recovers reasoning from truncated
         # output (``finish_reason=length`` mid-thinking).
         reasoning_text, text, structured_tool_calls = self._route_tokens_for_channels(
-            output.output_token_ids, fallback_text=text
+            output.output_token_ids,
+            fallback_text=text,
+            seed_token_ids=output_router_seed,
         )
 
         return GenerationOutput(
@@ -1621,7 +1753,7 @@ class BatchedEngine(BaseEngine):
 
     async def stream_generate(
         self,
-        prompt: str,
+        prompt: str | list[int],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -1920,6 +2052,14 @@ class BatchedEngine(BaseEngine):
             num_images=len(all_images),
             enable_thinking=enable_thinking,
         )
+        prompt, output_router_seed = self._prepare_harmony_no_thinking_prompt(
+            prompt,
+            enable_thinking=enable_thinking,
+            has_tools=bool(template_tools),
+            as_token_ids=True,
+        )
+        if output_router_seed is not None:
+            kwargs["_output_router_seed_token_ids"] = output_router_seed
 
         # ``forced_assistant_prefix`` — OpenAI-spec ``tool_choice`` forced
         # mode (#673). The route layer builds a parser-shaped prefix
@@ -2058,7 +2198,11 @@ class BatchedEngine(BaseEngine):
             return 0
 
     def _route_tokens_for_channels(
-        self, token_ids: list[int] | None, *, fallback_text: str
+        self,
+        token_ids: list[int] | None,
+        *,
+        fallback_text: str,
+        seed_token_ids: tuple[int, ...] | None = None,
     ) -> tuple[str, str, list[dict] | None]:
         """Run ``OutputRouter.feed_sequence`` on a completed token list.
 
@@ -2098,6 +2242,8 @@ class BatchedEngine(BaseEngine):
             return "", fallback_text, None
         try:
             router.reset()
+            for token_id in seed_token_ids or ():
+                router.feed(token_id)
             routed = router.feed_sequence(token_ids)
         except Exception as e:
             logger.debug("OutputRouter sequence routing failed: %s", e)
@@ -2426,6 +2572,12 @@ class BatchedEngine(BaseEngine):
             num_images=len(all_images),
             enable_thinking=enable_thinking,
         )
+        prompt, output_router_seed = self._prepare_harmony_no_thinking_prompt(
+            prompt,
+            enable_thinking=enable_thinking,
+            has_tools=bool(template_tools),
+            as_token_ids=True,
+        )
 
         # ``forced_assistant_prefix`` — see ``chat()`` for the rationale.
         # On the streaming path the prefix is also injected into the
@@ -2453,6 +2605,18 @@ class BatchedEngine(BaseEngine):
             kwargs["requires_prompt_integrity"] = True
 
         router = self._create_output_router()
+        if router is not None and output_router_seed is not None:
+            try:
+                router.reset()
+                for token_id in output_router_seed:
+                    router.feed(token_id)
+            except Exception as e:
+                logger.warning(
+                    "Harmony no-thinking output-router seed failed; "
+                    "falling back to unrouted output: %s",
+                    e,
+                )
+                router = None
         stream = self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
