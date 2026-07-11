@@ -231,7 +231,7 @@ class TestParseCodexJsonl:
         assert usage == {"input_tokens": 100, "output_tokens": 20}
 
     def test_concatenates_multiple_agent_messages_in_order(self):
-        """gpt-5.5 streams in chunks; the parser must keep order."""
+        """gpt-5.6-sol streams in chunks; the parser must keep order."""
         stdout = self._stream(
             {
                 "type": "item.completed",
@@ -311,14 +311,66 @@ class TestParseCodexJsonl:
 
 
 class TestModelPinning:
-    """The README + step description promise ``gpt-5.5``; the
+    """The README + step description promise ``gpt-5.6-sol``; the
     invocation must pass ``--model`` explicitly so a change to the
     caller's ``~/.codex/config.toml`` default can't silently swap the
     reviewer underneath the gate (codex round-1 BLOCKER on PR #505).
+
+    ``gpt-5.6-sol`` is the default; ``PR_VALIDATE_CODEX_MODEL`` overrides
+    it. The bare ``gpt-5.6`` id is 400-rejected under ChatGPT auth, so
+    the ``-sol`` suffix is required.
     """
 
-    def test_codex_model_constant_matches_documented(self):
-        assert CODEX_MODEL == "gpt-5.5"
+    @pytest.fixture(autouse=True)
+    def _restore_module_state(self):
+        """Reload ``codex_review`` under the ambient (real) env after each
+        test so a test that mutates ``PR_VALIDATE_CODEX_MODEL`` + reloads
+        can't leak a stale module-level ``CODEX_MODEL`` into later tests.
+        Reloading (rather than restoring a captured value) also rebinds
+        the ``@property`` and every other module global consistently.
+        """
+        import importlib
+
+        import scripts.pr_validate.steps.codex_review as _cr
+
+        try:
+            yield
+        finally:
+            importlib.reload(_cr)
+
+    def test_codex_model_constant_matches_documented(self, monkeypatch):
+        # Default (no override) must be the pinned gpt-5.6-sol id.
+        monkeypatch.delenv("PR_VALIDATE_CODEX_MODEL", raising=False)
+        import importlib
+
+        import scripts.pr_validate.steps.codex_review as _cr
+
+        importlib.reload(_cr)
+        assert _cr.CODEX_MODEL == "gpt-5.6-sol"
+
+    def test_codex_model_env_override(self, monkeypatch):
+        monkeypatch.setenv("PR_VALIDATE_CODEX_MODEL", "gpt-6.0-sol")
+        import importlib
+
+        import scripts.pr_validate.steps.codex_review as _cr
+
+        importlib.reload(_cr)
+        assert _cr.CODEX_MODEL == "gpt-6.0-sol"
+        # The step description must report the *effective* model, not a
+        # stale default, so scorecards/logs name the real reviewer.
+        assert "gpt-6.0-sol" in _cr.CodexReviewStep().description
+
+    def test_codex_model_blank_override_falls_back_to_default(self, monkeypatch):
+        # An empty / whitespace-only override must not become ``--model
+        # ""``; it falls back to the pinned default.
+        import importlib
+
+        import scripts.pr_validate.steps.codex_review as _cr
+
+        for blank in ("", "   ", "\t"):
+            monkeypatch.setenv("PR_VALIDATE_CODEX_MODEL", blank)
+            importlib.reload(_cr)
+            assert _cr.CODEX_MODEL == "gpt-5.6-sol"
 
     def test_codex_command_includes_explicit_model_flag(self, monkeypatch, tmp_path):
         """Drive the step with a fake ``codex`` binary that records the
