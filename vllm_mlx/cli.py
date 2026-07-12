@@ -1923,6 +1923,20 @@ def _normalize_speculative_config_or_exit(args):
         args.mtp_sidecar = config.model
         if config.num_speculative_tokens is not None:
             args.mtp_max_k = config.num_speculative_tokens
+        elif getattr(args, "force_spec_decode", False):
+            # User explicitly opted into spec-decode via --force-spec-decode
+            # but didn't pin a draft depth. K=1 chain-of-1 carries draft
+            # overhead with no net speedup; default to K=3 (the EV auto-K
+            # controller's intended default) so MTP actually accelerates.
+            #
+            # Only two draft-depth sources exist for the mtp method and
+            # neither is set here: (a) ``num_speculative_tokens`` in the JSON
+            # is handled by the branch above; (b) the legacy ``--mtp-max-k``
+            # flag CANNOT co-occur with ``--speculative-config`` — the
+            # mutual-exclusion guard (`_legacy_speculative_fields` lists
+            # ``mtp_max_k``) exits with code 2 before we reach this branch.
+            # So K=3 here never overwrites a user-pinned depth.
+            args.mtp_max_k = 3
         if config.disable_auto_k is not None:
             args.mtp_disable_auto_k = config.disable_auto_k
     elif config.method == "suffix":
@@ -6536,6 +6550,103 @@ def telemetry_command(args) -> None:
     sys.exit(1)
 
 
+def _parse_args_with_share_passthrough(
+    parser: argparse.ArgumentParser, raw_argv: list[str]
+) -> argparse.Namespace:
+    """Parse ``raw_argv`` with the fully-registered top-level ``parser``,
+    applying ``share``'s ``--`` end-of-options passthrough split.
+
+    ``rapid-mlx share <model> -- <serve flags…>`` forwards everything after
+    the literal ``--`` verbatim to the ``rapid-mlx serve`` that ``share``
+    spawns (stored on ``args._passthrough``). Splitting on ``--`` up front is
+    what keeps a value-taking serve flag such as
+    ``--speculative-config '{"method":"mtp"}'`` from having its JSON value
+    swallowed by share's required ``model`` positional — the passthrough
+    tokens never reach share's parser, so option/value grouping is preserved
+    exactly as typed. Every other subcommand (and ``share`` with no ``--``)
+    keeps argparse's native behavior, including hard errors on unrecognized
+    flags and native ``--`` end-of-options handling.
+
+    Factored out of ``main`` so tests can drive the real parser + split with
+    representative argv orderings (see tests/test_share_cli.py) — the crux
+    being that ``share`` must not corrupt ``model`` or the passthrough list.
+    """
+    # A ``--`` is only the passthrough separator when it comes AFTER a
+    # COMPLETE ``share <model>`` head. A ``--`` positioned BEFORE the model
+    # (``share -- MODEL``) or before the subcommand (``-- share MODEL``) is
+    # argparse's native end-of-options marker and must keep its native
+    # meaning — splitting there would strip the required positional and break
+    # those valid forms. So we only split when the tokens to the left of the
+    # first ``--`` STRICTLY parse as ``share`` WITH a model.
+    #
+    # ``normal`` invocations (no ``--`` at all — the overwhelming majority)
+    # skip this block entirely and hit the single ``parse_args`` below, so no
+    # converter/action runs twice on the common path.
+    if "--" in raw_argv:
+        import contextlib
+        import io
+
+        sep = raw_argv.index("--")
+        head_argv, passthrough_argv = raw_argv[:sep], raw_argv[sep + 1 :]
+        # Cheap gate before the probe: the passthrough split only ever applies
+        # to ``share``, so only probe when ``share`` is the SELECTED subcommand.
+        # The selected subcommand is the first non-option token in the head —
+        # the top-level parser's only pre-subcommand options (``--version`` /
+        # ``-V`` / ``-h`` / ``--no-telemetry``) are all valueless, so no earlier
+        # token can be an option *value* masquerading as the command. Checking
+        # the command token structurally (rather than ``"share" in head_argv``)
+        # excludes a positional value that merely equals "share" — e.g. a model
+        # named "share" after another subcommand (``serve share …``) — so NO
+        # non-share invocation is ever parsed twice (which would rerun argparse
+        # type converters / custom actions). A ``--`` before the command
+        # (``-- share MODEL``, empty head → ``cmd_token is None``) also skips the
+        # probe and keeps argparse's native end-of-options meaning.
+        cmd_token = next((t for t in head_argv if not t.startswith("-")), None)
+        if cmd_token == "share":
+            # Strict probe: does the head fully resolve to a ``share`` command
+            # with a model? A STRICT ``parse_args`` (not ``parse_known_args``)
+            # means an incomplete head (``share`` alone, i.e. ``share -- MODEL``)
+            # or a typo'd share flag makes the probe exit with a NON-ZERO code —
+            # in which case this ``--`` is NOT a passthrough separator and we
+            # fall through to native parsing. stderr is muted so the probe's
+            # would-be usage error never reaches the user (the fall-through
+            # re-parses and either succeeds or emits the real error itself).
+            #
+            # A ZERO exit is different: the probe already ran a terminal argparse
+            # *action* — ``--help`` / ``--version`` printed to stdout and called
+            # ``parser.exit(0)``. Swallowing that would make the fall-through
+            # parse print the SAME message a second time, so re-raise instead:
+            # the text prints exactly once and the process exits cleanly.
+            probed = None
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    probed = parser.parse_args(head_argv)
+                except SystemExit as exc:
+                    if exc.code not in (None, 0):
+                        probed = None
+                    else:
+                        raise
+            if (
+                probed is not None
+                and getattr(probed, "command", None) == "share"
+                and getattr(probed, "model", None) is not None
+            ):
+                # Head is a complete share command; the tokens after ``--`` are
+                # verbatim serve-flag passthrough. ``probed`` already holds
+                # share's authoritative parsed args (model + share flags); the
+                # denylist in share.cli then vets the passthrough.
+                probed._passthrough = passthrough_argv
+                return probed
+
+    # Everything else — non-share commands, ``share`` with no passthrough
+    # ``--``, and the ``share -- MODEL`` / ``-- share MODEL`` native forms —
+    # keeps argparse's native behavior, including native ``--`` handling and
+    # hard errors on unrecognized flags.
+    args = parser.parse_args(raw_argv)
+    args._passthrough = []
+    return args
+
+
 def main():
     from importlib.metadata import version as pkg_version
 
@@ -8032,7 +8143,9 @@ Examples:
     else:
         argcomplete.autocomplete(parser)
 
-    args = parser.parse_args()
+    # Systematic serve-flag passthrough for ``share`` via the standard ``--``
+    # end-of-options separator — see ``_parse_args_with_share_passthrough``.
+    args = _parse_args_with_share_passthrough(parser, sys.argv[1:])
 
     # First-run consent prompt — fires at most once per machine, only on
     # interactive subcommands when stdin is a tty. Safe no-op otherwise.

@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from vllm_mlx import cli as top_cli
 from vllm_mlx.share import cli as share_cli
 
 
@@ -286,6 +287,270 @@ def test_spawn_serve_passes_loopback_host():
     argv = mock_popen.call_args.args[0]
     assert "--host" in argv
     assert argv[argv.index("--host") + 1] == "127.0.0.1"
+
+
+def _real_top_parser() -> argparse.ArgumentParser:
+    """Build a top-level parser whose ``share`` subcommand is registered
+    through the SAME ``share_cli.register`` path ``cli.main`` uses, so these
+    tests exercise the real subparser (required ``model`` positional
+    included) and the real ``--`` passthrough split — not a hand-rolled
+    stand-in that could paper over the parser-layer bugs."""
+    parser = argparse.ArgumentParser(prog="rapid-mlx")
+    subparsers = parser.add_subparsers(dest="command")
+    share_cli.register(subparsers)
+    return parser
+
+
+def _drive_share_from_argv(argv, *, extra_patches=()):
+    """Parse ``argv`` through the real top-level parser + the real
+    ``cli._parse_args_with_share_passthrough`` split, then run
+    ``share_command`` with its lifecycle mocked and return
+    ``(args, spawned_serve_extra_args)``.
+
+    Driving from raw argv — rather than injecting a pre-built
+    ``_passthrough`` — is the whole point: it's the only way these tests can
+    catch a parser-layer regression that corrupts ``model`` or the
+    option/value grouping of the passthrough (codex review finding: a test
+    that hand-injects ``_passthrough`` stays green even when the parser
+    swallows the JSON value into share's ``model`` positional)."""
+    args = top_cli._parse_args_with_share_passthrough(_real_top_parser(), list(argv))
+    captured = _drive_share_capture(args, extra_patches=extra_patches)
+    return args, captured
+
+
+def test_share_forwards_passthrough_flags_after_double_dash():
+    """End-to-end: ``rapid-mlx share MODEL -- <serve flags>`` forwards every
+    token after ``--`` verbatim to the spawned serve, with option/value
+    grouping intact, so ``--force-spec-decode`` / ``--speculative-config``
+    work over a share tunnel even though share doesn't declare them."""
+    argv = [
+        "share",
+        "hy3-preview-4bit",
+        "--",
+        "--force-spec-decode",
+        "--speculative-config",
+        '{"method":"mtp"}',
+    ]
+    args, extra = _drive_share_from_argv(argv)
+
+    # The ``model`` positional must NOT swallow the JSON value of the
+    # passthrough flag — the exact corruption a bare parse_known_args had.
+    assert args.model == "hy3-preview-4bit"
+    assert args._passthrough == [
+        "--force-spec-decode",
+        "--speculative-config",
+        '{"method":"mtp"}',
+    ]
+    # Forwarded verbatim into the serve argv, option+value pairing preserved.
+    assert "--force-spec-decode" in extra
+    sc = extra.index("--speculative-config")
+    assert extra[sc + 1] == '{"method":"mtp"}'
+    # Share's own forwarded flags still present alongside the passthrough.
+    assert "--no-thinking" in extra
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["share", "--", "hy3-preview-4bit"],  # -- before the model
+        ["--", "share", "hy3-preview-4bit"],  # -- before the subcommand
+    ],
+)
+def test_share_native_double_dash_before_model_is_not_passthrough(argv):
+    """A ``--`` that precedes the model (or the subcommand) is argparse's
+    native end-of-options marker, NOT the passthrough separator: the model
+    still parses and there is no passthrough. Regression guard for the codex
+    finding that splitting at the first ``--`` unconditionally broke these
+    previously-valid forms by stripping the required positional."""
+    parser = _real_top_parser()
+    args = top_cli._parse_args_with_share_passthrough(parser, argv)
+    assert args.command == "share"
+    assert args.model == "hy3-preview-4bit"
+    assert args._passthrough == []
+
+
+def test_share_unknown_flag_without_double_dash_is_a_hard_error():
+    """Passthrough REQUIRES the ``--`` separator. A serve flag written
+    without it is a normal argparse error (not silently forwarded, not
+    swallowed) — this is what removes the model-positional value-steal
+    ambiguity for good and makes the passthrough grammar unambiguous."""
+    argv = ["share", "hy3-preview-4bit", "--force-spec-decode"]
+    with pytest.raises(SystemExit):
+        top_cli._parse_args_with_share_passthrough(_real_top_parser(), argv)
+
+
+@pytest.mark.parametrize(
+    "denied_tokens",
+    [
+        ["--host", "0.0.0.0"],
+        ["--host=0.0.0.0"],
+        # argparse keeps allow_abbrev=True on the serve child, so an
+        # abbreviation of a denied flag would resolve to the full flag and
+        # bypass a name-only denylist — the LAN-reexposure the review flagged.
+        ["--hos=0.0.0.0"],
+        ["--ho", "0.0.0.0"],
+        ["--api-key", "leaked-secret"],
+        ["--api", "leaked-secret"],
+        ["--port", "9999"],
+        ["--listen-fd", "7"],
+        ["--log-level", "DEBUG"],
+    ],
+)
+def test_share_rejects_denied_passthrough_flags_incl_abbreviations(denied_tokens):
+    """Flags share MUST own for its security / lifecycle model are rejected
+    (exit 2) rather than forwarded — including every unambiguous abbreviation
+    of them. The load-bearing case is ``--host`` (and ``--hos`` / ``--ho``):
+    a forwarded ``--host 0.0.0.0`` re-exposes the bearer-gated serve port on
+    the LAN, defeating the tunnel-only design. Rejection is driven from real
+    argv and happens before serve is ever spawned."""
+    argv = ["share", "hy3-preview-4bit", "--", *denied_tokens]
+    args = top_cli._parse_args_with_share_passthrough(_real_top_parser(), argv)
+    with (
+        patch.object(share_cli, "_maybe_confirm_download"),
+        patch.object(share_cli, "_spawn_serve") as spawn,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        share_cli.share_command(args)
+    assert exc_info.value.code == 2
+    spawn.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # Share head → the probe RUNS (``cmd_token == "share"``) and the share
+        # subparser's ``--help`` raises ``SystemExit(0)`` mid-probe. This is the
+        # case that actually exercises the zero-exit re-raise: without it the
+        # fall-through native parse would print share's help a SECOND time.
+        ["share", "hy3-preview-4bit", "--help", "--"],
+        ["share", "hy3-preview-4bit", "-h", "--"],
+        # Top-level head with no command token → probe is skipped; the native
+        # parse prints top-level help once. Kept so both the probe path and the
+        # skip path are covered.
+        ["--help", "--"],
+        ["-h", "--"],
+    ],
+)
+def test_double_dash_probe_does_not_double_print_help(argv, capsys):
+    """``… --help --`` must print help EXACTLY once and exit 0.
+
+    Regression guard for the codex finding that the ``--`` passthrough probe
+    swallowed the ``SystemExit(0)`` raised by argparse's terminal help/version
+    *action*: the probe ran ``parse_args(head)`` (printing help to stdout),
+    caught the exit, then fell through to the native parse which printed the
+    SAME help a second time. The probe now re-raises a zero exit so the action
+    fires once. stderr-only muting in the probe is why this bug was invisible —
+    help goes to stdout.
+
+    The share-head cases are load-bearing: a top-level ``--help`` skips the
+    probe entirely (no command token), so only a complete share head drives the
+    probe into the re-raise branch under test."""
+    parser = _real_top_parser()
+    with pytest.raises(SystemExit) as exc_info:
+        top_cli._parse_args_with_share_passthrough(parser, argv)
+    # Zero exit propagates (help/version are a successful terminal action).
+    assert exc_info.value.code in (None, 0)
+    out = capsys.readouterr().out
+    # ``usage:`` is argparse's help banner header — exactly one, not two.
+    assert out.count("usage:") == 1, f"help printed {out.count('usage:')}×, want 1"
+
+
+def test_main_routes_share_passthrough_to_spawned_serve(monkeypatch):
+    """End-to-end through ``cli.main`` (not the helper in isolation): a real
+    ``rapid-mlx share MODEL -- <serve flags>`` argv, parsed by ``main``'s own
+    ``sys.argv`` handling, must reach the spawned serve with the passthrough
+    forwarded verbatim. Guards the codex finding that the unit tests call
+    ``_parse_args_with_share_passthrough`` directly and so would stay green if
+    ``main`` ever stopped routing CLI args through it."""
+    monkeypatch.setenv("RAPID_MLX_TELEMETRY", "0")
+    monkeypatch.setattr(
+        top_cli.sys,
+        "argv",
+        [
+            "rapid-mlx",
+            "share",
+            "hy3-preview-4bit",
+            "--",
+            "--force-spec-decode",
+            "--speculative-config",
+            '{"method":"mtp"}',
+        ],
+    )
+
+    serve_proc = MagicMock()
+    serve_proc.poll.return_value = None
+    tunnel = _fake_tunnel()
+    captured: list[str] = []
+
+    def fake_spawn(*, alias, port, api_key, log_path, extra_args):  # noqa: ARG001
+        captured.extend(extra_args)
+        return serve_proc
+
+    patches = [
+        patch.object(share_cli, "_spawn_serve", side_effect=fake_spawn),
+        patch.object(share_cli, "_wait_for_healthz", return_value=True),
+        patch.object(share_cli, "_verify_auth_gate", return_value=True),
+        patch.object(share_cli.ws_tunnel, "TunnelClient", return_value=tunnel),
+        patch.object(share_cli.ws_tunnel, "wait_for_public_url", return_value=True),
+        patch.object(share_cli, "_pick_port", return_value=18765),
+        patch.object(share_cli, "_maybe_confirm_download"),
+        patch.object(
+            share_cli, "_resolve_served_model_name", return_value="hy3-preview-4bit"
+        ),
+        patch("time.sleep", side_effect=_ctrl_c_in_monitor_loop()),
+    ]
+    with contextlib.ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        # ``main`` may exit 0 via share's Ctrl-C-keeps-zero path; tolerate it.
+        with contextlib.suppress(SystemExit):
+            top_cli.main()
+
+    # The serve child receives the verbatim passthrough (option+value pairing
+    # intact) alongside share's own forwarded flags — proving main → helper →
+    # share_command → _spawn_serve is wired end to end.
+    assert "--force-spec-decode" in captured
+    sc = captured.index("--speculative-config")
+    assert captured[sc + 1] == '{"method":"mtp"}'
+
+
+def test_non_share_positional_value_share_skips_probe_no_double_convert():
+    """A non-``share`` invocation must NOT trigger the passthrough probe even
+    when a POSITIONAL VALUE happens to equal ``"share"`` — the probe is gated on
+    the structurally-selected command token (first non-option token), not on
+    ``"share"`` merely appearing somewhere in the head. Guards the codex finding
+    that a substring/``in`` check re-parsed such invocations twice, rerunning
+    argparse type converters / custom actions.
+
+    Proven the faithful way — a sibling subcommand with a spy type converter and
+    a model positional set to ``"share"``: the converter must fire exactly once
+    (probe skipped); a double parse would run it twice."""
+    parser = _real_top_parser()  # registers the real ``share`` subcommand
+    subparsers = next(
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    )
+    calls = {"n": 0}
+
+    def _spy_int(raw):
+        calls["n"] += 1
+        return int(raw)
+
+    diag = subparsers.add_parser("diag")
+    diag.add_argument("model")  # positional value is literally "share" below
+    diag.add_argument("--n", type=_spy_int)
+    diag.add_argument("rest", nargs="*")  # absorbs tokens after native ``--``
+
+    # Command token is ``diag`` (first non-option token); the ``"share"`` here is
+    # only diag's model value → probe skipped, converter runs on "5" once.
+    args = top_cli._parse_args_with_share_passthrough(
+        parser, ["diag", "share", "--n", "5", "--", "x"]
+    )
+    assert args.command == "diag"
+    assert args.model == "share"
+    assert args.n == 5
+    assert args.rest == ["x"]
+    assert args._passthrough == []
+    assert calls["n"] == 1, f"converter ran {calls['n']}×, want 1 (probe skipped)"
 
 
 def test_spawn_serve_passes_api_key_via_env_not_argv():

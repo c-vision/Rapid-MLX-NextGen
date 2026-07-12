@@ -282,6 +282,73 @@ def test_speculative_config_mtp_without_token_count_keeps_legacy_one_token() -> 
     assert args.mtp_disable_auto_k is False
 
 
+def test_speculative_config_mtp_force_spec_decode_defaults_k_three() -> None:
+    """When the user opts into spec-decode via ``--force-spec-decode`` but
+    doesn't pin ``num_speculative_tokens``, MTP defaults to K=3 (auto-K
+    controller's intended default) instead of the K=1 chain-of-1 that
+    carries draft overhead with no net speedup."""
+    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+
+    args = _spec_config_args(
+        speculative_config='{"method":"mtp"}', force_spec_decode=True
+    )
+
+    _normalize_speculative_config_or_exit(args)
+
+    assert args.spec_decode == "mtp"
+    assert args.mtp_max_k == 3
+    assert args.mtp_disable_auto_k is False
+
+
+def test_speculative_config_mtp_explicit_tokens_win_over_force_default() -> None:
+    """An explicit ``num_speculative_tokens`` always wins, even under
+    ``--force-spec-decode`` — the K=3 default only fills the unset case."""
+    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+
+    args = _spec_config_args(
+        speculative_config='{"method":"mtp","num_speculative_tokens":2}',
+        force_spec_decode=True,
+    )
+
+    _normalize_speculative_config_or_exit(args)
+
+    assert args.spec_decode == "mtp"
+    assert args.mtp_max_k == 2
+
+
+@pytest.mark.parametrize("explicit_k", [5, 1, 0])
+def test_speculative_config_rejects_explicit_max_k_flag_combo(
+    explicit_k, capsys
+) -> None:
+    """The ``--force-spec-decode`` K=3 default can never overwrite a
+    user-pinned ``--mtp-max-k`` because ``--mtp-max-k`` and
+    ``--speculative-config`` are mutually exclusive: the legacy-alias guard
+    (`_legacy_speculative_fields` lists ``mtp_max_k``) exits with code 2
+    before the mtp branch runs. This documents that the codex-flagged
+    "explicit depth silently overridden by 3" scenario is unreachable.
+
+    Parametrized over ``explicit_k`` INCLUDING ``1`` — the value that equals the
+    runtime default — and ``0``: the guard keys on ``mtp_max_k is not None`` (an
+    unset sentinel), NOT on ``!= 1``, so ``--mtp-max-k 1`` is a *set* value and
+    is rejected exactly like ``5``. This nails the codex claim that a
+    default-valued flag slips past the guard and gets silently rewritten to 3;
+    it does not — it exits 2, and ``mtp_max_k`` is never mutated to 3."""
+    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+
+    args = _spec_config_args(
+        speculative_config='{"method":"mtp"}',
+        force_spec_decode=True,
+        mtp_max_k=explicit_k,  # explicit --mtp-max-k alongside --speculative-config
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _normalize_speculative_config_or_exit(args)
+    assert exc_info.value.code == 2
+    assert "mutually exclusive" in capsys.readouterr().err
+    # The user's explicit depth is preserved, never silently overwritten to 3.
+    assert args.mtp_max_k == explicit_k
+
+
 def test_speculative_config_parse_none_cleanly_disables(monkeypatch) -> None:
     from vllm_mlx.cli import _normalize_speculative_config_or_exit
     from vllm_mlx.spec_decode import config as config_mod
