@@ -229,6 +229,17 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # bearer-token holder could write arbitrary files. Pure filesystem
         # sandbox knob; never consulted by the engine or scheduler.
         "RAPID_MLX_CACHE_EXPORT_DIR",
+        # #1100 codex round 5 (#2): single-instance-unsafe escape hatch for the
+        # KV cache export/import HTTP API. When the advisory cross-process
+        # ``flock`` on ``<dest>.txlock`` can't be taken (non-POSIX build, or a
+        # shared mount whose FS rejects flock), the export/import handlers
+        # normally 503 rather than risk two instances corrupting the fixed
+        # ``.new``/``.old`` staging on a shared FS. An operator who KNOWS they
+        # run a single instance on a flock-less mount sets this to ``1`` to
+        # proceed anyway. Read only by ``routes/cache.py::
+        # _reject_if_ipc_lock_degraded`` — pure filesystem-safety toggle; never
+        # selects a model, parser, or routing tier.
+        "RAPID_MLX_CACHE_ALLOW_UNSAFE_SHARED_FS",
         # G12 release-gauntlet random-coverage gate
         # (``scripts/release_check_m3_random.py``) sets this to a single
         # harness name (or comma-separated subset) when running a scoped

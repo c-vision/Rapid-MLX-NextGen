@@ -1291,14 +1291,74 @@ class EngineCore:
             self.scheduler.save_cache_to_disk, cache_dir, should_abort=should_abort
         )
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
+    def load_cache_from_disk(self, cache_dir: str, replace: bool = False) -> int:
         """Load prefix cache from disk.
 
         Loading also goes through the worker thread so the loaded arrays
         end up tagged with the generation_stream that subsequent fetches
         will run on.
+
+        ``replace=True`` (export/import "replace" strategy, #476) is
+        forwarded down to ``MemoryAwarePrefixCache.load_from_disk`` so the
+        cache clear happens atomically ON THIS worker thread, after the
+        on-disk index is validated — never on the asyncio loop thread
+        where a concurrent request could repopulate it mid-swap.
         """
-        return self._run_on_step_thread(self.scheduler.load_cache_from_disk, cache_dir)
+        return self._run_on_step_thread(
+            self.scheduler.load_cache_from_disk, cache_dir, replace=replace
+        )
+
+    def save_cache_with_outcome(self, cache_dir: str, should_abort=None):
+        """Save the prefix cache and return an operation-specific outcome.
+
+        #1100 codex round 4 (#2): the export route must NOT read a cache-
+        global ``_last_save_outcome`` field on the asyncio thread after the
+        save future resolves — a concurrent save to ANOTHER destination
+        (distinct per-destination lock, same underlying cache) could
+        overwrite that field in the gap between the op and the read. Here the
+        save AND the outcome capture run in ONE closure on the single mlx-step
+        worker, so no other cache op can interleave; the outcome is returned
+        as a value, not left on a shared field.
+        """
+        from .cache.protocol import SaveOutcome
+
+        def _do():
+            saved = self.scheduler.save_cache_to_disk(
+                cache_dir, should_abort=should_abort
+            )
+            cache = getattr(self.scheduler, "memory_aware_cache", None)
+            # ``is not None`` — a cache with 0 entries is falsy via ``__len__``,
+            # so ``if cache`` would wrongly skip the outcome read.
+            if cache is not None:
+                outcome = getattr(
+                    cache, "_last_save_outcome", "committed" if saved else "empty"
+                )
+            else:
+                outcome = "committed" if saved else "empty"
+            return SaveOutcome(outcome=outcome)
+
+        return self._run_on_step_thread(_do)
+
+    def load_cache_with_result(self, cache_dir: str, replace: bool = False):
+        """Load the prefix cache and return an operation-specific result.
+
+        #1100 codex round 4 (#2): same rationale as ``save_cache_with_
+        outcome`` — the load AND the loaded-byte capture run in ONE step-
+        thread closure so the byte count returned is exactly this load's,
+        never a value a concurrent load to another path clobbered.
+        """
+        from .cache.protocol import LoadResult
+
+        def _do():
+            entries = self.scheduler.load_cache_from_disk(cache_dir, replace=replace)
+            cache = getattr(self.scheduler, "memory_aware_cache", None)
+            # ``is not None`` — an emptied cache is falsy via ``__len__``.
+            bytes_loaded = (
+                int(getattr(cache, "_last_load_bytes", 0)) if cache is not None else 0
+            )
+            return LoadResult(entries=entries, bytes_loaded=bytes_loaded)
+
+        return self._run_on_step_thread(_do)
 
     def _release_model(self) -> None:
         """Release model ownership."""
@@ -1445,6 +1505,14 @@ class AsyncEngineCore:
         """Save prefix cache to disk."""
         return self.engine.save_cache_to_disk(cache_dir, should_abort=should_abort)
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
+    def load_cache_from_disk(self, cache_dir: str, replace: bool = False) -> int:
         """Load prefix cache from disk."""
-        return self.engine.load_cache_from_disk(cache_dir)
+        return self.engine.load_cache_from_disk(cache_dir, replace=replace)
+
+    def save_cache_with_outcome(self, cache_dir: str, should_abort=None):
+        """Forward the outcome-returning save (#1100 codex round 4 #2)."""
+        return self.engine.save_cache_with_outcome(cache_dir, should_abort=should_abort)
+
+    def load_cache_with_result(self, cache_dir: str, replace: bool = False):
+        """Forward the result-returning load (#1100 codex round 4 #2)."""
+        return self.engine.load_cache_with_result(cache_dir, replace=replace)

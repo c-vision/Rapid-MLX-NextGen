@@ -114,15 +114,47 @@ def _load_radix_index_after_cache(engine, cache_dir: str) -> None:
         logger.warning(f"[radix] rebuild_from_keys failed: {e}", exc_info=True)
 
 
+def _resolve_scheduler(engine):
+    """Return the engine's ``Scheduler`` across the two engine shapes.
+
+    Two live engine layouts expose the scheduler at DIFFERENT depths:
+
+    * A bare ``EngineCore`` (unit tests, embedded use) has
+      ``engine.scheduler`` directly.
+    * The production ``BatchedEngine`` does NOT — its ``._engine`` is an
+      ``AsyncEngineCore`` wrapper whose inner ``EngineCore`` holds the
+      real scheduler, i.e. ``engine._engine.engine.scheduler``. The old
+      ``getattr(engine, "scheduler", None)`` lookup silently returned
+      ``None`` under ``BatchedEngine``, so both radix-index persistence
+      AND the #476 cache-export path were no-ops in production. The same
+      unwrap already lives in ``engine/batched.py:894`` for the LLM
+      admission gate — this mirrors it as the single source of truth.
+
+    Every access is ``getattr(..., None)``-guarded so a genuinely foreign
+    engine (third-party, partially-built) yields ``None`` rather than
+    raising — the None-graceful contract callers already rely on.
+    """
+    # Direct-EngineCore shape.
+    scheduler = getattr(engine, "scheduler", None)
+    if scheduler is not None:
+        return scheduler
+    # BatchedEngine shape: engine._engine (AsyncEngineCore) → .engine
+    # (EngineCore) → .scheduler. Mirrors engine/batched.py:894.
+    wrapper = getattr(engine, "_engine", None)
+    inner = getattr(wrapper, "engine", None) if wrapper is not None else None
+    return getattr(inner, "scheduler", None)
+
+
 def _resolve_memory_aware_cache(engine):
     """Return the engine's ``MemoryAwarePrefixCache`` if present.
 
-    Walks the engine.scheduler.memory_aware_cache chain defensively —
-    external engines (third-party, ``BatchedEngine`` wrappers, etc.)
-    may not expose either attribute. Returning ``None`` means "no radix
-    surface available", which is the same as the hash-index path.
+    Resolves the scheduler via :func:`_resolve_scheduler` (which handles
+    both the bare-``EngineCore`` and wrapped-``BatchedEngine`` shapes)
+    then reads ``memory_aware_cache`` off it. Returning ``None`` means
+    "no radix / prefix-cache surface available", which the callers treat
+    as the hash-index path.
     """
-    scheduler = getattr(engine, "scheduler", None)
+    scheduler = _resolve_scheduler(engine)
     if scheduler is None:
         return None
     return getattr(scheduler, "memory_aware_cache", None)

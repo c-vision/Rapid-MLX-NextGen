@@ -6089,9 +6089,14 @@ class Scheduler:
         logger.info("[cache_persist] no memory-aware cache to save")
         return False
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
-        """Load prefix cache from disk. Returns number of entries loaded."""
+    def load_cache_from_disk(self, cache_dir: str, replace: bool = False) -> int:
+        """Load prefix cache from disk. Returns number of entries loaded.
+
+        ``replace=True`` (export/import "replace" strategy, #476) clears
+        the in-memory cache atomically inside the load, after the on-disk
+        index is validated — see ``MemoryAwarePrefixCache.load_from_disk``.
+        """
         if self.memory_aware_cache is not None:
-            return self.memory_aware_cache.load_from_disk(cache_dir)
+            return self.memory_aware_cache.load_from_disk(cache_dir, replace=replace)
         logger.info("[cache_persist] no memory-aware cache to load into")
         return 0

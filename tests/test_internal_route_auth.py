@@ -14,9 +14,10 @@ What stays from #728 and is pinned here:
 * Cancel envelope sanitization — F-151 part 2. The success body must NOT
   echo ``cfg.model_name``; the 404 path must NOT echo the request id;
   the 500 path must NOT echo the engine exception text.
-* Cache export/import 501 envelope sanitization (added in the #756
-  partial revert) — resolved sandbox paths + manifest contents stay in
-  server logs only.
+* Cache export/import response sanitization (added in the #756 partial
+  revert; updated for the #476 engine body) — the 200 export/import
+  summaries + the 403 sandbox-escape envelope must keep resolved sandbox
+  paths + manifest contents in server logs only, never on the wire.
 
 The auth-matrix tests from #728 (no-header → 403, wrong header → 403,
 LAN without api-key → 403) are gone because the auth gate is gone.
@@ -26,6 +27,7 @@ metadata; tests can pass it or not without changing behavior.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -219,40 +221,62 @@ def test_cancel_500_error_path_does_not_leak_exception_detail(client_factory):
 
 
 # ---------------------------------------------------------------------------
-# Cache export/import 501 envelope sanitization (kept from #756)
+# Cache export/import response sanitization (kept from #756, #476 engine body)
 # ---------------------------------------------------------------------------
 
 
-_EXPECTED_NOT_IMPLEMENTED_ENVELOPE = {
-    "error": {
-        "message": "engine integration pending",
-        "type": "not_implemented_error",
-        "code": None,
-    }
-}
+def _empty_prefix_cache_engine():
+    """A MagicMock engine whose prefix cache is None (empty snapshot) so the
+    engine-backed export/import handlers take the happy path and return 200
+    instead of tripping on a MagicMock ledger. Cache-config knobs are plain
+    scalars so ``build_manifest_from_engine_state`` reads real values."""
+    engine = MagicMock()
+    engine.scheduler.memory_aware_cache = None  # disabled → empty snapshot
+    engine.scheduler.config = SimpleNamespace(
+        kv_cache_dtype="bf16",
+        use_paged_cache=False,
+        kv_cache_turboquant=False,
+    )
+    engine.config = SimpleNamespace(model_name="test-model", model_path=None)
+    engine.save_cache_to_disk = MagicMock(return_value=False)
+    engine.load_cache_from_disk = MagicMock(return_value=0)
+    # #1100 codex round 4 (#2): the route prefers the outcome/result-returning
+    # engine methods. A bare MagicMock would auto-return a MagicMock whose
+    # ``.entries`` breaks arithmetic — pin real result objects (empty snapshot).
+    from vllm_mlx.cache.protocol import LoadResult, SaveOutcome
+
+    engine.save_cache_with_outcome = MagicMock(
+        return_value=SaveOutcome(outcome="empty")
+    )
+    engine.load_cache_with_result = MagicMock(
+        return_value=LoadResult(entries=0, bytes_loaded=0)
+    )
+    return engine
 
 
-def test_cache_export_501_envelope_does_not_leak_operator_path(client_factory):
-    """``POST /v1/cache/export`` 501 stub must not echo the resolved sandbox
-    destination — that expands to ``/Users/<USERNAME>/.cache/rapid-mlx/
-    cache_exports`` and leaks operator home dir / username to any
-    bearer-token holder. After the #728 revert the route runs on plain
-    ``verify_api_key``, so this leak shape matters even more when
-    ``--api-key`` is unset."""
+def test_cache_export_200_body_does_not_leak_operator_path(client_factory):
+    """``POST /v1/cache/export`` now returns a 200 summary. The body must
+    NOT echo the resolved sandbox destination — that expands to
+    ``/Users/<USERNAME>/.cache/rapid-mlx/cache_exports`` and would leak the
+    operator home dir / username to any bearer-token holder. After the #728
+    revert the route runs on plain ``verify_api_key``, so this leak shape
+    matters even more when ``--api-key`` is unset."""
+    from vllm_mlx.config import get_config
     from vllm_mlx.routes.cache import router as cache_router
 
     build, _ = client_factory
     client = build(api_key=None)
+    get_config().engine = _empty_prefix_cache_engine()
     client.app.include_router(cache_router)
 
     r = client.post("/v1/cache/export", json={})
-    assert r.status_code == 501, r.text
-    body = r.json()
+    assert r.status_code == 200, r.text
     for needle in ("/Users/", ".cache", "rapid-mlx", "cache_exports"):
-        assert needle not in r.text, f"{needle!r} leaked into 501 body: {r.text!r}"
+        assert needle not in r.text, f"{needle!r} leaked into 200 body: {r.text!r}"
     for needle in ("github.com", "issues/"):
-        assert needle not in r.text, f"{needle!r} leaked into 501 body: {r.text!r}"
-    assert body.get("detail") == _EXPECTED_NOT_IMPLEMENTED_ENVELOPE, body
+        assert needle not in r.text, f"{needle!r} leaked into 200 body: {r.text!r}"
+    # Only the caller-relative manifest filename is echoed, never an abs path.
+    assert r.json()["manifest_path"] == "manifest.json"
 
 
 _EXPECTED_SANDBOX_ESCAPE_ENVELOPE = {
@@ -310,18 +334,19 @@ def test_cache_export_403_sandbox_escape_does_not_leak_operator_path(
     assert body.get("detail") == _EXPECTED_SANDBOX_ESCAPE_ENVELOPE, body
 
 
-def test_cache_import_501_envelope_does_not_leak_operator_path(
+def test_cache_import_200_body_does_not_leak_operator_path(
     client_factory, tmp_path, monkeypatch
 ):
     """Same shape check for ``POST /v1/cache/import``. Point the sandbox
     at a tmp dir, hand-craft a valid manifest so the route gets past
-    validation into the 501 stub, then assert the body is path-free +
-    manifest-free."""
+    validation into the engine call, then assert the 200 body is
+    path-free + manifest-free (no resolved source path, no model id)."""
     monkeypatch.setenv("RAPID_MLX_CACHE_EXPORT_DIR", str(tmp_path))
 
     import json
 
     from vllm_mlx.cache.protocol import PROTOCOL_VERSION
+    from vllm_mlx.config import get_config
     from vllm_mlx.routes.cache import router as cache_router
 
     manifest = {
@@ -335,20 +360,25 @@ def test_cache_import_501_envelope_does_not_leak_operator_path(
 
     build, _ = client_factory
     client = build(api_key=None)
+    get_config().engine = _empty_prefix_cache_engine()
+    # The server must run the SAME model the manifest was exported from, or
+    # the #1100 BLOCKING-1 unconditional gate 409s before we can inspect a
+    # 200 body. Align the server model id with the manifest's so this leak-
+    # shape test reaches the happy path it's meant to guard.
+    get_config().model_name = "secret-org-model-12b-8bit"
     client.app.include_router(cache_router)
 
     r = client.post("/v1/cache/import", json={"source": str(tmp_path)})
-    assert r.status_code == 501, r.text
-    body = r.json()
-    # The resolved source path is the most direct leak the 501 stub
+    assert r.status_code == 200, r.text
+    # The resolved source path is the most direct leak the handler
     # could surface — exact-string check before the substring sweep.
     assert str(tmp_path) not in r.text, (
-        f"resolved source path {str(tmp_path)!r} leaked into 501 body: {r.text!r}"
+        f"resolved source path {str(tmp_path)!r} leaked into 200 body: {r.text!r}"
     )
     for needle in ("/Users/", ".cache", "cache_exports"):
-        assert needle not in r.text, f"{needle!r} leaked into 501 body: {r.text!r}"
+        assert needle not in r.text, f"{needle!r} leaked into 200 body: {r.text!r}"
+    # model_id from the manifest must not ride the import response body.
     assert "secret-org-model" not in r.text
-    assert body.get("detail") == _EXPECTED_NOT_IMPLEMENTED_ENVELOPE, body
 
 
 # ---------------------------------------------------------------------------

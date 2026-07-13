@@ -114,22 +114,42 @@ class TestStepThread:
         self, engine_core, monkeypatch
     ):
         """Loading also runs on the worker so loaded arrays are tagged with
-        the stream that subsequent fetches will run on."""
+        the stream that subsequent fetches will run on.
+
+        The ``replace`` flag (#1100 export/import "replace" strategy) is
+        threaded scheduler-ward as a keyword so the atomic clear-inside-load
+        happens on this same worker thread. ``fake_load`` therefore accepts
+        AND records ``replace`` — and the routing assertion (thread name)
+        still holds, which is the contract this test guards."""
         from vllm_mlx import engine_core as ec
 
         monkeypatch.setattr(ec, "_init_mlx_step_thread", lambda: None)
 
         captured = {}
 
-        def fake_load(cache_dir):
+        def fake_load(cache_dir, replace=False):
             captured["thread"] = threading.current_thread().name
+            captured["cache_dir"] = cache_dir
+            captured["replace"] = replace
             return 17
 
         engine_core.scheduler.load_cache_from_disk.side_effect = fake_load
 
         await engine_core.start()
         try:
+            # Default (merge) path: replace defaults to False and still routes
+            # to the worker.
             assert engine_core.load_cache_from_disk("/tmp/whatever") == 17
+            assert captured["cache_dir"] == "/tmp/whatever"
+            assert captured["replace"] is False
+            assert captured["thread"].startswith("mlx-step")
+
+            # Explicit replace=True must be forwarded through to the scheduler
+            # AND still run on the mlx-step worker (the clear-inside-load must
+            # be tagged with the worker's stream, not the asyncio thread's).
+            assert engine_core.load_cache_from_disk("/tmp/other", replace=True) == 17
+            assert captured["cache_dir"] == "/tmp/other"
+            assert captured["replace"] is True
             assert captured["thread"].startswith("mlx-step")
         finally:
             await engine_core.stop()
