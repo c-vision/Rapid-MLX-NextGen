@@ -73,8 +73,7 @@ class TestStreamingPostProcessorBasic:
         pp.reset()
 
         events = pp.process_chunk(_make_output("Done", finished=True))
-        # Should have content + finish
-        content_events = [e for e in events if e.type == "content"]
+        # Should include a finish event.
         finish_events = [e for e in events if e.type == "finish"]
         assert len(finish_events) == 1
         assert finish_events[0].finish_reason == "stop"
@@ -2185,7 +2184,7 @@ class TestStandardPathEdgeCases:
         pp = StreamingPostProcessor(cfg)
         pp.reset()
 
-        events = pp.process_chunk(_make_output("before <tag>"))
+        pp.process_chunk(_make_output("before <tag>"))
         assert tool_parser.extract_tool_calls_streaming.called
 
 

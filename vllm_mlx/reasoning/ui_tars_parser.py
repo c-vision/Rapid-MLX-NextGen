@@ -342,7 +342,6 @@ class UiTarsReasoningParser(ReasoningParser):
                 # ``delta_start_in_current`` (this delta's start in the
                 # buffer).
                 reason_start_in_current = max(after_open, delta_start_in_current)
-                reason_in_current = current_text[reason_start_in_current:]
                 # Now check whether the close-tag exit also lives in
                 # this buffer slice — if so split at the close tag and
                 # flip to content; else emit the whole slice as reasoning

@@ -426,7 +426,7 @@ class TestProcessorCallAdvanced:
 
         processor._consecutive_bias_count = processor._max_consecutive_bias
         logits = mx.zeros((1, 200))
-        result = processor(token_ids=[65], logits=logits)
+        processor(token_ids=[65], logits=logits)
         assert processor._active_pattern is None
         assert processor._consecutive_bias_count == 0
 

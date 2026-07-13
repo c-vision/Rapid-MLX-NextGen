@@ -359,7 +359,6 @@ def test_scheduler_create_batch_generator_passes_top_k(monkeypatch):
         prefill_batch_size = 1
         completion_batch_size = 1
         prefill_step_size = 1
-        chunked_prefill_tokens = 0
         spec_decode = "none"
         enable_suffix_decoding = False
 

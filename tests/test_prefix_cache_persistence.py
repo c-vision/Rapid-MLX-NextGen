@@ -1926,7 +1926,6 @@ def test_save_to_disk_preserves_old_dir_when_commit_fails(tmp_path, monkeypatch)
     import vllm_mlx.memory_cache as _mc
 
     cache_dir = tmp_path / "snap"
-    new_dir = tmp_path / "snap.new"
     old_dir = tmp_path / "snap.old"
     # Session 1: clean save (so cache_dir exists for session 2's
     # rename-1 to push it to .old).
@@ -2702,10 +2701,6 @@ def test_r12_pre_clean_failure_aborts_save(tmp_path, monkeypatch):
     # Patch shutil.rmtree so the pre-clean's rmtree call is a no-op (ie
     # the rmtree silently failed and ignore_errors swallowed it). The
     # save must detect the survivor and abort.
-    import vllm_mlx.memory_cache as _mc
-
-    real_rmtree = _mc.shutil.rmtree if hasattr(_mc, "shutil") else None
-
     import shutil as _real_shutil
 
     def _broken_rmtree(path, *args, **kwargs):

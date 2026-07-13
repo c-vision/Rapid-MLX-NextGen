@@ -465,13 +465,11 @@ class TestSchedulerPolicy:
             SamplingParams,
             SchedulerConfig,
         )
-        from vllm_mlx.scheduler import SchedulingPolicy
 
         model, tokenizer = model_and_tokenizer
         config = EngineConfig(
             scheduler_config=SchedulerConfig(
                 max_num_seqs=2,  # Small batch to test ordering
-                policy=SchedulingPolicy.FCFS,
             )
         )
 

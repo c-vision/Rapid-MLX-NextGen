@@ -95,7 +95,6 @@ class MCPConfig:
     """Root configuration for MCP client."""
 
     servers: dict[str, MCPServerConfig] = field(default_factory=dict)
-    max_tool_calls: int = 10
     default_timeout: float = 30.0
     # Tools whose names match HIGH_RISK_TOOL_PATTERNS (execute, shell, eval,
     # exec, system, run_command, subprocess) are blocked by default. Add the
@@ -112,7 +111,6 @@ class MCPConfig:
 
         return cls(
             servers=servers,
-            max_tool_calls=data.get("max_tool_calls", 10),
             default_timeout=data.get("default_timeout", 30.0),
             allowed_high_risk_tools=data.get("allowed_high_risk_tools", []),
         )

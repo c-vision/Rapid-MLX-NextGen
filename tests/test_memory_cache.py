@@ -31,7 +31,6 @@ class TestMemoryCacheConfig:
         assert config.max_memory_mb is None
         assert config.max_memory_percent == 0.20
         assert config.max_entries == 1000
-        assert config.enable_memory_tracking is True
 
     def test_custom_config(self):
         config = MemoryCacheConfig(

@@ -395,7 +395,7 @@ def test_copy_on_write_demo():
     print(f"Original conversation: 128 tokens, {initial_blocks} blocks")
 
     # Fork to new conversation (COW - no copy yet)
-    forked_table = cache.fork_cache("original", "forked")
+    cache.fork_cache("original", "forked")
 
     blocks_after_fork = paged_manager.stats.allocated_blocks
     shared_after_fork = paged_manager.stats.shared_blocks
@@ -455,7 +455,7 @@ def main():
     print("  - Hash-based deduplication")
 
     print("\nUsage:")
-    print("  vllm-mlx serve <model> --continuous-batching --use-paged-cache")
+    print("  vllm-mlx serve <model> --use-paged-cache")
     print()
 
 

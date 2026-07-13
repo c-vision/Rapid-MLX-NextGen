@@ -117,8 +117,7 @@ logger = logging.getLogger(__name__)
 # whose token count isn't a multiple of the underlying cache step would
 # force the loader to allocate a non-step-aligned buffer on first reuse,
 # which then trips the same allocation-noise path the in-process radix is
-# already careful to avoid (see _grow_kv_cache step rounding in
-# vllm_mlx/positioned_kv_cache.py).
+# already careful to avoid.
 DEFAULT_CHECKPOINT_INTERVAL = 256
 
 # Disk cap default: 20 GiB. The env override is honoured at scan-time so an
@@ -458,11 +457,8 @@ def write_checkpoint(
         cache: ``list`` of MLX-LM cache layers (KVCache /
             QuantizedKVCache / hybrid). Must round-trip through
             ``mlx_lm.save_prompt_cache``. The caller is responsible for
-            using :func:`vllm_mlx.positioned_kv_cache.positioned_update_and_fetch`
-            for any pre-checkpoint writes; passing a ``PositionedKVCache``
-            subclass instance here would WORK at write time but FAIL at
-            load time because ``mlx_lm.load_prompt_cache`` looks the
-            class name up in the upstream module globals.
+            using cache objects that round-trip through the upstream
+            ``mlx_lm`` serializer.
         root: directory containing per-request subdirs. Created on
             demand; survives across restarts.
         req_hash: short stable hash (see :func:`request_hash`).

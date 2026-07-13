@@ -125,7 +125,6 @@ def simulate_server_streaming(tokens: list[str], use_reasoning_parser: str = "qw
             continue
 
         content = delta_msg.content
-        reasoning = delta_msg.reasoning
 
         # Skip empty-string content (server.py line 2729)
         if content is not None and content == "":

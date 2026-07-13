@@ -145,7 +145,7 @@ class TestSchedulerDetokenizer:
         detok1 = scheduler_mock._get_detokenizer("req1")
         assert len(scheduler_mock._detokenizer_pool) == 1
 
-        detok2 = scheduler_mock._get_detokenizer("req2")
+        scheduler_mock._get_detokenizer("req2")
         assert len(scheduler_mock._detokenizer_pool) == 2
 
         # Same request ID returns same detokenizer

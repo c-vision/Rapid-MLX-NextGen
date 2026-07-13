@@ -50,14 +50,10 @@ of token ``t+1``). The R15-P1 task description called this a "4-step
 tree" with positions like ``[10, 11, 11, 12, 12, 13, 13]``, but the
 upstream Qwen3.5/3.6 release only ships a single MTP head. Vendoring
 the upstream PR as-is gives us chain-style MTP (1 draft / verify
-backbone pass, up to 2 tokens emitted). The tree-decode infrastructure
-in :mod:`vllm_mlx.positioned_kv_cache` is still used: PR #990's
-acceptance/rejection loop calls ``cache.trim(1)`` (attention layers) and
-``cache.rollback_state`` (GatedDeltaNet layers), both of which the
-:func:`positioned_update_and_fetch` helper from R15 #301 will
-transparently delegate to on the monotonic-decode fast path. A future
-``--speculative-config '{"method":"mtp-tree"}'`` could plug into the same scaffolding once
-upstream ships ``mtp_num_hidden_layers >= 2`` checkpoints.
+backbone pass, up to 2 tokens emitted). A future
+``--speculative-config '{"method":"mtp-tree"}'`` would need a dedicated
+tree-cache implementation once upstream ships
+``mtp_num_hidden_layers >= 2`` checkpoints.
 """
 
 from __future__ import annotations

@@ -775,7 +775,6 @@ class MemoryCacheConfig:
         max_memory_mb: Maximum memory in MB. If None, auto-detects.
         max_memory_percent: Fraction of available RAM to use (0.0-1.0).
         max_entries: Hard limit on number of entries (safety net).
-        enable_memory_tracking: Whether to track per-entry memory.
         kv_quantize: Whether to quantize KV cache layers for reduced memory.
         kv_bits: Number of bits for KV cache quantization.
         kv_group_size: Group size for KV cache quantization.
@@ -785,7 +784,6 @@ class MemoryCacheConfig:
     max_memory_mb: int | None = None
     max_memory_percent: float = _DEFAULT_MEMORY_PERCENT
     max_entries: int = 1000  # Safety limit
-    enable_memory_tracking: bool = True
     kv_quantize: bool = False
     kv_bits: int = 8
     kv_group_size: int = 64

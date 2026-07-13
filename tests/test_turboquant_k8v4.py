@@ -369,8 +369,6 @@ class TestFusedKernel:
     def test_fused_fallback_when_compile_fails(self):
         """Simulated Metal compile failure → fused wrapper transparent fallback."""
         rng = np.random.RandomState(0)
-        keys = mx.array(rng.randn(4, 8, 128).astype(np.float16))
-        signs = random_hadamard_signs(128, seed=42)
 
         # Patch the binding to act as if compilation failed: have the
         # binding return None. The wrapper must transparently fall back

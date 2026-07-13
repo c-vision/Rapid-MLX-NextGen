@@ -24,7 +24,6 @@ from vllm_mlx.request import (
 from vllm_mlx.scheduler import (
     Scheduler,
     SchedulerConfig,
-    SchedulingPolicy,
 )
 
 
@@ -181,7 +180,6 @@ class TestSchedulerConfig:
         config = SchedulerConfig()
 
         assert config.max_num_seqs == 256
-        assert config.policy == SchedulingPolicy.FCFS
         assert config.prefill_batch_size == 8
         assert config.completion_batch_size == 32
 
@@ -189,13 +187,11 @@ class TestSchedulerConfig:
         """Test custom scheduler config."""
         config = SchedulerConfig(
             max_num_seqs=64,
-            policy=SchedulingPolicy.PRIORITY,
             prefill_batch_size=4,
             completion_batch_size=16,
         )
 
         assert config.max_num_seqs == 64
-        assert config.policy == SchedulingPolicy.PRIORITY
 
 
 class TestSchedulerBasic:

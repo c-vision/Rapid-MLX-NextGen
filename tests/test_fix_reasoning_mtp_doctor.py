@@ -34,8 +34,8 @@ class TestReasoningCorrectionBeforeFinish:
         # Simulate streaming: model outputs short text without <think> tags
         # Parser holds it as potential reasoning until finalize
         parser.reset_state()
-        delta1 = parser.extract_reasoning_streaming("", "Hello", "Hello")
-        delta2 = parser.extract_reasoning_streaming("Hello", "Hello world", " world")
+        parser.extract_reasoning_streaming("", "Hello", "Hello")
+        parser.extract_reasoning_streaming("Hello", "Hello world", " world")
 
         # Finalize should produce correction (content that was held as reasoning)
         correction = parser.finalize_streaming("Hello world")

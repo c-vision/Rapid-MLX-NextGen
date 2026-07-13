@@ -17,7 +17,6 @@ import threading
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
 import mlx.core as mx
@@ -113,23 +112,12 @@ def _assemble_stop_tokens(
     return stop_tokens
 
 
-class SchedulingPolicy(Enum):
-    """Scheduling policy for request ordering."""
-
-    FCFS = "fcfs"  # First-Come-First-Served
-    PRIORITY = "priority"  # Priority-based
-
-
 @dataclass
 class SchedulerConfig:
     """Configuration for the scheduler."""
 
     # Maximum number of concurrent requests in the batch
     max_num_seqs: int = 256
-    # Maximum tokens to process per step (for prefill chunking)
-    max_num_batched_tokens: int = 8192
-    # Scheduling policy
-    policy: SchedulingPolicy = SchedulingPolicy.FCFS
     # BatchGenerator settings
     prefill_batch_size: int = 8
     completion_batch_size: int = 32
@@ -198,17 +186,6 @@ class SchedulerConfig:
     )
     paged_cache_block_size: int = 64  # Tokens per block
     max_cache_blocks: int = 1000  # Maximum number of cache blocks
-
-    # Chunked prefill: max tokens to prefill per scheduler step (0 = disabled)
-    # When enabled, large prompts are split into chunks so that active
-    # generation requests are not starved during long prefills.
-    chunked_prefill_tokens: int = 0
-
-    # Mid-prefill cache saving: save intermediate KV cache every N tokens
-    # during chunked prefill. If the client disconnects mid-prefill, the
-    # saved cache is reused for the next request with the same prefix.
-    # 0 = disabled. Only effective when chunked_prefill_tokens > 0.
-    mid_prefill_save_interval: int = 8192
 
     # Speculative decoding selection. "none" is baseline decode; "mtp"
     # installs the vendored mlx-lm PR #990 MTP draft/verify path through
@@ -457,468 +434,6 @@ class SchedulerOutput:
     outputs: list[RequestOutput] = field(default_factory=list)
     # Whether any work was done
     has_work: bool = False
-
-
-def _install_chunked_prefill(
-    batch_gen: "BatchGenerator",
-    budget: int,
-    mid_prefill_save=None,
-    prompt_cache_save=None,
-    pending_abort_ids: set[str] | None = None,
-    uid_to_request_id: dict[int, str] | None = None,
-    requests: dict[str, Any] | None = None,
-) -> None:
-    """
-    Monkey-patch a BatchGenerator instance so that large prefills are
-    broken into chunks of at most *budget* tokens each.
-
-    Between chunks the generation loop gets a chance to produce one token
-    for every active request, preventing starvation during long prefills.
-
-    Args:
-        batch_gen: The BatchGenerator to patch.
-        budget: Max tokens per prefill chunk.
-        mid_prefill_save: Optional callback(uid, processed, prompt_cache)
-            called after each chunk to save intermediate KV cache state.
-    """
-    import time as _time
-
-    from mlx_lm.generate import (
-        _left_pad_prompts,
-        _make_cache,
-        _merge_caches,
-        _right_pad_prompts,
-    )
-
-    # mlx-lm 0.31+ renamed Batch → GenerationBatch with different constructor
-    try:
-        from mlx_lm.generate import Batch as _Batch
-
-        _USE_NEW_BATCH = False
-    except ImportError:
-        from mlx_lm.generate import GenerationBatch as _Batch
-
-        _USE_NEW_BATCH = True
-
-    def _make_batch(
-        model,
-        uids,
-        y,
-        logprobs,
-        max_tokens,
-        num_tokens,
-        prompt_cache,
-        samplers,
-        logits_processors,
-        tokens,
-    ):
-        if _USE_NEW_BATCH:
-            # GenerationBatch(model, uids, inputs, prompt_cache, tokens,
-            #   samplers, fallback_sampler, logits_processors, state_machines, max_tokens)
-            return _Batch(
-                model=model,
-                uids=uids,
-                inputs=y,
-                prompt_cache=prompt_cache,
-                tokens=tokens,
-                samplers=samplers,
-                fallback_sampler=lambda x: x.argmax(-1),
-                logits_processors=logits_processors,
-                state_machines=[],
-                max_tokens=max_tokens,
-            )
-        else:
-            return _Batch(
-                uids,
-                y,
-                logprobs,
-                max_tokens,
-                num_tokens,
-                prompt_cache,
-                samplers,
-                logits_processors,
-                tokens,
-            )
-
-    # Keep references to originals
-    _orig_next = batch_gen._next
-    _orig_remove = batch_gen.remove
-    _orig_process_prompts = batch_gen._process_prompts
-
-    # Partial prefill state (None when no prefill in progress)
-    batch_gen._partial = None
-
-    # Monkey-patch _process_prompts to capture prompt-only cache state.
-    # At the point where _process_prompts returns, the Batch cache contains
-    # the exact prompt-only state: all prompt tokens have been processed
-    # through the model, but no output token has been fed back yet.
-    # This is the only safe capture point for hybrid Mamba+Transformer
-    # models whose MambaCache state is cumulative.
-    if prompt_cache_save is not None:
-
-        def _patched_process_prompts(prompts, _self=batch_gen):
-            batch = _orig_process_prompts(prompts)
-            for e, uid in enumerate(batch.uids):
-                if batch.num_tokens[e] == 0:
-                    try:
-                        prompt_cache_save(uid, batch.extract_cache(e))
-                    except Exception:
-                        pass
-            return batch
-
-        batch_gen._process_prompts = _patched_process_prompts
-
-    def _generation_step(self=batch_gen):
-        """Run one generation step on the active batch. Returns responses."""
-        batch = self.active_batch
-        if batch is None or len(batch) == 0:
-            return []
-
-        tic_gen = _time.perf_counter()
-        y, logprobs = batch.y, batch.logprobs
-        for i, toks in enumerate(batch.tokens):
-            batch.tokens[i] = mx.concatenate((toks, y[i : i + 1]))
-        batch.y, batch.logprobs = self._step(
-            y[:, None],
-            batch.cache,
-            batch.samplers,
-            batch.logits_processors,
-            batch.tokens,
-        )
-        mx.async_eval(batch.y, batch.logprobs)
-
-        y = y.tolist()
-        self._stats.generation_time += _time.perf_counter() - tic_gen
-
-        keep_idx = []
-        end_idx = []
-        responses = []
-        for e, (t, uid, num_tok, max_tok) in enumerate(
-            zip(y, batch.uids, batch.num_tokens, batch.max_tokens)
-        ):
-            cache_out = None
-            num_tok += 1
-            batch.num_tokens[e] = num_tok
-            if t in self.stop_tokens:
-                finish_reason = "stop"
-                end_idx.append(e)
-            elif num_tok >= max_tok:
-                finish_reason = "length"
-                end_idx.append(e)
-            else:
-                finish_reason = None
-                keep_idx.append(e)
-            if finish_reason is not None:
-                cache_out = batch.extract_cache(e)
-            responses.append(
-                self.Response(uid, t, logprobs[e], finish_reason, cache_out)
-            )
-
-        if len(end_idx):
-            if len(keep_idx) > 0:
-                batch.filter(keep_idx)
-            else:
-                self.active_batch = None
-
-        self._stats.generation_tokens += len(responses)
-        return responses
-
-    def _chunked_next(self=batch_gen):  # noqa: C901
-        """
-        Replacement for _next() that chunks large prefills.
-
-        Only intercepts when:
-        1. A partial prefill is in progress (_partial is not None)
-        2. The next prompt batch exceeds the budget
-
-        Everything else delegates to the original _next().
-        """
-        # ----- Continue a partial prefill -----
-        if self._partial is not None:
-            # Check for pending aborts BEFORE processing next chunk
-            if pending_abort_ids is not None and uid_to_request_id is not None:
-                partial_rids = {uid_to_request_id.get(u) for u in self._partial["uids"]}
-                aborted_rids = partial_rids & pending_abort_ids
-                if aborted_rids:
-                    logger.info(
-                        f"[chunked_prefill] abort detected mid-prefill, "
-                        f"clearing partial for: {aborted_rids}"
-                    )
-                    self._partial = None
-                    mx.clear_cache()
-                    return self._generation_step()
-
-            tic = _time.perf_counter()
-            partial = self._partial
-            inputs = partial["inputs"]
-            prompt_cache = partial["cache"]
-            remaining = inputs.shape[1]
-
-            n_to_process = min(budget, remaining - 1) if remaining > 1 else 0
-
-            if n_to_process > 0:
-                self.model(mx.contiguous(inputs[:, :n_to_process]), cache=prompt_cache)
-                mx.eval([c.state for c in prompt_cache])
-                inputs = inputs[:, n_to_process:]
-                partial["inputs"] = inputs
-                partial["processed"] += n_to_process
-
-                self.prompt_progress_callback(
-                    [
-                        (uid, partial["processed"], partial["total"])
-                        for uid in partial["uids"]
-                    ]
-                )
-
-                # Save intermediate cache for disconnect resilience
-                if mid_prefill_save is not None and len(partial["uids"]) == 1:
-                    mid_prefill_save(
-                        partial["uids"][0], partial["processed"], prompt_cache
-                    )
-
-                if partial.get("is_cached"):
-                    mx.clear_cache()
-
-            # Check if prefill is done (only 1 token left or 0)
-            if inputs.shape[1] <= 1:
-                # Finalize
-                if partial.get("is_cached"):
-                    mx.eval([c.state for c in prompt_cache])
-                    inputs = partial["last_inputs"]
-
-                for c in prompt_cache:
-                    c.finalize()
-                mx.clear_cache()
-
-                y, logprobs = self._step(
-                    inputs,
-                    prompt_cache,
-                    partial["samplers"],
-                    partial["logits_processors"],
-                    partial["tokens"],
-                )
-                mx.async_eval(y, logprobs)
-
-                new_batch = _make_batch(
-                    model=batch_gen.model,
-                    uids=list(partial["uids"]),
-                    y=y,
-                    logprobs=logprobs,
-                    max_tokens=list(partial["max_tokens"]),
-                    num_tokens=[0] * len(partial["uids"]),
-                    prompt_cache=prompt_cache,
-                    samplers=list(partial["samplers"]),
-                    logits_processors=list(partial["logits_processors"]),
-                    tokens=partial["tokens"],
-                )
-
-                # Save prompt-only cache BEFORE merging into active batch.
-                # This is the chunked-prefill equivalent of the
-                # _patched_process_prompts hook — at this point the cache
-                # contains the exact prompt-only state (num_tokens == 0).
-                if prompt_cache_save is not None and len(partial["uids"]) == 1:
-                    uid = partial["uids"][0]
-                    try:
-                        prompt_cache_save(uid, new_batch.extract_cache(0))
-                    except Exception:
-                        pass
-
-                if self.active_batch is None:
-                    self.active_batch = new_batch
-                else:
-                    self.active_batch.extend(new_batch)
-
-                self._partial = None
-                self._stats.prompt_time += _time.perf_counter() - tic
-            else:
-                # Not done yet — record prompt time for this chunk
-                self._stats.prompt_time += _time.perf_counter() - tic
-
-            # Generation step for active requests between chunks
-            return self._generation_step()
-
-        # ----- No partial — check if next prompt batch needs chunking -----
-        num_active = len(self.active_batch) if self.active_batch else 0
-        num_to_add = self.completion_batch_size - num_active
-
-        if num_to_add >= self.prefill_batch_size and self.unprocessed_prompts:
-            batch_prompts = self.unprocessed_prompts[: self.prefill_batch_size]
-            if batch_prompts:
-                total_tokens = sum(len(p[1]) for p in batch_prompts)
-
-                # Check if any prompt has a prefix_boundary that
-                # requires two-phase prefill for cache save at that boundary.
-                _needs_boundary_split = False
-                if requests is not None and uid_to_request_id is not None:
-                    for _uid, _toks, *_ in batch_prompts:
-                        _rid = uid_to_request_id.get(_uid)
-                        _req = requests.get(_rid) if _rid else None
-                        if _req and getattr(_req, "prefix_boundary", 0) > 0:
-                            _needs_boundary_split = True
-                            break
-
-                if total_tokens > budget or _needs_boundary_split:
-                    # Large prompt batch or prefix boundary — start partial prefill
-                    tic = _time.perf_counter()
-
-                    # Eval outstanding generation tokens before switching.
-                    # Also drain pending async_eval when active_batch is None
-                    # (previous request finished) — stale async_eval work on
-                    # generation_stream can block subsequent model forwards.
-                    if self.active_batch is not None:
-                        mx.eval(self.active_batch.y, self.active_batch.logprobs)
-                        self._stats.generation_time += _time.perf_counter() - tic
-                        tic = _time.perf_counter()
-                    else:
-                        mx.clear_cache()
-
-                    (
-                        uids,
-                        inputs_raw,
-                        max_tokens_list,
-                        caches,
-                        samplers,
-                        logits_processors,
-                        _prompt_checkpoints,
-                    ) = zip(*batch_prompts)
-                    lengths = [len(p) for p in inputs_raw]
-                    max_length = max(lengths)
-                    padding = [max_length - ln for ln in lengths]
-                    tokens = [mx.array(inp) for inp in inputs_raw]
-                    is_cached = not all(c[0].empty() for c in caches)
-
-                    self._stats.prompt_tokens += sum(lengths)
-
-                    if not is_cached:
-                        padded = _left_pad_prompts(inputs_raw, max_length=max_length)
-                        prompt_cache = _make_cache(
-                            self.model, padding, self.max_kv_size
-                        )
-                    else:
-                        last_inputs = mx.array([p[-1:] for p in inputs_raw])
-                        padded = _right_pad_prompts(inputs_raw, max_length=max_length)
-                        prompt_cache = _merge_caches(caches)
-                        for c in prompt_cache:
-                            c.prepare(
-                                lengths=[ln - 1 for ln in lengths],
-                                right_padding=padding,
-                            )
-
-                    # Remove from unprocessed
-                    self.unprocessed_prompts = self.unprocessed_prompts[
-                        self.prefill_batch_size :
-                    ]
-
-                    # Process first chunk — if prefix_boundary is set,
-                    # use it as the first chunk size so that mid_prefill_save
-                    # can capture the exact prefix cache state (critical for
-                    # hybrid Mamba+Transformer models where trim is unsafe).
-                    # When the request already has cached tokens (cache hit),
-                    # adjust the boundary relative to the remaining tokens.
-                    _first_chunk = budget
-                    if _needs_boundary_split and len(batch_prompts) == 1:
-                        _uid0 = uids[0]
-                        _rid0 = uid_to_request_id.get(_uid0)
-                        _req0 = requests.get(_rid0) if _rid0 else None
-                        _pb = getattr(_req0, "prefix_boundary", 0) if _req0 else 0
-                        _cached = getattr(_req0, "cached_tokens", 0) if _req0 else 0
-                        _adjusted_pb = _pb - _cached
-                        if 0 < _adjusted_pb < padded.shape[1]:
-                            _first_chunk = _adjusted_pb
-                    n_to_process = min(_first_chunk, padded.shape[1] - 1)
-                    if n_to_process > 0:
-                        self.model(
-                            mx.contiguous(padded[:, :n_to_process]),
-                            cache=prompt_cache,
-                        )
-                        mx.eval([c.state for c in prompt_cache])
-                        padded = padded[:, n_to_process:]
-                        if is_cached:
-                            mx.clear_cache()
-
-                    self._partial = {
-                        "uids": list(uids),
-                        "inputs": padded,
-                        "cache": prompt_cache,
-                        "tokens": tokens,
-                        "max_tokens": list(max_tokens_list),
-                        "samplers": list(samplers),
-                        "logits_processors": list(logits_processors),
-                        "processed": n_to_process,
-                        "total": max_length,
-                        "is_cached": is_cached,
-                    }
-                    if is_cached:
-                        self._partial["last_inputs"] = last_inputs
-
-                    self.prompt_progress_callback(
-                        [
-                            (uid, n_to_process, max_length)
-                            for uid in self._partial["uids"]
-                        ]
-                    )
-
-                    # Save intermediate cache for disconnect resilience
-                    if mid_prefill_save is not None and len(uids) == 1:
-                        mid_prefill_save(uids[0], n_to_process, prompt_cache)
-
-                    self._stats.prompt_time += _time.perf_counter() - tic
-
-                    # Generation step for active requests
-                    return self._generation_step()
-
-                else:
-                    # Small prompt batch — process directly without _orig_next.
-                    # _orig_next's while loop processes multiple batches per call
-                    # which causes batch-dimension mismatches in DeltaRNN conv_state
-                    # when mixing prefix-cached and fresh prompts.
-                    # Processing one batch per _next call avoids this.
-                    tic = _time.perf_counter()
-
-                    # Eval outstanding generation tokens before prefill.
-                    # Also drain when active_batch is None to clear stale
-                    # async_eval work from the previous request.
-                    if self.active_batch is not None:
-                        mx.eval(self.active_batch.y, self.active_batch.logprobs)
-                        self._stats.generation_time += _time.perf_counter() - tic
-                        tic = _time.perf_counter()
-                    else:
-                        mx.clear_cache()
-
-                    new_batch = self._process_prompts(batch_prompts)
-                    self.unprocessed_prompts = self.unprocessed_prompts[
-                        self.prefill_batch_size :
-                    ]
-
-                    if self.active_batch is None:
-                        self.active_batch = new_batch
-                    else:
-                        self.active_batch.extend(new_batch)
-
-                    self._stats.prompt_time += _time.perf_counter() - tic
-                    return self._generation_step()
-
-        # Pure generation or no work — run generation step directly
-        return self._generation_step()
-
-    def _patched_remove(uids_to_remove, _self=batch_gen):
-        """Clear partial state if aborted request is being prefilled."""
-        if _self._partial is not None:
-            partial_uids = set(_self._partial["uids"])
-            if partial_uids & set(uids_to_remove):
-                logger.info(
-                    f"[chunked_prefill] clearing partial state for aborted uids: "
-                    f"{partial_uids & set(uids_to_remove)}"
-                )
-                _self._partial = None
-                mx.clear_cache()  # flush Metal encoders after dropping partial state
-        _orig_remove(uids_to_remove)
-
-    batch_gen._next = _chunked_next
-    batch_gen._generation_step = _generation_step
-    batch_gen.remove = _patched_remove
-
-    logger.info(f"[chunked_prefill] installed with budget={budget} tokens per step")
 
 
 def _install_dense_sampler_fastpath(batch_gen: "BatchGenerator") -> None:
@@ -2878,59 +2393,6 @@ class Scheduler:
             # mlx-lm < 0.31.3 — no `stream` kwarg; fall back to legacy path.
             bg = BatchGenerator(**bg_kwargs)
 
-        # Install chunked prefill when explicitly configured OR when
-        # memory-aware cache is active (needed for prefix_boundary saves
-        # in agentic multi-turn workloads with hybrid Mamba+Transformer models).
-        #
-        # NOTE: mlx-lm 0.31+ has native prefill_step_size support in BatchGenerator.
-        # Our _install_chunked_prefill monkey-patches the old Batch API which was
-        # removed in 0.31+. Skip the monkey-patch if the old API is unavailable.
-        chunked_budget = self.config.chunked_prefill_tokens
-        need_chunked = chunked_budget > 0 or self.memory_aware_cache is not None
-        _has_old_batch_api = hasattr(bg, "_process_prompts")
-        if need_chunked and _has_old_batch_api:
-            if chunked_budget <= 0:
-                # No explicit budget — use a very large value so normal
-                # prompts pass through unchanged.  Prefix boundary splits
-                # still trigger via _needs_boundary_split.
-                chunked_budget = 999_999
-            mid_prefill_cb = None
-            save_interval = self.config.mid_prefill_save_interval
-            if save_interval > 0 and self.memory_aware_cache is not None:
-                mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
-                logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
-            prompt_cache_cb = None
-            if self.memory_aware_cache is not None:
-                prompt_cache_cb = self._make_prompt_cache_save_callback()
-            _install_chunked_prefill(
-                bg,
-                chunked_budget,
-                mid_prefill_cb,
-                prompt_cache_save=prompt_cache_cb,
-                pending_abort_ids=self._pending_abort_ids,
-                uid_to_request_id=self.uid_to_request_id,
-                requests=self.requests,
-            )
-        elif need_chunked and not _has_old_batch_api:
-            # mlx-lm 0.31+ removed _process_prompts, so the full chunked
-            # prefill monkey-patch can't run. The prompt-boundary cache
-            # snapshot (the part that actually feeds the prefix cache)
-            # is wired into Scheduler.step() via end_of_prompt response
-            # signals — see _snapshot_promoted_prompts (issue #163).
-            # The per-message boundary save is wired via insert_segments
-            # + end_of_segment — see _snapshot_boundary_segments
-            # (issue #427).
-            if chunked_budget > 0:
-                logger.info(
-                    "[chunked_prefill] mlx-lm 0.31+ removed the legacy "
-                    "Batch API; --chunked-prefill-tokens=%d is no-op'd "
-                    "and native prefill_step_size=%d is used instead. "
-                    "Per-message boundary snapshots ARE supported via "
-                    "insert_segments (issue #427).",
-                    chunked_budget,
-                    self.config.prefill_step_size,
-                )
-
         # Server-side wiring for ``--speculative-config '{"method":"mtp"}'``.
         # This installs the vendored PR #990 ``mtp_generate_step`` hot
         # loop as ``GenerationBatch._step``, gated on the target having
@@ -3049,9 +2511,7 @@ class Scheduler:
         prompt-cache-save callback so a future request with the identical
         prompt finds an exact-match entry in the prefix cache.
 
-        This is the new-API equivalent of the ``_patched_process_prompts``
-        hook installed by ``_install_chunked_prefill`` for the legacy Batch
-        API. Without it, hybrid models (Mamba/DeltaNet+Transformer) MISS
+        Without it, hybrid models (Mamba/DeltaNet+Transformer) MISS
         the prefix cache forever because their non-trimmable cache layers
         cannot satisfy the supersequence fallback path (issue #163).
         """
@@ -3111,12 +2571,7 @@ class Scheduler:
         finds the boundary entry and skips re-prefilling the shared
         prefix.
 
-        This is the mlx-lm 0.31+ replacement for the boundary-save
-        path that was disabled when the legacy ``_install_chunked_prefill``
-        monkey-patch could no longer run (the internal Batch API was
-        removed in 0.31). The ``_make_mid_prefill_save_callback``
-        infrastructure is still present for clients that downgrade to
-        the legacy API; this new path coexists rather than replaces it.
+        This uses mlx-lm 0.31+'s public cache-extraction API.
         """
         if self.memory_aware_cache is None or not prompt_responses:
             return
@@ -3229,80 +2684,6 @@ class Scheduler:
                     f"saved {prefix_boundary} tokens at message boundary "
                     f"store_time={_dt:.3f}s"
                 )
-
-    def _make_mid_prefill_save_callback(self, save_interval: int):
-        """Create a callback for saving intermediate KV cache during chunked prefill.
-
-        The callback is called after each chunk with (uid, processed_tokens,
-        prompt_cache).  It extracts the cache state (immutable MLX array
-        snapshots), reconstructs KVCache objects, and stores them in the
-        memory-aware prefix cache so that a subsequent request with the same
-        prompt prefix can skip the already-computed tokens.
-        """
-        import time as _time
-
-        def _mid_prefill_save(uid, processed_tokens, prompt_cache):
-            request_id = self.uid_to_request_id.get(uid)
-            if not request_id:
-                return
-            request = self.requests.get(request_id)
-            if not request or not request.prompt_token_ids:
-                return
-            # PFlash bypass: see scheduler.add_request for the
-            # positional-fiction rationale.
-            if _pflash_compressed(request):
-                return
-
-            total_cached = (request.cached_tokens or 0) + processed_tokens
-
-            # Always save at prefix_boundary (message boundary for cache
-            # reuse with different final user messages).
-            prefix_boundary = getattr(request, "prefix_boundary", 0)
-            at_prefix_boundary = prefix_boundary > 0 and total_cached == prefix_boundary
-
-            # Throttle: only save every save_interval tokens,
-            # unless we're at the prefix boundary.
-            last_save = getattr(request, "_mid_prefill_last_save", 0)
-            if not at_prefix_boundary and total_cached - last_save < save_interval:
-                return
-
-            # Extract immutable state snapshots
-            extracted = self._extract_cache_states(prompt_cache)
-            if not extracted:
-                return
-
-            # Reconstruct cache objects (directly usable by BatchGenerator)
-            reconstructed = self._reconstruct_cache_from_states(extracted)
-            if not reconstructed:
-                return
-
-            prefix_tokens = list(request.prompt_token_ids[:total_cached])
-
-            # Remove previous intermediate entry to avoid memory waste
-            old_key = getattr(request, "_mid_prefill_cache_key", None)
-            if old_key is not None:
-                self.memory_aware_cache.remove(list(old_key))
-
-            _t0 = _time.monotonic()
-            stored = self.memory_aware_cache.store(prefix_tokens, reconstructed)
-            _dt = _time.monotonic() - _t0
-
-            if stored:
-                request._mid_prefill_last_save = total_cached
-                request._mid_prefill_cache_key = tuple(prefix_tokens)
-                logger.info(
-                    f"[mid_prefill_cache] request={request_id[:12]} "
-                    f"saved {total_cached}/{len(request.prompt_token_ids)} tokens "
-                    f"({total_cached * 100 // len(request.prompt_token_ids)}%) "
-                    f"store_time={_dt:.3f}s"
-                )
-            else:
-                logger.debug(
-                    f"[mid_prefill_cache] request={request_id[:12]} "
-                    f"store rejected for {total_cached} tokens"
-                )
-
-        return _mid_prefill_save
 
     def _close_batch_generator(self) -> None:
         """Properly close BatchGenerator to restore wired_limit."""
@@ -5706,7 +5087,6 @@ class Scheduler:
                 break
 
         # Clear finished tracking for next step
-        old_finished = self.finished_req_ids
         self.finished_req_ids = set()
 
         # Adaptive interval: scale inversely with concurrency to prevent

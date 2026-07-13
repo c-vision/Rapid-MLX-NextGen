@@ -1,8 +1,7 @@
 # OpenAI-Compatible Server
 
 rapid-mlx provides a FastAPI server with full OpenAI API compatibility.
-Continuous batching is on by default; `--continuous-batching` is accepted as
-a no-op for back-compat.
+Continuous batching is always on.
 
 ## Starting the Server
 
@@ -32,7 +31,6 @@ rapid-mlx serve qwen3.5-9b-4bit --port 8000 --use-paged-cache
 | `--api-key` | API key for authentication | None |
 | `--rate-limit` | Requests per minute per client (0 = disabled) | 0 |
 | `--timeout` | Request timeout in seconds | 300 |
-| `--continuous-batching` | Accepted for back-compat (continuous batching is always on) | on |
 | `--use-paged-cache` | Enable paged KV cache | False |
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
@@ -412,7 +410,6 @@ Point Claude Code directly at your rapid-mlx server:
 ```bash
 # Start the server
 rapid-mlx serve mlx-community/Qwen3-Coder-Next-235B-A22B-4bit \
-  --continuous-batching \
   --enable-auto-tool-choice \
   --tool-call-parser hermes
 
@@ -693,10 +690,10 @@ Control streaming behavior with `--stream-interval`:
 
 ```bash
 # Smooth streaming
-rapid-mlx serve model --continuous-batching --stream-interval 1
+rapid-mlx serve model --stream-interval 1
 
 # Batched streaming (better for high-latency networks)
-rapid-mlx serve model --continuous-batching --stream-interval 5
+rapid-mlx serve model --stream-interval 5
 ```
 
 ## Open WebUI Integration
@@ -729,7 +726,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/rapid-mlx serve mlx-community/Qwen3-0.6B-8bit \
-  --continuous-batching --use-paged-cache --port 8000
+  --use-paged-cache --port 8000
 Restart=always
 
 [Install]
@@ -812,7 +809,6 @@ For production with 50+ concurrent users:
 
 ```bash
 rapid-mlx serve mlx-community/Qwen3-0.6B-8bit \
-  --continuous-batching \
   --use-paged-cache \
   --api-key your-secret-key \
   --rate-limit 60 \

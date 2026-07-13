@@ -768,7 +768,7 @@ class TestEdgeCases:
         """Test with malformed JSON."""
         parser = MistralToolParser()
         text = '[TOOL_CALLS] [{"name": "func", "arguments": {invalid json}]'
-        result = parser.extract_tool_calls(text)
+        parser.extract_tool_calls(text)
         # Should not crash, may or may not parse
 
     def test_nested_arguments(self):
@@ -827,7 +827,7 @@ class TestStreamingParsing:
         )
         assert result1 == {"content": "Let me"}
 
-        result2 = parser.extract_tool_calls_streaming(
+        parser.extract_tool_calls_streaming(
             previous_text="Let me",
             current_text="Let me[TOOL_CALLS]",
             delta_text="[TOOL_CALLS]",

@@ -1055,7 +1055,6 @@ def test_chat_command_switch_model_rollback_on_wait_failure(monkeypatch, capsys)
     active one, and (3) NOT clear chat history. Round-1 P0 regression test."""
 
     spawned: list[object] = []
-    teardowns: list[object] = []
 
     class _FakeProc:
         def __init__(self, name):

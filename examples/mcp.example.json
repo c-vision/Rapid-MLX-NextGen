@@ -21,6 +21,5 @@
       "timeout": 60
     }
   },
-  "max_tool_calls": 10,
   "default_timeout": 30.0
 }

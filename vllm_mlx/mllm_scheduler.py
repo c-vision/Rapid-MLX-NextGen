@@ -78,10 +78,6 @@ class MLLMSchedulerConfig:
     vision_cache_size: int = 100
     # Default max tokens
     default_max_tokens: int = 256
-    # Default video FPS for frame extraction
-    default_video_fps: float = 2.0
-    # Maximum video frames
-    max_video_frames: int = 128
     # Admission control: hard cap on concurrent in-flight MLLM
     # requests (queued + running). Matches the LLM scheduler
     # convention so ``max_concurrent_requests`` is uniform across

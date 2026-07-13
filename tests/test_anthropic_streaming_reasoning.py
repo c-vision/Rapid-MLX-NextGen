@@ -87,7 +87,7 @@ def _extract_delta_types(events: list[str]) -> list[tuple[str, str | None]]:
         for line in evt.split("\n"):
             line = line.strip()
             if line.startswith("event:"):
-                event_name = line.split(":", 1)[1].strip()
+                continue
             elif line.startswith("data:"):
                 data_str = line.split(":", 1)[1].strip()
                 try:

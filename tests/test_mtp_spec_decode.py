@@ -1519,7 +1519,6 @@ class _MockedQwen35Model:
 
     def _logits_for_positions(self, target_ids: list[int], batch: int) -> mx.array:
         """Build logits where each position's argmax is the matching target."""
-        seq = len(target_ids)
         out_rows = []
         for tid in target_ids:
             row = mx.zeros((batch, self.vocab))

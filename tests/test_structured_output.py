@@ -324,7 +324,7 @@ class TestInjectJsonInstruction:
 
         original = [{"role": "user", "content": "Hello"}]
         original_content = original[0]["content"]
-        result = _inject_json_instruction(original, "Return JSON only")
+        _inject_json_instruction(original, "Return JSON only")
 
         # Original should be unchanged
         assert len(original) == 1

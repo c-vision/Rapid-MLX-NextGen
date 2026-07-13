@@ -217,7 +217,7 @@ class TestPagedCacheManager:
         # Try to allocate more than available (300 tokens needs 5 blocks)
         # vLLM style: raises ValueError instead of returning empty list
         try:
-            blocks = manager.allocate_blocks_for_tokens(300)
+            manager.allocate_blocks_for_tokens(300)
             assert False, "Expected ValueError"
         except ValueError:
             pass

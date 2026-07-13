@@ -1174,7 +1174,6 @@ def test_rescue_still_fires_on_truncated_think_when_finish_unknown():
     that doesn't thread the kwarg), the gate is conservative and
     rescue still fires. The kwarg defaults to ``None`` for back-
     compat with existing callers."""
-    raw = "<think>just a thought"
     rescued = _rescue_silent_drop_from_reasoning(
         final_content=None,
         reasoning_text="just a thought",

@@ -25,8 +25,6 @@ testing:
 capabilities:
   function_calling: true
   streaming: true
-  vision: false
-  reasoning: false
 
 known_issues:
   - "Structured output with thinking models: token budget consumed by reasoning before JSON output"

@@ -25,7 +25,5 @@ testing:
 capabilities:
   function_calling: true
   streaming: false  # smolagents doesn't use streaming
-  vision: false
-  reasoning: false
 
 known_issues: []

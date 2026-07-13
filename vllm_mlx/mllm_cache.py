@@ -87,8 +87,6 @@ class MLLMPrefixCacheEntry:
 
     # Token tracking for prefix matching
     token_ids: list[int] = field(default_factory=list)  # Full token sequence
-    num_image_tokens: int = 0  # e.g., 256 for Gemma 3
-    num_text_tokens: int = 0
     prompt_tokens: int = 0  # Total prompt tokens (for stats)
 
     # Metadata
@@ -353,7 +351,6 @@ class MLLMPrefixCacheManager:
         vision_embeddings: Any,
         kv_cache: list[Any],
         token_ids: list[int],
-        num_image_tokens: int = 0,
         model_name: str = "",
     ) -> None:
         """
@@ -365,7 +362,6 @@ class MLLMPrefixCacheManager:
             vision_embeddings: Output of vision encoder (can be None for text-only)
             kv_cache: Language model KV cache states
             token_ids: Full token sequence
-            num_image_tokens: Number of image tokens (e.g., 256 for Gemma 3)
             model_name: Model name for validation
         """
         cache_key = self._make_cache_key(images, prompt)
@@ -376,8 +372,6 @@ class MLLMPrefixCacheManager:
             vision_embeddings=vision_embeddings,
             kv_cache=kv_cache,
             token_ids=token_ids,
-            num_image_tokens=num_image_tokens,
-            num_text_tokens=len(token_ids) - num_image_tokens,
             prompt_tokens=len(token_ids),
             model_name=model_name,
         )
@@ -419,7 +413,6 @@ class MLLMPrefixCacheManager:
             vision_embeddings=None,
             kv_cache=cache,
             token_ids=[0] * num_tokens,  # Dummy token IDs
-            num_image_tokens=0,
         )
 
     def get_stats(self) -> dict[str, Any]:

@@ -50,7 +50,6 @@ def _parse_streaming(data: dict) -> AgentStreamingSpec:
     extra_tags = [tuple(t) for t in tags] if tags else []
     return AgentStreamingSpec(
         extra_tool_tags=extra_tags,
-        suppress_patterns=s.get("suppress_patterns", []),
         max_tools=s.get("max_tools"),
     )
 
@@ -100,15 +99,12 @@ def _load_profile_from_yaml(path: Path) -> AgentProfile:
         stars=data.get("stars"),
         config=_parse_config(data),
         recommended_models=models.get("recommended", []),
-        parser_override=models.get("parser_override"),
         streaming=_parse_streaming(data),
         testing=_parse_testing(data),
         versions=_parse_versions(data),
         known_issues=data.get("known_issues", []),
         needs_function_calling=capabilities.get("function_calling", True),
         needs_streaming=capabilities.get("streaming", True),
-        needs_vision=capabilities.get("vision", False),
-        needs_reasoning=capabilities.get("reasoning", False),
     )
 
 

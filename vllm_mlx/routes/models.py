@@ -315,7 +315,7 @@ def _detect_capabilities(
     return caps
 
 
-def _reported_modality_for_embedding(locked_id: str) -> str:
+def _reported_modality_for_embedding() -> str:
     """Return the ``modality`` field for the embedding entry.
 
     F-D01 cosmetic fix: pre-fix the embedding entry advertised
@@ -680,7 +680,7 @@ def _build_model_info(model_id: str) -> ModelInfo:
         if profile is None:
             return ModelInfo(
                 id=model_id,
-                modality=_reported_modality_for_embedding(locked),
+                modality=_reported_modality_for_embedding(),
                 capabilities=["embedding"],
                 context_window=context_window,
                 audio_lanes=audio_lanes,
@@ -700,7 +700,7 @@ def _build_model_info(model_id: str) -> ModelInfo:
             is_moe=profile.is_moe,
             tool_call_parser=eff_tool,
             reasoning_parser=eff_reasoning,
-            modality=_reported_modality_for_embedding(locked),
+            modality=_reported_modality_for_embedding(),
             capabilities=["embedding"],
             context_window=context_window,
             audio_lanes=audio_lanes,

@@ -1009,7 +1009,7 @@ class TestResponsesStreamR10C3:
         fields like ``output``, ``part``, ``content_index`` required and
         our emitter dropped them.
         """
-        sdk_streaming = pytest.importorskip("openai.types.responses")
+        pytest.importorskip("openai.types.responses")
 
         client = responses_client.client
 

@@ -15,11 +15,9 @@ models:
     - "qwen3.5-9b-4bit"
     - "qwen3.6-35b-4bit"
     - "qwen3.5-4b-4bit"
-  parser_override: null
 
 streaming:
   extra_tool_tags: []
-  suppress_patterns: []
   max_tools: 0  # uses text action format, not FC
 
 testing:
@@ -31,8 +29,6 @@ testing:
 capabilities:
   function_calling: false  # text action format
   streaming: true
-  vision: true  # browser screenshots
-  reasoning: false
 
 known_issues:
   - "Requires Docker for sandbox execution"

@@ -2131,8 +2131,6 @@ async def test_strict_true_stream_helper_strips_colliding_raise_on_failure():
     would raise ``TypeError: got multiple values for keyword
     argument 'raise_on_failure'`` and the test would fail.
     """
-    from fastapi import Request
-
     from vllm_mlx.api.models import ChatCompletionRequest
     from vllm_mlx.routes.chat import stream_chat_completion_guided
 
@@ -2144,12 +2142,6 @@ async def test_strict_true_stream_helper_strips_colliding_raise_on_failure():
         messages=[{"role": "user", "content": "hi"}],
         stream=True,
     )
-
-    class _MockReq:
-        async def is_disconnected(self):
-            return False
-
-    raw_req: Request = _MockReq()  # type: ignore[assignment]
 
     # The collision case: kwargs ALREADY contains
     # ``raise_on_failure=False`` — a stale / contradictory value.

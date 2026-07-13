@@ -110,8 +110,6 @@ class ModelConfig:
     supports_dflash: bool = False
 
 
-# DEPRECATED dispatch surface — see ``vllm_mlx/reasoning/think_detector.py``.
-#
 # The name-regex map below is the ONLY fall-back when a serve target lacks
 # an explicit alias entry in ``aliases.json``. Every entry in this map is
 # a per-model regex used to dispatch parser implementations; the user has
@@ -120,8 +118,8 @@ class ModelConfig:
 #
 # Migration target: aliases declare capability booleans
 # (``can_emit_think``, ``has_native_tool_format``, …) and the engine
-# picks parser implementations at runtime via ``ThinkDetector`` and the
-# tool-call format probe. Do NOT add new regex entries here — extend
+# picks parser implementations through model configuration and tool-format
+# probing. Do NOT add new regex entries here — extend
 # ``aliases.json`` instead, which is the source of truth for any model
 # the project officially supports. Existing entries stay in place until
 # the migration completes (tracked separately so PRs stay tight on a

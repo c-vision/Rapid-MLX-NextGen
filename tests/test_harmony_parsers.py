@@ -5,7 +5,6 @@ Tests for Harmony format parsers (GPT-OSS models).
 Tests cover:
 - HarmonyToolParser: tool call extraction from commentary channel
 - HarmonyReasoningParser: reasoning extraction from analysis channel
-- convert_tools_to_typescript: OpenAI JSON Schema to TypeScript conversion
 
 Usage:
     pytest tests/test_harmony_parsers.py -v
@@ -15,7 +14,6 @@ import json
 
 import pytest
 
-from vllm_mlx.api.harmony_tools import convert_tools_to_typescript
 from vllm_mlx.reasoning import get_parser
 from vllm_mlx.reasoning.harmony_parser import HarmonyReasoningParser
 from vllm_mlx.tool_parsers import ToolParserManager
@@ -475,220 +473,6 @@ class TestHarmonyReasoningParser:
 
 
 # ============================================================================
-# TypeScript Tool Converter Tests
-# ============================================================================
-
-
-class TestHarmonyToolDefinitionConverter:
-    """Tests for convert_tools_to_typescript."""
-
-    def test_simple_tool(self):
-        """Convert a simple tool with required parameters."""
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_weather",
-                    "description": "Get weather for a location",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "location": {"type": "string"},
-                        },
-                        "required": ["location"],
-                    },
-                },
-            }
-        ]
-
-        result = convert_tools_to_typescript(tools)
-
-        assert "namespace functions" in result
-        assert "get_weather" in result
-        assert "location: string," in result
-        assert "// Get weather for a location" in result
-
-    def test_optional_parameters(self):
-        """Optional parameters get ? suffix."""
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "func",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "required_param": {"type": "string"},
-                            "optional_param": {"type": "number"},
-                        },
-                        "required": ["required_param"],
-                    },
-                },
-            }
-        ]
-
-        result = convert_tools_to_typescript(tools)
-
-        assert "required_param: string," in result
-        assert "optional_param?: number," in result
-
-    def test_enum_type(self):
-        """Enums become TypeScript union types."""
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "set_unit",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "unit": {
-                                "type": "string",
-                                "enum": ["celsius", "fahrenheit"],
-                            },
-                        },
-                    },
-                },
-            }
-        ]
-
-        result = convert_tools_to_typescript(tools)
-
-        assert '"celsius" | "fahrenheit"' in result
-
-    def test_multiple_tools(self):
-        """Multiple tools in one namespace."""
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "func_a",
-                    "description": "First function",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "func_b",
-                    "description": "Second function",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-        ]
-
-        result = convert_tools_to_typescript(tools)
-
-        assert "func_a" in result
-        assert "func_b" in result
-        assert "// First function" in result
-        assert "// Second function" in result
-
-    def test_no_tools(self):
-        """None input returns None."""
-        assert convert_tools_to_typescript(None) is None
-        assert convert_tools_to_typescript([]) is None
-
-    def test_no_parameters(self):
-        """Tool with no parameters uses empty signature."""
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "ping",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
-        ]
-
-        result = convert_tools_to_typescript(tools)
-
-        assert "type ping = () => any;" in result
-
-    def test_array_type(self):
-        """Array types convert to Array<type>."""
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "process",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "items": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                        },
-                    },
-                },
-            }
-        ]
-
-        result = convert_tools_to_typescript(tools)
-
-        assert "Array<string>" in result
-
-    def test_boolean_and_integer_types(self):
-        """Boolean and integer map correctly."""
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "config",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "enabled": {"type": "boolean"},
-                            "count": {"type": "integer"},
-                        },
-                    },
-                },
-            }
-        ]
-
-        result = convert_tools_to_typescript(tools)
-
-        assert "enabled?: boolean," in result
-        assert "count?: number," in result
-
-    def test_no_description(self):
-        """Tool without description has no comment line."""
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "no_desc",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
-        ]
-
-        result = convert_tools_to_typescript(tools)
-
-        assert "//" not in result
-        assert "no_desc" in result
-
-    def test_skips_non_function_types(self):
-        """Non-function tools are skipped."""
-        tools = [
-            {"type": "retrieval"},
-            {
-                "type": "function",
-                "function": {
-                    "name": "real_func",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-        ]
-
-        result = convert_tools_to_typescript(tools)
-
-        assert "real_func" in result
-        assert "retrieval" not in result
-
-
-# ============================================================================
 # Edge Case Tests
 # ============================================================================
 
@@ -1140,7 +924,6 @@ class TestHarmonyStreaming:
     def test_final_channel_streaming_emits_content(self, parser):
         """Final channel tokens are emitted as content after <|message|>."""
         # Build final channel token by token
-        base = ""
         chunks = [
             "<|channel|>final\n",
             "<|message|>",

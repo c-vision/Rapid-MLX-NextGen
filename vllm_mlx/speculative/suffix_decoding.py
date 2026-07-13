@@ -6,15 +6,13 @@ sliding index over the prompt + generated tokens, and at each generation
 step proposes a variable-length draft sequence by looking at *all* prior
 occurrences of the current suffix and ranking continuations by frequency.
 
-Compared to plain Prompt Lookup Decoding (PLD)
-(``vllm_mlx/speculative/prompt_lookup.py``), this drafter:
+Compared to a fixed-length lookup drafter, this implementation:
 
   1. Considers **all** match positions, not just the first, so an
      occasional spurious match can't drag the draft off the most likely
      continuation.
   2. **Adaptively truncates** the draft at the first low-confidence
-     position. PLD always emits ``num_draft_tokens`` regardless of
-     confidence, which wastes verify cycles when the suffix tree is
+     position, avoiding wasted verify cycles when the suffix tree is
      ambiguous.
   3. Tracks **per-position acceptance** so the verify loop can be greedy
      about long matches when the index is confident, and conservative

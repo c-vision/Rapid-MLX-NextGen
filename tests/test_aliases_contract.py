@@ -676,27 +676,6 @@ def test_bonsai_ternary_alias_wiring() -> None:
         )
 
 
-def test_rename_map_targets_are_live_aliases() -> None:
-    """``scripts/rename_map.json`` canonicalizes legacy bare alias names to
-    the current explicit aliases and is consumed by ``sweep_alias_refs.py``
-    to rewrite references repo-wide. Every target MUST be a live alias — a
-    dangling target (e.g. left behind when an alias is deleted) makes the
-    sweep rewrite references to a NON-EXISTENT model. Regression guard for
-    the ``bonsai-*-unpacked`` removal (the three legacy ``bonsai-*`` names
-    used to point at the now-deleted unpacked aliases)."""
-    rename_map = json.loads(
-        (
-            Path(__file__).resolve().parents[1] / "scripts" / "rename_map.json"
-        ).read_text()
-    )
-    profiles = list_profiles()
-    dangling = {old: new for old, new in rename_map.items() if new not in profiles}
-    assert not dangling, (
-        f"rename_map.json targets missing from aliases.json: {dangling}. "
-        f"Point each at a live alias or remove the entry."
-    )
-
-
 def test_deepseek_v4_flash_family_wires_deepseek_r1_reasoning_parser() -> None:
     """The DeepSeek-V4-Flash chat template emits ``<think>...</think>``
     blocks (gated by ``thinking_mode``). Without ``reasoning_parser`` set,

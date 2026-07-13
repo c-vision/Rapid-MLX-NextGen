@@ -127,10 +127,6 @@ class TargetedTestsStep(Step):
         # Classify each PR failure: regression vs pre-existing.
         regressions = sorted(set(pr_failed) - set(main_failed))
         pre_existing = sorted(set(pr_failed) & set(main_failed))
-        only_on_main = sorted(
-            set(main_failed) - set(pr_failed)
-        )  # interesting but unused
-
         if not regressions:
             return StepResult(
                 name=self.name,

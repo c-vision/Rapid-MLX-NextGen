@@ -32,11 +32,9 @@ models:
     - "qwen3.6-35b-4bit"
     - "qwen3.6-27b-4bit"
     - "qwen3.5-9b-4bit"
-  parser_override: null  # auto-detect (qwen3_coder_xml for Coder, hermes for 3.5)
 
 streaming:
   extra_tool_tags: []
-  suppress_patterns: []
   # qwen-code exposes shell + file + web + git tools — 12 tool slots
   # plus a few bookkeeping calls. Cap at 15.
   max_tools: 15
@@ -52,8 +50,6 @@ testing:
 capabilities:
   function_calling: true
   streaming: true
-  vision: false
-  reasoning: true  # respects `enable_thinking` chat_template_kwargs
 
 known_issues:
   - "qwen-code hardcodes the OpenAI-compat `/v1` suffix — set `baseUrl` to `http://localhost:8000/v1` not the root URL."

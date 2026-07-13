@@ -1804,7 +1804,7 @@ class TestPrefillErrorCleanup:
         # Make next() raise to simulate prefill error
         bg.next = MagicMock(side_effect=ValueError("prompt too large"))
 
-        output = scheduler.step()
+        scheduler.step()
 
         # Batch generator should have had remove() called
         assert len(bg.unprocessed_requests) == 0

@@ -1833,7 +1833,6 @@ class MLXMultimodalLM:
                     vision_embeddings=None,
                     kv_cache=cache_to_store,
                     token_ids=token_ids,
-                    num_image_tokens=256,
                     model_name=self.model_name,
                 )
                 logger.info(
@@ -2154,7 +2153,6 @@ class MLXMultimodalLM:
                     vision_embeddings=None,
                     kv_cache=cache_to_store,
                     token_ids=token_ids,
-                    num_image_tokens=256,
                     model_name=self.model_name,
                 )
                 logger.info(

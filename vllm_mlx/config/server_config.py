@@ -8,7 +8,6 @@ accessible from routes and middleware via `get_config()`.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,7 +28,6 @@ class ServerConfig:
     model_name: str | None = None
     model_alias: str | None = None
     model_path: str | None = None
-    inference_lock: asyncio.Lock | None = None
     # True only after lifespan has finished engine.start(), warmup,
     # prefix-cache load_from_disk, and MCP init. Used by /health/ready
     # so callers (e.g. validation pipelines) can wait for a real

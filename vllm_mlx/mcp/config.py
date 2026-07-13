@@ -153,11 +153,6 @@ def validate_config(data: dict[str, Any]) -> MCPConfig:
         except TypeError as e:
             raise ValueError(f"Invalid config for server '{name}': {e}")
 
-    # Validate other fields
-    max_tool_calls = data.get("max_tool_calls", 10)
-    if not isinstance(max_tool_calls, int) or max_tool_calls < 1:
-        raise ValueError("'max_tool_calls' must be a positive integer")
-
     default_timeout = data.get("default_timeout", 30.0)
     if not isinstance(default_timeout, (int, float)) or default_timeout <= 0:
         raise ValueError("'default_timeout' must be a positive number")
@@ -170,7 +165,6 @@ def validate_config(data: dict[str, Any]) -> MCPConfig:
 
     return MCPConfig(
         servers=servers,
-        max_tool_calls=max_tool_calls,
         default_timeout=default_timeout,
         allowed_high_risk_tools=allowed_high_risk_tools,
     )
@@ -205,7 +199,6 @@ def create_example_config() -> str:
                 "enabled": True,
             },
         },
-        "max_tool_calls": 10,
         "default_timeout": 30.0,
     }
     return json.dumps(example, indent=2)

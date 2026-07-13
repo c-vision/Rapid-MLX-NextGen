@@ -168,7 +168,7 @@ def test_mllm_batch_generator_init_does_not_call_new_stream(monkeypatch):
     monkeypatch.setattr(mx, "new_stream", _trap_new_stream)
 
     # Build the generator through the real constructor.
-    gen = MLLMBatchGenerator(
+    MLLMBatchGenerator(
         model=_RecordingVLMModel(),
         processor=object(),
         mm_processor=None,

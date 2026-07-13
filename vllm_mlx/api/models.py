@@ -2000,10 +2000,6 @@ class AssistantMessage(BaseModel):
 
         return sanitize_reasoning_content(v)
 
-    def model_post_init(self, __context) -> None:
-        """Reserved hook (previously seeded a ``reasoning`` alias)."""
-        pass
-
     @model_serializer(mode="wrap")
     def _serialize_assistant_message(self, handler):
         """Always emit ``content`` on the wire.

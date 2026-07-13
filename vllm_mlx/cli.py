@@ -2808,31 +2808,6 @@ def serve_command(args):
     if args.embedding_model:
         _load_embedding_model_or_exit(args, server.load_embedding_model)
 
-    # Warn about deprecated flags
-    if getattr(args, "simple_engine", False):
-        print(
-            "\n  ⚠ --simple-engine is deprecated and has no effect."
-            "\n    BatchedEngine is now the sole engine — it handles both"
-            "\n    single-user and multi-user workloads with equal performance.\n"
-        )
-    if getattr(args, "kv_bits", None) is not None:
-        print(
-            "\n  ⚠ --kv-bits is deprecated and has no effect."
-            "\n    For prefix cache quantization, use --kv-cache-quantization instead.\n"
-        )
-    if getattr(args, "draft_model", None):
-        print(
-            "\n  ⚠ --draft-model is deprecated and has no effect."
-            "\n    For DFlash speculative decoding, use "
-            """--speculative-config '{"method":"dflash"}' """
-            "(requires a DFlash-eligible alias). "
-            "For MTP, use "
-            """--speculative-config '{"method":"mtp"}' """
-            "(requires a model with MTP head).\n"
-        )
-    if getattr(args, "specprefill", False):
-        print("\n  ⚠ --specprefill is deprecated and has no effect.\n")
-
     # Resolve per-alias TurboQuant default before the mutual-exclusion
     # check below — operator-explicit values still win. The
     # ``turboquant_scheduler_kwargs`` helper is the shared invariant
@@ -3015,8 +2990,6 @@ def serve_command(args):
         use_paged_cache=args.use_paged_cache,
         paged_cache_block_size=args.paged_cache_block_size,
         max_cache_blocks=args.max_cache_blocks,
-        # Chunked prefill
-        chunked_prefill_tokens=args.chunked_prefill_tokens,
         # Prefill step size (chunk size). Must be plumbed here — BatchedEngine
         # reads it off scheduler_config only; the legacy load_model kwarg was
         # accepted but never used. See #400 and the CLI ↔ Config fidelity
@@ -3084,8 +3057,6 @@ def serve_command(args):
     )
 
     print("Mode: Continuous batching (for multiple concurrent users)")
-    if args.chunked_prefill_tokens > 0:
-        print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
     if getattr(args, "spec_decode", "none") == "mtp":
         print(
             "MTP: enabled via --speculative-config, "
@@ -6975,38 +6946,6 @@ Examples:
         help="Default max tokens for generation (default: 32768)",
     )
     serve_parser.add_argument(
-        "--continuous-batching",
-        action="store_true",
-        default=True,
-        help="Enable continuous batching (default: on).",
-    )
-    # Deprecated flags — accepted silently to avoid breaking user scripts
-    serve_parser.add_argument(
-        "--simple-engine",
-        action="store_true",
-        default=False,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--kv-bits",
-        type=int,
-        default=None,
-        choices=[4, 8],
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--kv-group-size",
-        type=int,
-        default=64,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--draft-model",
-        type=str,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
         "--speculative-config",
         dest="speculative_config",
         default=None,
@@ -7116,6 +7055,46 @@ Examples:
         default=None,
         help=argparse.SUPPRESS,
     )
+    # Deprecated no-op flags — accepted-but-ignored for backward compat.
+    # These once controlled removed engine paths (the single BatchedEngine,
+    # legacy KV-bit quant, the --draft-model / --num-draft-tokens speculation
+    # frontend, the --specprefill prototype, and the legacy chunked-prefill
+    # monkey-patch that mlx-lm 0.31+ made unreachable). The implementations are
+    # gone, but the launcher must still PARSE these flags without an argparse
+    # hard-fail so existing user launch scripts (and older docs) keep booting.
+    # They are consumed-and-discarded: stored on ``args`` but never read. Hidden
+    # from --help (argparse.SUPPRESS); slated for removal in a future release.
+    serve_parser.add_argument(
+        "--continuous-batching",
+        action="store_true",
+        default=True,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--simple-engine",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        choices=[4, 8],
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--draft-model",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     serve_parser.add_argument(
         "--num-draft-tokens",
         type=int,
@@ -7147,6 +7126,12 @@ Examples:
         help=argparse.SUPPRESS,
     )
     serve_parser.add_argument(
+        "--chunked-prefill-tokens",
+        type=int,
+        default=0,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
         default=0.90,
@@ -7171,16 +7156,6 @@ Examples:
         type=int,
         default=1000,
         help="Maximum number of cache blocks (default: 1000)",
-    )
-    # Chunked prefill
-    serve_parser.add_argument(
-        "--chunked-prefill-tokens",
-        type=int,
-        default=0,
-        help="Max prefill tokens per scheduler step (0=disabled). "
-        "Breaks large prompts into chunks to prevent concurrent requests from starving. "
-        "Recommended for Claude Code and agentic workloads with large tool schemas: "
-        "--chunked-prefill-tokens 2048",
     )
     # Task #292: opt-in for ``/v1/audio/*`` routes on a text-only server.
     # The audio-mode boot path (``rapid-mlx serve kokoro`` etc.) auto-

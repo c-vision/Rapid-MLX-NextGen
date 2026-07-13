@@ -319,8 +319,8 @@ class TestToolForwarding:
         kwargs = {"tools": tools, "video_fps": 2.0, "video_max_frames": 64}
 
         # Simulate what chat() does: pop tools before native video branch
-        video_fps = kwargs.pop("video_fps", 2.0)
-        video_max_frames = kwargs.pop("video_max_frames", 128)
+        kwargs.pop("video_fps", 2.0)
+        kwargs.pop("video_max_frames", 128)
         popped_tools = kwargs.pop("tools", None)
 
         assert popped_tools == tools

@@ -121,7 +121,6 @@ async def test_disconnect_recovery():
 
     await asyncio.sleep(1)
     async with aiohttp.ClientSession() as session:
-        t0 = time.monotonic()
         tokens, elapsed, _ = await stream_completions(
             session, "Say hello. ", max_tokens=16, timeout=30
         )

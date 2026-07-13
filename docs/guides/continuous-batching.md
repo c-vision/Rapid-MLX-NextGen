@@ -1,8 +1,13 @@
 # Continuous Batching
 
 Continuous batching enables higher throughput when serving multiple concurrent
-users. It is **on by default** — the `--continuous-batching` flag is accepted
-for back-compat but is a no-op.
+users and is always enabled.
+
+> **Deprecated flag:** `--continuous-batching` is a no-op — batching is always
+> on, so the flag does nothing. It is still **accepted-but-ignored** for
+> backward compatibility (old launch scripts keep booting), but it is hidden
+> from `--help` and slated for removal in a future release. Drop it from new
+> commands.
 
 ## Default Behaviour
 

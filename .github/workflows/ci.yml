@@ -109,7 +109,6 @@ jobs:
             tests/test_structured_output.py \
             tests/test_reasoning_parser.py \
             tests/test_tool_parsers.py \
-            tests/test_streaming_json_encoder.py \
             tests/test_native_tool_format.py \
             tests/test_prefix_cache.py \
             tests/test_mllm_cache.py \

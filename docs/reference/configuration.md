@@ -24,7 +24,6 @@
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--continuous-batching` | Enable batching | `false` |
 | `--stream-interval` | Tokens per stream chunk | `1` |
 | `--max-num-seqs` | Max concurrent sequences | `256` |
 
@@ -149,7 +148,6 @@ rapid-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit
 
 ```bash
 rapid-mlx serve mlx-community/Qwen3-0.6B-8bit \
-  --continuous-batching \
   --use-paged-cache \
   --api-key your-secret-key \
   --rate-limit 60 \
@@ -161,8 +159,7 @@ rapid-mlx serve mlx-community/Qwen3-0.6B-8bit \
 ```bash
 rapid-mlx serve mlx-community/Devstral-Small-2507-4bit \
   --enable-auto-tool-choice \
-  --tool-call-parser mistral \
-  --continuous-batching
+  --tool-call-parser mistral
 ```
 
 ### With MCP Tools
@@ -171,31 +168,27 @@ rapid-mlx serve mlx-community/Devstral-Small-2507-4bit \
 rapid-mlx serve mlx-community/Qwen3-4B-4bit \
   --mcp-config mcp.json \
   --enable-auto-tool-choice \
-  --tool-call-parser qwen \
-  --continuous-batching
+  --tool-call-parser qwen
 ```
 
 ### Reasoning Model
 
 ```bash
 rapid-mlx serve mlx-community/Qwen3-8B-4bit \
-  --reasoning-parser qwen3 \
-  --continuous-batching
+  --reasoning-parser qwen3
 ```
 
 ### With Embeddings
 
 ```bash
 rapid-mlx serve mlx-community/Qwen3-4B-4bit \
-  --embedding-model mlx-community/multilingual-e5-small-mlx \
-  --continuous-batching
+  --embedding-model mlx-community/multilingual-e5-small-mlx
 ```
 
 ### High Throughput
 
 ```bash
 rapid-mlx serve mlx-community/Qwen3-0.6B-8bit \
-  --continuous-batching \
   --stream-interval 5 \
   --max-num-seqs 256
 ```

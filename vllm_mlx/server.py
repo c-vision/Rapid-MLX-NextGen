@@ -18,11 +18,8 @@ Features:
 - Tool calling (Qwen/Llama formats)
 
 Usage:
-    # Simple mode (maximum throughput)
+    # Start the server
     python -m vllm_mlx.server --model mlx-community/Llama-3.2-3B-Instruct-4bit
-
-    # Batched mode (for multiple concurrent users)
-    python -m vllm_mlx.server --model mlx-community/Llama-3.2-3B-Instruct-4bit --continuous-batching
 
     # With MCP tools
     python -m vllm_mlx.server --model mlx-community/Qwen3-4B-4bit --mcp-config mcp.json
@@ -302,9 +299,6 @@ _pin_system_prompt: bool = False  # Auto-pin system prompt prefix cache blocks
 _pinned_system_prompt_hash: str | None = None  # Hash of pinned system prompt
 
 
-from .runtime.cache import (  # noqa: E402
-    get_cache_dir as _get_cache_dir,  # noqa: F401
-)
 from .runtime.cache import (
     load_prefix_cache_from_disk as _load_prefix_cache_from_disk,
 )
@@ -1545,7 +1539,6 @@ def _sync_config() -> None:
     cfg.model_name = _model_name
     cfg.model_alias = _model_alias
     cfg.model_path = _model_path
-    cfg.inference_lock = None  # legacy, unused with BatchedEngine
     cfg.default_max_tokens = _default_max_tokens
     cfg.default_max_tokens_is_explicit = _default_max_tokens_is_explicit
     cfg.default_timeout = _default_timeout
@@ -1717,11 +1710,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Start with simple mode (maximum throughput)
+    # Start the server
     python -m vllm_mlx.server --model mlx-community/Llama-3.2-3B-Instruct-4bit
-
-    # Start with continuous batching (for multiple users)
-    python -m vllm_mlx.server --model mlx-community/Llama-3.2-3B-Instruct-4bit --continuous-batching
 
     # With MCP tools
     python -m vllm_mlx.server --model mlx-community/Qwen3-4B-4bit --mcp-config mcp.json
@@ -1828,12 +1818,6 @@ Examples:
         default=False,
         help="Force-off HarmonyStreamingRouter upgrade; use legacy state machine. Mutually exclusive with --force-openai-harmony-streaming.",
     )
-    parser.add_argument(
-        "--continuous-batching",
-        action="store_true",
-        default=True,
-        help="Enable continuous batching (default: on).",
-    )
     # PFlash long-prompt prefill compression (#287). Off by default. The
     # unified ``rapid-mlx serve`` CLI exposes the same surface; we mirror
     # it here so the standalone ``python -m vllm_mlx.server`` path is
@@ -1841,18 +1825,8 @@ Examples:
     from .cli import _add_pflash_args as _add_pflash_args_to_server_parser
 
     _add_pflash_args_to_server_parser(parser)
-    # Deprecated flags — accepted silently to avoid breaking user scripts
     import argparse as _ap
 
-    parser.add_argument(
-        "--simple-engine", action="store_true", default=False, help=_ap.SUPPRESS
-    )
-    parser.add_argument(
-        "--kv-bits", type=int, default=None, choices=[4, 8], help=_ap.SUPPRESS
-    )
-    parser.add_argument("--kv-group-size", type=int, default=64, help=_ap.SUPPRESS)
-    parser.add_argument("--draft-model", type=str, default=None, help=_ap.SUPPRESS)
-    parser.add_argument("--num-draft-tokens", type=int, default=4, help=_ap.SUPPRESS)
     # TurboQuant flags — MUST match ``rapid-mlx serve`` (cli.py) choice
     # set + defaults so this standalone entry is functionally at parity.
     # Pre-#969, this parser was missing the ``"none"`` off-switch added

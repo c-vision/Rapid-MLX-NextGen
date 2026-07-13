@@ -15,11 +15,9 @@ models:
     - "qwen3.6-35b-4bit"
     - "qwen3.5-4b-4bit"
     - "deepseek-r1-8b-4bit"
-  parser_override: null
 
 streaming:
   extra_tool_tags: []
-  suppress_patterns: []
   max_tools: 0  # Aider does NOT use function calling
 
 testing:
@@ -31,8 +29,6 @@ testing:
 capabilities:
   function_calling: false  # uses text edit formats, not FC
   streaming: true
-  vision: true  # supports images/URLs
-  reasoning: false
 
 known_issues:
   - "Does NOT use function calling — uses text edit formats (unified diff, search/replace)"

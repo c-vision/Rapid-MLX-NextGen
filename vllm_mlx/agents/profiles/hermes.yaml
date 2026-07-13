@@ -23,12 +23,10 @@ models:
     - "gemma-4-26b-4bit"
     - "qwen3.5-35b-a3b"
     - "qwen3.6-35b-4bit"
-  parser_override: null  # use auto-detect per model
 
 streaming:
   extra_tool_tags:
     - ["[Calling tool", "\n"]  # Gemma 4 mimicry pattern
-  suppress_patterns: []
   max_tools: 62  # Hermes injects 62 tools per request
 
 testing:
@@ -41,8 +39,6 @@ testing:
 capabilities:
   function_calling: true
   streaming: true
-  vision: false
-  reasoning: true  # works with thinking models
 
 known_issues:
   - "todo tool conflict: Hermes injects a 'todo' tool that causes errors with Gemma 4. Fix: exclude from platform_toolsets or use -t flag"

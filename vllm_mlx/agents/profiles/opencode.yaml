@@ -37,11 +37,9 @@ models:
     - "qwen3.5-9b-4bit"
     - "qwen3.6-35b-4bit"
     - "qwen3.5-4b-4bit"
-  parser_override: null
 
 streaming:
   extra_tool_tags: []
-  suppress_patterns: []
   max_tools: 25  # mirrors Claude Code tool count
 
 testing:
@@ -53,8 +51,6 @@ testing:
 capabilities:
   function_calling: true
   streaming: true
-  vision: false
-  reasoning: true
 
 known_issues:
   - "Config schema may need updating across OpenCode versions — if this template doesn't load, run `opencode --help` and check `~/.config/opencode/opencode.json` against the docs at opencode.ai."

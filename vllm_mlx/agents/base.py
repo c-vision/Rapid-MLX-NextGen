@@ -29,7 +29,6 @@ class AgentStreamingSpec:
     """Agent-specific streaming behavior."""
 
     extra_tool_tags: list[tuple[str, str]] = field(default_factory=list)
-    suppress_patterns: list[str] = field(default_factory=list)
     max_tools: int | None = None  # how many tools the agent injects per request
 
 
@@ -81,7 +80,6 @@ class AgentProfile:
 
     # Model compatibility
     recommended_models: list[str] = field(default_factory=list)
-    parser_override: str | None = None  # force a specific tool parser
 
     # Streaming
     streaming: AgentStreamingSpec = field(default_factory=AgentStreamingSpec)
@@ -98,8 +96,6 @@ class AgentProfile:
     # Capabilities the agent expects from the server
     needs_function_calling: bool = True
     needs_streaming: bool = True
-    needs_vision: bool = False
-    needs_reasoning: bool = False
 
     def get_config_for_version(
         self, agent_version: str | None = None

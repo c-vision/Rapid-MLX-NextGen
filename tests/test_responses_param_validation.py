@@ -199,7 +199,7 @@ class TestResponsesTopK:
             headers=HEADERS,
         )
         assert resp.status_code == 400, resp.text
-        body = resp.json()
+        resp.json()
         # Error envelope shape matches the sanitized 400 path
         # (``install_exception_handlers`` converts Pydantic errors).
         assert "top_k" in resp.text, (

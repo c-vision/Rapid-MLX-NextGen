@@ -2,7 +2,7 @@
 
 Detailed configuration record for every model evaluation. **Update this file whenever you add or re-run an eval.**
 
-> All evals on this page were run on **Apple M3 Ultra (256GB)** using **SimpleEngine** (default, no `--continuous-batching`).
+> Historical note: these March 2026 evals were run on **Apple M3 Ultra (256GB)** using the then-default **SimpleEngine**.
 >
 > mlx-lm version: **0.30.7** | vllm-mlx: **main branch (2026-03-04)**
 

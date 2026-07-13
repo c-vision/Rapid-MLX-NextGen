@@ -256,7 +256,8 @@ def test_sampler_cache_is_bounded_lru(monkeypatch):
             self.top_k = 20
 
     # Fill past the cap.
-    samplers = [sched._get_request_sampler(_SP(0.1 * i)) for i in range(6)]
+    for i in range(6):
+        sched._get_request_sampler(_SP(0.1 * i))
     assert len(sched._sampler_cache) == 4, "cap must hold even under churn"
 
     # Oldest entries (temp=0.0, 0.1) are evicted. The 5th tuple element

@@ -148,7 +148,7 @@ class TestVideoFrameExtraction:
 
     def test_extract_video_frames_smart(self, test_video_path):
         """Test smart frame extraction."""
-        cv2 = pytest.importorskip("cv2")
+        pytest.importorskip("cv2")
         from vllm_mlx.models.mllm import extract_video_frames_smart
 
         # Extract frames
@@ -161,7 +161,7 @@ class TestVideoFrameExtraction:
 
     def test_extract_frames_respects_max_frames(self, test_video_path):
         """Test that max_frames limit is respected."""
-        cv2 = pytest.importorskip("cv2")
+        pytest.importorskip("cv2")
         from vllm_mlx.models.mllm import extract_video_frames_smart
 
         frames = extract_video_frames_smart(test_video_path, fps=30.0, max_frames=5)
@@ -170,7 +170,7 @@ class TestVideoFrameExtraction:
 
     def test_save_frames_to_temp(self, test_video_path):
         """Test saving frames to temp files."""
-        cv2 = pytest.importorskip("cv2")
+        pytest.importorskip("cv2")
         from vllm_mlx.models.mllm import extract_video_frames_smart, save_frames_to_temp
 
         frames = extract_video_frames_smart(test_video_path, fps=1.0, max_frames=2)

@@ -67,7 +67,7 @@ Install with: pip install 'rapid-mlx[audio]'
 pip install mlx-audio>=0.2.9
 
 # Required dependencies for TTS
-pip install sounddevice soundfile scipy numba tiktoken misaki spacy num2words loguru phonemizer
+pip install sounddevice soundfile scipy misaki spacy num2words phonemizer-fork numba tiktoken loguru
 
 # Download spacy English model
 python -m spacy download en_core_web_sm

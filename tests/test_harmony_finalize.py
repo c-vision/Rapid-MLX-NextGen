@@ -258,7 +258,7 @@ def harmony_router():
     harmony encoding's vocab. Skips if ``openai-harmony`` isn't
     installed in the test environment.
     """
-    openai_harmony = pytest.importorskip("openai_harmony")
+    pytest.importorskip("openai_harmony")
     from openai_harmony import HarmonyEncodingName, load_harmony_encoding
 
     from vllm_mlx.output_router import TokenMap

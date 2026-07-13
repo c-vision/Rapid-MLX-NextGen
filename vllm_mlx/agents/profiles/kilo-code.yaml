@@ -31,11 +31,9 @@ models:
     - "qwen3.6-35b-4bit"
     - "qwen3.5-9b-4bit"
     - "gpt-oss-20b-mxfp4-q8"
-  parser_override: null
 
 streaming:
   extra_tool_tags: []
-  suppress_patterns: []
   # Kilo inherits Cline's tool surface — file / shell / browser /
   # search / MCP. Cap at 25.
   max_tools: 25
@@ -51,8 +49,6 @@ testing:
 capabilities:
   function_calling: true
   streaming: true
-  vision: false  # image-input planned; not shipped as of 0.3.x
-  reasoning: true
 
 known_issues:
   - "Kilo Code is a Cline fork with independent maintenance — do not point Kilo at a Cline config; the schema drifted after the split."

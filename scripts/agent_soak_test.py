@@ -309,7 +309,7 @@ class SoakTestRunner:
         for i in range(10):
             if self.remaining() <= 0:
                 break
-            result = await self.nonstream_request(
+            await self.nonstream_request(
                 [{"role": "user", "content": random.choice(TOOL_PROMPTS)}],
                 max_tokens=200,
                 tools=AGENT_TOOLS[:5],

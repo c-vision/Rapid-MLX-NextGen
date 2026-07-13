@@ -148,9 +148,9 @@ def run(
     )
     print()
     print("Usage:")
-    print("  rapid-mlx serve <model> --continuous-batching --kv-cache-quantization")
+    print("  rapid-mlx serve <model> --kv-cache-quantization")
     print(
-        "  rapid-mlx serve <model> --continuous-batching --kv-cache-quantization "
+        "  rapid-mlx serve <model> --kv-cache-quantization "
         "--kv-cache-quantization-bits 4"
     )
 

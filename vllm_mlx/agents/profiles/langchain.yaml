@@ -25,8 +25,6 @@ testing:
 capabilities:
   function_calling: true
   streaming: true
-  vision: false
-  reasoning: false
 
 known_issues:
   - "with_structured_output() overrides max_tokens to None; thinking models burn budget"

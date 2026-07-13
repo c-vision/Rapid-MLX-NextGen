@@ -439,7 +439,6 @@ Explain the bug and provide the corrected code.""",
     # === Summary ===
     print("\n" + "=" * 90)
     total = len(results)
-    checks = [r for r in results if "check_fn" not in r]  # All have been checked inline
     avg_tps = sum(r["tps"] for r in results) / total
     total_tokens = sum(r["completion_tokens"] for r in results)
     total_time = sum(r["elapsed"] for r in results)

@@ -171,30 +171,6 @@ class AliasProfile:
     # modality slot and broke construction without raising. Keep new
     # fields at the tail.
     modality: Modality = "text"
-    # ---- Deprecated as of v0.7.3 (PR #555 in-house diffusion loop
-    # reverted) -------------------------------------------------------
-    # These fields are no longer load-bearing — diffusion lane now
-    # passes through to mlx-vlm ``stream_diffusion_generate`` directly,
-    # so the knobs have no consumer. They remain on the dataclass for
-    # one release window so v0.7.2 programmatic callers that read
-    # ``profile.diffusion_backend`` etc. don't ``AttributeError``
-    # (pr_validate r5 BLOCKING #2 — codex flagged the dataclass-vs-loader
-    # asymmetry).
-    #
-    # ``diffusion_backend`` default is ``"mlx-vlm"`` not ``"rapid"``
-    # (pr_validate r7 BLOCKING #2). v0.7.2 had ``"rapid"`` to flag the
-    # in-house loop; after the revert, every diffusion request flows
-    # to mlx-vlm regardless of this value — keeping ``"rapid"`` would
-    # be a programmatic-reader lie about routing. ``_coerce`` still
-    # threads any operator-overridden value through, so customized
-    # v0.7.2 aliases.json files preserve their tuned strings during
-    # the window (pr_validate r6 BLOCKING).
-    #
-    # All three will be removed in v0.8.0 alongside the matching entry
-    # in ``_DEPRECATED_PROFILE_KEYS``.
-    diffusion_backend: str = "mlx-vlm"
-    diffusion_fixed_steps: int = 8
-    diffusion_sc_every: int = 1
     # PFlash long-prompt compression eligibility (#287). Default
     # ``"unknown"`` keeps the engine's PFlash mode at ``"off"`` so a
     # brand-new alias never silently enables compression on an
@@ -289,45 +265,8 @@ def _coerce(alias: str, value: object) -> AliasProfile:
             "recommended_sampling",
             "pflash_tier",
             "turboquant_tier",
-            # Deprecated v0.7.2 PR #555 diffusion knobs — kept in the
-            # allowed set so they construct an ``AliasProfile`` with
-            # the deprecated no-op fields populated. Warning is emitted
-            # by the deprecation handler below; the fields will be
-            # dropped from both the dataclass and this set in v0.8.0.
-            "diffusion_backend",
-            "diffusion_fixed_steps",
-            "diffusion_sc_every",
         }
     )
-    # Deprecated keys shipped on the v0.7.2 ``AliasProfile`` (PR #555
-    # in-house diffusion loop). v0.7.3 reverted the loop, so these
-    # are no longer load-bearing, but an operator who customized
-    # ``aliases.json`` against v0.7.2 — or is mid-upgrade with a
-    # v0.7.2 install on PyPI before yank propagates — would hit
-    # ``unknown key`` on startup if we hard-reject. Accept-and-warn
-    # for one release window (v0.7.3 → v0.8.0), then strip before
-    # constructing ``AliasProfile`` so the dataclass __init__ doesn't
-    # see the unrecognised kwargs (codex r2 BLOCKING #2).
-    _DEPRECATED_PROFILE_KEYS: frozenset[str] = frozenset(
-        {"diffusion_backend", "diffusion_fixed_steps", "diffusion_sc_every"}
-    )
-    deprecated_present = set(value.keys()) & _DEPRECATED_PROFILE_KEYS
-    if deprecated_present:
-        import logging as _logging  # local import: avoid module-import cost on hot paths
-
-        _log = _logging.getLogger(__name__)
-        for k in sorted(deprecated_present):
-            _log.warning(
-                "alias %r: key %r is deprecated as of v0.7.3 (PR #555 "
-                "in-house diffusion loop was reverted; the knob is no "
-                "longer load-bearing). The value is accepted for one "
-                "release window and stored on AliasProfile as a no-op "
-                "field so programmatic readers don't AttributeError. "
-                "Remove the key from your aliases.json to silence this "
-                "warning; the key will be hard-rejected in v0.8.0.",
-                alias,
-                k,
-            )
     unknown_keys = set(value.keys()) - _ALLOWED_PROFILE_KEYS
     if unknown_keys:
         raise ValueError(
@@ -572,16 +511,6 @@ def _coerce(alias: str, value: object) -> AliasProfile:
         ddtree_speculative_tokens=ddtree_speculative_tokens,
         ddtree_tree_budget=ddtree_tree_budget,
         recommended_sampling=recommended_sampling,
-        # Deprecated v0.7.2 PR #555 knobs — explicitly threaded through
-        # so an operator who customized ``aliases.json`` with non-default
-        # values keeps them on the resulting ``AliasProfile`` instance
-        # during the v0.7.3 → v0.8.0 deprecation window. Without the
-        # explicit forward, the dataclass would fall back to the field
-        # defaults and a customized config would silently revert
-        # (pr_validate r6 BLOCKING).
-        diffusion_backend=value.get("diffusion_backend", "mlx-vlm"),
-        diffusion_fixed_steps=value.get("diffusion_fixed_steps", 8),
-        diffusion_sc_every=value.get("diffusion_sc_every", 1),
         pflash_tier=pflash_tier,
         turboquant_tier=turboquant_tier,
         min_memory_gb=min_memory_gb,

@@ -75,7 +75,7 @@ REQUIRED_TEST_PACKAGES: tuple[tuple[str, str, str], ...] = (
     (
         "aiohttp",
         "aiohttp>=3.9.0",
-        "prompt-lookup bench tests import aiohttp at module load",
+        "async HTTP tests import aiohttp at module load",
     ),
     (
         "PIL",
