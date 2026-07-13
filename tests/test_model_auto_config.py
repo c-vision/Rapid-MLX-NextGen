@@ -119,7 +119,8 @@ class TestDetectModelConfig:
         assert config.tool_call_parser == "mistral"
         assert config.reasoning_parser is None
 
-    # Qwen3-Coder (no reasoning parser)
+    # Qwen3-Coder-Next emits the XML ``<function=...>`` tool envelope and
+    # has no thinking channel (see its upstream chat template/model card).
     @pytest.mark.parametrize(
         "model_path",
         [
@@ -127,10 +128,10 @@ class TestDetectModelConfig:
             "lmstudio-community/Qwen3-Coder-Next-MLX-6bit",
         ],
     )
-    def test_qwen_coder(self, model_path):
+    def test_qwen_coder_next(self, model_path):
         config = detect_model_config(model_path)
         assert config is not None
-        assert config.tool_call_parser == "hermes"
+        assert config.tool_call_parser == "qwen3_coder_xml"
         assert config.reasoning_parser is None
 
     # DeepSeek V3.1 thinking-channel → deepseek_v31 parser. R12-5

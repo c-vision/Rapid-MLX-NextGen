@@ -287,10 +287,17 @@ _MODEL_PATTERNS: list[tuple[re.Pattern, ModelConfig]] = [
     (
         re.compile(r"qwen3[-_]?(coder[-_]?next|next)", re.IGNORECASE),
         ModelConfig(
-            tool_call_parser="hermes",
+            tool_call_parser="qwen3_coder_xml",
             reasoning_parser=None,
             is_hybrid=True,
             supports_spec_decode=False,
+            # Coder-Next is hybrid Gated-DeltaNet + MoE: DFlash draft-model
+            # decoding is unsupported. This mirrors the alias profiles so a
+            # user serving the raw HF path (no alias) gets the same safe
+            # gate. ``is_moe`` is not a ModelConfig field (it lives only on
+            # AliasProfile), so the MoE fact is carried by the aliases; the
+            # direct-path only needs the hybrid + capability gates.
+            supports_dflash=False,
         ),
     ),
     # Qwen3.6 MoE (A3B / A10B / generic MoE markers) — hybrid

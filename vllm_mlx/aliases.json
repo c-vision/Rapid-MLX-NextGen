@@ -471,10 +471,45 @@
   },
   "qwen3-coder-4bit": {
     "hf_path": "lmstudio-community/Qwen3-Coder-Next-MLX-4bit",
-    "tool_call_parser": "hermes",
+    "tool_call_parser": "qwen3_coder_xml",
     "reasoning_parser": null,
     "is_hybrid": true,
-    "supports_spec_decode": false
+    "is_moe": true,
+    "supports_spec_decode": false,
+    "supports_dflash": false,
+    "recommended_sampling": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 40
+    }
+  },
+  "qwen3-coder-next-80b-4bit": {
+    "hf_path": "mlx-community/Qwen3-Coder-Next-4bit",
+    "tool_call_parser": "qwen3_coder_xml",
+    "reasoning_parser": null,
+    "is_hybrid": true,
+    "is_moe": true,
+    "supports_spec_decode": false,
+    "supports_dflash": false,
+    "recommended_sampling": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 40
+    }
+  },
+  "qwen3-coder-next-80b-8bit": {
+    "hf_path": "lmstudio-community/Qwen3-Coder-Next-MLX-8bit",
+    "tool_call_parser": "qwen3_coder_xml",
+    "reasoning_parser": null,
+    "is_hybrid": true,
+    "is_moe": true,
+    "supports_spec_decode": false,
+    "supports_dflash": false,
+    "recommended_sampling": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 40
+    }
   },
   "qwen3-vl-4b-4bit": {
     "hf_path": "mlx-community/Qwen3-VL-4B-Instruct-4bit",
