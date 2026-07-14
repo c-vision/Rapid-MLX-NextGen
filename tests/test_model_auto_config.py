@@ -992,6 +992,259 @@ class TestVisibility:
         for line in table.splitlines():
             assert len(line) <= 80, f"line too wide: {line!r}"
 
+    # --- MTP path / KV-share truth-in-labeling rows ---
+
+    def test_table_has_mtp_and_kv_share_rows(self):
+        # Both rows must be present on every rendered table so users see
+        # the spec-decode/KV-share truth without loading weights.
+        cfg = detect_model_config("mlx-community/gemma-4-12B-it-4bit")
+        table = format_profile_table("mlx-community/gemma-4-12B-it-4bit", cfg)
+        assert "MTP path" in table
+        assert "KV-share" in table
+
+    def test_gemma4_mtp_is_sidecar_and_kv_share_yes(self):
+        # Gemma 4 uses an assistant/sidecar drafter (no native head) and
+        # ships cross-layer KV-sharing (num_kv_shared_layers > 0). The
+        # ``(default)`` qualifier signals the value is the family default,
+        # not a per-checkpoint config.json read (info stays weight-free).
+        cfg = detect_model_config("mlx-community/gemma-4-12B-it-4bit")
+        assert cfg is not None and cfg.supports_spec_decode is True
+        table = format_profile_table("mlx-community/gemma-4-12B-it-4bit", cfg)
+        assert "MTP path         : sidecar" in table
+        assert "KV-share         : yes (default)" in table
+
+    def test_hy3_mtp_is_native_and_kv_share_no(self):
+        # HY3 ships a native DeepSeek-V3-style MTP head; not a Gemma 4, so
+        # no cross-layer KV-share.
+        cfg = detect_model_config("mlx-community/Hy3-preview-4bit")
+        assert cfg is not None and cfg.supports_spec_decode is True
+        table = format_profile_table("mlx-community/Hy3-preview-4bit", cfg)
+        assert "MTP path         : native" in table
+        assert "KV-share         : no" in table
+
+    def test_qwen35_spec_off_mtp_disabled(self):
+        # Native-MTP family (Qwen3.5), but this alias has spec decode off
+        # (no MTP head registered) → the honest MTP path is ``disabled``.
+        cfg = detect_model_config("mlx-community/Qwen3.5-4B-MLX-4bit")
+        assert cfg is not None and cfg.supports_spec_decode is False
+        table = format_profile_table("mlx-community/Qwen3.5-4B-MLX-4bit", cfg)
+        assert "MTP path         : disabled" in table
+        assert "KV-share         : no" in table
+
+    def test_non_mtp_spec_on_family_mtp_disabled(self):
+        # Qwen3 dense enables spec decode via SuffixDecoding, NOT MTP.
+        # The MTP-path row must stay ``disabled`` — SuffixDecoding is a
+        # different lane, surfaced by the Spec-decode / Suffix-tier rows.
+        cfg = detect_model_config("mlx-community/Qwen3-0.6B-8bit")
+        assert cfg is not None and cfg.supports_spec_decode is True
+        table = format_profile_table("mlx-community/Qwen3-0.6B-8bit", cfg)
+        assert "MTP path         : disabled" in table
+        assert "KV-share         : no" in table
+
+    def test_unknown_model_reports_unknown_not_definite(self):
+        # ``cfg is None`` path — no regex/alias matched, so the
+        # architecture is genuinely UNKNOWN (an opaquely named Qwen3.5 /
+        # Gemma 4 checkpoint lands here too). codex #1112 [BLOCKING]
+        # round 7: reporting a definite ``disabled`` / ``no`` would falsely
+        # claim the model lacks MTP / KV-sharing — report ``unknown``.
+        table = format_profile_table("some-brand-new-model-xyz", None)
+        assert "MTP path         : unknown (unmatched profile)" in table
+        assert "KV-share         : unknown (unmatched profile)" in table
+        # Must NOT falsely assert a definite off-state for an unknown arch.
+        assert "MTP path         : disabled" not in table
+        assert "KV-share         : no" not in table
+
+    def test_mtp_path_value_stays_within_contract(self):
+        # codex #1112 [NIT] round 4 + [BLOCKING] round 8: the RENDERED MTP-
+        # path value must always be one of the documented tokens. This
+        # parses ``format_profile_table`` output (the real public surface),
+        # NOT ``_mtp_path_label`` in isolation — so the ``cfg is None``
+        # branch's ``unknown`` value is covered too. Contract vocabulary:
+        # a MATCHED profile → native | sidecar | disabled; the UNMATCHED
+        # (``cfg is None``) branch → "unknown (unmatched profile)".
+        import re
+
+        matched_allowed = {"native", "sidecar", "disabled"}
+        probes = [
+            "mlx-community/gemma-4-12B-it-4bit",
+            "mlx-community/Hy3-preview-4bit",
+            "mlx-community/Qwen3.5-4B-MLX-4bit",
+            "mlx-community/Qwen3-0.6B-8bit",
+            "mlx-community/Qwen3.6-35B-A3B-4bit",
+            "gemma4-labs/Llama-3-8B-Instruct-4bit",
+            "some-org/Qwen3.5-gemma-4-merge-8bit",
+            "totally-unknown-model",
+        ]
+        row_re = re.compile(r"MTP path\s+:\s+(.*?)\s+│")
+        for name in probes:
+            cfg = detect_model_config(name)
+            table = format_profile_table(name, cfg)
+            m = row_re.search(table)
+            assert m is not None, f"no MTP path row rendered for {name!r}"
+            value = m.group(1)
+            if cfg is None:
+                assert value == "unknown (unmatched profile)", (
+                    f"unmatched profile {name!r} must report unknown, got {value!r}"
+                )
+            else:
+                assert value in matched_allowed, (
+                    f"matched profile {name!r} escaped the contract: {value!r}"
+                )
+
+    def test_mtp_kv_share_rows_fit_box(self):
+        # New rows must not break the fixed-width box on any family.
+        for name in (
+            "mlx-community/gemma-4-12B-it-4bit",
+            "mlx-community/Hy3-preview-4bit",
+            "mlx-community/Qwen3.5-4B-MLX-4bit",
+        ):
+            table = format_profile_table(name, detect_model_config(name))
+            widths = {
+                len(line)
+                for line in table.splitlines()
+                if line.startswith(("│", "┌", "└"))
+            }
+            assert len(widths) == 1, (
+                f"MTP/KV-share rows broke box alignment for {name}: "
+                f"widths={widths}\n{table}"
+            )
+
+    def test_family_marker_in_org_dir_does_not_mislabel(self):
+        # codex #1112 [BLOCKING]: a family marker in an ORG / parent
+        # directory must not spoof the MTP/KV-share family. This exercises
+        # the REAL public path (``detect_model_config`` →
+        # ``format_profile_table``), NOT a hand-built stub — because
+        # ``detect_model_config``'s regex table matches the FULL path, an
+        # org prefix like ``gemma4-labs/…`` yields a ``gemma4`` parser
+        # stamp on a non-Gemma model; the info-row family resolver must
+        # require the family marker in the NAME segment, so the stamp
+        # alone cannot spoof the label. The name segment here is a plain
+        # Llama / Mistral checkpoint — no family marker → disabled / no.
+        for spoof in (
+            "gemma4-labs/Llama-3-8B-Instruct-4bit",
+            "qwen3.5-community/Mistral-7B-Instruct-4bit",
+            "hy3-org/Llama-3-8B-Instruct-4bit",
+        ):
+            table = format_profile_table(spoof, detect_model_config(spoof))
+            assert "MTP path         : disabled" in table, (
+                f"org-dir marker spoofed MTP path for {spoof}:\n{table}"
+            )
+            assert "KV-share         : no" in table, (
+                f"org-dir marker spoofed KV-share for {spoof}:\n{table}"
+            )
+
+    def test_qwen35_spec_on_stub_labels_native(self):
+        # codex #1112 [NIT] round 4: a positive assertion that a spec-decode-
+        # enabled Qwen3.5/3.6 name renders ``MTP path: native`` via the
+        # name regex — so deleting Qwen handling from ``_NATIVE_MTP_NAME_RE``
+        # would break this test (the shipped Qwen3.5 aliases all have spec
+        # decode OFF, which alone can't catch a native-regex regression).
+        from vllm_mlx.model_auto_config import _mtp_path_label
+        from vllm_mlx.model_profile import ModelProfile
+
+        for name in ("some-org/Qwen3.5-9B-custom-4bit", "some-org/Qwen3.6-9B-4bit"):
+            stub = ModelProfile(hf_path=name)  # spec decode defaults True
+            assert _mtp_path_label(stub.hf_path, stub) == "native"
+
+    def test_gemma4_name_in_segment_still_labels_sidecar(self):
+        # Positive control for the anchoring fix: when the Gemma 4 marker
+        # IS in the model-name segment (direct HF path, no parser stamp
+        # because it's an unaliased path routed through the regex), it
+        # must still label sidecar / KV-share yes.
+        from vllm_mlx.model_auto_config import _kv_share_label, _mtp_path_label
+        from vllm_mlx.model_profile import ModelProfile
+
+        # No parser stamp, spec on — the name segment carries ``gemma-4``.
+        stub = ModelProfile(hf_path="some-org/gemma-4-9b-custom-4bit")
+        assert _kv_share_label(stub.hf_path, stub) == "yes (default)"
+        assert _mtp_path_label(stub.hf_path, stub) == "sidecar"
+
+    def test_leading_family_token_beats_provenance_suffix(self):
+        # codex #1112 round 5 + round 9: the family is decided by the
+        # LEADING architecture-position token, not a later provenance
+        # token. ``Hy3-distilled-from-Gemma-4`` leads with ``Hy3`` → native
+        # (the trailing ``gemma-4`` is provenance and is ignored). The
+        # resolver is name-based, so parser stamps here are irrelevant —
+        # this documents leading-token precedence, not stamp precedence.
+        from vllm_mlx.model_auto_config import _kv_share_label, _mtp_path_label
+        from vllm_mlx.model_profile import ModelProfile
+
+        stub = ModelProfile(hf_path="some-org/Hy3-distilled-from-Gemma-4-8bit")
+        assert _mtp_path_label(stub.hf_path, stub) == "native"
+        assert _kv_share_label(stub.hf_path, stub) == "no"
+
+    def test_quant_prefix_before_family_token_still_resolves(self):
+        # codex #1112 [BLOCKING] round 9: a repackaged/renamed checkpoint
+        # may prepend a quantization/format prefix before the architecture
+        # token. Those must still resolve to the family, while a mid-name
+        # provenance token (not a known prefix) stays rejected.
+        from vllm_mlx.model_auto_config import _kv_share_label, _mtp_path_label
+        from vllm_mlx.model_profile import ModelProfile
+
+        for name, mtp, kv in (
+            ("some-org/quantized-gemma-4-12b", "sidecar", "yes (default)"),
+            ("some-org/mlx-gemma-4-9b-it", "sidecar", "yes (default)"),
+            ("some-org/4bit-gemma-4-12b", "sidecar", "yes (default)"),
+            ("some-org/quant-Qwen3.6-35B", "native", "no"),
+            ("some-org/mlx-Hy3-preview", "native", "no"),
+        ):
+            stub = ModelProfile(hf_path=name)  # spec decode defaults True
+            assert _mtp_path_label(name, stub) == mtp, name
+            assert _kv_share_label(name, stub) == kv, name
+
+    def test_family_token_substrings_and_provenance_rejected(self):
+        # codex #1112 [NIT] round 2 + [BLOCKING] round 5: a family token
+        # must be at the START of the name segment (the architecture-
+        # position slot). Reject (a) substrings — ``Llama-3-hy3per-8B``
+        # contains ``hy3``, ``megemma4x`` contains ``gemma4`` — and (b)
+        # LATER provenance tokens — ``Llama-3-Distilled-from-Gemma-4`` is a
+        # Llama, ``Mistral-merge-of-Qwen3.5`` is a Mistral.
+        from vllm_mlx.model_auto_config import _kv_share_label, _mtp_path_label
+        from vllm_mlx.model_profile import ModelProfile
+
+        for name in (
+            "some-org/Llama-3-hy3per-8B",
+            "some-org/megemma4x-13B",
+            "some-org/Llama-3-Distilled-from-Gemma-4-8bit",
+            "some-org/Mistral-merge-of-Qwen3.5-7b",
+            "some-org/Yi-based-on-Hy3-9b",
+        ):
+            stub = ModelProfile(hf_path=name)  # spec decode defaults True
+            assert _mtp_path_label(name, stub) == "disabled", name
+            assert _kv_share_label(name, stub) == "no", name
+
+    def test_architecture_position_token_wins_in_merge_name(self):
+        # codex #1112 round 5: in a merge name the LEADING family token is
+        # the architecture; the later token is provenance. ``Qwen3.5-gemma-
+        # 4-merge`` is a Qwen3.5-architecture merge → native; ``gemma-4-
+        # qwen3.5-merge`` leads with Gemma 4 → sidecar / KV-share yes.
+        from vllm_mlx.model_auto_config import _kv_share_label, _mtp_path_label
+        from vllm_mlx.model_profile import ModelProfile
+
+        qwen_lead = ModelProfile(hf_path="some-org/Qwen3.5-gemma-4-merge-8bit")
+        assert _mtp_path_label(qwen_lead.hf_path, qwen_lead) == "native"
+        assert _kv_share_label(qwen_lead.hf_path, qwen_lead) == "no"
+
+        gemma_lead = ModelProfile(hf_path="some-org/gemma-4-qwen3.5-merge-8bit")
+        assert _mtp_path_label(gemma_lead.hf_path, gemma_lead) == "sidecar"
+        assert _kv_share_label(gemma_lead.hf_path, gemma_lead) == "yes (default)"
+
+    def test_stamp_does_not_override_architecture_position(self):
+        # A ``gemma4`` parser stamp (which can come from an org-dir regex
+        # match on the full path) does NOT override the architecture-
+        # position name marker: ``Qwen3.5-…`` leads with Qwen3.5, so it
+        # stays native even with a stray gemma4 stamp.
+        from vllm_mlx.model_auto_config import _kv_share_label, _mtp_path_label
+        from vllm_mlx.model_profile import ModelProfile
+
+        stamped = ModelProfile(
+            hf_path="some-org/Qwen3.5-gemma-4-merge-8bit",
+            tool_call_parser="gemma4",
+            reasoning_parser="gemma4",
+        )
+        assert _mtp_path_label(stamped.hf_path, stamped) == "native"
+        assert _kv_share_label(stamped.hf_path, stamped) == "no"
+
 
 class TestGetProfile:
     """``get_profile()`` is the public one-shot API."""
