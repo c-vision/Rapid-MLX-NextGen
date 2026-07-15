@@ -39,6 +39,7 @@ import asyncio
 import gc
 import logging
 import os
+from dataclasses import dataclass
 
 import uvicorn
 from fastapi import FastAPI
@@ -681,6 +682,25 @@ _DEFAULT_CORS_HEADERS: tuple[str, ...] = (
 _DEFAULT_CORS_MAX_AGE: int = 3600
 
 
+@dataclass(frozen=True)
+class ResolvedCORSPolicy:
+    """The fully resolved CORS policy shared by all HTTP server modes."""
+
+    origins: tuple[str, ...]
+    methods: tuple[str, ...]
+    headers: tuple[str, ...]
+    max_age: int
+    allow_credentials: bool
+
+
+_last_resolved_cors_policy: ResolvedCORSPolicy | None = None
+
+
+def get_resolved_cors_policy() -> ResolvedCORSPolicy | None:
+    """Return the policy configured during this process's CLI startup."""
+    return _last_resolved_cors_policy
+
+
 class _SpecAlignedCORSMiddleware(CORSMiddleware):
     """``CORSMiddleware`` whose preflight rejection is spec-aligned (L-02).
 
@@ -860,6 +880,8 @@ def configure_cors_from_env(
 
     Returns the resolved origin list (empty list when CORS is disabled).
     """
+    global _last_resolved_cors_policy
+
     # ``came_from_cli`` discriminates the two compat tiers (codex round-3
     # BLOCKING). The legacy ``--cors-origins`` CLI path used to imply
     # ``allow_headers=["*"]`` / ``allow_methods=["*"]``; existing browser
@@ -1025,6 +1047,18 @@ def configure_cors_from_env(
                 creds_env,
             )
 
+    # Keep the policy snapshot byte-for-byte equivalent to the middleware
+    # actually installed below. In particular, a credentialed wildcard is
+    # invalid under Fetch and must never reappear on DFlash via its separate
+    # FastAPI application.
+    if "*" in origins and allow_credentials:
+        logger.warning(
+            "%s requested with a wildcard origin is invalid per the "
+            "Fetch spec; forcing allow_credentials=False",
+            "RAPID_MLX_CORS_ALLOW_CREDENTIALS",
+        )
+        allow_credentials = False
+
     # Fail-closed path: ``RAPID_MLX_CORS_ALLOW_ORIGINS`` was set but
     # parsed to an empty list (operator-controlled typo). Don't register
     # CORSMiddleware — that's the visible signal the WARNING above
@@ -1033,8 +1067,16 @@ def configure_cors_from_env(
     # lambda — we never call ``configure_cors(...)`` on the fail-closed
     # path, so the stub's signature doesn't matter.
     if not origins:
+        _last_resolved_cors_policy = None
         return []
 
+    _last_resolved_cors_policy = ResolvedCORSPolicy(
+        origins=tuple(origins),
+        methods=tuple(methods),
+        headers=tuple(headers),
+        max_age=max_age,
+        allow_credentials=allow_credentials,
+    )
     configure_cors(
         origins,
         methods=methods,

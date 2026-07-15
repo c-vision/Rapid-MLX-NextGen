@@ -3242,6 +3242,13 @@ def serve_command(args):
             cors_origins=cors_origins,
             uvicorn_log_level=uvicorn_log_level,
             no_thinking=args.no_thinking,
+            api_key=server._api_key,
+            rate_limit=args.rate_limit,
+            max_request_bytes=server._max_request_bytes,
+            body_receive_timeout_seconds=server._body_receive_timeout_seconds,
+            default_timeout=server._default_timeout,
+            max_concurrent_requests=args.max_concurrent_requests,
+            cors_policy=server.get_resolved_cors_policy(),
         )
         return
 
