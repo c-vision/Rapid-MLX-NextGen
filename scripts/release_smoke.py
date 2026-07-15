@@ -12,6 +12,8 @@ This script creates a brand-new venv and either:
   - pip-installs the working tree (pip handles PEP 517 build internally,
     so no `build` or `hatchling` dep is required on the dev env), or
   - pip-installs `rapid-mlx==X.Y.Z` from PyPI (post-tag verification).
+  - installs each wheel/sdist already present in a release candidate's
+    ``dist/`` directory (the pre-publish artifact-acceptance path).
 
 Then it imports the modules that the published entrypoints would import.
 An ``AttributeError`` / ``ImportError`` here means we are about to ship a
@@ -20,6 +22,7 @@ release that no user can ``pip install`` and use.
 Usage:
     python3 scripts/release_smoke.py            # install working tree in clean venv, smoke-import
     python3 scripts/release_smoke.py --version 0.6.55  # post-tag: install from PyPI
+    python3 scripts/release_smoke.py --dist-dir dist  # test the actual wheel + sdist
 
 Exit code: 0 on success, 1 on any failure. Designed to be the last gate
 before pushing a ``chore: bump version to X.Y.Z`` commit.
@@ -111,8 +114,9 @@ def smoke(install_spec: str, *, source: str) -> None:
 
         # ``pip install <local-path>`` invokes the PEP 517 build backend
         # declared in ``pyproject.toml`` directly — no separate ``build``
-        # package needed on the dev env. The wheel that gets built and
-        # installed is bit-identical to what would land on PyPI.
+        # package needed on the dev env. ``--dist-dir`` is the stronger
+        # release path: it installs the exact artifact produced by CI rather
+        # than a fresh local build.
         print(f"[release-smoke] installing {source}: {install_spec}")
         run([str(py), "-m", "pip", "install", "--quiet", install_spec], env=env)
 
@@ -131,18 +135,69 @@ def smoke(install_spec: str, *, source: str) -> None:
             shutil.rmtree(venv, ignore_errors=True)
 
 
+def _artifact_version(name: str) -> str:
+    """Extract the version from a ``rapid_mlx-<version>`` artifact filename.
+
+    ``rapid_mlx-0.10.9-py3-none-any.whl`` -> ``0.10.9``;
+    ``rapid_mlx-0.10.9.tar.gz``           -> ``0.10.9``.
+    """
+    stem = name
+    if stem.endswith(".tar.gz"):
+        stem = stem[: -len(".tar.gz")]
+        return stem[len("rapid_mlx-") :]
+    if stem.endswith(".whl"):
+        # rapid_mlx-<version>-<pytag>-<abitag>-<plat>.whl
+        return stem[len("rapid_mlx-") :].split("-", 1)[0]
+    raise ValueError(f"unrecognized artifact filename: {name}")
+
+
+def release_artifacts(dist_dir: Path) -> tuple[Path, Path]:
+    """Return the sole rapid-mlx wheel and sdist in a candidate directory."""
+
+    if not dist_dir.is_dir():
+        raise ValueError(f"--dist-dir is not a directory: {dist_dir}")
+    all_files = sorted(path for path in dist_dir.iterdir() if path.is_file())
+    wheels = sorted(path for path in dist_dir.glob("rapid_mlx-*.whl") if path.is_file())
+    sdists = sorted(
+        path for path in dist_dir.glob("rapid_mlx-*.tar.gz") if path.is_file()
+    )
+    if len(wheels) != 1 or len(sdists) != 1 or len(all_files) != 2:
+        raise ValueError(
+            "--dist-dir must contain exactly one rapid_mlx-*.whl and one "
+            "rapid_mlx-*.tar.gz, with no extra files"
+        )
+    wheel_version = _artifact_version(wheels[0].name)
+    sdist_version = _artifact_version(sdists[0].name)
+    if wheel_version != sdist_version:
+        raise ValueError(
+            "--dist-dir wheel and sdist are different versions "
+            f"({wheel_version} vs {sdist_version}); a release candidate must "
+            "be a single coherent build"
+        )
+    return wheels[0].resolve(), sdists[0].resolve()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
         "--version",
         help="If set, install `rapid-mlx==<VERSION>` from PyPI instead of building locally. "
         "Use post-tag to verify the published wheel.",
+    )
+    source.add_argument(
+        "--dist-dir",
+        type=Path,
+        help="Install both release artifacts already built under this directory.",
     )
     args = parser.parse_args()
 
     try:
         if args.version:
             smoke(f"rapid-mlx=={args.version}", source="PyPI")
+        elif args.dist_dir:
+            for artifact in release_artifacts(args.dist_dir):
+                smoke(str(artifact), source=f"release artifact {artifact.name}")
         else:
             smoke(str(REPO_ROOT), source="working tree")
     except subprocess.CalledProcessError as exc:
@@ -152,6 +207,9 @@ def main() -> int:
             "    for any user whose runtime deps differ from the dev env.",
             file=sys.stderr,
         )
+        return 1
+    except ValueError as exc:
+        print(f"\n[release-smoke] FAIL: {exc}", file=sys.stderr)
         return 1
     return 0
 

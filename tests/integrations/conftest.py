@@ -174,6 +174,20 @@ def _strict() -> bool:
     return os.environ.get("RAPID_MLX_MATRIX_STRICT", "").strip() == "1"
 
 
+def _no_skips() -> bool:
+    """Return whether release acceptance treats a skipped matrix cell as red.
+
+    ``RAPID_MLX_MATRIX_STRICT`` already turns a missing/mismatched server
+    into a failure.  Client-library and host-tool prerequisites historically
+    used plain ``pytest.skip`` so a release runner missing Docker, Aider, or
+    an SDK could still look green.  The artifact-release runner sets this
+    stricter opt-in to make every ordinary skip actionable.  Documented,
+    strict ``xfail`` cases retain their own semantics and are not changed.
+    """
+
+    return os.environ.get("RAPID_MLX_MATRIX_NO_SKIPS", "").strip() == "1"
+
+
 def matrix_strict_mode() -> bool:
     """Public accessor for ``RAPID_MLX_MATRIX_STRICT``.
 
@@ -183,6 +197,85 @@ def matrix_strict_mode() -> bool:
     before running the matrix.
     """
     return _strict()
+
+
+def _has_strict_xfail_marker(item: pytest.Item) -> bool:
+    """True iff the cell carries an ``xfail(strict=True)`` marker.
+
+    The release-approved skip exceptions are EXACTLY the strict-xfail cells
+    registered in ``pytest_collection_modifyitems`` (and pinned by
+    ``test_strict_xfail_registry.py``). We gate on the marker itself rather
+    than ``report.wasxfail``: pytest also sets ``wasxfail`` for NON-strict
+    ``xfail(strict=False, ...)`` markers and for dynamic ``pytest.xfail()``
+    calls, so a ``wasxfail`` check would let an un-audited, non-strict xfail
+    silently bypass ``RAPID_MLX_MATRIX_NO_SKIPS`` — shrinking the required-
+    PASS coverage the release gate exists to guarantee (codex review).
+    """
+    for marker in item.iter_markers(name="xfail"):
+        if marker.kwargs.get("strict") is True:
+            return True
+    return False
+
+
+def _skip_should_become_failure(
+    *, nodeid: str, wasxfail: object, has_strict_marker: bool
+) -> bool:
+    """Decide whether a skipped matrix cell must be upgraded to a failure.
+
+    Pure decision function (no pytest objects) so the exact NO_SKIPS policy
+    can be unit-tested across every case — see
+    ``test_no_skip_gate_policy.py``. Assumes the caller has already checked
+    ``_no_skips()`` and ``report.skipped``.
+
+    Returns True (=> fail) UNLESS the cell is a release-approved exception:
+    it must BOTH carry an ``xfail(strict=True)`` marker AND have actually
+    exercised the expected failure this run (``wasxfail`` set). A strict-xfail
+    cell that merely SKIPPED on a missing prerequisite has ``wasxfail=None``
+    and is NOT exempt.
+    """
+    if not any(module in nodeid for module in _INTEGRATION_MATRIX_MODULES):
+        # Not a matrix cell — leave its skip alone.
+        return False
+    exempt = wasxfail is not None and has_strict_marker
+    return not exempt
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[object]):
+    """Reject ordinary skips when the release artifact matrix asks for it."""
+
+    outcome = yield
+    report = outcome.get_result()
+    if not _no_skips() or not report.skipped:
+        return
+
+    # The ONLY release-approved skip exception is a cell that BOTH (a) carries
+    # an explicit ``xfail(strict=True)`` marker (the documented, snapshot-
+    # pinned set) AND (b) actually exercised the expected failure this run
+    # (``report.wasxfail`` is set only when the body ran and xfailed). Both
+    # signals are required:
+    #   * ``wasxfail`` alone would also exempt NON-strict / dynamic xfails,
+    #     letting an un-audited xfail bypass the no-skip gate.
+    #   * the strict marker alone would exempt a strict-xfail cell that merely
+    #     SKIPPED on a missing prerequisite (server/client/host) without ever
+    #     exercising the expected failure — silently passing the release matrix
+    #     with missing coverage.
+    # A missing prerequisite on a strict-xfail cell therefore still fails here.
+    if not _skip_should_become_failure(
+        nodeid=item.nodeid,
+        wasxfail=getattr(report, "wasxfail", None),
+        has_strict_marker=_has_strict_xfail_marker(item),
+    ):
+        return
+
+    report.outcome = "failed"
+    report.longrepr = (
+        str(item.path),
+        0,
+        "release artifact matrix forbids skipped cells; install the missing "
+        "client/host prerequisite or record a narrow strict xfail with an "
+        "upstream issue.",
+    )
 
 
 def strict_skip_or_fail(reason: str) -> None:
