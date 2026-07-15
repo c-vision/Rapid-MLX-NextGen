@@ -1359,6 +1359,46 @@ def load_model(
     _profile = resolve_profile(_model_alias or model_name)
     if _profile is not None and _profile.recommended_sampling:
         _alias_recommended_sampling = dict(_profile.recommended_sampling)
+
+    # Alias-declared ``is_text_only`` → the registered ``force_text``
+    # routing kwarg. When an alias profile pins ``is_text_only=True``
+    # (e.g. Ternary-Bonsai-27B: a multimodal-config checkpoint whose
+    # vision path our mlx-vlm loader can't drive, but whose text tower is
+    # coherent via mlx-lm's qwen3_5), fold that into the effective
+    # ``force_text`` so the text-only mlx-lm lane is chosen with no CLI
+    # flag. This is NOT a new routing surface: ``is_text_only`` is a
+    # state description (parallel to ``is_hybrid`` / ``is_moe``) and it
+    # feeds the SAME ``force_text`` kwarg already registered in
+    # ``AUTO_ROUTING_FLAG_PAIRS`` (``--mllm`` / ``--no-mllm``, #393).
+    #
+    # Set it UNCONDITIONALLY (do NOT gate on ``not force_mllm``): an
+    # explicit ``--mllm`` on such an alias must then collide with this
+    # ``force_text=True`` at the ``force_mllm and force_text``
+    # mutual-exclusion check below and raise loudly — an operator who
+    # insists on the (broken) MLLM path for a text-only-pinned alias gets
+    # a clear error, NOT a silent flip to the garbling MLLM engine.
+    # Gating on ``not force_mllm`` here would suppress that guard and
+    # silently select the broken path (codex #1116 BLOCKING).
+    if _profile is not None and _profile.is_text_only:
+        if not force_text:
+            logger.info(
+                "Alias profile declares is_text_only=True — routing to the "
+                "text-only mlx-lm lane (MLLM auto-detection overridden per "
+                "alias, #393)"
+            )
+        force_text = True
+        # Fail FAST on the alias-pin ↔ ``--mllm`` conflict — before the
+        # generation-config load / cloud-router / guardrail I/O below. The
+        # general ``force_mllm and force_text`` guard further down still
+        # covers direct ``load_model(force_mllm=True, force_text=True)``
+        # callers; this early raise just avoids doing config I/O for an
+        # invocation we already know is invalid (codex #1116 nit).
+        if force_mllm:
+            raise ValueError(
+                "force_mllm and force_text are mutually exclusive — "
+                "pick at most one to override auto-detection. "
+                "(alias pins is_text_only=True but --mllm was also given)"
+            )
     try:
         gen_cfg = load_generation_config_sampling(model_name)
     except Exception as _e:  # pragma: no cover — defensive belt-and-suspenders

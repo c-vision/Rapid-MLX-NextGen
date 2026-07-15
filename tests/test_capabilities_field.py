@@ -491,3 +491,88 @@ class TestCapabilityShapeAndOrder:
             restore()
         caps = entry["capabilities"]
         assert len(caps) == len(set(caps)), f"duplicate tags: {caps}"
+
+
+class TestIsTextOnlyOverride:
+    """``is_text_only`` alias state-pin authoritatively suppresses the
+    ``vision`` capability + ``image`` modality on the wire.
+
+    A vision-config checkpoint served text-only (e.g. Ternary-Bonsai-27B:
+    ``config.json`` declares ``vision_config`` and its safetensors ship
+    ``vision_tower`` weights, so ``is_mllm_model`` on the local dir returns
+    True — yet the alias pins ``is_text_only=True`` and we serve only the
+    text backbone via mlx-lm). ``/v1/models`` MUST advertise ``text`` /
+    no-``vision``, else clients send image content the engine can't accept.
+    """
+
+    def test_is_vlm_false_when_text_only_even_if_detector_says_vlm(self, monkeypatch):
+        from vllm_mlx.routes import models as models_route
+
+        # Force the underlying detector to claim VLM — mirrors the real
+        # local-dir verdict for Ternary-Bonsai-27B.
+        monkeypatch.setattr(models_route, "is_mllm_model", lambda _mid: True)
+        # Without the pin, the detector's True flows through.
+        assert models_route._is_vlm("some/vision-config-repo", "text") is True
+        # With is_text_only, the pin wins — no vision advertised.
+        assert (
+            models_route._is_vlm("some/vision-config-repo", "text", is_text_only=True)
+            is False
+        )
+
+    def test_reported_modality_text_when_text_only(self, monkeypatch):
+        from vllm_mlx.routes import models as models_route
+
+        monkeypatch.setattr(models_route, "is_mllm_model", lambda _mid: True)
+        # Without the pin, a detector-True flips the wire modality to image.
+        assert (
+            models_route._reported_modality("some/vision-config-repo", "text")
+            == "image"
+        )
+        # With the pin, the wire stays text.
+        assert (
+            models_route._reported_modality(
+                "some/vision-config-repo", "text", is_text_only=True
+            )
+            == "text"
+        )
+
+    def test_capabilities_have_no_vision_when_text_only(self, monkeypatch):
+        from vllm_mlx.routes import models as models_route
+
+        monkeypatch.setattr(models_route, "is_mllm_model", lambda _mid: True)
+        caps = models_route._detect_capabilities(
+            "some/vision-config-repo",
+            profile_modality="text",
+            profile_tool_parser="hermes",
+            is_text_only=True,
+        )
+        assert "vision" not in caps, caps
+        assert "text" in caps and "tools" in caps
+
+    def test_build_model_info_forwards_is_text_only_for_bonsai_alias(self, monkeypatch):
+        """Integration guard (codex #1116 NIT): the direct-helper tests
+        above stay green even if ``_build_model_info`` STOPS forwarding
+        ``profile.is_text_only`` into ``_reported_modality`` /
+        ``_detect_capabilities``. This test drives the real
+        ``_build_model_info`` on the ``bonsai-27b-2bit`` alias — whose
+        profile pins ``is_text_only=True`` — with the VLM detector forced
+        True (mirrors the checkpoint's local-dir verdict). If the
+        forwarding is dropped, the detector's True leaks through and this
+        fails: modality flips to ``image`` and ``vision`` appears.
+        """
+        from vllm_mlx.routes import models as models_route
+
+        # Force the detector to claim VLM for this id — without the
+        # is_text_only forwarding, the wire would advertise vision.
+        monkeypatch.setattr(models_route, "is_mllm_model", lambda _mid: True)
+
+        info = models_route._build_model_info("bonsai-27b-2bit")
+        assert info.modality == "text", (
+            f"bonsai-27b-2bit is_text_only pin not forwarded through "
+            f"_build_model_info — modality leaked to {info.modality!r}."
+        )
+        assert "vision" not in info.capabilities, (
+            f"bonsai-27b-2bit is_text_only pin not forwarded — vision "
+            f"capability leaked: {info.capabilities}."
+        )
+        assert "text" in info.capabilities
