@@ -4079,6 +4079,69 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
+    def _resolve_exact_hit_tokens(self, request) -> list:
+        """Resolve ``tokens_to_process`` for an exact cache hit (remaining == []).
+
+        A warm exact-repeat re-forwards the last prompt token; to stay
+        byte-equal to a cold prefill the saved cache must be trimmed by 1 (it
+        un-writes the doubled last token). That trim requires EVERY layer to be
+        trimmable. A rotated ``RotatingKVCache`` (sliding-window: Gemma 4 /
+        GPT-OSS, once ``offset >= max_size`` → ``is_trimmable()`` False) is NOT
+        trimmable, and ``RotatingKVCache.trim`` cannot un-write the rotated slot
+        — so a skipped trim would double-count the last token and drift the
+        first generated token (verified on gpt-oss-20b: a borderline-confidence
+        greedy token can flip).
+
+        Correctness-first fallback: on a non-trimmable exact hit, drop the
+        reused cache and full-prefill (byte-equal to cold by construction). The
+        agent-loop win — a stable prefix + a NEW suffix (prefix-EXTENSION,
+        remaining >= 1) — is trim-free and already byte-exact, handled by the
+        caller's ``elif request.remaining_tokens`` branch and untouched by this
+        fallback. Only an identical re-request of a rotated prompt loses reuse.
+        """
+        tokens_to_process = request.prompt_token_ids[-1:]
+        if request.prompt_cache is None:
+            return tokens_to_process
+        try:
+            from mlx_lm.models.cache import (
+                can_trim_prompt_cache,
+                trim_prompt_cache,
+            )
+
+            if can_trim_prompt_cache(request.prompt_cache):
+                trim_prompt_cache(request.prompt_cache, 1)
+            else:
+                logger.debug(
+                    "[cache_fetch] exact-hit on non-trimmable "
+                    "(rotated sliding-window) cache for request=%s: "
+                    "trim(1) impossible, full-prefilling to stay "
+                    "byte-equal to cold",
+                    request.request_id[:12],
+                )
+                request.prompt_cache = None
+                request.cached_tokens = 0
+                request.remaining_tokens = request.prompt_token_ids
+                tokens_to_process = request.prompt_token_ids
+        except Exception as _trim_exc:  # noqa: BLE001
+            # Any trim failure (inspection raised, or a partial/half-applied
+            # trim) leaves the reused cache in an unknown state. Re-forwarding
+            # only the last token on top of an un-trimmed cache reintroduces the
+            # exact-hit drift this helper exists to prevent, so fall back to the
+            # SAME cold full-prefill as the non-trimmable branch — byte-equal to
+            # cold by construction, never drifting.
+            logger.debug(
+                "[cache_fetch] exact-hit trim(1) failed for "
+                "request=%s: %s (dropping reused cache and full-prefilling "
+                "to stay byte-equal to cold)",
+                request.request_id[:12],
+                _trim_exc,
+            )
+            request.prompt_cache = None
+            request.cached_tokens = 0
+            request.remaining_tokens = request.prompt_token_ids
+            return request.prompt_token_ids
+        return tokens_to_process
+
     def _schedule_waiting(self) -> list[Request]:
         """
         Move requests from waiting queue to running.
@@ -4137,24 +4200,10 @@ class Scheduler:
                 # Position and softmax denominator now match the fresh
                 # path exactly, restoring byte-equal output between a
                 # cold prompt and a warm-cache repeat.
-                tokens_to_process = request.prompt_token_ids[-1:]
-                if request.prompt_cache is not None:
-                    try:
-                        from mlx_lm.models.cache import (
-                            can_trim_prompt_cache,
-                            trim_prompt_cache,
-                        )
-
-                        if can_trim_prompt_cache(request.prompt_cache):
-                            trim_prompt_cache(request.prompt_cache, 1)
-                    except Exception as _trim_exc:  # noqa: BLE001
-                        logger.debug(
-                            "[cache_fetch] exact-hit trim(1) failed for "
-                            "request=%s: %s (continuing without trim; "
-                            "output may drift from fresh baseline)",
-                            request.request_id[:12],
-                            _trim_exc,
-                        )
+                # Trim vs non-trimmable fallback is factored into a helper so
+                # the correctness-critical branch is unit-testable in isolation
+                # (see tests/test_sliding_window_prefix_reuse.py).
+                tokens_to_process = self._resolve_exact_hit_tokens(request)
             elif request.remaining_tokens:
                 tokens_to_process = request.remaining_tokens
             else:

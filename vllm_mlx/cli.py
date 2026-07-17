@@ -6798,17 +6798,33 @@ Examples:
         default=0.20,
         help="Fraction of available RAM for cache if auto-detecting (default: 0.20)",
     )
-    # #1103: bounded trim-free prefix reuse for hybrid (GatedDeltaNet /
-    # Mamba MoE) models. Opt-in: the default 0 keeps the #1075 policy of
-    # dropping recurrent-state entries at store time.
+    # #1103: bounded trim-free prefix reuse for "non-trimmable" cache entries.
+    # Opt-in: the default 0 keeps the #1075 policy of dropping them at store
+    # time. Two model families produce non-trimmable layers and both benefit:
+    #   * hybrid recurrent-state (GatedDeltaNet / Mamba MoE) — ArraysCache;
+    #   * sliding-window attention (Gemma 4, GPT-OSS) — RotatingKVCache once
+    #     the ring has rotated (offset >= sliding_window → is_trimmable False).
+    # The store gate and the trim-free fetch paths are class-agnostic — they
+    # key off is_trimmable() — so lifting the store drop for N>0 recovers
+    # within-conversation prefix reuse for BOTH families (generalized from
+    # recurrent-state to sliding-window). NOTE: prefix-EXTENSION hits (stable
+    # prefix + new suffix) are served trim-free; an EXACT re-request of a
+    # rotated sliding-window prompt instead full-prefills, because the
+    # scheduler's trim(1) exact-hit compensation is unavailable on a rotated
+    # cache (see Scheduler._resolve_exact_hit_tokens).
     serve_parser.add_argument(
         "--hybrid-cache-entries",
         type=int,
         default=0,
         help=(
-            "Retain up to N hybrid (recurrent-state) prefix-cache entries for "
-            "exact/prefix-extension reuse; 0 disables (default: 0). Useful for "
-            "stable-system-prompt agent workloads on GatedDeltaNet/Mamba models."
+            "Retain up to N non-trimmable prefix-cache entries for "
+            "prefix-extension reuse (a stable prefix + a new suffix each turn); "
+            "0 disables (default: 0). Covers both hybrid recurrent-state "
+            "(GatedDeltaNet/Mamba) AND sliding-window (Gemma 4, GPT-OSS) "
+            "models. Best for stable-system-prompt / long-context agent "
+            "workloads. An identical exact re-request of a rotated "
+            "sliding-window prompt falls back to a full prefill (byte-equal to "
+            "cold)."
         ),
     )
     serve_parser.add_argument(
