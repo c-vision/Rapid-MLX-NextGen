@@ -2711,16 +2711,23 @@ class BatchedEngine(BaseEngine):
             return self._engine.save_cache_to_disk(cache_dir, should_abort=should_abort)
         return False
 
-    def load_cache_from_disk(self, cache_dir: str, replace: bool = False) -> int:
+    def load_cache_from_disk(
+        self, cache_dir: str, replace: bool = False, protected_import: bool = True
+    ) -> int:
         """Load prefix cache from disk. Returns number of entries loaded.
 
         ``replace=True`` (export/import "replace" strategy, #476) forwards
         to the underlying engine so the cache clear runs atomically on the
         mlx-step thread after index validation — see
         ``EngineCore.load_cache_from_disk``.
+
+        ``protected_import`` (#1111 codex r3): True for explicit HTTP import
+        (pin), False for startup auto-load (obey the retention bound).
         """
         if self._engine:
-            return self._engine.load_cache_from_disk(cache_dir, replace=replace)
+            return self._engine.load_cache_from_disk(
+                cache_dir, replace=replace, protected_import=protected_import
+            )
         return 0
 
     def save_cache_with_outcome(self, cache_dir: str, should_abort=None):
@@ -2744,16 +2751,23 @@ class BatchedEngine(BaseEngine):
 
         raise EngineNotReadyError("cannot export cache: inner engine is not loaded")
 
-    def load_cache_with_result(self, cache_dir: str, replace: bool = False):
+    def load_cache_with_result(
+        self, cache_dir: str, replace: bool = False, protected_import: bool = True
+    ):
         """Forward to the inner engine's result-returning load (#1100 codex
         round 4 #2). Returns a ``LoadResult`` computed on the step thread.
 
         #1100 codex round 8 (#4): absent inner engine → raise
         ``EngineNotReadyError`` (→ route 503) rather than reporting a
         successful zero-entry load, matching ``save_cache_with_outcome``.
+
+        ``protected_import`` (#1111 codex r3): defaults True — this
+        result-returning path serves the EXPLICIT HTTP import (#476).
         """
         if self._engine:
-            return self._engine.load_cache_with_result(cache_dir, replace=replace)
+            return self._engine.load_cache_with_result(
+                cache_dir, replace=replace, protected_import=protected_import
+            )
         from ..cache.protocol import EngineNotReadyError
 
         raise EngineNotReadyError("cannot import cache: inner engine is not loaded")

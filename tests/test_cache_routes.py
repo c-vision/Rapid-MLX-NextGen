@@ -3155,6 +3155,54 @@ def test_base_engine_load_result_default_tolerates_old_one_arg_signature():
 
     assert _KwargsEngine().load_cache_with_result("/tmp/x", replace=True).entries == 1
 
+    # #1111 codex r4: forwarding of ``protected_import`` must be DECOUPLED from
+    # ``replace`` acceptance. An engine that accepts ``protected_import`` but NOT
+    # ``replace`` must still receive a non-default ``protected_import=False`` —
+    # the old nested-under-``accepts_replace`` code silently dropped it.
+    class _ProtectedOnlyEngine(BaseEngine):
+        locals().update(_stubs)
+
+        def __init__(self):
+            self.saw_protected = "unset"
+
+        def load_cache_from_disk(self, cache_dir, protected_import: bool = True):
+            self.saw_protected = protected_import
+            return 5
+
+    p = _ProtectedOnlyEngine()
+    # replace left at default (False) → dropped silently; protected_import=False
+    # is non-default and MUST be forwarded even though replace isn't accepted.
+    assert (
+        p.load_cache_with_result(
+            "/tmp/x", replace=False, protected_import=False
+        ).entries
+        == 5
+    )
+    assert p.saw_protected is False, (
+        "protected_import must forward independently of replace acceptance"
+    )
+
+    # Symmetric case: accepts ``replace`` but NOT ``protected_import``. A
+    # non-default protected_import=False can't be honored → fail loudly rather
+    # than silently upgrade to protected (which would re-open the growth bug).
+    class _ReplaceOnlyEngine(BaseEngine):
+        locals().update(_stubs)
+
+        def load_cache_from_disk(self, cache_dir, replace: bool = False):
+            return 9
+
+    with pytest.raises(TypeError, match="protected_import"):
+        _ReplaceOnlyEngine().load_cache_with_result(
+            "/tmp/x", replace=True, protected_import=False
+        )
+    # But the DEFAULT protected_import=True is fine to drop silently.
+    assert (
+        _ReplaceOnlyEngine()
+        .load_cache_with_result("/tmp/x", replace=True, protected_import=True)
+        .entries
+        == 9
+    )
+
 
 def test_read_committed_cache_counts_rejects_malformed_index_fail_closed(tmp_path):
     """#1100 codex round 7 (#3): ``_read_committed_cache_counts`` must FAIL

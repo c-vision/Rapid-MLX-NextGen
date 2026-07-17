@@ -1006,10 +1006,41 @@ class _CacheEntry:
     # (hybrid GatedDeltaNet / Mamba MoE). Computed once at creation so the
     # hybrid-bound eviction scan doesn't re-inspect layers per store.
     non_trimmable: bool = False
+    # #1111 regression fix: PROTECTED vs EVICTABLE split, ported from SGLang's
+    # RadixCache (``python/sglang/srt/mem_cache/radix_cache.py``) ``lock_ref``
+    # reference-counting — a node with ``lock_ref > 0`` is moved out of the
+    # evictable set (``evictable_size_``) into the protected set
+    # (``protected_size_``) and ``evict()`` never touches it — and vLLM v1's
+    # ``KVCacheBlock.ref_cnt`` (``vllm/v1/core/block_pool.py``), where a block
+    # with ``ref_cnt > 0`` is excluded from the ``free_block_queue`` LRU.
+    #
+    # Protection is set by the CALLER and is NOT the same for the two disk-load
+    # entry points (#1111 codex r3 — they must NOT be treated identically):
+    #  * EXPLICIT ``POST /v1/cache/import`` (#476) → ``protected=True``: an
+    #    operator deliberately loading specific entries. This is the DEGENERATE,
+    #    persistent-lifetime case of the idiom — a lock held for the entry's
+    #    whole life, like SGLang's ``host_ref_counter`` on a persisted entry.
+    #    Exempt from the opportunistic hybrid retention enforcer at BOTH call
+    #    sites (N=0 drop skips them; they do NOT count against the N>0 bound).
+    #  * process-restart AUTO-LOAD-ON-STARTUP (radix persistence) →
+    #    ``protected=False``: ``save_to_disk`` persists ALL live entries incl.
+    #    opportunistic ones, so protecting reloaded entries every boot would
+    #    grow the protected set ~N per restart and defeat the cap. Reloaded
+    #    non-trimmable entries stay UNPROTECTED and obey the bound at commit.
+    # Live-STORE entries are always ``protected=False`` (the opportunistic path
+    # the bound governs). The bound governs OPPORTUNISTIC (unprotected) entries.
+    protected: bool = False
 
     @classmethod
     def create(cls, tokens: list[int], cache: list[Any]) -> _CacheEntry:
-        """Create a cache entry with memory estimation."""
+        """Create a cache entry with memory estimation.
+
+        Live-store entries are EVICTABLE (``protected=False``) — the
+        opportunistic-store path the hybrid retention bound governs. Disk-load
+        entries are constructed directly (see ``load_from_disk``) with
+        ``protected=protected_import``: True for the explicit HTTP import (#476),
+        False for the process-restart startup auto-load.
+        """
         memory = estimate_kv_cache_memory(cache)
         return cls(
             tokens=tuple(tokens),
@@ -1932,45 +1963,61 @@ class MemoryAwarePrefixCache:
         )
 
     def _enforce_hybrid_bound_locked(self) -> list[tuple[int, ...]]:
-        """Enforce the ``hybrid_reuse_max_entries`` bound over non-trimmable
-        (hybrid recurrent-state) entries.
+        """Enforce the ``hybrid_reuse_max_entries`` bound over EVICTABLE
+        (unprotected) non-trimmable (hybrid recurrent-state) entries.
 
         Caller must hold ``self._lock``. Returns the LIST of evicted keys (in
         eviction order) so the persistent-load path can reconcile its loaded
         tallies against only the keys that belonged to THIS import — a bound
-        pass may evict PRE-EXISTING non-trimmable entries (merge mode) that
-        were never part of the current load and must not be subtracted from it.
+        pass may evict PRE-EXISTING evictable non-trimmable entries (merge mode)
+        that were never part of the current load and must not be subtracted.
 
         #1103: non-trimmable entries carry unique-superset keys across
         conversations (#1025), so unlike KV-only entries they are never
         reclaimed by prefix-subset eviction and can pile up unbounded. This
-        bound is the single source of truth for how many are retained and is
-        shared by BOTH the store path (after inserting a fresh non-trimmable
-        entry) and the persistent-load commit path (after installing a staged
-        set, which may carry legacy hybrid entries from a pre-#1075 snapshot).
+        bound is the single source of truth for how many OPPORTUNISTIC ones are
+        retained.
 
-        Semantics MATCH the store-time gate exactly:
+        PROTECTED vs EVICTABLE (ported from SGLang RadixCache ``lock_ref`` /
+        vLLM ``KVCacheBlock.ref_cnt`` — see ``_CacheEntry.protected``):
+        explicitly-loaded entries (disk import #476 + auto-load-on-startup)
+        carry ``protected=True`` and are EXCLUDED from the candidate set here,
+        exactly as SGLang's ``evict()`` only draws from ``evictable_leaves``
+        (nodes with ``lock_ref == 0``). They are therefore exempt from BOTH the
+        ``N <= 0`` drop AND the ``N > 0`` count/trim below. The bound acts on
+        the opportunistic (live-store #1075) set ONLY.
+
+        Semantics over the EVICTABLE set:
 
         * ``hybrid_reuse_max_entries <= 0`` (disabled, the default) → drop ALL
-          non-trimmable entries, so a server restart that reloads a snapshot is
-          byte-for-byte the #1075 drop-at-store behavior — including retaining
-          NONE when N == 0.
-        * ``> 0`` → LRU-evict the oldest non-trimmable entries until at most N
-          remain. ``_entries`` is an ``OrderedDict`` in LRU order, so the head
-          of the filtered list is the least-recently-used.
+          evictable non-trimmable entries (``keep = max(limit, 0) == 0``).
+        * ``> 0`` → LRU-evict the oldest evictable non-trimmable entries until
+          at most N remain. ``_entries`` is an ``OrderedDict`` in LRU order, so
+          the head of the filtered list is the least-recently-used.
+
+        Called UNCONDITIONALLY at BOTH sites (live-store after inserting a
+        fresh non-trimmable entry; disk-load commit after installing a staged
+        set). Because protected entries are excluded from the candidate set,
+        the disk-load call no longer needs a ``N > 0`` guard — an explicit
+        import is protected and survives regardless of N, while any legacy
+        UNPROTECTED opportunistic entry still obeys the bound.
         """
         limit = self._config.hybrid_reuse_max_entries
-        non_trimmable_keys = [
-            key for key, e in self._entries.items() if e.non_trimmable
+        # PROTECTED entries (explicit import / auto-load) are never candidates —
+        # the SGLang ``evictable_leaves`` exclusion of ``lock_ref > 0`` nodes.
+        evictable_non_trimmable_keys = [
+            key
+            for key, e in self._entries.items()
+            if e.non_trimmable and not e.protected
         ]
         # limit <= 0 disables reuse: ``max(limit, 0)`` keeps NONE, dropping
-        # every non-trimmable entry (matches the store-path ``<= 0`` drop-at-
-        # store). Slice the eviction prefix once — the head of the LRU-ordered
-        # list is oldest — instead of repeated ``pop(0)`` (O(n**2) on a large
-        # persisted snapshot).
+        # every EVICTABLE non-trimmable entry (matches the store-path ``<= 0``
+        # drop-at-store). Slice the eviction prefix once — the head of the
+        # LRU-ordered list is oldest — instead of repeated ``pop(0)`` (O(n**2)
+        # on a large persisted snapshot).
         keep = max(limit, 0)
-        n_evict = max(0, len(non_trimmable_keys) - keep)
-        victims = non_trimmable_keys[:n_evict]
+        n_evict = max(0, len(evictable_non_trimmable_keys) - keep)
+        victims = evictable_non_trimmable_keys[:n_evict]
         for oldest in victims:
             self._evict_entry_locked(oldest, reason="hybrid_bound")
         return victims
@@ -2751,8 +2798,33 @@ class MemoryAwarePrefixCache:
         self._last_save_outcome = "committed" if committed else "failed"
         return committed
 
-    def load_from_disk(self, cache_dir: str, replace: bool = False) -> int:
+    def load_from_disk(
+        self, cache_dir: str, replace: bool = False, protected_import: bool = True
+    ) -> int:
         """Load cache entries from disk.
+
+        ``protected_import`` (#1111 regression follow-up, codex r3): marks the
+        loaded entries PROTECTED (exempt from the opportunistic hybrid retention
+        bound — SGLang ``lock_ref`` / vLLM ``ref_cnt`` idiom). It DISTINGUISHES
+        the two callers of this path, which must NOT be treated identically:
+
+        * ``True`` (default) — the EXPLICIT ``POST /v1/cache/import`` (#476): an
+          operator deliberately loading specific entries. They are pinned for
+          their lifetime, never opportunistically evicted.
+        * ``False`` — the process-restart STARTUP auto-load (radix persistence,
+          ``runtime/cache.py`` lifespan). Protection is a RUNTIME property of an
+          explicit operator action, not a persisted-and-immortalized attribute.
+          ``save_to_disk`` writes ALL live entries — including opportunistic
+          (unprotected) non-trimmable ones — so if startup reloaded them as
+          protected, the protected set would grow ~N per restart and defeat the
+          ``hybrid_reuse_max_entries`` cap (shutdown persists N opportunistic ->
+          boot reloads them protected -> new opportunistic added within the
+          bound -> persisted -> protected next boot -> unbounded). With
+          ``False``, reloaded non-trimmable entries are UNPROTECTED and obey the
+          bound at commit (N=0 default -> not retained, matching #1111's opt-in
+          design; N>0 -> bounded at N). Trimmable entries are untouched by the
+          enforcer either way. Mirrors SGLang/vLLM, where lock_ref / ref_cnt are
+          runtime refcounts, never immortal across a restart.
 
         ``replace=True`` implements the export/import "replace" merge
         strategy (#476) as an ATOMIC stage-then-swap on this thread: EVERY
@@ -3222,9 +3294,24 @@ class MemoryAwarePrefixCache:
                     memory_bytes=memory,
                     # #1103: legacy on-disk snapshots (pre-#1075 saves) can
                     # carry hybrid recurrent-state entries; flag them so the
-                    # hybrid-reuse bound and the non_trimmable_entries gauge
-                    # see them the same as freshly stored ones.
+                    # non_trimmable_entries gauge sees them the same as freshly
+                    # stored ones.
                     non_trimmable=_cache_has_non_trimmable(cache),
+                    # #1111 regression fix + codex r3: protection is set by the
+                    # CALLER, because the two callers of this load path are NOT
+                    # equivalent and must be treated DIFFERENTLY:
+                    #  * EXPLICIT ``POST /v1/cache/import`` (#476) ->
+                    #    ``protected_import=True``: an operator deliberately
+                    #    loading entries; pinned for their lifetime (SGLang
+                    #    ``lock_ref`` / vLLM ``ref_cnt`` protected-set idiom).
+                    #  * process-restart STARTUP auto-load ->
+                    #    ``protected_import=False``: reloaded entries stay
+                    #    UNPROTECTED and obey the retention bound. Marking them
+                    #    protected would make the protected set grow ~N per
+                    #    restart and defeat ``hybrid_reuse_max_entries`` (save
+                    #    persists opportunistic entries; see load_from_disk
+                    #    docstring for the full restart cycle).
+                    protected=protected_import,
                 )
                 staged[tokens_key] = entry
                 staged_memory += memory
@@ -3430,21 +3517,40 @@ class MemoryAwarePrefixCache:
 
                 loaded_bytes += entry.memory_bytes
 
-            # #1103 codex BLOCKING-1: loaded snapshots can carry non-trimmable
-            # hybrid entries (flagged at staging above). Unlike the store path,
-            # nothing gated them on the way in, so a restart could retain them
-            # ABOVE ``hybrid_reuse_max_entries`` — or retain them at all when
-            # N == 0 — breaking both the opt-in AND the bounded guarantee.
-            # Enforce the SAME bound the store path applies: with N <= 0 this
-            # drops every non-trimmable entry (byte-for-byte #1075 after a
-            # restart); with N > 0 it LRU-trims down to N. Runs inside the
-            # commit critical section so a scraper never sees an over-bound
-            # cache. Reconcile the reported tallies against ONLY the evicted
-            # keys that belonged to THIS import (``staged``): in merge mode the
-            # bound can evict PRE-EXISTING non-trimmable entries too, and those
-            # were never counted in ``loaded`` / ``loaded_bytes``, so
-            # subtracting them would under-count (potentially to 0) a load that
-            # actually installed new entries.
+            # #1111 regression fix (PROTECTED-entry semantics, ported from
+            # SGLang RadixCache ``lock_ref`` / vLLM ``KVCacheBlock.ref_cnt`` —
+            # see ``_CacheEntry.protected`` and ``_enforce_hybrid_bound_locked``).
+            #
+            # An explicit disk load / import is an operator DELIBERATELY
+            # installing specific entries (#476 export -> import) — the same
+            # class as SGLang's persisted, ``host_ref_counter``-protected nodes.
+            # Every staged entry was constructed with ``protected=True`` above,
+            # so the retention enforcer's candidate set (evictable = unprotected
+            # non-trimmable) EXCLUDES them: they survive at any N, exactly like
+            # SGLang's ``evict()`` skipping ``lock_ref > 0`` nodes. This fixes
+            # the #1111 regression at its ROOT rather than at the load MOMENT:
+            # before, a later live ``store`` that fired the enforcer LRU-evicted
+            # the imported entry (survived zero requests); now the entry stays
+            # protected for its whole lifetime.
+            #
+            # We STILL call the enforcer here (unconditionally — protected
+            # entries are simply not candidates): a merge load can carry legacy
+            # UNPROTECTED opportunistic non-trimmable entries (pre-existing in
+            # the live cache), and those must still obey the bound so a merge
+            # can't re-open the #1075 leak. The store path's ``N=0`` gate
+            # ensures fresh live stores never insert an unprotected non-trimmable
+            # entry, so in practice the only evictable candidates a load sees are
+            # historical — but running the enforcer keeps the invariant robust.
+            #
+            # Reconcile the reported tallies against ONLY the evicted keys that
+            # belonged to THIS import (``staged``): in merge mode the bound can
+            # evict PRE-EXISTING evictable entries too, and those were never
+            # counted in ``loaded`` / ``loaded_bytes``, so subtracting them would
+            # under-count (potentially to 0) a load that actually installed new
+            # entries. Because staged entries are protected, they are never
+            # victims here, so this subtraction is effectively a no-op for the
+            # import itself — kept for defence against a future unprotected
+            # staged path.
             for victim in self._enforce_hybrid_bound_locked():
                 staged_entry = staged.get(victim)
                 if staged_entry is not None:

@@ -1292,7 +1292,9 @@ class EngineCore:
             self.scheduler.save_cache_to_disk, cache_dir, should_abort=should_abort
         )
 
-    def load_cache_from_disk(self, cache_dir: str, replace: bool = False) -> int:
+    def load_cache_from_disk(
+        self, cache_dir: str, replace: bool = False, protected_import: bool = True
+    ) -> int:
         """Load prefix cache from disk.
 
         Loading also goes through the worker thread so the loaded arrays
@@ -1304,9 +1306,16 @@ class EngineCore:
         cache clear happens atomically ON THIS worker thread, after the
         on-disk index is validated — never on the asyncio loop thread
         where a concurrent request could repopulate it mid-swap.
+
+        ``protected_import`` (#1111 codex r3): True for explicit HTTP import
+        (pin loaded entries), False for startup auto-load (loaded entries obey
+        the hybrid retention bound) — see ``MemoryAwarePrefixCache.load_from_disk``.
         """
         return self._run_on_step_thread(
-            self.scheduler.load_cache_from_disk, cache_dir, replace=replace
+            self.scheduler.load_cache_from_disk,
+            cache_dir,
+            replace=replace,
+            protected_import=protected_import,
         )
 
     def save_cache_with_outcome(self, cache_dir: str, should_abort=None):
@@ -1340,18 +1349,26 @@ class EngineCore:
 
         return self._run_on_step_thread(_do)
 
-    def load_cache_with_result(self, cache_dir: str, replace: bool = False):
+    def load_cache_with_result(
+        self, cache_dir: str, replace: bool = False, protected_import: bool = True
+    ):
         """Load the prefix cache and return an operation-specific result.
 
         #1100 codex round 4 (#2): same rationale as ``save_cache_with_
         outcome`` — the load AND the loaded-byte capture run in ONE step-
         thread closure so the byte count returned is exactly this load's,
         never a value a concurrent load to another path clobbered.
+
+        ``protected_import`` (#1111 codex r3): forwarded to the load; the
+        result-returning path is used by the EXPLICIT HTTP import (#476), so it
+        defaults True (pin loaded entries).
         """
         from .cache.protocol import LoadResult
 
         def _do():
-            entries = self.scheduler.load_cache_from_disk(cache_dir, replace=replace)
+            entries = self.scheduler.load_cache_from_disk(
+                cache_dir, replace=replace, protected_import=protected_import
+            )
             cache = getattr(self.scheduler, "memory_aware_cache", None)
             # ``is not None`` — an emptied cache is falsy via ``__len__``.
             bytes_loaded = (
@@ -1506,14 +1523,22 @@ class AsyncEngineCore:
         """Save prefix cache to disk."""
         return self.engine.save_cache_to_disk(cache_dir, should_abort=should_abort)
 
-    def load_cache_from_disk(self, cache_dir: str, replace: bool = False) -> int:
+    def load_cache_from_disk(
+        self, cache_dir: str, replace: bool = False, protected_import: bool = True
+    ) -> int:
         """Load prefix cache from disk."""
-        return self.engine.load_cache_from_disk(cache_dir, replace=replace)
+        return self.engine.load_cache_from_disk(
+            cache_dir, replace=replace, protected_import=protected_import
+        )
 
     def save_cache_with_outcome(self, cache_dir: str, should_abort=None):
         """Forward the outcome-returning save (#1100 codex round 4 #2)."""
         return self.engine.save_cache_with_outcome(cache_dir, should_abort=should_abort)
 
-    def load_cache_with_result(self, cache_dir: str, replace: bool = False):
+    def load_cache_with_result(
+        self, cache_dir: str, replace: bool = False, protected_import: bool = True
+    ):
         """Forward the result-returning load (#1100 codex round 4 #2)."""
-        return self.engine.load_cache_with_result(cache_dir, replace=replace)
+        return self.engine.load_cache_with_result(
+            cache_dir, replace=replace, protected_import=protected_import
+        )

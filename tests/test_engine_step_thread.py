@@ -127,10 +127,14 @@ class TestStepThread:
 
         captured = {}
 
-        def fake_load(cache_dir, replace=False):
+        # #1111 codex r3: ``protected_import`` is threaded to the scheduler
+        # alongside ``replace``; ``fake_load`` accepts AND records it so this
+        # routing test also guards the new kwarg's passthrough.
+        def fake_load(cache_dir, replace=False, protected_import=True):
             captured["thread"] = threading.current_thread().name
             captured["cache_dir"] = cache_dir
             captured["replace"] = replace
+            captured["protected_import"] = protected_import
             return 17
 
         engine_core.scheduler.load_cache_from_disk.side_effect = fake_load
@@ -138,10 +142,12 @@ class TestStepThread:
         await engine_core.start()
         try:
             # Default (merge) path: replace defaults to False and still routes
-            # to the worker.
+            # to the worker. protected_import defaults True (explicit-import
+            # semantics).
             assert engine_core.load_cache_from_disk("/tmp/whatever") == 17
             assert captured["cache_dir"] == "/tmp/whatever"
             assert captured["replace"] is False
+            assert captured["protected_import"] is True
             assert captured["thread"].startswith("mlx-step")
 
             # Explicit replace=True must be forwarded through to the scheduler
@@ -150,6 +156,16 @@ class TestStepThread:
             assert engine_core.load_cache_from_disk("/tmp/other", replace=True) == 17
             assert captured["cache_dir"] == "/tmp/other"
             assert captured["replace"] is True
+            assert captured["thread"].startswith("mlx-step")
+
+            # The STARTUP auto-load passes protected_import=False; it must be
+            # forwarded through to the scheduler on the worker thread too.
+            assert (
+                engine_core.load_cache_from_disk("/tmp/boot", protected_import=False)
+                == 17
+            )
+            assert captured["cache_dir"] == "/tmp/boot"
+            assert captured["protected_import"] is False
             assert captured["thread"].startswith("mlx-step")
         finally:
             await engine_core.stop()

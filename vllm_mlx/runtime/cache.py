@@ -67,7 +67,14 @@ def load_prefix_cache_from_disk() -> None:
     try:
         d = get_cache_dir()
         logger.info(f"[lifespan] Loading prefix cache from {d}")
-        loaded = cfg.engine.load_cache_from_disk(d)
+        # #1111 codex r3: the STARTUP auto-load must NOT protect reloaded
+        # entries. ``save_to_disk`` persists ALL live entries — including
+        # opportunistic (unprotected) non-trimmable ones — so protecting them on
+        # every boot would grow the protected set ~N per restart and defeat the
+        # ``hybrid_reuse_max_entries`` cap. ``protected_import=False`` makes
+        # reloaded non-trimmable entries obey the retention bound at commit;
+        # only the EXPLICIT ``POST /v1/cache/import`` (#476) pins its entries.
+        loaded = cfg.engine.load_cache_from_disk(d, protected_import=False)
         if loaded > 0:
             logger.info(f"[lifespan] Loaded {loaded} prefix cache entries")
         else:
