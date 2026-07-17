@@ -363,6 +363,60 @@ def _render_response_format_counters() -> list[str]:
     return out
 
 
+def _render_response_cache_counters() -> list[str]:
+    """Render the opt-in prompt-deterministic response-cache counters.
+
+    Two process-local monotonic counters — hits and misses — exposed the
+    same way as the H-06 response_format counters (plain ints behind a
+    lock in ``vllm_mlx/response_cache.py``, NOT the ``_StickyCounter-
+    Accumulator``: those counters never reset within a process, so no
+    accumulator dance is needed). Surfaced even when ``engine.get_stats``
+    is unavailable, since the counters live in module state, not the
+    engine. When the cache is disabled (``--response-cache-entries 0``)
+    both counters stay at zero — the series is still emitted so operators
+    can confirm the feature is inert.
+    """
+    try:
+        from ..response_cache import get_response_cache
+
+        rc_stats = get_response_cache().snapshot()
+    except Exception:
+        rc_stats = {"hits": 0, "misses": 0}
+    out: list[str] = []
+    out.extend(
+        _fmt_metric(
+            "rapid_mlx_response_cache_hits_total",
+            "counter",
+            (
+                "Prompt-deterministic response-cache hits — completely "
+                "repeated greedy (temperature==0 / top_k==1) chat "
+                "requests served from the stored completion with zero GPU "
+                "decode. Zero when the cache is disabled "
+                "(--response-cache-entries 0, the default)."
+            ),
+            int(rc_stats.get("hits", 0)),
+        )
+    )
+    out.extend(
+        _fmt_metric(
+            "rapid_mlx_response_cache_misses_total",
+            "counter",
+            (
+                "Prompt-deterministic response-cache LOOKUP misses — eligible "
+                "greedy chat requests that reached the cache lookup and found "
+                "no stored completion. Ticked at lookup time (before "
+                "admission / generation), so a subsequently rejected or "
+                "failed request is still counted as a lookup miss and may not "
+                "produce a stored entry. Non-greedy / streaming / multimodal "
+                "requests are NOT eligible and do NOT tick this counter. Pair "
+                "with rapid_mlx_response_cache_hits_total for the hit rate."
+            ),
+            int(rc_stats.get("misses", 0)),
+        )
+    )
+    return out
+
+
 def _derive_mtp_family(cfg: Any) -> str:
     """Best-effort family sniff from ``cfg.model_name`` / ``cfg.model_path``.
 
@@ -868,6 +922,12 @@ def _render_prometheus(cfg: Any) -> str:
     # engine-None / get_stats-failure early returns so dashboards see
     # the series even between restarts.
     lines.extend(_render_response_format_counters())
+
+    # Opt-in prompt-deterministic response-cache hit/miss counters —
+    # same engine-independence rationale: the counters live in the
+    # response_cache module singleton, not the engine, so emit them
+    # before the engine-None / get_stats early returns.
+    lines.extend(_render_response_cache_counters())
 
     # R15 #297 MoE+MXFP4 / MoE+NVFP4 load-time guardrail counters —
     # same engine-independence rationale: the guardrail fires at

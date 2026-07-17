@@ -341,7 +341,25 @@ class SchedulerConfig:
     mtp_max_k: int = 3
     mtp_disable_auto_k: bool = False
 
+    # Opt-in prompt-deterministic RESPONSE CACHE (exact-match short-circuit).
+    # 0 (default) disables it entirely — no store, no lookup, zero behavior
+    # change. N > 0 LRU-bounds the cache to N fully-computed deterministic
+    # responses so a completely repeated greedy request returns the stored
+    # completion verbatim, zero GPU decode. Distinct from the prefix/KV cache
+    # (which reuses prefix STATE); this returns the whole stored completion.
+    # Consumed at the route layer (``vllm_mlx/response_cache.py`` singleton,
+    # configured at serve boot), not by the scheduler hot loop — kept on
+    # SchedulerConfig purely so the CLI plumbs it through the same
+    # construction sites as every other cache knob.
+    #
+    # Keep this field last: positional ``SchedulerConfig(...)`` construction
+    # binds by position, so appending new fields at the end avoids shifting
+    # the position of any existing field.
+    response_cache_entries: int = 0
+
     def __post_init__(self) -> None:
+        if self.response_cache_entries < 0:
+            raise ValueError("response_cache_entries must be >= 0")
         if self.enable_mtp:
             import warnings
 

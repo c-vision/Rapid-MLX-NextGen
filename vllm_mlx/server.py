@@ -1527,6 +1527,47 @@ def load_model(
     # that format on subsequent turns. See #225.
     _sync_config()
 
+    # Opt-in prompt-deterministic response cache: configure the process
+    # singleton's LRU capacity from the resolved SchedulerConfig knob.
+    # 0 (default) keeps the cache inert. ``configure_response_cache``
+    # atomically sets capacity, clears the store, and bumps the epoch — a
+    # stored completion is only valid for the exact model artifact that
+    # produced it, but the key spans only the model id, so this (re)load
+    # invalidation prevents serving completions from a previously-loaded
+    # model after a reload of changed weights under the same id.
+    #
+    # load_model is boot-only: it is invoked once from serve_command before
+    # uvicorn begins accepting requests, and there is no runtime model-swap
+    # route. So the order in which the engine is published versus the cache
+    # invalidated cannot race with a live request — the epoch-versioned
+    # reconfigure is correctness-by-construction today, and defense-in-depth
+    # if a runtime reload endpoint is ever added.
+    #
+    # Best-effort: a cache-config failure must never block model load — but
+    # on failure the PREVIOUS cache must NOT stay live under the NEW model
+    # (that would serve stale cross-model output). The fail-safe rebinds the
+    # singleton to a fresh disabled instance via ``force_disable_response_
+    # cache`` rather than calling a method on the possibly-wedged instance
+    # that just failed — a fresh capacity-0 object is inert by construction.
+    try:
+        from .response_cache import configure_response_cache
+
+        configure_response_cache(
+            int(getattr(scheduler_config, "response_cache_entries", 0) or 0)
+        )
+    except Exception as _rc_e:
+        logger.warning(
+            f"response cache reconfigure failed on model load ({_rc_e}); "
+            "forcing the cache disabled + empty so it cannot serve stale "
+            "cross-model output"
+        )
+        try:
+            from .response_cache import force_disable_response_cache
+
+            force_disable_response_cache()
+        except Exception:  # pragma: no cover — defensive
+            pass
+
     # Set native tool format support on the engine (thread-safe via instance property)
     _engine.preserve_native_tool_format = _detect_native_tool_support()
     if _engine.preserve_native_tool_format:
