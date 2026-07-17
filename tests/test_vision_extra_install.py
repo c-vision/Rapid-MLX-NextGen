@@ -582,9 +582,7 @@ def _spec_excludes_064(spec: str) -> bool:
     from packaging.requirements import Requirement
     from packaging.version import Version
 
-    return not Requirement(spec).specifier.contains(
-        Version("0.6.4"), prereleases=True
-    )
+    return not Requirement(spec).specifier.contains(Version("0.6.4"), prereleases=True)
 
 
 def test_all_mlx_vlm_specs_exclude_broken_064() -> None:
