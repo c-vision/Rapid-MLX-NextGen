@@ -2986,6 +2986,8 @@ def serve_command(args):
         use_memory_aware_cache=not args.no_memory_aware_cache,
         cache_memory_mb=args.cache_memory_mb,
         cache_memory_percent=args.cache_memory_percent,
+        # #1103: bounded trim-free hybrid (recurrent-state) prefix reuse.
+        hybrid_cache_entries=getattr(args, "hybrid_cache_entries", 0),
         # Paged cache options
         use_paged_cache=args.use_paged_cache,
         paged_cache_block_size=args.paged_cache_block_size,
@@ -4038,6 +4040,10 @@ def bench_command(args):
             use_memory_aware_cache=not args.no_memory_aware_cache,
             cache_memory_mb=args.cache_memory_mb,
             cache_memory_percent=args.cache_memory_percent,
+            # #1103: bounded trim-free hybrid (recurrent-state) prefix reuse.
+            # Bench path mirrors serve so hybrid-reuse effects show up in
+            # `rapid-mlx bench` numbers too.
+            hybrid_cache_entries=getattr(args, "hybrid_cache_entries", 0),
             # Paged cache options
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
@@ -6792,6 +6798,19 @@ Examples:
         default=0.20,
         help="Fraction of available RAM for cache if auto-detecting (default: 0.20)",
     )
+    # #1103: bounded trim-free prefix reuse for hybrid (GatedDeltaNet /
+    # Mamba MoE) models. Opt-in: the default 0 keeps the #1075 policy of
+    # dropping recurrent-state entries at store time.
+    serve_parser.add_argument(
+        "--hybrid-cache-entries",
+        type=int,
+        default=0,
+        help=(
+            "Retain up to N hybrid (recurrent-state) prefix-cache entries for "
+            "exact/prefix-extension reuse; 0 disables (default: 0). Useful for "
+            "stable-system-prompt agent workloads on GatedDeltaNet/Mamba models."
+        ),
+    )
     serve_parser.add_argument(
         "--no-memory-aware-cache",
         action="store_true",
@@ -7656,6 +7675,21 @@ Examples:
         type=int,
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
+    )
+    # #1103 codex BLOCKING-2: the bench path reads args.hybrid_cache_entries
+    # (see the MemoryCacheConfig assembly above) but the flag was only
+    # registered on serve_parser, so `rapid-mlx bench --hybrid-cache-entries N`
+    # was rejected and the getattr fell back to 0. Register it here too, with
+    # the same semantics/default as serve, so bench honors the knob.
+    bench_parser.add_argument(
+        "--hybrid-cache-entries",
+        type=int,
+        default=0,
+        help=(
+            "Retain up to N hybrid (recurrent-state) prefix-cache entries for "
+            "exact/prefix-extension reuse; 0 disables (default: 0). Useful for "
+            "stable-system-prompt agent workloads on GatedDeltaNet/Mamba models."
+        ),
     )
     # Paged cache options (experimental)
     bench_parser.add_argument(

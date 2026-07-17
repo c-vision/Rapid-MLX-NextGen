@@ -187,6 +187,15 @@ class SchedulerConfig:
     paged_cache_block_size: int = 64  # Tokens per block
     max_cache_blocks: int = 1000  # Maximum number of cache blocks
 
+    # #1103: bounded trim-free prefix reuse for hybrid (GatedDeltaNet /
+    # Mamba MoE) models. 0 (default) keeps the #1075 drop-at-store policy;
+    # N > 0 retains at most N recurrent-state entries for exact /
+    # prefix-extension reuse (LRU-evicted among themselves). Appended AFTER
+    # the pre-existing cache fields (codex #1103 NIT-5): keeps every field
+    # that predates this PR at its original dataclass position so no future
+    # positional ``SchedulerConfig(...)`` construction can silently rebind.
+    hybrid_cache_entries: int = 0
+
     # Speculative decoding selection. "none" is baseline decode; "mtp"
     # installs the vendored mlx-lm PR #990 MTP draft/verify path through
     # the common speculative-config frontend.
@@ -1963,6 +1972,8 @@ class Scheduler:
                     kv_turboquant_bits=self.config.kv_cache_turboquant_bits,
                     kv_turboquant_group_size=self.config.kv_cache_turboquant_group_size,
                     kv_turboquant_mode=self.config.kv_cache_turboquant_mode,
+                    # #1103: bounded trim-free hybrid reuse (0 = #1075 policy).
+                    hybrid_reuse_max_entries=self.config.hybrid_cache_entries,
                 )
                 # R15-P1 (task #303): radix-tree prefix-cache index.
                 # Constructed when ``prefix_cache_index == "radix"`` and
