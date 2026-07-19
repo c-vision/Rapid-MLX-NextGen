@@ -741,6 +741,7 @@ class EngineCore:
         prefix_boundary: int = 0,
         has_tools: bool = False,
         requires_prompt_integrity: bool = False,
+        grammar_logits_processor: Any | None = None,
     ) -> str:
         """
         Add a request for processing.
@@ -775,6 +776,7 @@ class EngineCore:
             prefix_boundary=prefix_boundary,
             has_tools=has_tools,
             requires_prompt_integrity=requires_prompt_integrity,
+            grammar_logits_processor=grammar_logits_processor,
         )
 
         # Throttle requests for hybrid models (GatedDeltaNet + Transformer).

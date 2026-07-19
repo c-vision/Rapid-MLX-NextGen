@@ -281,6 +281,218 @@ def _forced_tool_call_prefix(parser_name: str | None, function_name: str) -> str
     return None
 
 
+def _normalize_tool_choice_for_grammar(tool_choice) -> dict | None:
+    """Normalize an OpenAI ``tool_choice`` into a collision-safe tagged form.
+
+    Returns ``{"mode": "required"}`` or ``{"mode": "named", "name": <str>}``
+    for the two constrained-in-PR-3 modes, or ``None`` to skip grammar
+    constraint (``"auto"`` / ``"none"`` / anything unrecognized).
+
+    WHY A TAGGED FORM (deferred codex #2 — string collision): per the OpenAI
+    spec ``tool_choice`` is EITHER a string enum (``"auto" | "required" |
+    "none"``) OR an object ``{"type":"function","function":{"name":...}}``. A
+    tool NAME only ever appears inside the object form — never as a bare
+    string. So a tool literally named ``"required"`` (or ``"auto"`` /
+    ``"none"``) under ``tool_choice="auto"`` must be treated as AUTO (the tool
+    stays available, unconstrained), and selecting it requires the object form
+    ``{"type":"function","function":{"name":"required"}}``. Discriminating on
+    SHAPE here — bare string vs object — before any comparison against tool
+    names makes the string-enum path and the named-tool path structurally
+    unable to collide. The tool name is only ever read out of the object.
+
+    PR-3 SCOPE: only ``"required"`` and the named object form are constrained.
+    ``"auto"`` deliberately returns ``None`` (unconstrained — the auto-path
+    grammar is PR-5, paused pending operator greenlight), and ``"none"``
+    returns ``None`` (the model sees no tools; the #445 route handler already
+    drops ``request.tools``). ``None``/absent ``tool_choice`` is auto by
+    default -> also ``None`` here.
+    """
+    # Object form is the ONLY place a tool name appears: a named choice.
+    if isinstance(tool_choice, dict):
+        if tool_choice.get("type") == "function":
+            fn = tool_choice.get("function")
+            # ``function`` must be a dict. A malformed truthy-but-non-dict value
+            # (e.g. a string or list from external input) must degrade to
+            # free-form, NOT reach ``.get`` and raise an AttributeError -> HTTP
+            # 500 (codex #558-PR3 blocking). Anything non-dict -> unconstrained.
+            if isinstance(fn, dict):
+                name = fn.get("name")
+                if isinstance(name, str) and name:
+                    return {"mode": "named", "name": name}
+        return None
+    # Bare-string enum path (or None). Only ``"required"`` is constrained in
+    # PR-3; ``"auto"``/``"none"``/None all fall through to free-form.
+    if tool_choice == "required":
+        return {"mode": "required"}
+    return None
+
+
+def _tool_grammar_eligible(cfg, request) -> bool:
+    """Cheap synchronous gate: could this request possibly get a grammar?
+
+    Runs the trivial checks (env opt-in, tools present, a family parser
+    configured, and ``tool_choice`` in the PR-3a constrained set) with NO heavy
+    imports and NO grammar/tokenizer construction. The route calls this on the
+    event loop so the vast majority of traffic — requests without tools, and
+    ``"auto"``/``"none"`` choices — short-circuits WITHOUT ever entering the
+    thread offload. Only an eligible request pays the ``asyncio.to_thread``
+    offload for the actual (possibly ~1s cold) build (codex #558-PR3).
+
+    OPT-IN (PR-3a scope): ``RAPID_MLX_CONSTRAIN_TOOLS`` defaults to OFF. PR-3a
+    ships the runtime WITHOUT the client-schema size/depth/count DoS caps and
+    the bounded compile-pool admission (those are resource-hardening, split to
+    PR-3b). Because the compile runs on client-controlled schema input, we do
+    NOT enable it by default until that hardening lands — an operator opts in
+    explicitly (``RAPID_MLX_CONSTRAIN_TOOLS=1``/``on``/``true``). Flipping the
+    default to on is gated on PR-3b (and the auto path on PR-5).
+    """
+    if os.environ.get("RAPID_MLX_CONSTRAIN_TOOLS", "0") not in ("1", "on", "true"):
+        return False
+    if not getattr(request, "tools", None) or not getattr(
+        cfg, "tool_call_parser", None
+    ):
+        return False
+    return (
+        _normalize_tool_choice_for_grammar(getattr(request, "tool_choice", None))
+        is not None
+    )
+
+
+def _maybe_build_tool_grammar_processor(engine, cfg, request):
+    """Build a per-request ``GrammarLogitsProcessor`` for #558, or ``None``.
+
+    Non-breaking: returns ``None`` (today's free-form-then-parse fallback)
+    whenever anything is missing — env opt-out, no tools, no family parser,
+    ``tool_choice`` not in the PR-3 constrained set (required/named), the
+    parser opts out of ``structure_info``, llguidance unavailable, or the
+    tokenizer cannot back an ``LLTokenizer``.
+
+    Re-runs the cheap eligibility checks (so it stays correct when called
+    directly, e.g. from tests) before the heavy path; the route gates on
+    ``_tool_grammar_eligible`` first to keep the offload off the hot path.
+    """
+    if not _tool_grammar_eligible(cfg, request):
+        return None
+
+    choice = _normalize_tool_choice_for_grammar(getattr(request, "tool_choice", None))
+    if choice is None:  # pragma: no cover - _tool_grammar_eligible already gated
+        return None  # auto / none / unrecognized -> unconstrained (PR-5 owns auto)
+
+    try:
+        from ..api.tool_grammar import (
+            GrammarLogitsProcessor,
+            build_tool_grammar,
+            get_lltokenizer,
+        )
+        from ..tool_parsers import ToolParserManager
+
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is None:
+            return None
+        # Resolve the ``LLTokenizer`` FIRST (codex #558-PR3 nit): a tokenizer
+        # already memoized as unsupported returns ``None`` here without paying
+        # the client-controlled grammar compile below. ``get_lltokenizer`` is a
+        # cache hit in steady state, so this reorder is free on the hot path and
+        # avoids compiling a grammar we'd only discard.
+        lltok = get_lltokenizer(tokenizer)
+        if lltok is None:
+            return None
+        parser_cls = ToolParserManager.get_tool_parser(cfg.tool_call_parser)
+        parser = parser_cls(tokenizer=tokenizer)
+
+        # Flatten OpenAI tools -> [{name, parameters}] for the grammar builder.
+        flat_tools = []
+        for t in request.tools:
+            fn = t.function if hasattr(t, "function") else t.get("function", t)
+            name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+            if not name:
+                return None
+            has_params = (
+                ("parameters" in fn)
+                if isinstance(fn, dict)
+                else hasattr(fn, "parameters")
+            )
+            params = (
+                fn.get("parameters")
+                if isinstance(fn, dict)
+                else getattr(fn, "parameters", None)
+            )
+            # ABSENT (or null) ``parameters`` == the tool takes NO arguments.
+            # Use a CLOSED empty-object schema so the grammar forbids ANY key,
+            # rather than the open ``{"type":"object"}`` (whose implicit
+            # ``additionalProperties: true`` would let the model hallucinate
+            # arbitrary arguments into a no-arg call — codex #558-PR3). An
+            # explicitly-supplied schema (including a bare ``{}`` = allow-any)
+            # is preserved verbatim; only the absent/None case is defaulted.
+            if not has_params or params is None:
+                params = {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                }
+            flat_tools.append({"name": name, "parameters": params})
+
+        # For a NAMED choice, narrow to the single target tool BEFORE building.
+        # We then always pass ``tool_choice="required"`` to the builder over
+        # the (narrowed or full) tool list. This sidesteps the builder's own
+        # name-string path entirely: a tool literally named ``"required"`` can
+        # never be misread as the ``required`` enum, because we resolve the
+        # target from the tagged form's ``name`` and feed the builder a
+        # narrowed list + the ``"required"`` quantifier (forces exactly one of
+        # the listed tools). ``named`` over a 1-element list == a single forced
+        # tool; ``required`` over the full list == one-or-more of any tool.
+        if choice["mode"] == "named":
+            target = choice["name"]
+            narrowed = [t for t in flat_tools if t["name"] == target]
+            if not narrowed:
+                # Named target not in tools. The #445 route handler already
+                # 400s this case before we get here, but stay defensive:
+                # free-form fallback rather than an empty/forcing grammar.
+                return None
+            flat_tools = narrowed
+
+        # OpenAI ``parallel_tool_calls=False`` -> force EXACTLY ONE call so the
+        # grammar matches the downstream single-call cap (codex #558-PR3). A
+        # NAMED choice is already single-tool but could still emit ≥2 calls to
+        # the same tool without this; ``required`` could emit calls to several
+        # tools. Only an explicit ``False`` narrows to exactly-one (``True`` /
+        # unset keep the one-or-more ``required`` grammar, per OpenAI semantics).
+        single_call = getattr(request, "parallel_tool_calls", None) is False
+        grammar = build_tool_grammar(
+            flat_tools, "required", parser, single_call=single_call
+        )
+        if grammar is None:
+            return None
+
+        # Reasoning-aware delay (design §5). We rely on PATH A: the grammar's
+        # own lazy ``TAG_TEXT`` free prefix naturally swallows any
+        # ``<think>...</think>`` block before the trigger, so reasoning flows
+        # unconstrained WITHOUT a runtime gate. The runtime gate (path B) is a
+        # ground-truth-corrected FOOTGUN here: a model that emits NO reasoning
+        # (no ``</think>``) would keep the mask OFF forever and defeat the
+        # constraint entirely (observed on qwen3.5 tool_choice=required). So we
+        # pass ``reasoning_end_token=None`` — path A alone is correct for
+        # triggered structural tags (matches vLLM's same-step exception).
+        processor = GrammarLogitsProcessor(
+            lltok,
+            grammar,
+            reasoning_end_token=None,
+            tokenizer=tokenizer,
+        )
+        # A broken matcher (grammar failed to compile) masks NOTHING. Returning
+        # it here would set ``grammar_logits_processor`` on the request, which
+        # in turn disables the forced-prefix fallback at the call site while
+        # producing fully-unconstrained output — strictly worse than either
+        # lever alone (codex #558-PR3). Fall back to free-form/forced-prefix.
+        if processor.is_broken():
+            logger.error("tool-grammar: grammar failed to compile; free-form fallback")
+            return None
+        return processor
+    except Exception:
+        logger.exception("tool-grammar: failed to build processor; free-form fallback")
+        return None
+
+
 def _recover_partial_tool_args(
     raw_text: str | None, expected_name: str | None = None
 ) -> str | None:
@@ -2032,6 +2244,47 @@ async def _create_chat_completion_impl(
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
+    # Grammar-constrained tool calling (#558 PR-3a). When the request carries
+    # ``tools``, a family parser that declares a ``structure_info``, and an
+    # EXPLICIT ``tool_choice`` of ``"required"`` or a named function, build a
+    # per-request ``GrammarLogitsProcessor`` that structurally constrains a
+    # completed tool call to name a real tool and satisfy its JSON schema in the
+    # family wire format. OPT-IN via env ``RAPID_MLX_CONSTRAIN_TOOLS``
+    # (defaults OFF; set to 1/on/true — client-schema DoS-hardening is PR-3b).
+    # ``tool_choice="auto"`` stays UNCONSTRAINED (the auto-path grammar is PR-5,
+    # paused). Falls back to today's free-form-then-parse when opted out, the
+    # parser opts out (returns None), or llguidance/tokenizer is unavailable —
+    # non-breaking, no default change.
+    #
+    # Built BEFORE the forced-prefix block below because the two are mutually
+    # exclusive: when the grammar is active it already forces + fully
+    # constrains the call from token 0, whereas the forced ASSISTANT PREFIX
+    # injects the wire-envelope opener into the PROMPT. Combining them is a
+    # bug (codex #558-PR3): the grammar processor baselines the injected
+    # prefix away as "prompt", so the matcher starts at grammar position 0
+    # while generation has already emitted the opener — bypassing
+    # argument-schema enforcement or producing a duplicate opener. So we skip
+    # the forced prefix entirely whenever the grammar is active.
+    #
+    # The cheap eligibility gate runs SYNCHRONOUSLY on the loop so the vast
+    # majority of traffic (no tools, ``"auto"``/``"none"`` choices) never enters
+    # the thread offload (codex #558-PR3). Only an eligible request pays the
+    # off-loop build via ``asyncio.to_thread`` — it compiles a client-controlled
+    # grammar and, on the FIRST request for a tokenizer, does the documented ~1s
+    # ``LLTokenizer`` build; running that inline would block the event loop for
+    # every other in-flight request. The Lark->llguidance grammar compile is
+    # already ``lru_cache``d (``_compile_lark_cached``) and the tokenizer is
+    # memoized (``get_lltokenizer``), so steady-state cost is small — but the
+    # cold path and per-request ``LLMatcher`` construction still belong off-loop.
+    # (Bounded compile-pool admission + client-schema DoS caps are PR-3b.)
+    _glp = None
+    if _tool_grammar_eligible(cfg, request):
+        _glp = await asyncio.to_thread(
+            _maybe_build_tool_grammar_processor, engine, cfg, request
+        )
+    if _glp is not None:
+        chat_kwargs["grammar_logits_processor"] = _glp
+
     # OpenAI ``tool_choice`` forced-function — assistant-turn prefix
     # injection. The chat-template renderer (and the engine's
     # ``chat()``/``stream_chat()``) accept ``forced_assistant_prefix``;
@@ -2041,9 +2294,10 @@ async def _create_chat_completion_impl(
     # No per-model regex, no per-alias config — the prefix is derived
     # solely from ``cfg.tool_call_parser`` and the requested function
     # name. See ``_forced_tool_call_prefix`` for the parser-shape
-    # taxonomy.
+    # taxonomy. SKIPPED when a grammar processor is active (see above) —
+    # the grammar is the stronger, self-sufficient lever.
     _forced_prefix = None
-    if request.tools and request.tool_choice is not None:
+    if _glp is None and request.tools and request.tool_choice is not None:
         _forced_name: str | None = None
         if (
             isinstance(request.tool_choice, dict)

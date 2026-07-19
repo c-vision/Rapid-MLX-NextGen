@@ -246,6 +246,25 @@ def test_lark_quantifier_tracks_tool_choice():
     )
 
 
+def test_lark_single_call_forces_exactly_one_tag():
+    # parallel_tool_calls=False -> single_call -> EXACTLY ONE call (no
+    # quantifier). Overrides the ``required`` ``+`` so the grammar can't emit
+    # multiple calls (codex #558-PR3 blocking).
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
+    lark = build_tool_lark(TOOLS, "required", infos, single_call=True)
+    # No trailing repetition quantifier on the alternation -> exactly one tag.
+    assert "start: (tag_0 | tag_1) tag_end" in lark
+    assert "start: (tag_0 | tag_1)+ tag_end" not in lark
+    assert "start: (tag_0 | tag_1)* tag_end" not in lark
+    # single_call does not override auto's zero-or-more (auto never sets it, but
+    # be explicit that auto stays ``*`` even if single_call were passed).
+    assert "start: (tag_0 | tag_1)* tag_end" in build_tool_lark(
+        TOOLS, "auto", infos, single_call=True
+    )
+
+
 def test_named_choice_narrows_to_single_forced_tag():
     # A NAMED tool_choice is expressed by the caller narrowing ``tools`` to the
     # single requested function before calling the builder (design §4). The

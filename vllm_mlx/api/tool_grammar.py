@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Grammar-constrained tool calling (#558) — grammar builder (PR-1).
+"""Grammar-constrained tool calling (#558) — grammar builder + runtime processor.
 
 This module turns a chat request's ``tools`` + ``tool_choice`` into an
 llguidance grammar that STRUCTURALLY GUARANTEES every emitted tool call
@@ -8,13 +8,14 @@ satisfy that tool's JSON Schema, and (c) uses the model family's tool-call
 wire format. It constrains only the FORM of a call, never the decision of
 whether/which to call.
 
-Scope of this PR-1: the pure, side-effect-free grammar BUILDER plus the
-``StructureInfo`` wire-triple dataclass and a compiled-grammar LRU cache.
-**Nothing here is wired into the request path** — no logits processor, no
-scheduler/chat.py routing. ``build_tool_grammar`` has no call sites yet, so
-this file is no-behavior-change scaffolding. The runtime
-``GrammarLogitsProcessor`` and its wiring land in PR-3; the per-family
-``ToolParser.structure_info()`` overrides land in PR-2.
+Layering: the pure, side-effect-free grammar BUILDER (``build_tool_grammar`` /
+``build_tool_lark``), the ``StructureInfo`` wire-triple dataclass and the
+compiled-grammar LRU cache landed in PR-1; the per-family
+``ToolParser.structure_info()`` overrides landed in PR-2. PR-3 (this change)
+adds the RUNTIME half: ``GrammarLogitsProcessor`` (the per-token mask that
+applies a compiled grammar to logits each decode step) and ``build_lltokenizer``
+(the ``LLTokenizer`` factory). The chat route / scheduler wiring that carries a
+per-request processor into the decode loop lands alongside these in PR-3.
 
 Design + prior-art: ``design-558-constrained-tool-calling.md``. The
 mechanism is the "structural tags with triggers" pattern that vLLM
@@ -38,6 +39,8 @@ list of "sentinel" substrings that must render as special-token refs.
 
 import json
 import logging
+import threading
+import weakref
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
@@ -45,16 +48,45 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Reuse the exact llguidance surface the guided-decoding path already imports
-# (proves availability + shares the native MLX mask kernel). Only the
-# compile-side factory (``LLMatcher.grammar_from_lark``) is used here; the
-# per-token mask kernel is a PR-3 concern and is deliberately not imported.
+# (proves availability + shares the native MLX mask kernel). Detection is split
+# into two INDEPENDENT layers so a failure in the runtime-only bridge cannot
+# disable the grammar BUILDER (codex #558-PR3):
+#
+#   * BUILDER + mask layer (``HAS_LLGUIDANCE``): the compile-side factory
+#     (``LLMatcher.grammar_from_lark``) drives ``build_tool_grammar``, and the
+#     per-token mask kernel (``allocate_token_bitmask`` /
+#     ``fill_next_token_bitmask`` / ``apply_token_bitmask``) drives the mask in
+#     ``GrammarLogitsProcessor``. If this layer is present the builder works.
+#   * RUNTIME BRIDGE layer (``HAS_LL_TOKENIZER``): ``llguidance.hf`` +
+#     ``LLTokenizer`` build the tokenizer that the runtime processor needs. If
+#     ONLY this layer is missing, grammars still compile — the runtime falls
+#     back (``get_lltokenizer`` returns ``None`` -> free-form) without falsely
+#     reporting the whole feature unavailable.
 try:
-    from llguidance.mlx import LLMatcher
+    from llguidance.mlx import (
+        LLMatcher,
+        allocate_token_bitmask,
+        apply_token_bitmask,
+        fill_next_token_bitmask,
+    )
 
     HAS_LLGUIDANCE = True
 except ImportError:  # pragma: no cover - mirrors guided.py degrade path
     HAS_LLGUIDANCE = False
     LLMatcher = None
+    allocate_token_bitmask = None
+    apply_token_bitmask = None
+    fill_next_token_bitmask = None
+
+try:
+    import llguidance.hf as _llguidance_hf
+    from llguidance import LLTokenizer
+
+    HAS_LL_TOKENIZER = True
+except ImportError:  # pragma: no cover - runtime bridge only
+    HAS_LL_TOKENIZER = False
+    _llguidance_hf = None
+    LLTokenizer = None
 
 
 @dataclass(frozen=True)
@@ -240,6 +272,8 @@ def build_tool_lark(
     tools: list[dict[str, Any]],
     tool_choice: str,
     structure_infos: list["StructureInfo"],
+    *,
+    single_call: bool = False,
 ) -> str:
     """Assemble the Lark grammar for a set of per-tool structure triples.
 
@@ -249,6 +283,14 @@ def build_tool_lark(
 
       * ``auto``                        -> ``(...)*``  (may emit zero calls)
       * ``required`` / a function name  -> ``(...)+``  (design R1: ≥1 forced)
+
+    ``single_call=True`` (OpenAI ``parallel_tool_calls=False``) forces EXACTLY
+    ONE call — the alternation carries NO repetition quantifier, so the model
+    must emit exactly one tag and stop. This overrides the ``required`` ``+``
+    (``auto`` never sets ``single_call`` — a zero-or-one grammar would still let
+    ``auto`` emit no call, which the ``*`` already allows). Without this the
+    ``required`` grammar could emit multiple calls even when the client
+    explicitly disabled parallel calls (codex #558-PR3).
 
     ``"none"`` must NOT reach this function — ``none`` produces no grammar at
     all (the model sees no tools, design §4); passing it here is a caller
@@ -309,8 +351,14 @@ def build_tool_lark(
                 f"sentinel (trigger={si.trigger!r}, sentinels={si.sentinels!r})"
             )
 
-    # auto -> zero-or-more (may emit no call); everything else forces ≥1.
-    quant = "*" if tool_choice == "auto" else "+"
+    # auto -> zero-or-more (may emit no call); single_call -> exactly one (no
+    # quantifier); everything else forces ≥1.
+    if tool_choice == "auto":
+        quant = "*"
+    elif single_call:
+        quant = ""  # exactly one tag: parallel_tool_calls=False
+    else:
+        quant = "+"
     tag_names = " | ".join(f"tag_{i}" for i in range(len(tools)))
     lark = (
         "%llguidance {}\n"
@@ -364,6 +412,8 @@ def build_tool_grammar(
     tools: list[dict[str, Any]],
     tool_choice: str,
     parser: Any,
+    *,
+    single_call: bool = False,
 ) -> str | None:
     """Public entry: (tools, tool_choice, parser) -> compiled llguidance grammar.
 
@@ -445,9 +495,383 @@ def build_tool_grammar(
         structure_infos.append(si)
 
     try:
-        lark = build_tool_lark(tools, tool_choice, structure_infos)
+        lark = build_tool_lark(
+            tools, tool_choice, structure_infos, single_call=single_call
+        )
     except ValueError:
         # Malformed structure_info / unsupported tool_choice -> free-form.
         logger.exception("tool-grammar: build_tool_lark rejected inputs")
         return None
     return _compile_lark_cached(lark)
+
+
+# --------------------------------------------------------------------------
+# Runtime logits processor (design §3.3 / §5). Mirrors the
+# ``MiniMaxToolLogitsProcessor.__call__(token_ids, logits)`` signature the
+# scheduler's per-request ``request_processors`` slot expects, so a
+# ``GrammarLogitsProcessor`` composes with the penalty processors already in
+# that slot.
+# --------------------------------------------------------------------------
+class GrammarLogitsProcessor:
+    """Applies a compiled llguidance grammar mask to logits each decode step.
+
+    Contract with mlx-lm's decode loop: the processor is called every step
+    with ``(token_ids, logits)`` where ``token_ids`` is the FULL CUMULATIVE
+    sequence so far (prompt + everything generated), NOT just the newly
+    sampled token. ``TokenBuffer.update_and_fetch`` returns ``buffer[:end]``,
+    so the prompt tokens are present on the very first call. Feeding those
+    prompt tokens into the grammar matcher would immediately reject them
+    (the grammar describes the tool-call OUTPUT, not the prompt) and break
+    the constraint. This processor therefore BASELINES past the prompt on the
+    first call and only ever advances the matcher over generated tokens.
+
+    Reasoning-aware (design §5): if a ``reasoning_end_token`` is supplied, the
+    mask is held OFF (all tokens allowed) until that token string appears in
+    the decoded output, so a ``<think>...</think>`` block is not constrained.
+    The chat route deliberately passes ``reasoning_end_token=None`` and relies
+    on PATH A (the grammar's own lazy ``TAG_TEXT`` free prefix swallows
+    reasoning before the trigger) — a runtime gate keyed on ``</think>`` is a
+    footgun for models that emit no reasoning (the mask would stay off
+    forever). The flag remains for defense-in-depth callers that want path B.
+    """
+
+    def __init__(
+        self,
+        lltokenizer: Any,
+        grammar: str,
+        *,
+        reasoning_end_token: str | None = None,
+        tokenizer: Any = None,
+    ):
+        self._lltok = lltokenizer
+        self._matcher = LLMatcher(lltokenizer, grammar)
+        err = self._matcher.get_error()
+        # A non-empty ``get_error()`` means the grammar failed to compile. A
+        # broken matcher masks nothing (``__call__`` returns logits unchanged),
+        # so callers MUST NOT treat a broken processor as an active constraint —
+        # they should fall back to free-form / forced-prefix instead. The route
+        # builder (``_maybe_build_tool_grammar_processor``) checks ``is_broken``
+        # and returns ``None`` in that case (codex #558-PR3).
+        self._compile_error = err or None
+        self._broken = bool(err)
+        if err:
+            logger.error("tool-grammar: matcher compile error: %s", err)
+        self._vocab = lltokenizer.vocab_size
+        self._bitmask = allocate_token_bitmask(1, self._vocab)
+        self._reasoning_end_token = reasoning_end_token
+        self._reasoning_ended = reasoning_end_token is None
+        self._tokenizer = tokenizer
+        # mlx-lm passes the FULL cumulative token sequence each step (see class
+        # docstring). ``_prompt_len`` is the baseline captured on the first
+        # call; ``_committed`` tracks how many of the cumulative ids have been
+        # consumed into the matcher so far.
+        self._prompt_len: int | None = None
+        self._committed = 0
+
+    def is_broken(self) -> bool:
+        """Whether the grammar failed to compile (masks nothing; use fallback)."""
+        return self._broken
+
+    def _maybe_open_after_reasoning(self, token_ids: Any) -> None:
+        if self._reasoning_ended or self._tokenizer is None:
+            return
+        try:
+            gen_ids = list(token_ids)
+            if self._prompt_len is not None:
+                gen_ids = gen_ids[self._prompt_len :]
+            text = self._tokenizer.decode(gen_ids)
+        except Exception:
+            return
+        if self._reasoning_end_token in text:
+            self._reasoning_ended = True
+
+    def __call__(self, token_ids: Any, logits: Any) -> Any:
+        if self._broken:
+            return logits
+        # mlx-lm hands us the FULL cumulative sequence (prompt + generated) each
+        # step. NEVER copy the whole thing (``list(token_ids)`` would be O(n) per
+        # step => O(n^2) over a long constrained generation — codex #558-PR3).
+        # ``len(...)`` is O(1); we only ever materialize the UNCOMMITTED TAIL.
+        n = len(token_ids)
+        if self._prompt_len is None:
+            # First step: everything present so far is the prompt — no token
+            # has been sampled and appended yet at mask-compute time. Baseline
+            # here so the matcher is NEVER fed prompt tokens (MUST-FIX #1).
+            self._prompt_len = n
+            self._committed = n
+        # Commit any newly-generated tokens since the last call so the matcher
+        # state tracks the real output stream (design §6: commit every token).
+        # Slice ONLY the new tail — never the already-committed prefix.
+        if self._committed < n:
+            tail = token_ids[self._committed : n]
+            for t in tail:
+                self._committed += 1
+                if not self._reasoning_ended:
+                    continue
+                tok = int(t)
+                if not self._matcher.consume_token(tok):
+                    logger.debug(
+                        "tool-grammar: matcher rejected committed token %d", tok
+                    )
+
+        # Reasoning gate is checked AFTER committing this step's tokens. NOTE
+        # (codex #558-PR3 nit, path B only): if a single multi-token update
+        # carried both ``</think>`` and the first post-reasoning tool-call
+        # tokens, those tokens are advanced past without being consumed here.
+        # Precise ``</think>``-boundary token alignment (excluding the reasoning
+        # bytes but consuming the tail) is design §7 open-Q1, deferred with the
+        # PR-5 auto path. This is dormant in production: the chat route uses
+        # PATH A (``reasoning_end_token=None`` => ``_reasoning_ended`` is True
+        # from construction, so the ``continue`` above never fires and every
+        # token is consumed). Only a defense-in-depth path-B caller that sets
+        # ``reasoning_end_token`` hits the deferral.
+        if not self._reasoning_ended:
+            self._maybe_open_after_reasoning(token_ids)
+        if not self._reasoning_ended:
+            return logits  # free generation during reasoning
+
+        if self._matcher.is_stopped():
+            return logits
+
+        fill_next_token_bitmask(self._matcher, self._bitmask, 0)
+        model_vocab = logits.shape[-1]
+        if model_vocab > self._vocab:
+            # The model head can be wider than the tokenizer vocab (padded
+            # embedding). The bitmask is real-vocab-width, so mask only the
+            # real-vocab prefix — but PRESERVE the original ``[..., model_vocab]``
+            # shape (the logits-processor contract: mlx-lm concatenates every
+            # row's processed logits, so a narrower return breaks batched
+            # decode — codex #558-PR3). Force the padded tail to ``-inf`` so
+            # those never-valid ids can't be sampled, then re-join.
+            import mlx.core as mx
+
+            head = apply_token_bitmask(logits[..., : self._vocab], self._bitmask)
+            tail_shape = (*logits.shape[:-1], model_vocab - self._vocab)
+            tail = mx.full(tail_shape, -float("inf"), dtype=logits.dtype)
+            return mx.concatenate([head, tail], axis=-1)
+        if model_vocab < self._vocab:
+            # Inverse case (codex #558-PR3): the TOKENIZER carries added tokens
+            # beyond the model's narrower output head. The bitmask is packed to
+            # the full tokenizer vocab (``ceil(vocab/32)`` int32 words), so
+            # applying it whole to the narrower logits would over-cover. Slice
+            # the packed bitmask to the model-width WORD count (each int32 word
+            # covers 32 ids) and apply that — any tokenizer id >= model_vocab
+            # has no logit column to sample from anyway, so dropping those tail
+            # words is safe. ``apply_token_bitmask`` reads only ``batch`` rows
+            # (no vocab-width assert), so the model-width prefix mask is enough.
+            words = (model_vocab + 31) // 32
+            return apply_token_bitmask(logits, self._bitmask[..., :words])
+        return apply_token_bitmask(logits, self._bitmask)
+
+    def reset(self) -> None:
+        self._matcher.reset()
+        self._prompt_len = None
+        self._committed = 0
+        self._reasoning_ended = self._reasoning_end_token is None
+
+
+def build_lltokenizer(tokenizer: Any) -> Any:
+    """Build an llguidance ``LLTokenizer`` from an mlx-lm ``TokenizerWrapper``.
+
+    llguidance needs the underlying *fast* (Rust-backed) transformers
+    tokenizer. mlx-lm's ``TokenizerWrapper`` exposes it at ``._tokenizer``
+    (what ``guided.py`` uses). We try candidates in priority order:
+
+      1. the wrapper's inner ``._tokenizer`` (a transformers 5.x
+         ``TokenizersBackend`` — this is what ``llguidance.hf.from_tokenizer``
+         accepts and is the common case);
+      2. the object as-is (for a raw fast tokenizer passed directly);
+      3. a DIRECT ``LLTokenizer(<tokenizer.json>)`` build from the fast
+         tokenizer's ``backend_tokenizer.to_str()``.
+
+    Candidate 3 is the spike-proven fallback for the transformers gotcha: on
+    some transformers revisions ``from_tokenizer``'s ``isinstance`` gate
+    rejects a ``Qwen2Tokenizer``-family object even though its serialized
+    ``tokenizer.json`` builds a valid ``LLTokenizer`` directly. ``guided.py``
+    has no such fallback, so tool-calling models on those revisions would
+    silently degrade to free-form; candidate 3 closes that gap.
+
+    Returns ``None`` if none of the candidates yields an ``LLTokenizer`` (the
+    caller degrades to today's free-form-then-parse behavior).
+    """
+    # Needs the runtime bridge (``llguidance.hf`` / ``LLTokenizer``), which is
+    # detected independently of the builder layer (codex #558-PR3).
+    if not HAS_LL_TOKENIZER:
+        return None
+
+    candidates = []
+    inner = getattr(tokenizer, "_tokenizer", None)
+    if inner is not None:
+        candidates.append(inner)
+    candidates.append(tokenizer)
+
+    # Candidates 1 & 2: llguidance.hf.from_tokenizer (the fast path).
+    for cand in candidates:
+        if getattr(cand, "is_fast", True) is False:
+            continue
+        try:
+            return _llguidance_hf.from_tokenizer(cand)
+        except Exception:
+            continue
+
+    # Candidate 3: direct build from the serialized fast tokenizer. Probe both
+    # the wrapper's inner tokenizer and the object itself for a
+    # ``backend_tokenizer`` exposing ``to_str()``.
+    for cand in candidates:
+        backend = getattr(cand, "backend_tokenizer", None)
+        to_str = getattr(backend, "to_str", None)
+        if to_str is None:
+            continue
+        try:
+            # No explicit ``n_vocab``: llguidance infers the true vocab from
+            # the serialized tokenizer (a too-small override is rejected).
+            return LLTokenizer(to_str())
+        except Exception:
+            continue
+
+    logger.warning("tool-grammar: could not build an LLTokenizer for this model")
+    return None
+
+
+# One ``LLTokenizer`` per model tokenizer. Building it is a ~1s, vocab-scale
+# operation (llguidance's own docstring flags it "expensive … should be
+# cached"), so rebuilding it on every explicit tool request would add real
+# latency + allocation churn to the async request path. The engine holds ONE
+# tokenizer for its lifetime, so we memoize per tokenizer.
+#
+# The ``LLTokenizer`` is a Rust object that CANNOT be weak-referenced, and a
+# ``TokenizerWrapper`` isn't reliably weak-referenceable either — so we cannot
+# use a WeakKey/WeakValue dictionary. Instead we (a) stash the built tokenizer
+# as a private attribute ON the tokenizer (primary cache; dies with the
+# tokenizer, no leak) and (b) fall back to a ``WeakKeyDictionary`` on the
+# tokenizer when it's weak-referenceable but rejects attribute assignment.
+# Both are keyed on the live tokenizer object, so a swapped/reloaded model
+# drops its stale entry automatically. A tokenizer that can't back an
+# ``LLTokenizer`` is remembered via a per-tokenizer sentinel so we don't
+# rebuild-and-fail on every request — but only AFTER a bounded retry budget, so
+# a TRANSIENT conversion/resource failure doesn't permanently disable grammar
+# enforcement for that tokenizer (codex #558-PR3 nit). Successful builds are
+# cached immediately; failures accrue toward the budget and are only sealed as
+# ``_LLTOKENIZER_UNAVAILABLE`` once exhausted.
+_LLTOKENIZER_ATTR = "_rapid_mlx_lltokenizer"
+_LLTOKENIZER_FAIL_ATTR = "_rapid_mlx_lltokenizer_fails"
+_LLTOKENIZER_MAX_BUILD_ATTEMPTS = 3  # transient failures retried before sealing
+_LLTOKENIZER_UNAVAILABLE = object()  # sentinel stored when build permanently fails
+_LLTOKENIZER_WEAK_CACHE: "weakref.WeakKeyDictionary[Any, Any]" = (
+    weakref.WeakKeyDictionary()
+)
+_LLTOKENIZER_FAIL_COUNTS: "weakref.WeakKeyDictionary[Any, int]" = (
+    weakref.WeakKeyDictionary()
+)
+# Single-flight lock around the cache-MISS build. ``get_lltokenizer`` now runs
+# inside ``asyncio.to_thread`` (chat route), so a cold traffic burst can land N
+# concurrent misses for the SAME tokenizer and, without this, each thread would
+# run the documented ~1s build (codex #558-PR3). We serialize the miss path and
+# re-check the caches inside the lock so the build happens at most once. The
+# lock is process-global (coarse) but only contended on the cold path — steady
+# state hits the lock-free cache reads above.
+_LLTOKENIZER_BUILD_LOCK = threading.Lock()
+
+
+def _lltokenizer_cache_get(tokenizer: Any) -> tuple[bool, Any]:
+    """Return ``(hit, value)`` from the attribute + weak caches (no build)."""
+    cached = getattr(tokenizer, _LLTOKENIZER_ATTR, None)
+    if cached is _LLTOKENIZER_UNAVAILABLE:
+        return True, None
+    if cached is not None:
+        return True, cached
+    try:
+        wcached = _LLTOKENIZER_WEAK_CACHE.get(tokenizer)
+    except TypeError:  # tokenizer not weak-referenceable
+        wcached = None
+    if wcached is _LLTOKENIZER_UNAVAILABLE:
+        return True, None
+    if wcached is not None:
+        return True, wcached
+    return False, None
+
+
+def get_lltokenizer(tokenizer: Any) -> Any:
+    """Return a cached ``LLTokenizer`` for ``tokenizer``, building once.
+
+    Thin memoizing wrapper over :func:`build_lltokenizer` (see it for the
+    candidate/fallback details). The ~1s build runs at most once per
+    tokenizer even under concurrent cold misses. Returns ``None`` (and
+    remembers it) when no ``LLTokenizer`` can be built.
+    """
+    if not HAS_LL_TOKENIZER or tokenizer is None:
+        return None
+    # Fast path: lock-free cache read.
+    hit, value = _lltokenizer_cache_get(tokenizer)
+    if hit:
+        return value
+
+    # Miss: serialize so concurrent to_thread callers don't all build (~1s each).
+    with _LLTOKENIZER_BUILD_LOCK:
+        # Re-check under the lock — another thread may have built it while we
+        # waited.
+        hit, value = _lltokenizer_cache_get(tokenizer)
+        if hit:
+            return value
+
+        built = build_lltokenizer(tokenizer)
+        if built is not None:
+            # Success: cache immediately and clear any accrued failure count.
+            _store_lltokenizer(tokenizer, built)
+            try:
+                _LLTOKENIZER_FAIL_COUNTS.pop(tokenizer, None)
+            except TypeError:
+                pass
+            return built
+
+        # Failure: only SEAL as permanently-unavailable once the retry budget is
+        # exhausted, so a transient conversion/resource error is retried on the
+        # next request instead of disabling grammar enforcement for the whole
+        # process lifetime (codex #558-PR3 nit).
+        fails = _bump_lltokenizer_fail_count(tokenizer)
+        if fails >= _LLTOKENIZER_MAX_BUILD_ATTEMPTS:
+            _store_lltokenizer(tokenizer, _LLTOKENIZER_UNAVAILABLE)
+        return None
+
+
+def _store_lltokenizer(tokenizer: Any, result: Any) -> None:
+    """Persist ``result`` (an ``LLTokenizer`` or the UNAVAILABLE sentinel)."""
+    try:
+        setattr(tokenizer, _LLTOKENIZER_ATTR, result)
+        return
+    except Exception:
+        pass
+    try:
+        _LLTOKENIZER_WEAK_CACHE[tokenizer] = result
+    except TypeError:
+        pass  # un-cacheable tokenizer: rebuild each call (correctness OK)
+
+
+def _bump_lltokenizer_fail_count(tokenizer: Any) -> int:
+    """Increment and return this tokenizer's accumulated build-failure count.
+
+    Prefers a per-tokenizer attribute (dies with the tokenizer, no leak); falls
+    back to a ``WeakKeyDictionary``; if neither is writable, treats every
+    failure as the FIRST attempt (never seals) so an un-cacheable tokenizer
+    keeps retrying rather than being wrongly disabled.
+    """
+    cur = getattr(tokenizer, _LLTOKENIZER_FAIL_ATTR, None)
+    if isinstance(cur, int):
+        nxt = cur + 1
+        try:
+            setattr(tokenizer, _LLTOKENIZER_FAIL_ATTR, nxt)
+            return nxt
+        except Exception:
+            pass
+    else:
+        try:
+            setattr(tokenizer, _LLTOKENIZER_FAIL_ATTR, 1)
+            return 1
+        except Exception:
+            pass
+    try:
+        nxt = _LLTOKENIZER_FAIL_COUNTS.get(tokenizer, 0) + 1
+        _LLTOKENIZER_FAIL_COUNTS[tokenizer] = nxt
+        return nxt
+    except TypeError:
+        return 1  # un-cacheable: always look like the first attempt, keep retrying

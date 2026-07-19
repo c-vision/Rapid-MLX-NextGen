@@ -1682,6 +1682,9 @@ class BatchedEngine(BaseEngine):
         # below before the tool parser scans it.
         assistant_text_prefix = kwargs.pop("_assistant_text_prefix", "") or ""
         output_router_seed = kwargs.pop("_output_router_seed_token_ids", None)
+        # Grammar-constrained tool calling (#558): per-request logits
+        # processor forwarded to the scheduler's request_processors slot.
+        grammar_logits_processor = kwargs.pop("grammar_logits_processor", None)
         if output_router_seed is None and isinstance(prompt, str):
             # ``build_prompt(enable_thinking=False)`` is part of the public
             # engine contract and returns the prepared Harmony string. A
@@ -1705,6 +1708,7 @@ class BatchedEngine(BaseEngine):
             prefix_boundary=prefix_boundary,
             has_tools=has_tools,
             requires_prompt_integrity=requires_prompt_integrity,
+            grammar_logits_processor=grammar_logits_processor,
         )
 
         if assistant_text_prefix:
@@ -1892,12 +1896,15 @@ class BatchedEngine(BaseEngine):
         # PFlash routing hints (#287) — parity with generate().
         has_tools = bool(kwargs.pop("has_tools", False))
         requires_prompt_integrity = bool(kwargs.pop("requires_prompt_integrity", False))
+        # Grammar-constrained tool calling (#558) — streaming parity.
+        grammar_logits_processor = kwargs.pop("grammar_logits_processor", None)
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
             has_tools=has_tools,
             requires_prompt_integrity=requires_prompt_integrity,
+            grammar_logits_processor=grammar_logits_processor,
         )
         # C-01 force-abort: publish the scheduler request id (text path)
         # so the route's disconnect_guard can call abort_request directly

@@ -137,6 +137,7 @@ Create `mcp.json`:
 | `VLLM_MLX_TEST_MODEL` | Default model for tests |
 | `HF_TOKEN` | HuggingFace authentication token |
 | `OPENAI_API_KEY` | Set to any value for SDK compatibility |
+| `RAPID_MLX_CONSTRAIN_TOOLS` | Grammar-constrained tool calling (best-effort, **opt-in**). When set to `1`/`on`/`true` AND a `--tool-call-parser` is set AND a request sends `tools` with `tool_choice="required"` or a named function, the server compiles a grammar that constrains generation so a completed tool call names a real tool with schema-valid arguments in the family wire format. **Off by default** (`0`) pending resource-hardening; requests without tools, or with `tool_choice="auto"`/`"none"`, are always unaffected. **Best-effort fallback:** the request silently falls back to the free-form-then-parse path (no hard error, no structural guarantee) when the `[guided]` extra (`llguidance`) is not installed, the model's tokenizer cannot back an `LLTokenizer`, the grammar fails to compile, or the parser family declares no structural info. `parallel_tool_calls=false` narrows the grammar to exactly one call. Note: the structural guarantee holds only for a call the model runs to a grammar-accepted completion — a `max_tokens` cutoff mid-call can still truncate the arguments and yield invalid JSON. |
 
 ## Example Configurations
 

@@ -170,6 +170,13 @@ class Request:
     has_tools: bool = False
     requires_prompt_integrity: bool = False
 
+    # Grammar-constrained tool calling (#558). Optional per-request logits
+    # processor that masks decoding to a tool-call grammar. Set by the chat
+    # route when ``tools`` + ``tool_choice in {required, named}`` and the
+    # family's parser declares a ``structure_info``. ``None`` -> today's
+    # free-form-then-parse behavior (non-breaking default).
+    grammar_logits_processor: Any | None = None
+
     # PFlash prompt compression state. When pflash_metadata["compressed"]
     # is True, prompt_token_ids is the compressed list and
     # original_prompt_token_ids holds the pre-compression sequence so
