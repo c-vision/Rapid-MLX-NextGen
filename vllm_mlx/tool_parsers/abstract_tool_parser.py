@@ -291,6 +291,35 @@ class ToolParser(ABC):
         return ""
 
     # -----------------------------------------------------------------
+    # Grammar-constrained tool calling (#558)
+    # -----------------------------------------------------------------
+    def structure_info(self):
+        """Return a callable ``name -> StructureInfo`` for grammar constraint.
+
+        Mirrors SGLang's ``BaseFormatDetector.structure_info`` contract. A
+        parser that supports decoder-level grammar constraint overrides this
+        to return a function mapping a concrete tool name to the
+        ``(begin, end, trigger, sentinels)`` wire triple for THIS family
+        (``vllm_mlx.api.tool_grammar.StructureInfo``). The grammar builder
+        (``vllm_mlx.api.tool_grammar.build_tool_grammar``) assembles those
+        triples into an llguidance grammar so every emitted tool call is
+        structurally guaranteed to name a real tool whose ``arguments``
+        satisfy that tool's JSON Schema in this family's wire format.
+
+        Default returns ``None`` — the family is not yet grammar-constrained,
+        so the caller falls back to today's free-form-then-parse behavior.
+        This keeps the ABC change NON-BREAKING: existing parsers behave
+        exactly as before until they opt in by overriding this method (the
+        per-family overrides land in a follow-up PR, mirroring how SGLang
+        rolls out ``structure_info`` detector-by-detector).
+
+        Returns:
+            A callable ``(tool_name: str) -> StructureInfo | None``, or
+            ``None`` if this parser does not support grammar constraint.
+        """
+        return None
+
+    # -----------------------------------------------------------------
     # General text-format tool call fallback
     # -----------------------------------------------------------------
     # Models at low quantization sometimes degrade after multiple tool
