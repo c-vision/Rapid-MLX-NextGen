@@ -64,7 +64,7 @@ class _GuidedEngine:
             {"messages": messages, "json_schema": json_schema, "kwargs": kwargs}
         )
         if self._raise:
-            raise RuntimeError("simulated outlines failure")
+            raise RuntimeError("simulated guided-decode failure")
         return GenerationOutput(
             text=self._guided_text,
             new_text=self._guided_text,
@@ -382,8 +382,9 @@ def test_streaming_guided_falls_back_to_unconstrained_on_engine_failure():
     """If generate_with_schema raises, the helper must fall back to
     stream_chat so the request still returns a response.
 
-    Fallback rationale: a failure in outlines (import error at runtime,
-    grammar compilation error on a pathological schema, etc.) under
+    Fallback rationale: a failure in guided decoding (llguidance import
+    error at runtime, grammar compilation error on a pathological schema,
+    etc.) under
     ``strict=False`` (suggestion-only) should degrade to unconstrained
     generation rather than 500. Clients in suggestion-only use cases
     can validate the response themselves; defensive servers log the

@@ -779,7 +779,7 @@ def _convert_output_config(
 
     Backport of upstream vLLM PR #42396. Only ``format.type == "json_schema"``
     is supported on this surface today; downstream of this call the existing
-    chat-completions guided-decode pipeline (``api/guided.py`` + outlines)
+    chat-completions guided-decode pipeline (``api/guided.py`` + llguidance)
     runs unchanged.
 
     ``output_config.effort`` is intentionally NOT translated here — see the

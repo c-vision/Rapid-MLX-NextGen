@@ -264,7 +264,7 @@ class AnthropicOutputFormat(BaseModel):
     output to the Anthropic Messages surface via
     ``output_config.format = json_schema``. This mirrors the OpenAI
     ``response_format.json_schema`` shape so the existing guided-decode
-    pipeline (see ``api/guided.py`` + outlines) can drive constrained
+    pipeline (see ``api/guided.py`` + llguidance) can drive constrained
     JSON output on ``/v1/messages`` clients (e.g. Claude SDKs) without
     a separate code path.
 

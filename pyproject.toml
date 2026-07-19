@@ -267,9 +267,13 @@ dev = [
 vllm = [
     "vllm>=0.4.0",
 ]
-# Guided decoding with outlines for structured JSON output
+# Guided decoding with llguidance for structured JSON output.
+# llguidance drives constrained decoding via its native MLX Metal mask
+# kernel (llguidance.mlx); it interprets JSON Schema natively ($defs/$ref/
+# anyOf/enum/numeric-bounds/additionalProperties). Replaced outlines[mlxlm]
+# in 0.10 — see vllm_mlx/api/guided.py.
 guided = [
-    "outlines[mlxlm]>=1.0.0",
+    "llguidance>=1.7.6",
 ]
 # Audio dependencies for TTS/STT (mlx-audio)
 audio = [

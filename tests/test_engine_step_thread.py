@@ -400,10 +400,11 @@ class TestGuidedGenerationStepThread:
     _run_guided_generation on the mlx-step worker (the same thread that
     loaded the model), not asyncio's default executor.
 
-    outlines materializes mx.array against the model weights. mlx-lm 0.31.3+
-    tags every array with the calling thread's default stream. If guided
-    generation runs on a different thread than the model load thread, the
-    first eval crashes with "There is no Stream(gpu, N) in current thread".
+    Guided decoding materializes mx.array against the model weights (the
+    llguidance mask kernel + the mlx decode loop). mlx-lm 0.31.3+ tags every
+    array with the calling thread's default stream. If guided generation
+    runs on a different thread than the model load thread, the first eval
+    crashes with "There is no Stream(gpu, N) in current thread".
 
     The bug was silent in production because _run_guided_generation catches
     the exception and falls back to non-guided generation — guided decoding
@@ -457,7 +458,7 @@ class TestGuidedGenerationStepThread:
                 f"_run_guided_generation ran on {captured['thread']!r}, "
                 "expected mlx-step worker. asyncio.to_thread() would dispatch "
                 "to the default executor and crash with 'There is no Stream(gpu, N)' "
-                "the first time outlines materializes against the model."
+                "the first time guided decoding materializes against the model."
             )
         finally:
             executor.shutdown(wait=True)
@@ -529,7 +530,7 @@ class TestGuidedGenerationStepThread:
 
         monkeypatch.setattr(batched_mod, "HAS_GUIDED", True)
 
-        # Simulate outlines failure: _run_guided_generation returns None.
+        # Simulate guided-decode failure: _run_guided_generation returns None.
         # Use MagicMock (not a bare lambda) so the test fails loud if the
         # call site's positional/kwarg signature changes — a bare
         # ``lambda **_: None`` would silently swallow signature drift and

@@ -2617,7 +2617,7 @@ async def _create_chat_completion_impl(
                     "%s.supports_guided_generation=False). Falling back "
                     "to unconstrained decoding — schema will NOT be "
                     "enforced. Install with `pip install "
-                    "'rapid-mlx[guided]'` to enable outlines-backed "
+                    "'rapid-mlx[guided]'` to enable llguidance-backed "
                     "schema enforcement.",
                     type(engine).__name__,
                 )
@@ -2964,10 +2964,10 @@ async def _create_chat_completion_impl(
 
     # H-06: when the client asked for strict json_schema mode and we
     # routed through guided decoding, validate the buffered text
-    # against the schema. Outlines should make this unreachable; a
+    # against the schema. llguidance should make this unreachable; a
     # non-zero ``rapid_mlx_response_format_strict_violations_total``
     # rate signals that the constrained-decoding path silently
-    # degraded (e.g. ``generate_with_schema`` swallowed an outlines
+    # degraded (e.g. ``generate_with_schema`` swallowed an llguidance
     # API change and fell back to ``self.chat(...)``).
     #
     # Codex r2 BLOCKING #3: under the strict contract, returning a
@@ -4592,7 +4592,7 @@ async def stream_chat_completion_guided(
     """Stream chat completion with json_schema constrained decoding.
 
     Runs ``engine.generate_with_schema`` (which produces a single buffered
-    ``GenerationOutput`` — outlines integration has no native streaming
+    ``GenerationOutput`` — llguidance integration has no native streaming
     interface), then synthesizes an SSE stream from the buffered text.
     Pre-fix, ``stream=true`` requests with ``response_format: json_schema``
     silently bypassed ``GuidedGenerator`` because the stream branch of
@@ -4751,7 +4751,7 @@ async def stream_chat_completion_guided(
         # SSE envelope instead of letting the schema-invalid bytes
         # reach the client.
         #
-        # Outlines should make this unreachable; the violations
+        # llguidance should make this unreachable; the violations
         # counter ticks regardless so operators see both the rate
         # AND the error response. We emit a single SSE error chunk
         # carrying the canonical OpenAI envelope, then DONE — clients
@@ -4792,7 +4792,7 @@ async def stream_chat_completion_guided(
             yield f'{_sse_prefix}"content":{json.dumps(content)}{_sse_suffix}'
 
         # ``output`` is the single buffered ``GenerationOutput`` from
-        # ``engine.generate_with_schema`` (outlines integration has no
+        # ``engine.generate_with_schema`` (llguidance integration has no
         # native streaming interface — see this function's docstring).
         # Token counts are therefore read once and final; the main
         # ``stream_chat_completion`` path re-reads inside the stream

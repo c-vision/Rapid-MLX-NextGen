@@ -8,7 +8,7 @@ the ``[guided]`` extra installed (the path that previously surfaced a
 the H-06 carry / R12-4 PR body for the design rationale).
 
 The design choice (option a in the R12-4 design doc):
-    1. Run the engine UNCONSTRAINED (no outlines guidance).
+    1. Run the engine UNCONSTRAINED (no llguidance guidance).
     2. Strip any markdown / prose wrapper from the model output.
     3. Validate the parsed JSON against the supplied schema.
     4. If invalid AND repair is enabled: re-prompt the engine ONCE

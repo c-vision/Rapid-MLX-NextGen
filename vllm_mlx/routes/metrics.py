@@ -303,7 +303,7 @@ def _render_response_format_counters() -> list[str]:
             (
                 "Strict json_schema responses that failed post-decode "
                 "jsonschema.validate (H-06). Constrained decoding via "
-                "outlines should make this unreachable — any non-zero "
+                "llguidance should make this unreachable — any non-zero "
                 "rate on a guided install signals that the guided path "
                 "silently degraded. On non-guided installs this counts "
                 "the requests that ultimately surfaced 422 to the client "

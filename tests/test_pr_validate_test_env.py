@@ -124,7 +124,7 @@ def _pkg_name(dep: str) -> str:
         if sep in head:
             head = head.split(sep, 1)[0]
             break
-    # Strip extras like "outlines[mlxlm]".
+    # Strip extras like "uvicorn[standard]".
     return head.split("[", 1)[0].strip()
 
 

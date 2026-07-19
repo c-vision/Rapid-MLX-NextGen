@@ -1,9 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Guided generation for structured JSON output using outlines.
+Guided generation for structured JSON output using llguidance.
 
 This module provides constrained decoding for JSON schema enforcement,
 ensuring model outputs strictly adhere to specified schemas.
+
+Backend
+-------
+The constraint engine is `llguidance <https://github.com/guidance-ai/llguidance>`_,
+driving an ``mlx_lm`` decode loop. On every step llguidance computes a
+token bitmask for the current grammar state and its native ``llguidance.mlx``
+Metal kernel writes ``-inf`` into the logits of every disallowed token
+before sampling. This replaces the former ``outlines``-backed path; the
+public surface (``GuidedGenerator``, ``generate_with_schema``,
+``is_guided_available``, ``json_schema_to_pydantic``) is unchanged.
+
+Two constraint modes are supported, matching the two the OpenAI
+``response_format`` route exposes today:
+
+* ``generate_json``        — a full JSON Schema (``$defs``/``$ref``/
+  ``anyOf``/``enum``/numeric bounds/``additionalProperties:false``/nested
+  objects all interpreted natively by llguidance).
+* ``generate_json_object`` — any syntactically valid JSON *object* (the
+  ``response_format={"type":"json_object"}`` mode).
 """
 
 import logging
@@ -21,26 +40,88 @@ from .. import _mlx_compat as _mlx_compat
 
 _mlx_compat.install()
 
-# Check for outlines availability
+# Check for llguidance availability. We need three surfaces:
+#   * ``llguidance``            — grammar factories (grammar_from_json_schema)
+#   * ``llguidance.hf``         — build an LLTokenizer from a HF fast tokenizer
+#   * ``llguidance.mlx``        — LLMatcher + the native Metal mask kernel
+# and ``mlx_lm`` / ``mlx.core`` for the decode loop. Any of these missing
+# means guided generation is not installed; degrade gracefully.
 try:
-    import mlx_lm
-    import outlines
+    import llguidance as _llguidance
+    import llguidance.hf as _llguidance_hf
+    import mlx.core as mx
+    import mlx_lm  # noqa: F401  (imported for availability probe / shim trigger)
+    from llguidance.mlx import (
+        LLMatcher,
+        allocate_token_bitmask,
+        apply_token_bitmask,
+        fill_next_token_bitmask,
+    )
 
-    HAS_OUTLINES = True
-except ImportError:
-    HAS_OUTLINES = False
-    outlines = None
+    HAS_LLGUIDANCE = True
+except ImportError as _guided_import_error:
+    # Log WHICH component failed before degrading. A bare, silent
+    # ``HAS_LLGUIDANCE = False`` makes a broken / version-incompatible
+    # llguidance install indistinguishable from an intentionally-absent
+    # ``[guided]`` extra — the operator sees "guided unavailable" either
+    # way. Surfacing the exception detail (e.g. a moved symbol in
+    # ``llguidance.mlx`` after a minor bump) turns an opaque no-op into a
+    # diagnosable one. Degrade behavior is unchanged: guided generation is
+    # still disabled.
+    logger.warning(
+        "Guided generation disabled: could not import the llguidance "
+        "stack (%s: %s). Install the extra with `pip install "
+        "'rapid-mlx[guided]'`; if it is installed, this indicates a "
+        "broken or version-incompatible llguidance/mlx install.",
+        type(_guided_import_error).__name__,
+        _guided_import_error,
+    )
+    HAS_LLGUIDANCE = False
+    mx = None
     mlx_lm = None
+    _llguidance = None
+    _llguidance_hf = None
+    LLMatcher = None
+    allocate_token_bitmask = None
+    apply_token_bitmask = None
+    fill_next_token_bitmask = None
+
+
+# Prompt chunk size for the constrained-decode prefill. Matches
+# ``mlx_lm.generate.generate_step``'s ``prefill_step_size`` default (2048)
+# so guided decode shares the same peak-memory behavior as the standard
+# mlx-lm decode path: the prompt is fed to the model in ≤ this-many-token
+# chunks (with the KV cache eval'd + ``mx.clear_cache()`` between chunks)
+# instead of one sequence-wide forward pass that OOMs on long contexts.
+_PREFILL_STEP_SIZE = 2048
 
 
 def is_guided_available() -> bool:
-    """Check if guided generation with outlines is available."""
-    return HAS_OUTLINES
+    """Check if guided generation with llguidance is available."""
+    return HAS_LLGUIDANCE
+
+
+# A permissive grammar for the ``json_object`` mode: any single, complete
+# JSON *object* (``{...}``). We express it as a one-line JSON Schema of
+# ``{"type": "object"}`` and let llguidance compile it — this admits
+# arbitrary keys/values (nested objects, arrays, numbers, strings, etc.)
+# exactly like OpenAI's ``response_format={"type":"json_object"}`` while
+# still guaranteeing the top-level value is an object. This replaces the
+# previous outlines regex ``\{[^{}]*\}`` which (a) was silently degraded
+# to unconstrained on outlines 1.3.x (BUG-1) and (b) could not represent
+# nested objects even when it did run.
+_JSON_OBJECT_SCHEMA = '{"type": "object"}'
 
 
 def json_schema_to_pydantic(schema: dict[str, Any]) -> type | None:
     """
     Convert a JSON schema to a Pydantic model dynamically.
+
+    Kept as a public backward-compat surface. It is NOT used on the
+    guided-generation hot path — llguidance interprets the raw JSON
+    schema natively, so routing the constraint through this shallow
+    converter would silently drop ``$defs``/``$ref``/``anyOf``/``enum``/
+    numeric-bounds and re-introduce the waybarrios#546-class bug.
 
     Args:
         schema: JSON schema dict
@@ -112,10 +193,18 @@ def json_schema_to_pydantic(schema: dict[str, Any]) -> type | None:
 
 class GuidedGenerator:
     """
-    Guided generation using outlines for constrained JSON decoding.
+    Guided generation using llguidance for constrained JSON decoding.
 
     This class wraps an MLX model to provide structured output generation
-    that guarantees valid JSON matching a specified schema.
+    that guarantees valid JSON matching a specified schema (or, in
+    ``json_object`` mode, any valid JSON object).
+
+    The llguidance ``LLTokenizer`` is built lazily on first use and cached
+    on the instance — it is derived from the INNER transformers fast/Rust
+    tokenizer (``tokenizer._tokenizer``), not the ``mlx_lm``
+    ``TokenizerWrapper``. If the model ships without a fast tokenizer,
+    tokenizer construction fails gracefully (logged, returns ``None`` from
+    generation) rather than crashing.
     """
 
     def __init__(self, model, tokenizer):
@@ -124,23 +213,248 @@ class GuidedGenerator:
 
         Args:
             model: MLX model instance
-            tokenizer: Tokenizer instance
+            tokenizer: Tokenizer instance (mlx_lm ``TokenizerWrapper``)
         """
-        if not HAS_OUTLINES:
+        if not HAS_LLGUIDANCE:
             raise ImportError(
-                "outlines is required for guided generation. "
+                "llguidance is required for guided generation. "
                 "Install with: pip install 'rapid-mlx[guided]'"
             )
 
         self._model = model
         self._tokenizer = tokenizer
-        self._outlines_model = None
+        # Lazily-built llguidance tokenizer. ``False`` is the
+        # "not-yet-attempted" sentinel; ``None`` means "attempted and
+        # unavailable" (so we don't rebuild on every call); a real
+        # ``LLTokenizer`` otherwise.
+        self._lltokenizer: Any = False
 
-    def _get_outlines_model(self):
-        """Get or create the outlines model wrapper."""
-        if self._outlines_model is None:
-            self._outlines_model = outlines.from_mlxlm(self._model, self._tokenizer)
-        return self._outlines_model
+    def _get_lltokenizer(self):
+        """Get or build the llguidance ``LLTokenizer``.
+
+        llguidance needs the underlying *fast* (Rust-backed) transformers
+        tokenizer, exposed by ``mlx_lm``'s ``TokenizerWrapper`` as
+        ``._tokenizer``. Models loaded with a slow (pure-Python)
+        tokenizer do not have that attribute in a usable form; in that
+        case we log once and return ``None`` so the caller can degrade to
+        unconstrained generation instead of raising.
+
+        Returns:
+            An ``LLTokenizer`` instance, or ``None`` if one cannot be
+            built for this model.
+        """
+        # Cached (either a real tokenizer or the ``None`` "unavailable"
+        # sentinel after a prior failed attempt).
+        if self._lltokenizer is not False:
+            return self._lltokenizer
+
+        hf_tok = getattr(self._tokenizer, "_tokenizer", None)
+        if hf_tok is None:
+            logger.warning(
+                "Guided generation unavailable: the model's tokenizer has "
+                "no underlying fast (Rust) tokenizer (`._tokenizer`), which "
+                "llguidance requires. Falling back to unconstrained "
+                "generation."
+            )
+            self._lltokenizer = None
+            return None
+
+        # A fast tokenizer is required for `llguidance.hf.from_tokenizer`;
+        # a slow tokenizer lacks `is_fast`/the Rust internals it reads.
+        if getattr(hf_tok, "is_fast", True) is False:
+            logger.warning(
+                "Guided generation unavailable: the model's tokenizer is a "
+                "slow (non-fast) tokenizer, which llguidance cannot consume. "
+                "Falling back to unconstrained generation."
+            )
+            self._lltokenizer = None
+            return None
+
+        try:
+            self._lltokenizer = _llguidance_hf.from_tokenizer(hf_tok)
+        except Exception:
+            logger.exception(
+                "Guided generation unavailable: failed to build an "
+                "llguidance LLTokenizer from the model's fast tokenizer. "
+                "Falling back to unconstrained generation."
+            )
+            self._lltokenizer = None
+            return None
+
+        return self._lltokenizer
+
+    def _decode_constrained(
+        self,
+        grammar: str,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+    ) -> str | None:
+        """Run an ``mlx_lm`` decode loop constrained by an llguidance grammar.
+
+        Incremental generation MIRRORS ``mlx_lm``'s supported decode path
+        (``mlx_lm.generate.generate_step``): a per-request KV cache built
+        with ``mlx_lm.models.cache.make_prompt_cache(model)`` is threaded
+        through *every* model call via the ``cache=`` kwarg. The prompt is
+        prefilled WITH the cache, and each subsequent step feeds only the
+        single new token — the cache carries the prompt + all prior tokens
+        forward, so the model keeps full context instead of seeing one bare
+        token in isolation. This matches how rapid-mlx's own engine threads
+        the cache (e.g. ``mllm_batch_generator`` / ``engine/batched``):
+        ``make_prompt_cache(model)`` then ``model(ids, cache=cache)``.
+
+        Prefill is CHUNKED, not single-call. Feeding the whole prompt in one
+        ``model(prompt[None], cache=cache)`` forward pass materializes
+        sequence-wide activations and OOMs on long production prompts (e.g.
+        structured extraction over a long document). We therefore port the
+        exact chunking loop from ``mlx_lm.generate.generate_step`` (mlx-lm
+        0.31.3, ``generate.py`` lines 424-453): process the prompt in
+        ``_PREFILL_STEP_SIZE`` (2048, mlx-lm's default) token chunks,
+        ``mx.eval`` the cache state and ``mx.clear_cache()`` between chunks
+        to bound peak memory, and leave the trailing (< step size) remainder
+        to produce the first constrained sample's last-token logits.
+
+        Threading note: guided generation runs on the model-owning executor
+        thread and the mask kernel shares that thread's default stream, so
+        we do NOT introduce ``mx.new_stream``. The cache is per-call local
+        state — no cross-thread sharing.
+
+        On every step:
+          1. ``fill_next_token_bitmask`` computes the allow-mask for the
+             matcher's current state.
+          2. Logits are sliced to ``lltok.vocab_size`` (the model's logit
+             width can exceed the tokenizer vocab — the padding tail is
+             never a real token) and the native ``apply_token_bitmask``
+             Metal kernel writes ``-inf`` into disallowed positions.
+          3. The next token is chosen (greedy at ``temperature<=0``, else
+             temperature sampling) and fed back into the matcher.
+          4. The model is advanced by that one token, appending its KV into
+             the same cache.
+
+        Returns the decoded text ONLY when the grammar reached an accepting
+        (fully-satisfied) state; ``None`` otherwise — i.e. if the grammar
+        failed to compile, the tokenizer was unavailable, generation was
+        truncated by ``max_tokens`` mid-object, or a token was rejected
+        mid-parse. An incomplete result is never returned to the caller,
+        which treats ``None`` as guided-unavailable (strict-mode 422).
+        """
+        from mlx_lm.models.cache import make_prompt_cache
+
+        lltok = self._get_lltokenizer()
+        if lltok is None:
+            return None
+
+        model = self._model
+        tokenizer = self._tokenizer
+
+        # llguidance NEVER raises on grammar errors — it stores them on the
+        # matcher. Construct, then check ``get_error()`` explicitly.
+        matcher = LLMatcher(lltok, grammar)
+        err = matcher.get_error()
+        if err:
+            logger.error("llguidance grammar/compile error: %s", err)
+            return None
+
+        vocab = lltok.vocab_size
+        bitmask = allocate_token_bitmask(1, vocab)
+
+        prompt_ids = tokenizer.encode(prompt)
+
+        # Empty-prompt guard. When ``encode`` yields ``[]`` (e.g. an empty
+        # prompt string), indexing the last-token logits ``[:, -1, :]`` off a
+        # zero-length sequence axis raises, and guided generation silently
+        # returned None. Seed with the tokenizer's BOS id if it defines one
+        # (matches how a real prompt would begin) so a legitimately-empty
+        # prompt still produces valid constrained output. If there is no BOS,
+        # there is nothing to prefill and no last-token logits to sample from,
+        # so degrade to guided-unavailable (None) rather than indexing an
+        # empty axis.
+        if not prompt_ids:
+            bos_id = getattr(tokenizer, "bos_token_id", None)
+            if bos_id is None:
+                logger.warning(
+                    "Guided generation: empty prompt with no tokenizer BOS "
+                    "token id — nothing to prefill. Returning None."
+                )
+                return None
+            prompt_ids = [int(bos_id)]
+
+        # Per-request KV cache (mirrors mlx_lm.generate.generate_step).
+        cache = make_prompt_cache(model)
+
+        # ---- Chunked prefill (ported from mlx_lm.generate.generate_step,
+        #      mlx-lm 0.31.3 generate.py:424-453). Feeding the whole prompt in
+        #      one forward pass materializes sequence-wide activations and OOMs
+        #      on long contexts. Instead process the prompt in
+        #      ``_PREFILL_STEP_SIZE`` chunks, eval'ing the cache state and
+        #      clearing the MLX buffer cache between chunks to bound peak
+        #      memory. mlx-lm's loop condition ``while remaining > 1`` always
+        #      leaves ≥ 1 trailing token; that trailing (< step size) remainder
+        #      is fed last and its last-token logits seed the first constrained
+        #      sample. The KV cache carries the whole prompt forward, so every
+        #      generated token still sees full context.
+        y = mx.array(prompt_ids)
+        while y.size > _PREFILL_STEP_SIZE:
+            model(y[:_PREFILL_STEP_SIZE][None], cache=cache)
+            mx.eval([c.state for c in cache])
+            y = y[_PREFILL_STEP_SIZE:]
+            mx.clear_cache()
+
+        # Trailing remainder (1 .. _PREFILL_STEP_SIZE tokens): this final
+        # forward pass yields the last-token logits for the first sample.
+        logits = model(y[None], cache=cache)[:, -1, :]
+
+        generated: list[int] = []
+        for _ in range(max_tokens):
+            if matcher.is_stopped():
+                break
+
+            # 1. allow-mask for the current matcher state.
+            fill_next_token_bitmask(matcher, bitmask, 0)
+
+            # 2. slice logits to the tokenizer vocab width, then apply the
+            #    mask via the native Metal kernel (disallowed -> -inf).
+            model_vocab = logits.shape[1]
+            cur_logits = logits[:, :vocab] if model_vocab > vocab else logits
+            masked = apply_token_bitmask(cur_logits, bitmask)
+
+            # 3. pick a token.
+            if temperature and temperature > 0:
+                tok = int(mx.random.categorical(masked / temperature, axis=1).item())
+            else:
+                tok = int(mx.argmax(masked, axis=1).item())
+
+            # 4. feed back into the matcher. Because we masked, this should
+            #    always be accepted; if not, abort — the result is now an
+            #    incomplete parse and MUST NOT be returned as if valid.
+            ok = matcher.consume_token(tok)
+            if not ok or matcher.is_error():
+                e = matcher.get_error()
+                if e:
+                    logger.error("llguidance rejected token %d: %s", tok, e)
+                return None
+
+            generated.append(tok)
+
+            # 5. Only advance the model if another constrained step will
+            #    actually run. Checking termination BEFORE the next forward
+            #    pass avoids a wasted model call (and needless cache mutation)
+            #    when this token already stopped the matcher or we have hit
+            #    ``max_tokens`` — the prior code always advanced, one step
+            #    past the last token it could ever use.
+            if matcher.is_stopped() or len(generated) >= max_tokens:
+                break
+            logits = model(mx.array([tok])[None], cache=cache)[:, -1, :]
+
+        # Only return output the grammar actually completed. ``is_accepting``
+        # is True iff the matcher is in a state where the grammar is fully
+        # satisfied and could terminate here. If we fell out of the loop on
+        # ``max_tokens`` with an unclosed object, the parse is incomplete —
+        # return None so the caller degrades to guided-unavailable / 422
+        # rather than leaking a truncated JSON fragment.
+        if not generated or not matcher.is_accepting():
+            return None
+        return tokenizer.decode(generated)
 
     def generate_json(
         self,
@@ -151,71 +465,48 @@ class GuidedGenerator:
     ) -> str | None:
         """Generate JSON output constrained to a schema.
 
-        Hands the raw schema dict to outlines via
-        ``outlines.types.dsl.JsonSchema``, which natively understands
+        The raw schema dict is compiled by llguidance via
+        ``LLMatcher.grammar_from_json_schema``, which natively understands
         ``$defs``, ``$ref``, ``anyOf``, ``enum``, numeric bounds,
-        ``additionalProperties: false``, and nested objects. The
-        previous code path passed the schema through
-        ``json_schema_to_pydantic`` first — that converter silently
-        dropped every one of those constructs, so outlines was given a
-        Pydantic model that was a strict superset of the user's schema.
-        On a real-world schema with ``$defs`` + ``$ref`` (waybarrios#546
-        repro), this surfaced as outlines streaming a valid JSON array
-        when the schema required an object. Pass the dict through and
-        let outlines own schema interpretation.
+        ``additionalProperties: false``, and nested objects. We compile
+        with ``overrides={"whitespace_flexible": True}`` (llguidance's
+        default) so structural whitespace is OPTIONAL, not forbidden.
 
-        (We import the ``JsonSchema`` class directly rather than going
-        through the top-level ``outlines.json_schema`` factory; see the
-        in-function comment for why.)
+        Whitespace flexibility is a correctness requirement, not cosmetic.
+        With ``whitespace_flexible: False`` the grammar forbids the space
+        after ``:`` / ``,`` — but a chat-tuned model's natural top token
+        after ``"answer":`` is the SPACE-prefixed string opener (`` "``).
+        Masking that token forces greedy decoding onto the next-best
+        allowed token, which on real models derails an UNBOUNDED string
+        field into fluent-but-wrong content (observed: ``"answer"`` became a
+        fabricated URL instead of ``"Paris"``). Permitting the space keeps
+        the model on its true distribution, so the answer stays coherent.
+        Downstream validation is whitespace-agnostic (it ``json.loads`` then
+        ``jsonschema.validate``), and the route re-serialises via
+        ``json.dumps``, so the extra structural whitespace never reaches the
+        client — the parsed object is identical.
+
+        We deliberately do NOT route the schema through
+        ``json_schema_to_pydantic`` first — that shallow converter silently
+        drops every one of those constructs, which on a real-world schema
+        with ``$defs`` + ``$ref`` (waybarrios#546 repro) surfaced as a
+        valid JSON *array* where the schema required an object. The dict is
+        handed to llguidance directly.
         """
         try:
-            outlines_model = self._get_outlines_model()
+            import json as _json
 
-            # Use the ``JsonSchema`` class from ``outlines.types.dsl``
-            # directly rather than the top-level ``outlines.json_schema``
-            # factory. The factory is a convenience export — it landed
-            # mid-way through the 1.x line and is absent on the floor of
-            # our declared ``outlines>=1.0.0`` dependency range, where
-            # this attribute lookup raises ``AttributeError`` (codex R5
-            # P1: that exception silently bubbles to the catch below,
-            # returns None, and ``generate_with_schema`` falls back to
-            # *unconstrained* generation for every json_schema request
-            # while the chat route logs "Using guided generation"). The
-            # underlying ``JsonSchema`` class has been stable since the
-            # feature first shipped, so importing it directly avoids
-            # the surface-version dependency.
-            #
-            # Import failures are surfaced loudly (WARNING-level
-            # logger.exception with full traceback) before returning
-            # ``None`` so operators can detect that guided generation
-            # was silently disabled — DeepSeek R2 found that the prior
-            # bare ``logger.error`` swallowed the traceback for the new
-            # ``outlines.types.dsl`` import path, which on an older
-            # outlines without that submodule would otherwise look
-            # indistinguishable from a runtime generation failure.
-            from outlines.types.dsl import JsonSchema
-
-            schema_constraint = JsonSchema(json_schema)
-            result = outlines_model(
-                prompt,
-                output_type=schema_constraint,
+            schema_str = _json.dumps(json_schema)
+            grammar = LLMatcher.grammar_from_json_schema(
+                schema_str,
+                overrides={"whitespace_flexible": True},
+            )
+            return self._decode_constrained(
+                grammar=grammar,
+                prompt=prompt,
                 max_tokens=max_tokens,
+                temperature=temperature,
             )
-            return result
-
-        except ImportError:
-            # Specifically distinguish "outlines installed but
-            # ``outlines.types.dsl`` missing/renamed" from a generic
-            # runtime failure — this is the failure mode the comment
-            # block above warns about. ``logger.exception`` includes
-            # the full traceback so the operator sees the import path
-            # that broke, not just a flat string.
-            logger.exception(
-                "Guided generation unavailable: import of outlines "
-                "constraint API failed. Falling back to unconstrained "
-                "generation."
-            )
-            return None
         except Exception:
             logger.exception("Guided generation failed")
             return None
@@ -229,6 +520,14 @@ class GuidedGenerator:
         """
         Generate any valid JSON object.
 
+        Constrains decoding to a generic ``{"type": "object"}`` JSON Schema
+        via llguidance — the ``response_format={"type":"json_object"}``
+        mode. This is a real constraint (BUG-1 fix): the previous outlines
+        path used ``generate.regex(...)`` which was removed in outlines
+        1.3.x, so ``generate_json_object`` silently degraded to
+        unconstrained output. It now guarantees the top-level value is a
+        complete JSON object with arbitrary (nested) contents.
+
         Args:
             prompt: Input prompt
             max_tokens: Maximum tokens to generate
@@ -238,19 +537,21 @@ class GuidedGenerator:
             JSON string, or None on failure
         """
         try:
-            from outlines import generate
-
-            outlines_model = self._get_outlines_model()
-
-            # Use regex to constrain to valid JSON
-            json_regex = r"\{[^{}]*\}"
-            generator = generate.regex(outlines_model, json_regex)
-            result = generator(prompt, max_tokens=max_tokens)
-
-            return result
-
-        except Exception as e:
-            logger.error(f"JSON object generation failed: {e}")
+            # ``whitespace_flexible: True`` (default) — see ``generate_json``
+            # for why forbidding structural whitespace derails greedy
+            # decoding on real models into fluent-but-wrong content.
+            grammar = LLMatcher.grammar_from_json_schema(
+                _JSON_OBJECT_SCHEMA,
+                overrides={"whitespace_flexible": True},
+            )
+            return self._decode_constrained(
+                grammar=grammar,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except Exception:
+            logger.exception("JSON object generation failed")
             return None
 
 
@@ -276,7 +577,7 @@ def generate_with_schema(
     Returns:
         JSON string or None if guided generation unavailable/failed
     """
-    if not HAS_OUTLINES:
+    if not HAS_LLGUIDANCE:
         return None
 
     try:

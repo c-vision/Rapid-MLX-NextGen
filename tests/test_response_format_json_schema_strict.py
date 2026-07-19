@@ -9,7 +9,7 @@ Pins the systemic fix for v0.8 H-06:
   OpenAI SDK structured-output helper) silently received schema
   violations.
 
-* Post-fix, ``strict=true`` activates outlines-backed constrained
+* Post-fix, ``strict=true`` activates llguidance-backed constrained
   decoding via ``engine.generate_with_schema`` (the same path
   ``stream=true`` already used for ``json_schema`` requests). When the
   ``[guided]`` extra is missing, the route 400s with a canonical OpenAI-
@@ -20,7 +20,7 @@ Pins the systemic fix for v0.8 H-06:
   ``/metrics``: ``rapid_mlx_response_format_strict_total`` for every
   admitted strict request, and ``rapid_mlx_response_format_strict_violations_total``
   for any post-decode ``jsonschema.validate`` rejection (smoke alarm —
-  outlines should make this unreachable).
+  llguidance should make this unreachable).
 
 The contract surfaces:
 
@@ -291,7 +291,7 @@ def _payload(*, strict: bool, stream: bool = False) -> dict:
 
 
 def test_strict_true_guided_available_non_streaming_routes_to_constrained():
-    """Non-stream strict=true + outlines available → guided path used."""
+    """Non-stream strict=true + llguidance available → guided path used."""
     engine = _Engine(supports_guided=True, guided_text=_VALID_PAYLOAD)
     client = _make_client(engine)
 
@@ -299,13 +299,13 @@ def test_strict_true_guided_available_non_streaming_routes_to_constrained():
     assert resp.status_code == 200, resp.text
 
     # The guided path must have been hit; the unconstrained chat path
-    # must not be the primary dispatch when outlines is available.
+    # must not be the primary dispatch when llguidance is available.
     assert len(engine.guided_calls) == 1, (
         f"expected 1 guided call, got {len(engine.guided_calls)} "
         f"(chat_calls={len(engine.chat_calls)})"
     )
-    # The schema passed to outlines must be the raw user schema —
-    # un-wrapped from ``response_format`` so outlines can interpret
+    # The schema passed to llguidance must be the raw user schema —
+    # un-wrapped from ``response_format`` so llguidance can interpret
     # ``$defs``/``$ref``/``additionalProperties:false`` natively (PR #419).
     assert engine.guided_calls[0]["json_schema"] == _VALID_SCHEMA
 
@@ -317,7 +317,7 @@ def test_strict_true_guided_available_non_streaming_routes_to_constrained():
 
 
 def test_strict_true_guided_available_streaming_routes_to_constrained():
-    """Stream strict=true + outlines available → guided streaming path."""
+    """Stream strict=true + llguidance available → guided streaming path."""
     engine = _Engine(supports_guided=True, guided_text=_VALID_PAYLOAD)
     client = _make_client(engine)
 
@@ -338,7 +338,7 @@ def test_strict_true_guided_available_streaming_routes_to_constrained():
 )
 def test_strict_true_responses_validate_for_10_distinct_valid_payloads(valid_payload):
     """10-prompt sweep: every response the route admits MUST validate
-    against the schema when outlines is in play.
+    against the schema when llguidance is in play.
 
     This is the contract-level pin: H-06 fix means even when the model
     would normally drift, the guided path produces output that
@@ -366,7 +366,7 @@ def test_strict_true_responses_validate_for_10_distinct_valid_payloads(valid_pay
 def test_strict_true_guided_unavailable_returns_422_on_violation_non_streaming():
     """R12-4 — pre-R12-4 ``[guided]`` missing returned 400
     ``guided_extra_required`` and broke pydantic-ai. Post-R12-4 the
-    request runs UNCONSTRAINED via ``engine.chat`` (no outlines),
+    request runs UNCONSTRAINED via ``engine.chat`` (no llguidance),
     the route then validates the output against the schema and
     surfaces 422 with a structured ``json_schema_violation``
     envelope when validation fails after one repair retry.
@@ -1434,7 +1434,7 @@ def test_strict_true_streaming_buffer_cap_counts_bytes_not_chars(monkeypatch):
 
 
 def test_strict_false_guided_unavailable_falls_through_to_prompt_injection():
-    """``strict=false`` without outlines must NOT 400.
+    """``strict=false`` without llguidance must NOT 400.
 
     The existing prompt-injection contract is suggestion-only; clients
     that send ``strict=false`` are opting INTO that contract. Only
@@ -1453,7 +1453,7 @@ def test_strict_false_guided_unavailable_falls_through_to_prompt_injection():
 
 
 def test_strict_false_guided_available_routes_to_guided():
-    """``strict=false`` + outlines available preserves the existing
+    """``strict=false`` + llguidance available preserves the existing
     guided-routing behavior — the route opportunistically constrains
     whenever it can, regardless of the strict flag. Only the 400 gate
     is gated on ``strict=true``."""
@@ -1534,33 +1534,33 @@ def test_post_decode_schema_violation_returns_502():
 
 
 # ---------------------------------------------------------------------------
-# Faked-absent outlines (monkeypatch the import) — 400 envelope on missing extra
+# Faked-absent llguidance (monkeypatch the import) — 400 envelope on missing extra
 # ---------------------------------------------------------------------------
 
 
-def test_strict_true_with_outlines_module_faked_absent(monkeypatch):
-    """R12-4 — when ``guided.HAS_OUTLINES`` is False the production
+def test_strict_true_with_llguidance_module_faked_absent(monkeypatch):
+    """R12-4 — when ``guided.HAS_LLGUIDANCE`` is False the production
     ``BatchedEngine.supports_guided_generation`` property composes
     to False. Post-R12-4, that no longer triggers a 400 — it
     triggers the post-generate validation + repair retry path.
     Pin the composition contract here so refactors that decouple
-    HAS_OUTLINES → guided-availability are caught."""
+    HAS_LLGUIDANCE → guided-availability are caught."""
     # The pre-monkeypatch assertion below requires the ``[guided]``
-    # extra (``outlines``) to be installed; skip cleanly in no-extras
+    # extra (``llguidance``) to be installed; skip cleanly in no-extras
     # environments rather than failing on the setup pre-condition.
-    pytest.importorskip("outlines")
+    pytest.importorskip("llguidance")
 
     from vllm_mlx.api import guided as guided_mod
 
     # Before the monkeypatch, the guided extra IS installed.
     assert guided_mod.is_guided_available() is True
 
-    monkeypatch.setattr(guided_mod, "HAS_OUTLINES", False)
+    monkeypatch.setattr(guided_mod, "HAS_LLGUIDANCE", False)
 
     # After the monkeypatch, the helper composes to False.
     assert guided_mod.is_guided_available() is False
     # An engine honestly reporting ``supports_guided_generation=False``
-    # (the production shape on a HAS_OUTLINES=False install) now
+    # (the production shape on a HAS_LLGUIDANCE=False install) now
     # runs the unconstrained chat path and validates; with a valid
     # output the request returns 200.
     engine = _Engine(supports_guided=False, chat_text=_VALID_PAYLOAD)
@@ -1802,7 +1802,7 @@ def test_responses_strict_true_guided_failure_returns_502(_rate_limiter_state):
 
     class _BrokenEngine(_Engine):
         async def generate_with_schema(self, *, messages, json_schema, **kwargs):
-            raise RuntimeError("simulated outlines failure")
+            raise RuntimeError("simulated llguidance failure")
 
     engine = _BrokenEngine(supports_guided=True)
     client = _make_responses_client(engine, _rate_limiter_state)
@@ -2320,7 +2320,7 @@ def test_check_schema_validity_uses_declared_draft_via_schema_key():
 
 def test_strict_true_streaming_guided_raises_emits_error_sse_no_fallback():
     """Codex r6 BLOCKING: when the strict streaming path's
-    ``generate_with_schema`` raises (outlines API change, grammar
+    ``generate_with_schema`` raises (llguidance API change, grammar
     compilation failure, runtime error in the executor task), the
     helper PREVIOUSLY fell back to ``stream_chat_completion`` —
     silently emitting unconstrained SSE chunks under a contract
@@ -2329,7 +2329,7 @@ def test_strict_true_streaming_guided_raises_emits_error_sse_no_fallback():
     """
     engine = _Engine(
         supports_guided=True,
-        guided_raises=RuntimeError("outlines grammar compile failed"),
+        guided_raises=RuntimeError("llguidance grammar compile failed"),
     )
     client = _make_client(engine)
     resp = client.post("/v1/chat/completions", json=_payload(strict=True, stream=True))
@@ -2361,7 +2361,7 @@ def test_strict_true_non_streaming_guided_raises_returns_502_no_fallback():
     fallback validates; it isn't a contract guarantee."""
     engine = _Engine(
         supports_guided=True,
-        guided_raises=RuntimeError("outlines grammar compile failed"),
+        guided_raises=RuntimeError("llguidance grammar compile failed"),
     )
     client = _make_client(engine)
     resp = client.post("/v1/chat/completions", json=_payload(strict=True))
@@ -2383,11 +2383,11 @@ def test_strict_false_streaming_guided_raises_still_falls_back():
     """Suggestion-only ``strict=false`` MUST keep the legacy
     fallback semantics — the H-06 fix only changes behavior under
     the strict contract. A strict=false caller asking for a JSON
-    schema gets best-effort: outlines tries, and if it fails the
+    schema gets best-effort: llguidance tries, and if it fails the
     unconstrained streaming path takes over."""
     engine = _Engine(
         supports_guided=True,
-        guided_raises=RuntimeError("outlines grammar compile failed"),
+        guided_raises=RuntimeError("llguidance grammar compile failed"),
     )
     client = _make_client(engine)
     resp = client.post("/v1/chat/completions", json=_payload(strict=False, stream=True))
@@ -2425,7 +2425,7 @@ class _SyncFailureEngine(_Engine):
     SYNCHRONOUSLY at call time, not at coroutine-await time.
 
     Production code path: ``engine.generate_with_schema(...)`` is
-    called inside a ``try`` block; if outlines import is broken or
+    called inside a ``try`` block; if llguidance import is broken or
     the engine does sync grammar setup that errors out, the call
     raises BEFORE returning a coroutine. The route's tight try
     around the call must catch this and surface it as a 502
@@ -2459,7 +2459,7 @@ class _SyncFailureEngine(_Engine):
         self.guided_calls.append(
             {"messages": messages, "json_schema": json_schema, "kwargs": kwargs}
         )
-        raise RuntimeError("simulated outlines grammar compile failure at setup time")
+        raise RuntimeError("simulated llguidance grammar compile failure at setup time")
 
 
 def test_strict_true_responses_sync_setup_failure_returns_502(_rate_limiter_state):

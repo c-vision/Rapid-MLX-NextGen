@@ -371,7 +371,7 @@ def test_11():
     a complex schema round-trip to wrong-shape JSON (a JSON array where
     the schema requires an object). The unit tests in test_guided.py
     pin the wiring; this end-to-end check runs against the live server
-    so any future regression in the actual outlines integration also
+    so any future regression in the actual llguidance integration also
     trips the doctor harness.
     """
     print("=" * 60)

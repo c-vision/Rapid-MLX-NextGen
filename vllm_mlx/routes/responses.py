@@ -849,7 +849,7 @@ async def _non_stream(
     timeout = cfg.default_timeout
 
     # H-06: when the request asks for strict json_schema, route
-    # through ``engine.generate_with_schema`` for outlines-backed
+    # through ``engine.generate_with_schema`` for llguidance-backed
     # constrained decoding. The route gate above already 400'd if
     # guided was unavailable, so reaching here under strict means
     # ``supports_guided_generation`` was True. Under strict we DO
@@ -879,7 +879,7 @@ async def _non_stream(
     # ``try`` (the one starting at ``try: _guided_coro = ...``
     # below). Sync setup errors from
     # ``engine.generate_with_schema(...)`` — AttributeError,
-    # NotImplementedError, outlines-import errors, kwargs
+    # NotImplementedError, llguidance-import errors, kwargs
     # collisions if the sanitization at line ~450 ever regressed —
     # materialize synchronously and the tight try catches them.
     # ``_wait_with_disconnect`` then handles the actual await
@@ -953,7 +953,7 @@ async def _non_stream(
             # unconstrained path — timeout/disconnect surface as
             # the route's standard 408/499/503 envelopes (handled
             # by the outer try/except). Any guided-specific
-            # runtime failure (outlines grammar error during
+            # runtime failure (llguidance grammar error during
             # await, etc.) is translated to 502 below by checking
             # the exception class explicitly so cancellation /
             # timeout aren't misclassified.

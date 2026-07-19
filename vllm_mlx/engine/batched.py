@@ -2773,7 +2773,7 @@ class BatchedEngine(BaseEngine):
         raise EngineNotReadyError("cannot import cache: inner engine is not loaded")
 
     # ------------------------------------------------------------------
-    # Guided generation (JSON schema constrained decoding via outlines)
+    # Guided generation (JSON schema constrained decoding via llguidance)
     # ------------------------------------------------------------------
 
     @property
@@ -2793,14 +2793,14 @@ class BatchedEngine(BaseEngine):
     ) -> GenerationOutput:
         """Generate JSON output constrained to a schema using guided decoding.
 
-        Uses outlines for constrained generation to guarantee the output is
+        Uses llguidance for constrained generation to guarantee the output is
         valid JSON matching the specified schema.  Runs synchronously in a
         thread pool to avoid blocking the event loop.
 
         Args:
             raise_on_failure: When True, raise ``RuntimeError`` instead of
                 silently falling back to unconstrained ``self.chat(...)`` if
-                ``_run_guided_generation`` returns ``None`` (outlines
+                ``_run_guided_generation`` returns ``None`` (llguidance
                 import/grammar failure caught upstream). The non-streaming
                 route leaves this False — a buffered unconstrained reply
                 is acceptable degradation. The streaming route passes
@@ -2856,7 +2856,7 @@ class BatchedEngine(BaseEngine):
         # on its weights must come from that same thread — see the third-leg
         # fix in PR #182. asyncio.to_thread() would dispatch to the default
         # executor and crash with "There is no Stream(gpu, N) in current
-        # thread" the first time outlines materializes anything against the
+        # thread" the first time llguidance materializes anything against the
         # model. Silent in production because _run_guided_generation catches
         # the exception and falls back to non-guided generation, so guided
         # decoding has been quietly broken since #174.
@@ -2897,7 +2897,7 @@ class BatchedEngine(BaseEngine):
             if raise_on_failure:
                 raise RuntimeError(
                     "Guided generation produced no result "
-                    "(outlines import/grammar failure — see prior log)"
+                    "(llguidance import/grammar failure — see prior log)"
                 )
             logger.warning(
                 "Guided generation failed, falling back to regular generation"
@@ -2968,7 +2968,7 @@ class BatchedEngine(BaseEngine):
         ``_model_load_executor`` unset, so ``generate_with_schema`` will
         fall back to ``asyncio.to_thread`` and hit
         ``RuntimeError: There is no Stream(gpu, N) in current thread``
-        the first time outlines materializes against the model. If you
+        the first time llguidance materializes against the model. If you
         wire this method up to a production code path, hand the model's
         owning ThreadPoolExecutor in via a new arg and assign it to
         ``self._model_load_executor``.

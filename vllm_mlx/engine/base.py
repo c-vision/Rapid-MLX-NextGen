@@ -486,7 +486,7 @@ class BaseEngine(ABC):
 
         Default ``False``; override to return ``True`` only when
         ``generate_with_schema`` is also implemented (the route checks
-        this flag before calling). Allows engines without ``outlines`` /
+        this flag before calling). Allows engines without ``llguidance`` /
         guided decoding to participate in the contract without
         implementing the optional schema path.
         """
