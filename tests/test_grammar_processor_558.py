@@ -1640,10 +1640,13 @@ def test_missing_parameters_flattens_to_closed_schema_in_production_path(
 
     captured = {}
 
-    def _spy_build(flat_tools, mode, parser, *, single_call=False):
+    def _spy_build(
+        flat_tools, mode, parser, *, single_call=False, reasoning_sentinels=()
+    ):
         captured["flat_tools"] = flat_tools
         captured["mode"] = mode
         captured["single_call"] = single_call
+        captured["reasoning_sentinels"] = reasoning_sentinels
         return None  # short-circuit: we only need the flattened tools
 
     # ``build_tool_grammar`` is imported inside the route function, so patch it
@@ -1690,7 +1693,9 @@ def test_parallel_tool_calls_false_threads_single_call(tok, monkeypatch):
 
     captured = {}
 
-    def _spy_build(flat_tools, mode, parser, *, single_call=False):
+    def _spy_build(
+        flat_tools, mode, parser, *, single_call=False, reasoning_sentinels=()
+    ):
         captured["single_call"] = single_call
         return None
 
@@ -1713,6 +1718,46 @@ def test_parallel_tool_calls_false_threads_single_call(tok, monkeypatch):
     assert _single_call_for(False) is True, "parallel_tool_calls=False -> single"
     assert _single_call_for(True) is False, "parallel_tool_calls=True -> one-or-more"
     assert _single_call_for(None) is False, "unset -> one-or-more (OpenAI default)"
+
+
+@_requires_llguidance
+def test_route_threads_reasoning_sentinels_from_configured_parser(tok, monkeypatch):
+    """PR-4 wiring: when a reasoning parser is configured, the chat route derives
+    its single-special-token reasoning markers and threads them into
+    ``build_tool_grammar`` so the grammar's free prefix tolerates ``<think>``.
+    A cfg WITHOUT a reasoning parser threads ``()`` (non-reasoning grammar)."""
+    from vllm_mlx.api import tool_grammar as tg_mod
+    from vllm_mlx.routes import chat as chat_mod
+
+    # Guard: the assertion is only meaningful if this tokenizer carries
+    # <think>/</think> as single special tokens (it does on pinned Qwen3.5).
+    if not tg_mod.are_single_special_tokens(tok, ("<think>", "</think>")):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+
+    captured = {}
+
+    def _spy_build(
+        flat_tools, mode, parser, *, single_call=False, reasoning_sentinels=()
+    ):
+        captured["reasoning_sentinels"] = reasoning_sentinels
+        return None
+
+    monkeypatch.setattr(tg_mod, "build_tool_grammar", _spy_build)
+    engine = _EngineStub(tok)
+
+    def _sentinels_for(reasoning_parser_name):
+        captured.clear()
+        cfg = _CfgStub("hermes")
+        if reasoning_parser_name is not None:
+            cfg.reasoning_parser_name = reasoning_parser_name
+        request = _RequestStub([_FunctionTool("get_time")], "required")
+        chat_mod._maybe_build_tool_grammar_processor(engine, cfg, request)
+        return captured.get("reasoning_sentinels")
+
+    # Reasoning parser configured -> <think>/</think> threaded into the builder.
+    assert _sentinels_for("qwen3") == ("<think>", "</think>")
+    # No reasoning parser -> empty (non-reasoning grammar, no regression).
+    assert _sentinels_for(None) == ()
 
 
 @_requires_llguidance

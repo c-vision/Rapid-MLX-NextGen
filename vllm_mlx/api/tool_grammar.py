@@ -225,6 +225,112 @@ def are_single_special_tokens(tokenizer: Any, candidates: tuple[str, ...]) -> bo
     return True
 
 
+def resolve_reasoning_sentinels(
+    reasoning_parser_name: str | None, tokenizer: Any
+) -> tuple[str, ...]:
+    """Reasoning-boundary special tokens (``<think>``/``</think>``) for path A.
+
+    Looks up the configured reasoning parser (by the server config's
+    ``reasoning_parser_name``) and reads its ``start_token`` / ``end_token``
+    markers (e.g. ``<think>`` / ``</think>``). Returns ONLY the markers that are
+    PROVEN single special tokens on ``tokenizer`` (via
+    ``are_single_special_tokens``), so the grammar's reasoning-tolerant prefix
+    references real atomic tokens the model can emit — never a byte string the
+    lazy prefix cannot match (#558 PR-4 GROUND TRUTH; see ``build_tool_lark``).
+
+    Returns ``()`` (the non-reasoning path — grammar byte-identical to PR-3)
+    when: no reasoning parser is configured, the parser class exposes no
+    ``start_token``/``end_token``, the markers are not single special tokens on
+    this tokenizer, or anything raises. A missing/degenerate reasoning parser
+    must NOT disable tool-call enforcement — it only means the free prefix is
+    the bare ``TAG_TEXT`` (no reasoning tolerance), which is correct for a
+    non-reasoning model.
+
+    We reuse ``are_single_special_tokens`` — the exact gate the tool sentinels
+    use — so ``<think>`` on a tokenizer that splits it into ordinary text is
+    correctly excluded (declaring it a special-token ref there would build an
+    unenforceable prefix, the same failure mode the sentinel gate guards).
+    """
+    if not reasoning_parser_name or tokenizer is None:
+        return ()
+    try:
+        from ..reasoning import get_parser
+    except Exception:
+        # The reasoning package failed to import — an unexpected defect, not an
+        # unconfigured parser. Log it (with the parser name) so it is not
+        # silently indistinguishable from the benign case (codex #558-PR4 nit).
+        logger.exception(
+            "tool-grammar: reasoning package import failed for parser %r; "
+            "no reasoning tolerance",
+            reasoning_parser_name,
+        )
+        return ()
+    try:
+        parser_cls = get_parser(reasoning_parser_name)
+    except KeyError:
+        # EXPECTED: an unknown/unregistered reasoning parser name. No reasoning
+        # tolerance (free prefix stays bare TAG_TEXT); never disables tool
+        # enforcement. This is a benign config case, not logged as an error.
+        return ()
+    except Exception:
+        # UNEXPECTED lookup failure (registry defect) — surface it with the
+        # parser name rather than silently degrading, so a real bug is not
+        # masked as "parser not configured" (codex #558-PR4 nit).
+        logger.exception(
+            "tool-grammar: unexpected error resolving reasoning parser %r; "
+            "no reasoning tolerance",
+            reasoning_parser_name,
+        )
+        return ()
+    markers: list[str] = []
+    for attr in ("start_token", "end_token"):
+        try:
+            # ``start_token``/``end_token`` are read-only properties on the
+            # concrete parsers (deepseek_r1/qwen3/glm4); reading them off the
+            # CLASS returns the property object, so instantiate to get the str.
+            # The reasoning parsers take no required ctor args.
+            value = getattr(parser_cls(), attr, None)
+        except Exception:
+            value = None
+        if isinstance(value, str) and value:
+            markers.append(value)
+    if not markers:
+        return ()
+    # Dedup preserving order (start_token/end_token are distinct, but a parser
+    # could in principle repeat one).
+    ordered = tuple(dict.fromkeys(markers))
+    # Only keep markers that are single special tokens on THIS tokenizer.
+    kept = tuple(m for m in ordered if are_single_special_tokens(tokenizer, (m,)))
+    return kept
+
+
+def _is_lark_special_token_ref(s: str) -> bool:
+    """True iff ``s`` is safe to emit as a BARE llguidance special-token ref.
+
+    llguidance Lark treats a bare ``<name>`` as a special-token reference, so a
+    reasoning sentinel is interpolated verbatim into the grammar source. Being a
+    single special token on the tokenizer does NOT guarantee the string is valid
+    Lark rule syntax when interpolated raw — e.g. a hypothetical ``[THINK]``
+    marker would be parsed as a Lark char-class, and an inner ``>``/whitespace
+    would break the reference (codex #558-PR4 nit). We therefore require the
+    ``<...>`` special-token-ref shape: a leading ``<``, a trailing ``>``, a
+    non-empty body, and no interior ``<``/``>`` or whitespace that would
+    desync the reference. Reasoning markers that fail this are DROPPED (the free
+    prefix silently loses that marker's tolerance) rather than emitting Lark
+    that fails to compile — a best-effort degrade consistent with the rest of
+    this module. In practice the shipped reasoning parsers only ever produce
+    ``<think>``/``</think>``, which pass.
+    """
+    if len(s) < 3 or s[0] != "<" or s[-1] != ">":
+        return False
+    body = s[1:-1]
+    if not body:
+        return False
+    # Reject anything that would break out of the ``<...>`` reference: interior
+    # angle brackets or any whitespace (Lark token refs are a single lexeme).
+    return not any(c in body for c in "<>") and not any(c.isspace() for c in body)
+
+
 def _lark_escape(s: str) -> str:
     """Render ``s`` as a Lark double-quoted string literal (JSON-escaped)."""
     if not s:
@@ -274,6 +380,7 @@ def build_tool_lark(
     structure_infos: list["StructureInfo"],
     *,
     single_call: bool = False,
+    reasoning_sentinels: tuple[str, ...] = (),
 ) -> str:
     """Assemble the Lark grammar for a set of per-tool structure triples.
 
@@ -303,18 +410,70 @@ def build_tool_lark(
     collapses to a single forced tag. The builder does not itself resolve a
     function name out of a multi-tool list — that routing lands in PR-3.
 
-    Every tag is: ``TAG_TEXT <trigger-and-begin> %json <schema> <end>``.
-    ``TAG_TEXT`` is the lazy free prefix that swallows reasoning/prose until
-    the trigger — this is also the reasoning-aware delay (design §5 path A).
+    Every tag is: ``<free-prefix> <trigger-and-begin> %json <schema> <end>``.
+    The free prefix is the lazy region that swallows reasoning/prose until the
+    trigger — this is the reasoning-aware delay (design §5 path A).
     REQUIREMENT (applies to ALL modes, not just ``auto``): the trigger MUST be
     a single special token, declared in ``sentinels``. This is enforced
-    UNCONDITIONALLY because the lazy ``TAG_TEXT`` prefix can reassemble a
+    UNCONDITIONALLY because the lazy free prefix can reassemble a
     multi-byte *text* trigger from ordinary token pieces in any mode — a
     text trigger is unenforceable regardless of the ``*``/``+`` quantifier, so
     the builder rejects it (raises ``ValueError``) rather than silently
     producing an unenforceable grammar. Full text-trigger support (excluding
-    the trigger byte sequence from ``TAG_TEXT`` across token boundaries) is
+    the trigger byte sequence from the free prefix across token boundaries) is
     design §7 open-Q1, deferred to the PR-5 auto path.
+
+    REASONING-TOLERANT PREFIX (#558 PR-4, path A). ``reasoning_sentinels`` is an
+    ORDERED ``(open, close)`` pair of the model family's reasoning-boundary
+    strings (``<think>`` / ``</think>``) that the caller has PROVEN are single
+    special tokens on this tokenizer (via ``are_single_special_tokens``). GROUND
+    TRUTH (verified on the real Qwen3.6 tokenizer, 2026-07): a bare
+    ``TAG_TEXT: /(.|\\n)*/`` free prefix is a BYTE regex and therefore CANNOT
+    match a ``<think>`` *special token* (id 248068) — the design-doc §5.3 claim
+    that a bare ``TAG_TEXT`` "swallows the whole ``<think>...</think>`` block" is
+    FALSE whenever those markers are special tokens (exactly the reasoning case
+    this PR targets). The matcher rejects the very first ``<think>`` token and
+    path A collapses. To make path A actually correct we build the prefix from
+    two rule flavours (refs MUST be rule-level, not lexer terminals — llguidance
+    rejects special tokens inside a terminal):
+
+      * ``lead: opened? bal_prefix`` — consumed ONCE at ``start: lead ...``.
+        ``opened: TAG_TEXT <close>`` permits a SINGLE optional leading close.
+      * ``bal_prefix: TAG_TEXT (reasoning_block TAG_TEXT)*`` with
+        ``reasoning_block: <open> TAG_TEXT <close>`` — BALANCED-only, reused by
+        every ``tag_i`` and the trailing ``tag_end``.
+
+    The block is BALANCED (codex #558-PR4 round-3): a mid-stream ``<think>``
+    opener MUST be closed by ``</think>`` before the trigger. An
+    unbalanced-tolerant ``rtok: <think> | </think>`` would accept an UNCLOSED
+    ``<think>...<tool_call>...</tool_call>`` that a lenient reasoning parser
+    could classify entirely as reasoning, letting the tool call be swallowed and
+    ``tool_choice="required"`` slip.
+
+    The ``opened?`` leading-close handles the PREFILLED-``<think>`` case (codex
+    #558-PR4 round-4): many reasoning chat templates prefill ``<think>`` at the
+    END of the prompt (verified on Qwen3.6 and DeepSeek-R1 — the assistant turn
+    ends ``...<think>``), so GENERATION begins already inside reasoning. The
+    grammar processor baselines past the prompt and only sees the GENERATED
+    tokens, which then begin with reasoning text and a ``</think>`` whose opener
+    lives in the (unseen) prompt. Without it the balanced block would reject that
+    leading ``</think>`` and BLOCK the required call on every prefilled-think
+    model. Because the leading close lives ONLY in the one-time ``lead`` rule
+    (every ``tag_i``/``tag_end`` uses the balanced-only ``bal_prefix``), the
+    tolerance is GLOBALLY at-most-one: a stray ``</think>`` before a LATER call
+    or after the final call is rejected (codex #558-PR4 round-5 — a prefix that
+    reused ``opened?`` everywhere would allow a stray close at each position).
+    The no-reasoning path stays direct (the tag can begin immediately, no
+    ``<think>`` required).
+
+    When ``reasoning_sentinels`` is empty / has fewer than two distinct
+    well-formed ``<...>`` refs (no reasoning parser, or its markers are NOT
+    single special tokens on this tokenizer) the prefix is the bare ``TAG_TEXT``
+    — the non-reasoning grammar is byte-identical to PR-3, so this change is a
+    strict superset with ZERO regression for non-reasoning constrained calls. The
+    reasoning tolerance lives in the compiled grammar, never in a runtime on/off
+    gate (path B, a footgun that desyncs the matcher on multi-token boundaries —
+    see ``GrammarLogitsProcessor``).
     """
     if not tools:
         raise ValueError("build_tool_lark: tools must not be empty")
@@ -360,13 +519,76 @@ def build_tool_lark(
     else:
         quant = "+"
     tag_names = " | ".join(f"tag_{i}" for i in range(len(tools)))
-    lark = (
-        "%llguidance {}\n"
-        f"start: ({tag_names}){quant} tag_end\n"
-        "tag_end: TAG_TEXT\n"
-        r"TAG_TEXT: /(.|\n)*/"
-        "\n"
+
+    # Free-prefix nonterminals (design §5 path A). With NO reasoning pair every
+    # tag and the trailing ``tag_end`` consume a bare lazy ``TAG_TEXT`` byte
+    # regex, so the emitted grammar is byte-identical to PR-3 (no regression).
+    # With a reasoning (open, close) pair we split into a one-time ``lead``
+    # (optional prefilled-close) and a balanced-only ``bal_prefix`` reused per
+    # tag / tag_end — see the build_tool_lark docstring for the full rationale
+    # (round-3 balance, round-4 prefill, round-5 globally-at-most-one).
+    #
+    # ``reasoning_sentinels`` is an ORDERED ``(open, close)`` pair. We take the
+    # first two DISTINCT, well-formed ``<...>`` special-token refs as
+    # ``(open, close)``; anything else (fewer than two, a marker that is a single
+    # tokenizer token but not a valid bare Lark ref like ``[THINK]``, or open ==
+    # close) drops reasoning tolerance and falls back to the bare ``TAG_TEXT``
+    # prefix — a safe degrade, never a compile failure.
+    reasoning_refs = tuple(
+        dict.fromkeys(
+            s for s in reasoning_sentinels if s and _is_lark_special_token_ref(s)
+        )
     )
+    reasoning_pair = reasoning_refs[:2] if len(reasoning_refs) >= 2 else ()
+
+    if not reasoning_pair:
+        # No reasoning tolerance: the free prefix is the bare lazy ``TAG_TEXT``
+        # byte regex EVERYWHERE, so the emitted grammar is byte-identical to
+        # PR-3 (no reasoning regression).
+        lark = (
+            "%llguidance {}\n"
+            f"start: ({tag_names}){quant} tag_end\n"
+            "tag_end: TAG_TEXT\n"
+            r"TAG_TEXT: /(.|\n)*/"
+            "\n"
+        )
+    else:
+        # BALANCED + PREFILL-TOLERANT (codex #558-PR4 rounds 3-5). Two prefix
+        # flavours:
+        #   * ``lead`` — consumed ONCE at the very start (``start: lead ...``).
+        #     It permits a SINGLE optional leading close (``opened?``) modelling
+        #     a prompt-prefilled ``<think>``: many reasoning chat templates
+        #     prefill ``<think>`` at the END of the prompt (verified on Qwen3.6
+        #     and DeepSeek-R1 — the assistant turn ends ``...<think>``), so
+        #     GENERATION begins already inside reasoning. The grammar processor
+        #     baselines PAST the prompt and only sees the GENERATED tokens, which
+        #     then begin with reasoning text + a ``</think>`` whose opener lives
+        #     in the unseen prompt. Without this the balanced block would reject
+        #     that leading ``</think>`` and BLOCK the required call.
+        #   * ``bal_prefix`` — BALANCED-ONLY, reused by every ``tag_i`` and the
+        #     trailing ``tag_end``. It admits zero+ EXPLICIT balanced
+        #     ``<open> ... <close>`` blocks but NO stray close. Using it (not the
+        #     lead prefix) between/after calls means the one-time prefill
+        #     tolerance is GLOBALLY at-most-one — a stray ``</think>`` before a
+        #     later call, or after the final call, is rejected (codex round-5:
+        #     reusing an ``opened?`` prefix everywhere would allow a stray close
+        #     at each of those positions).
+        # A mid-stream ``<open>`` that never closes is rejected everywhere (it is
+        # not the single leading close and has no matching ``<close>``).
+        open_ref, close_ref = reasoning_pair
+        lark = (
+            "%llguidance {}\n"
+            f"start: lead ({tag_names}){quant} tag_end\n"
+            "lead: opened? bal_prefix\n"
+            f"opened: TAG_TEXT {close_ref}\n"
+            "bal_prefix: TAG_TEXT (reasoning_block TAG_TEXT)*\n"
+            f"reasoning_block: {open_ref} TAG_TEXT {close_ref}\n"
+            "tag_end: bal_prefix\n"
+            r"TAG_TEXT: /(.|\n)*/"
+            "\n"
+        )
+    prefix_ref = "bal_prefix" if reasoning_pair else "TAG_TEXT"
+
     for i, (tool, si) in enumerate(zip(tools, structure_infos)):
         # Only substitute the default when ``parameters`` is ABSENT. A
         # falsy-but-present schema ({} = allow-any, false = allow-none) is a
@@ -387,7 +609,7 @@ def build_tool_lark(
         schema = json.dumps(params)
         begin_body = _emit_literal_with_sentinels(si.begin, si.sentinels)
         end_body = _emit_literal_with_sentinels(si.end, si.sentinels)
-        lark += f"\ntag_{i}: TAG_TEXT {begin_body} %json {schema}"
+        lark += f"\ntag_{i}: {prefix_ref} {begin_body} %json {schema}"
         if end_body:
             lark += f" {end_body}"
         lark += "\n"
@@ -414,6 +636,7 @@ def build_tool_grammar(
     parser: Any,
     *,
     single_call: bool = False,
+    reasoning_sentinels: tuple[str, ...] = (),
 ) -> str | None:
     """Public entry: (tools, tool_choice, parser) -> compiled llguidance grammar.
 
@@ -428,6 +651,13 @@ def build_tool_grammar(
     request objects; that responsibility lives with the routing PR so the
     builder stays a small, pure, request-shape-agnostic unit. An unexpected
     shape degrades safely to ``None`` (free-form) rather than crashing.
+
+    ``reasoning_sentinels`` (#558 PR-4, path A): an ORDERED ``(open, close)``
+    pair of reasoning-boundary special tokens (``<think>`` / ``</think>``) the
+    CALLER has proven single special tokens on this tokenizer. Passed through to
+    ``build_tool_lark`` so the free prefix admits a BALANCED ``<think>...
+    </think>`` block before the trigger. Empty (the default) reproduces the PR-3
+    non-reasoning grammar exactly.
 
     Returns ``None`` when ``tool_choice`` is ``"none"`` (no constraint at
     all), when the parser declares no ``structure_info`` (family not yet
@@ -496,7 +726,11 @@ def build_tool_grammar(
 
     try:
         lark = build_tool_lark(
-            tools, tool_choice, structure_infos, single_call=single_call
+            tools,
+            tool_choice,
+            structure_infos,
+            single_call=single_call,
+            reasoning_sentinels=reasoning_sentinels,
         )
     except ValueError:
         # Malformed structure_info / unsupported tool_choice -> free-form.

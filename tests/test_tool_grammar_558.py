@@ -544,3 +544,607 @@ def test_bad_enum_value_is_rejected(tok, lltok):
         '<tool_call>\n{"name": "get_weather", "arguments": {"city": "P", "unit": "kelvin',
     )
     assert accepted < total, "invalid enum value was NOT rejected by the grammar"
+
+
+# --------------------------------------------------------------------------
+# PR-4: reasoning-tolerant grammar (path A). A REASONING model emits a
+# ``<think>...</think>`` block BEFORE the tool call. The bare ``TAG_TEXT``
+# byte-regex free prefix from PR-3 CANNOT match a ``<think>`` special token, so
+# path A collapses (the matcher rejects the first ``<think>`` token). PR-4
+# enumerates the reasoning-boundary special tokens as RULE-level special-token
+# refs in the free prefix so the grammar admits reasoning, THEN enforces the
+# tool-call schema. These tests prove:
+#   * the reasoning-tolerant Lark has the prefix/rtok rules (structure);
+#   * the non-reasoning grammar is byte-identical to PR-3 (no regression);
+#   * a ``<think>...</think>`` prefix + valid call is ACCEPTED end-to-end;
+#   * a non-reasoning call STILL works under the reasoning-tolerant grammar;
+#   * a schema-violating token AFTER reasoning is still MASKED (negative ctrl).
+# The pure-string structure tests always run; the enforcement tests reuse the
+# single-special-token ``tok``/``lltok`` fixtures above.
+# --------------------------------------------------------------------------
+_REASONING_SENTINELS = ("<think>", "</think>")
+
+
+def test_reasoning_prefix_lark_has_balanced_block_rules():
+    """With a reasoning (open, close) pair the free prefix splits into a one-time
+    ``lead: opened? bal_prefix`` (single optional prefilled-close) and a
+    BALANCED-only ``bal_prefix: TAG_TEXT (reasoning_block TAG_TEXT)*`` reused by
+    every tag / tag_end — a BALANCED, PREFILL-tolerant, globally-at-most-one
+    rule-level block, not an unordered alternation (codex #558-PR4 round-5)."""
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
+    lark = build_tool_lark(
+        TOOLS, "required", infos, reasoning_sentinels=_REASONING_SENTINELS
+    )
+    # ``start`` consumes the one-time ``lead`` before the calls. ``lead`` permits
+    # a SINGLE optional leading close (``opened?``) modelling a prompt-prefilled
+    # ``<think>``, then a BALANCED-only ``bal_prefix`` — NOT the unordered
+    # ``<think> | </think>`` alternation (which accepted an unclosed opener).
+    assert "start: lead (tag_0 | tag_1)+ tag_end" in lark
+    assert "lead: opened? bal_prefix" in lark
+    assert "opened: TAG_TEXT </think>" in lark
+    assert "bal_prefix: TAG_TEXT (reasoning_block TAG_TEXT)*" in lark
+    assert "reasoning_block: <think> TAG_TEXT </think>" in lark
+    assert "rtok:" not in lark  # the old unordered alternation is gone
+    # Reasoning refs are bare token references, NOT quoted byte literals.
+    assert '"<think>"' not in lark
+    assert '"</think>"' not in lark
+    # Every tag body and the trailing tag_end consume the BALANCED-ONLY
+    # ``bal_prefix`` (the one-time prefilled-close tolerance lives ONLY in
+    # ``lead``, so a stray close before a later call / after the final call is
+    # rejected — globally at-most-one).
+    assert "tag_end: bal_prefix" in lark
+    assert "tag_0: bal_prefix <tool_call>" in lark
+    # ``opened?`` must NOT be reused per-tag (that would allow a stray leading
+    # close at every call position — codex round-5 blocking).
+    assert "tag_0: prefix" not in lark
+    assert "tag_0: lead" not in lark
+    assert "tag_0: opened" not in lark
+
+
+# The exact grammar PR-3 emits for ``TOOLS`` at ``tool_choice="required"``. This
+# is a CHECKED-IN GOLDEN captured from the pre-PR-4 builder — comparing against
+# it (not against another call of the same implementation) proves the
+# non-reasoning path is byte-identical to PR-3 even if the whole builder drifted
+# (codex #558-PR4 blocking: default==explicit_empty only proves the two paths
+# agree, not that either matches PR-3).
+_PR3_GOLDEN_LARK = (
+    "%llguidance {}\n"
+    "start: (tag_0 | tag_1)+ tag_end\n"
+    "tag_end: TAG_TEXT\n"
+    "TAG_TEXT: /(.|\\n)*/\n"
+    "\n"
+    'tag_0: TAG_TEXT <tool_call> "\\n{\\"name\\": \\"get_weather\\", '
+    '\\"arguments\\": " %json {"type": "object", "properties": {"city": '
+    '{"type": "string"}, "unit": {"type": "string", "enum": ["c", "f"]}}, '
+    '"required": ["city"], "additionalProperties": false} "}\\n" </tool_call>\n'
+    "\n"
+    'tag_1: TAG_TEXT <tool_call> "\\n{\\"name\\": \\"get_time\\", '
+    '\\"arguments\\": " %json {"type": "object", "properties": {"tz": '
+    '{"type": "string"}}, "required": ["tz"], "additionalProperties": false} '
+    '"}\\n" </tool_call>\n'
+)
+
+
+def test_non_reasoning_lark_is_unchanged_from_pr3():
+    """Empty reasoning_sentinels reproduces the PR-3 grammar BYTE-FOR-BYTE — the
+    non-reasoning path carries ZERO regression. Asserts against a checked-in
+    PR-3 golden (not another call of the same code), so a shared regression in
+    both call paths cannot hide behind ``default == explicit_empty``."""
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
+    default = build_tool_lark(TOOLS, "required", infos)
+    explicit_empty = build_tool_lark(TOOLS, "required", infos, reasoning_sentinels=())
+    # Both no-reasoning call shapes are byte-identical to the PR-3 golden.
+    assert default == _PR3_GOLDEN_LARK, "non-reasoning grammar drifted from PR-3"
+    assert explicit_empty == _PR3_GOLDEN_LARK
+    # No reasoning machinery leaks into the non-reasoning grammar (redundant with
+    # the golden, kept as a readable intent assertion).
+    assert "lead:" not in default
+    assert "bal_prefix:" not in default
+    assert "reasoning_block:" not in default
+    assert "rtok:" not in default
+
+
+def test_reasoning_sentinels_dedup_and_drop_empty():
+    """Duplicate / empty reasoning markers are de-duped and dropped; the first
+    two DISTINCT refs become the balanced ``(open, close)`` block."""
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
+    lark = build_tool_lark(
+        TOOLS,
+        "required",
+        infos,
+        reasoning_sentinels=("<think>", "", "<think>", "</think>"),
+    )
+    # Deduped to (open=<think>, close=</think>); no empty ref, no self-pair.
+    assert "reasoning_block: <think> TAG_TEXT </think>" in lark
+    assert "reasoning_block: <think> TAG_TEXT <think>" not in lark
+
+
+def test_single_reasoning_marker_degrades_to_bare_prefix():
+    """A single reasoning marker (no distinct close) cannot form a balanced
+    block, so the prefix degrades to the bare ``TAG_TEXT`` (no reasoning
+    tolerance) rather than emitting a half-open block."""
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
+    lark = build_tool_lark(TOOLS, "required", infos, reasoning_sentinels=("<think>",))
+    assert "reasoning_block:" not in lark
+    assert "lead:" not in lark
+    assert "bal_prefix:" not in lark
+    assert "tag_end: TAG_TEXT" in lark
+
+
+def test_malformed_reasoning_sentinel_is_dropped_not_emitted():
+    """A marker that is NOT a valid bare ``<...>`` special-token ref (e.g. a
+    ``[THINK]`` char-class shape, or one with interior whitespace/brackets) is
+    DROPPED — it must never be interpolated into Lark as syntactically-invalid
+    source (codex #558-PR4 nit). The remaining well-formed pair still emits."""
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
+    # Only ``<think>``/``</think>`` are valid refs; the others are dropped, so
+    # the balanced (open, close) pair is recovered from the survivors.
+    lark = build_tool_lark(
+        TOOLS,
+        "required",
+        infos,
+        reasoning_sentinels=("[THINK]", "<think>", "<a b>", "<x<y>", "</think>"),
+    )
+    assert "reasoning_block: <think> TAG_TEXT </think>" in lark
+    # None of the malformed markers leaked into the grammar source.
+    assert "[THINK]" not in lark
+    assert "<a b>" not in lark
+    assert "<x<y>" not in lark
+
+    # If FEWER than two valid refs survive, the prefix degrades to bare TAG_TEXT
+    # (no reasoning machinery) rather than emitting broken Lark.
+    lark_all_bad = build_tool_lark(
+        TOOLS, "required", infos, reasoning_sentinels=("[THINK]", "<a b>")
+    )
+    assert "lead:" not in lark_all_bad
+    assert "bal_prefix:" not in lark_all_bad
+    assert "reasoning_block:" not in lark_all_bad
+    assert "tag_end: TAG_TEXT" in lark_all_bad
+
+
+def test_resolve_reasoning_sentinels_from_parser(tok):
+    """``resolve_reasoning_sentinels`` reads the configured reasoning parser's
+    boundary tokens and keeps only single-special-token markers on THIS
+    tokenizer. On the Qwen3 tokenizer both ``<think>``/``</think>`` qualify."""
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        resolve_reasoning_sentinels,
+    )
+
+    # Guard: the fixture tokenizer must actually carry <think>/</think> as
+    # single special tokens for this assertion to be meaningful. (It does on the
+    # pinned Qwen3.5 tokenizer; skip only if a future revision drops them.)
+    if not are_single_special_tokens(tok, _REASONING_SENTINELS):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+    assert resolve_reasoning_sentinels("qwen3", tok) == _REASONING_SENTINELS
+    # deepseek_r1 uses the same <think>/</think> markers.
+    assert resolve_reasoning_sentinels("deepseek_r1", tok) == _REASONING_SENTINELS
+
+
+def test_resolve_reasoning_sentinels_degrades_safely(tok):
+    """No parser / unknown parser -> ``()`` — a missing reasoning parser must NOT
+    disable tool enforcement, only omit reasoning tolerance."""
+    from vllm_mlx.api.tool_grammar import resolve_reasoning_sentinels
+
+    assert resolve_reasoning_sentinels(None, tok) == ()
+    assert resolve_reasoning_sentinels("", tok) == ()
+    assert resolve_reasoning_sentinels("no_such_parser", tok) == ()
+    # No tokenizer -> () regardless of parser.
+    assert resolve_reasoning_sentinels("qwen3", None) == ()
+
+
+@_requires_llguidance
+def test_reasoning_prefix_then_tool_call_is_accepted(tok, lltok):
+    """PATH A PROOF: a ``<think>...</think>`` reasoning block followed by a valid
+    hermes tool call is accepted IN FULL and terminates — the grammar tolerated
+    the reasoning prefix, then enforced the tool-call schema."""
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_tool_grammar,
+    )
+
+    if not are_single_special_tokens(tok, _REASONING_SENTINELS):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+    grammar = build_tool_grammar(
+        TOOLS,
+        "required",
+        _HermesStubParser(),
+        reasoning_sentinels=_REASONING_SENTINELS,
+    )
+    assert grammar is not None
+    accepted, total, accepting = _consume(
+        grammar,
+        lltok,
+        tok,
+        "<think>I should check the weather in Paris.</think>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>",
+    )
+    assert accepted == total, (
+        f"reasoning-prefixed call rejected ({accepted}/{total}) — path A broken"
+    )
+    assert accepting, "reasoning-prefixed call is not an accepting (terminal) state"
+
+
+@_requires_llguidance
+def test_reasoning_tolerant_prefix_is_what_admits_the_think_token(tok, lltok):
+    """The reasoning-tolerant prefix (PR-4) is what makes path A work: WITH
+    reasoning sentinels the ``<think>`` special token is admitted; the bare
+    PR-3 prefix does not admit it on this tokenizer.
+
+    We assert the LOAD-BEARING direction — the reasoning-tolerant grammar
+    accepts the ``<think>``-prefixed call — unconditionally. For the legacy
+    grammar we only DOCUMENT that the bare byte prefix does not accept the
+    ``<think>`` special token today (the exact bug PR-4 fixes); we do NOT assert
+    the legacy MUST stay broken, so a future llguidance that lets byte terminals
+    match special tokens would not spuriously fail this suite (codex #558-PR4
+    nit) — it would just make the reasoning-tolerant prefix redundant, which the
+    positive assertion still tolerates."""
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_tool_grammar,
+    )
+
+    if not are_single_special_tokens(tok, _REASONING_SENTINELS):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+    call = (
+        "<think>reasoning</think>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>"
+    )
+
+    # LOAD-BEARING: the reasoning-tolerant grammar accepts the whole call.
+    tolerant = build_tool_grammar(
+        TOOLS, "required", _HermesStubParser(), reasoning_sentinels=_REASONING_SENTINELS
+    )
+    t_accepted, t_total, t_accepting = _consume(tolerant, lltok, tok, call)
+    assert t_accepted == t_total and t_accepting, (
+        "reasoning-tolerant prefix did NOT admit the <think>-prefixed call — "
+        "path A broken"
+    )
+
+    # DOCUMENTED (not asserted as a hard requirement): the bare PR-3 prefix does
+    # not admit the leading <think> special token on this tokenizer. If a future
+    # llguidance changes this, the tolerant path above still passes; we surface
+    # the change via an xfail-style note rather than a hard failure.
+    legacy = build_tool_grammar(TOOLS, "required", _HermesStubParser())
+    l_accepted, l_total, _ = _consume(legacy, lltok, tok, call)
+    if l_accepted >= l_total:
+        pytest.skip(
+            "bare TAG_TEXT prefix now admits the <think> special token — the "
+            "reasoning-tolerant prefix is redundant here (llguidance changed); "
+            "PR-4 remains correct, revisit whether it is still necessary"
+        )
+    # Current behavior: legacy rejects before consuming the whole call because
+    # the leading <think> special token is unmatched by the byte prefix.
+    assert l_accepted < l_total
+
+
+@_requires_llguidance
+def test_reasoning_grammar_still_accepts_non_reasoning_call(tok, lltok):
+    """No regression: under the reasoning-TOLERANT grammar a plain (no-reasoning)
+    tool call is STILL accepted and terminates — reasoning tolerance is additive,
+    it does not require a ``<think>`` block."""
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_tool_grammar,
+    )
+
+    if not are_single_special_tokens(tok, _REASONING_SENTINELS):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+    grammar = build_tool_grammar(
+        TOOLS,
+        "required",
+        _HermesStubParser(),
+        reasoning_sentinels=_REASONING_SENTINELS,
+    )
+    accepted, total, accepting = _consume(
+        grammar,
+        lltok,
+        tok,
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>",
+    )
+    assert accepted == total, f"non-reasoning call rejected ({accepted}/{total})"
+    assert accepting, "non-reasoning call is not an accepting (terminal) state"
+
+
+@_requires_llguidance
+def test_off_schema_argument_rejected_after_reasoning(tok, lltok):
+    """NEGATIVE CONTROL: after a ``<think>...</think>`` block AND the trigger, a
+    schema-violating argument (integer where the schema requires a string) is
+    still MASKED — the reasoning tolerance did not weaken the post-reasoning
+    schema enforcement."""
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_tool_grammar,
+    )
+
+    if not are_single_special_tokens(tok, _REASONING_SENTINELS):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+    grammar = build_tool_grammar(
+        TOOLS,
+        "required",
+        _HermesStubParser(),
+        reasoning_sentinels=_REASONING_SENTINELS,
+    )
+    # Precise negative control (codex #558-PR4 blocking): ``accepted < total``
+    # alone would also pass if some EARLIER token were rejected, which would not
+    # prove the off-schema integer is what the grammar masked. So we (1) prove
+    # the valid prefix — reasoning + trigger + ``"city": `` — is accepted IN
+    # FULL, then (2) prove the grammar rejects at exactly the token that starts
+    # the integer value. ``4`` violates the ``"city": string`` schema.
+    valid_prefix = (
+        "<think>reasoning</think>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": '
+    )
+    pre_accepted, pre_total, _ = _consume(grammar, lltok, tok, valid_prefix)
+    assert pre_accepted == pre_total, (
+        f"valid reasoning+trigger prefix was rejected ({pre_accepted}/{pre_total})"
+        " — the negative control below would be meaningless"
+    )
+    # Now append the schema-violating integer. The grammar must accept exactly
+    # the prefix tokens and reject at the first token of the ``4`` value.
+    accepted, total, _ = _consume(grammar, lltok, tok, valid_prefix + "4")
+    assert total > pre_total, "appending '4' did not add a token to encode"
+    assert accepted == pre_total, (
+        f"grammar rejected at token {accepted}, not at the off-schema integer "
+        f"(prefix has {pre_total} tokens) — schema enforcement leaked or "
+        "mis-fired through the reasoning-tolerant prefix"
+    )
+
+
+@_requires_llguidance
+def test_unbalanced_think_opener_is_rejected(tok, lltok):
+    """BALANCED-BLOCK PROOF (codex #558-PR4 blocking): an UNCLOSED ``<think>``
+    (opener with no ``</think>``) before the trigger is rejected — the grammar
+    forces the opener to be closed before the tool call, so a lenient reasoning
+    parser can never swallow the whole ``<think>...<tool_call>...`` region as
+    reasoning and drop the required call."""
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_tool_grammar,
+    )
+
+    if not are_single_special_tokens(tok, _REASONING_SENTINELS):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+    grammar = build_tool_grammar(
+        TOOLS,
+        "required",
+        _HermesStubParser(),
+        reasoning_sentinels=_REASONING_SENTINELS,
+    )
+    # <think> opens but NEVER closes before the tool call -> must be rejected.
+    accepted, total, _ = _consume(
+        grammar,
+        lltok,
+        tok,
+        "<think>reasoning that never closes\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>",
+    )
+    assert accepted < total, (
+        "unclosed <think> opener was accepted — the reasoning block is not "
+        "balanced, so tool_choice=required could be swallowed into reasoning"
+    )
+    # Control: the SAME sequence with a </think> close IS accepted in full.
+    b_accepted, b_total, b_accepting = _consume(
+        grammar,
+        lltok,
+        tok,
+        "<think>reasoning that closes</think>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>",
+    )
+    assert b_accepted == b_total and b_accepting, (
+        "the balanced <think>...</think> variant should be accepted in full"
+    )
+
+
+@_requires_llguidance
+def test_prefilled_think_leading_close_is_accepted(tok, lltok):
+    """PREFILL-TOLERANCE PROOF (codex #558-PR4 round-4 blocking): reasoning chat
+    templates prefill ``<think>`` at the END of the prompt (Qwen3.6, DeepSeek-R1),
+    so the GENERATED stream begins already inside reasoning — reasoning text,
+    then a ``</think>`` whose opener lives in the unseen prompt, then the call.
+    The grammar admits ONE such leading close (``opened?``) so the required tool
+    call is NOT blocked on prefilled-think models."""
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_tool_grammar,
+    )
+
+    if not are_single_special_tokens(tok, _REASONING_SENTINELS):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+    grammar = build_tool_grammar(
+        TOOLS,
+        "required",
+        _HermesStubParser(),
+        reasoning_sentinels=_REASONING_SENTINELS,
+    )
+    # Generated stream when <think> is prompt-prefilled: reasoning text, leading
+    # </think> (no generated opener), then the call. Must be accepted IN FULL.
+    accepted, total, accepting = _consume(
+        grammar,
+        lltok,
+        tok,
+        "The user wants the weather.</think>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>",
+    )
+    assert accepted == total and accepting, (
+        "prefilled-<think> generated stream (leading </think>) was rejected — "
+        "the required tool call would be blocked on every prefilled-think model"
+    )
+
+
+@_requires_llguidance
+def test_two_leading_closes_are_rejected(tok, lltok):
+    """``opened?`` admits AT MOST ONE leading close (the single prefilled-think
+    opener). A SECOND unmatched ``</think>`` is rejected — the prefill tolerance
+    does not degrade into accepting arbitrary stray closes."""
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_tool_grammar,
+    )
+
+    if not are_single_special_tokens(tok, _REASONING_SENTINELS):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+    grammar = build_tool_grammar(
+        TOOLS,
+        "required",
+        _HermesStubParser(),
+        reasoning_sentinels=_REASONING_SENTINELS,
+    )
+    # Two leading closes with no matching opens -> the second is unmatched.
+    accepted, total, _ = _consume(
+        grammar,
+        lltok,
+        tok,
+        "a</think>b</think>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>",
+    )
+    assert accepted < total, (
+        "two leading </think> closes were accepted — opened? must permit only "
+        "one (the single prompt-prefilled opener)"
+    )
+
+
+@_requires_llguidance
+def test_stray_close_after_call_is_rejected(tok, lltok):
+    """GLOBALLY-AT-MOST-ONE PROOF (codex #558-PR4 round-5 blocking #2): the
+    trailing ``tag_end`` consumes the BALANCED-only ``bal_prefix``, NOT the
+    prefill-tolerant ``lead``. So a stray unmatched ``</think>`` AFTER the call
+    (with no leading close to consume the one-time tolerance) is rejected — the
+    prefilled-close tolerance is a one-time initial-prefix allowance, not a free
+    stray close at every position. A prefix that reused ``opened?`` everywhere
+    would wrongly accept this."""
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_tool_grammar,
+    )
+
+    if not are_single_special_tokens(tok, _REASONING_SENTINELS):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+    grammar = build_tool_grammar(
+        TOOLS,
+        "required",
+        _HermesStubParser(),
+        reasoning_sentinels=_REASONING_SENTINELS,
+    )
+    # A balanced reasoning block + a valid call, then a STRAY unmatched </think>
+    # in the tag_end region. tag_end uses bal_prefix (no leading-close tolerance),
+    # so the trailing stray close must be rejected.
+    accepted, total, _ = _consume(
+        grammar,
+        lltok,
+        tok,
+        "<think>reasoning</think>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>trailing</think>",
+    )
+    assert accepted < total, (
+        "a stray </think> AFTER the call was accepted — tag_end must consume the "
+        "balanced-only bal_prefix, not the prefill-tolerant lead (the leading-"
+        "close tolerance is one-time, globally at most one)"
+    )
+
+
+# DeepSeek-R1 uses the ``deepseek_r1`` reasoning parser and, like Qwen3, prefills
+# ``<think>`` in its chat template. Test against the ACTUAL formatted DeepSeek
+# prompt (codex #558-PR4 round-4) to prove the prefill tolerance is not
+# Qwen-specific.
+_DEEPSEEK_MODEL = "mlx-community/DeepSeek-R1-Distill-Qwen-32B-4bit"
+# Pin the revision (codex #558-PR4 round-5 nit) so this prefill proof runs
+# against an IMMUTABLE artifact, mirroring the Qwen fixture: the chat-template
+# ``<think>`` prefill and the ``<tool_call>``/``<think>`` single-special-token
+# layout are fixed at this commit. Combined with ``local_files_only=True`` the
+# test uses ONLY the locally-cached snapshot — it never fetches from the Hub and
+# a different upstream revision cannot silently change what is exercised. It
+# skips (never fails) when this exact revision is not in the local cache.
+_DEEPSEEK_REVISION = "4e0d3848a0ad8f9fb54638891e4928f04fcca978"
+
+
+@_requires_llguidance
+def test_deepseek_r1_prefilled_think_template_is_tolerated(lltok):
+    """Using the REAL DeepSeek-R1 chat template (which prefills ``<think>``) and
+    the ``deepseek_r1`` reasoning parser, the generated stream — reasoning text +
+    a leading ``</think>`` + the tool call — is accepted in full. Proves the
+    prefill tolerance holds for DeepSeek-R1's actual formatted prompt, not just
+    a hand-written string (codex #558-PR4 round-4)."""
+    transformers = pytest.importorskip("transformers")
+    try:
+        ds_tok = transformers.AutoTokenizer.from_pretrained(
+            _DEEPSEEK_MODEL,
+            revision=_DEEPSEEK_REVISION,
+            local_files_only=True,
+        )
+    except _offline_skip_exc_types():  # pragma: no cover - uncached revision
+        pytest.skip(
+            f"{_DEEPSEEK_MODEL}@{_DEEPSEEK_REVISION[:8]} not in local cache — "
+            "prefill proof requires the pinned revision cached locally"
+        )
+
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_lltokenizer,
+        build_tool_grammar,
+        resolve_reasoning_sentinels,
+    )
+
+    if not are_single_special_tokens(ds_tok, ("<tool_call>", "</tool_call>")):
+        pytest.skip("DeepSeek tokenizer lacks single-token <tool_call> sentinels")
+
+    # The REAL template must prefill <think> at the end of the assistant turn —
+    # otherwise this test would not exercise the prefill path.
+    rendered = ds_tok.apply_chat_template(
+        [{"role": "user", "content": "Weather in Paris? Use the tool."}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    if not rendered.rstrip().endswith("<think>"):
+        pytest.skip("DeepSeek-R1 template revision no longer prefills <think>")
+
+    # deepseek_r1 reasoning parser -> <think>/</think>, kept iff single tokens.
+    sentinels = resolve_reasoning_sentinels("deepseek_r1", ds_tok)
+    if sentinels != ("<think>", "</think>"):
+        pytest.skip("DeepSeek tokenizer lacks single-token <think>/</think>")
+
+    # Build the DeepSeek LLTokenizer via the PRODUCTION path (build_lltokenizer):
+    # DeepSeek-R1's tokenizer is a ``Qwen2Tokenizer`` that raw
+    # ``llguidance.hf.from_tokenizer`` rejects on some transformers revisions —
+    # the candidate-3 serialized fallback in build_lltokenizer closes exactly
+    # that gap, which is why the route uses it. A None here is a genuine env gap.
+    ds_lltok = build_lltokenizer(ds_tok)
+    if ds_lltok is None:  # pragma: no cover - conversion gap is an env issue
+        pytest.skip("could not build an LLTokenizer for the DeepSeek tokenizer")
+
+    grammar = build_tool_grammar(
+        TOOLS, "required", _HermesStubParser(), reasoning_sentinels=sentinels
+    )
+    assert grammar is not None
+    # Generated stream after the prompt-prefilled <think>: reasoning, leading
+    # </think>, then the tool call.
+    accepted, total, accepting = _consume(
+        grammar,
+        ds_lltok,
+        ds_tok,
+        "The user wants Paris weather.</think>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>",
+    )
+    assert accepted == total and accepting, (
+        "DeepSeek-R1 prefilled-<think> generated stream was rejected — the "
+        "required tool call would be blocked on DeepSeek-R1"
+    )

@@ -637,6 +637,7 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
             GrammarLogitsProcessor,
             build_tool_grammar,
             get_lltokenizer,
+            resolve_reasoning_sentinels,
         )
         from ..tool_parsers import ToolParserManager
 
@@ -712,21 +713,40 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
         # tools. Only an explicit ``False`` narrows to exactly-one (``True`` /
         # unset keep the one-or-more ``required`` grammar, per OpenAI semantics).
         single_call = getattr(request, "parallel_tool_calls", None) is False
+
+        # Reasoning-tolerant grammar (design §5 path A, #558 PR-4). Bake the
+        # model's reasoning-boundary special tokens (``<think>``/``</think>``)
+        # into the grammar's FREE PREFIX so a thinking-enabled model may emit
+        # its ``<think>...</think>`` block and THEN produce a grammar-enforced
+        # tool call. GROUND TRUTH: a bare ``TAG_TEXT`` byte-regex prefix CANNOT
+        # match a ``<think>`` special token — path A only works once those
+        # tokens are enumerated as special-token refs in the prefix. We derive
+        # them from the configured reasoning parser and keep only the ones that
+        # are single special tokens on THIS tokenizer; a non-reasoning model (no
+        # parser / text markers) yields ``()`` and the PR-3 non-reasoning
+        # grammar unchanged.
+        reasoning_sentinels = resolve_reasoning_sentinels(
+            getattr(cfg, "reasoning_parser_name", None), tokenizer
+        )
         grammar = build_tool_grammar(
-            flat_tools, "required", parser, single_call=single_call
+            flat_tools,
+            "required",
+            parser,
+            single_call=single_call,
+            reasoning_sentinels=reasoning_sentinels,
         )
         if grammar is None:
             return None
 
-        # Reasoning-aware delay (design §5). We rely on PATH A: the grammar's
-        # own lazy ``TAG_TEXT`` free prefix naturally swallows any
-        # ``<think>...</think>`` block before the trigger, so reasoning flows
-        # unconstrained WITHOUT a runtime gate. The runtime gate (path B) is a
-        # ground-truth-corrected FOOTGUN here: a model that emits NO reasoning
-        # (no ``</think>``) would keep the mask OFF forever and defeat the
-        # constraint entirely (observed on qwen3.5 tool_choice=required). So we
-        # pass ``reasoning_end_token=None`` — path A alone is correct for
-        # triggered structural tags (matches vLLM's same-step exception).
+        # Reasoning-aware delay (design §5) is baked into the GRAMMAR (path A
+        # above), NOT a runtime gate. The runtime gate (path B) is a
+        # ground-truth-corrected FOOTGUN: a model that emits NO reasoning (no
+        # ``</think>``) would keep the mask OFF forever and defeat the constraint
+        # entirely (observed on qwen3.5 tool_choice=required); and toggling the
+        # mask mid-stream desyncs the matcher on multi-token ``</think>``
+        # boundaries. So we pass ``reasoning_end_token=None`` — the grammar's
+        # reasoning-tolerant free prefix is the correct and only reasoning lever
+        # for triggered structural tags (matches vLLM's same-step exception).
         processor = GrammarLogitsProcessor(
             lltok,
             grammar,
