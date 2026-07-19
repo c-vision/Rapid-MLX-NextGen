@@ -38,9 +38,16 @@ def _read_json(
     path: Path | None, *, max_bytes: int = MAX_METADATA_FILE_BYTES
 ) -> dict[str, Any] | None:
     """Read one bounded JSON object, returning ``None`` on cache failures."""
-    if path is None or not path.is_file():
+    if path is None:
         return None
     try:
+        # ``is_file()`` is INSIDE the try (codex #5): on a stale/unmounted
+        # network share or a permission-denied directory the probe itself can
+        # raise ``OSError``, which must be treated as file-absent (return
+        # ``None``) rather than escaping at model-load.  Mirrors the enumeration
+        # guard in ``_single_safetensors_has_multimodal_weights``.
+        if not path.is_file():
+            return None
         if path.stat().st_size > max_bytes:
             return None
         with path.open(encoding="utf-8") as f:
@@ -52,9 +59,15 @@ def _read_json(
 
 def _read_text(path: Path | None) -> str | None:
     """Read one bounded template, returning ``None`` on cache failures."""
-    if path is None or not path.is_file():
+    if path is None:
         return None
     try:
+        # ``is_file()`` is INSIDE the try (codex #5): a stale/unmounted network
+        # share or permission-denied directory can make the probe itself raise
+        # ``OSError``, which must be treated as file-absent (return ``None``)
+        # rather than escaping at model-load.
+        if not path.is_file():
+            return None
         if path.stat().st_size > MAX_METADATA_FILE_BYTES:
             return None
         with path.open(encoding="utf-8") as f:
@@ -102,10 +115,13 @@ def _read_named_chat_templates(snapshot_dir: Path) -> dict[str, str]:
     ``chat_templates[name]`` entry, with ``name = filename.removesuffix(".jinja")``.
     """
     template_dir = snapshot_dir / CHAT_TEMPLATE_DIR
-    if not template_dir.is_dir():
-        return {}
     named: dict[str, str] = {}
     try:
+        # ``is_dir()`` is INSIDE the try (codex #5): the probe can itself raise
+        # ``OSError`` on a stale/unmounted share, which must be treated as
+        # "directory absent" (return ``{}``) rather than escaping at model-load.
+        if not template_dir.is_dir():
+            return {}
         template_files = sorted(template_dir.glob("*.jinja"))
     except OSError:
         return {}
@@ -146,9 +162,13 @@ def read_local_model_metadata(model_path: str) -> ModelMetadata | None:
     """Read metadata from a local model directory without interpreting IDs."""
     try:
         snapshot_dir = Path(model_path)
-    except (TypeError, ValueError):
-        return None
-    if not snapshot_dir.is_dir():
+        # ``is_dir()`` is INSIDE the try (codex #5): the probe can itself raise
+        # ``OSError`` on a stale/unmounted share or permission-denied path, which
+        # must be treated as "not a local dir" (return ``None`` so the caller
+        # falls back to the HF-cache lookup) rather than escaping at model-load.
+        if not snapshot_dir.is_dir():
+            return None
+    except (TypeError, ValueError, OSError):
         return None
     return ModelMetadata(
         config=_read_json(snapshot_dir / "config.json"),

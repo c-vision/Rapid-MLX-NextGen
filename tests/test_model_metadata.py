@@ -45,6 +45,36 @@ def test_readers_reject_missing_malformed_non_object_and_oversized_files(tmp_pat
     assert metadata._read_text(invalid_utf8) is None
 
 
+def test_probe_oserror_is_treated_as_absent_not_propagated(tmp_path, monkeypatch):
+    """codex #5: the ``is_file()`` / ``is_dir()`` PROBES are inside the OSError
+    handler, so a stale/unmounted network share or permission-denied directory
+    (where the probe itself raises ``OSError``) yields the documented file-absent
+    result instead of crashing the routing path at model-load.
+    """
+    from pathlib import Path
+
+    def _boom(self, *args, **kwargs):
+        raise OSError("stale mount / permission denied")
+
+    # A real path so the readers reach the probe (the ``path is None`` short
+    # circuit runs first and would otherwise mask the probe).
+    config = tmp_path / "config.json"
+    _write_json(config, {"model_type": "qwen3"})
+    template = tmp_path / "chat_template.jinja"
+    template.write_text("hi", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "is_file", _boom)
+    # ``is_file()`` raising must be swallowed → absent sentinel, not propagate.
+    assert metadata._read_json(config) is None
+    assert metadata._read_text(template) is None
+
+    # ``is_dir()`` raising in the named-template scan and the local-dir entry
+    # point must likewise be swallowed rather than escape.
+    monkeypatch.setattr(Path, "is_dir", _boom)
+    assert metadata._read_named_chat_templates(tmp_path) == {}
+    assert metadata.read_local_model_metadata(str(tmp_path)) is None
+
+
 def test_local_metadata_prefers_standalone_template_then_tokenizer_fallback(tmp_path):
     standalone = tmp_path / "standalone"
     standalone.mkdir()
