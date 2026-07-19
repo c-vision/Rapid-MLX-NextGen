@@ -53,6 +53,49 @@ class QwenToolParser(ToolParser):
     # Pattern for bracket-style: [Calling tool: func_name({...})]
     BRACKET_PATTERN = re.compile(r"\[Calling tool:\s*(\w+)\((\{.*?\})\)\]", re.DOTALL)
 
+    _GRAMMAR_SENTINELS = ("<tool_call>", "</tool_call>")
+
+    def structure_info(self):
+        """Grammar-constraint wire triple for the qwen ``<tool_call>`` JSON
+        body (#558). Qwen shares the hermes ``<tool_call>…</tool_call>`` wire:
+        ``<tool_call>`` / ``</tool_call>`` are single special tokens in
+        Qwen3/Hermes tokenizers, so they are declared as ``sentinels`` and
+        rendered as Lark special-token refs by the grammar builder. The
+        arguments object is constrained by the tool's JSON Schema via ``%json``
+        (injected by ``build_tool_lark``).
+
+        Wire: ``<tool_call>\n{"name": "NAME", "arguments": <schema>}\n</tool_call>``
+
+        As on the hermes parser, we OPT OUT (return ``None`` -> free-form
+        fallback) unless the model's tokenizer proves both sentinels are single
+        tokens — a special-token sentinel on a tokenizer that encodes
+        ``<tool_call>`` as multi-token text would build an unenforceable
+        grammar. Grammar constraint is a best-effort opt-in, never required.
+        """
+        from vllm_mlx.api.tool_grammar import (
+            StructureInfo,
+            are_single_special_tokens,
+        )
+
+        if not are_single_special_tokens(self.model_tokenizer, self._GRAMMAR_SENTINELS):
+            return None
+
+        def _info(name: str):
+            # JSON-encode ``name`` so a name containing ``"`` or ``\`` yields a
+            # well-formed JSON string literal in the wire (json.dumps adds the
+            # surrounding quotes and escapes). ``begin`` still starts with the
+            # ``<tool_call>`` trigger (builder invariant).
+            begin = f'<tool_call>\n{{"name": {json.dumps(name)}, "arguments": '
+            end = "}\n</tool_call>"
+            return StructureInfo(
+                begin=begin,
+                end=end,
+                trigger="<tool_call>",
+                sentinels=self._GRAMMAR_SENTINELS,
+            )
+
+        return _info
+
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:

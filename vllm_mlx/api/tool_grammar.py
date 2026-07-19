@@ -74,6 +74,125 @@ class StructureInfo:
     sentinels: tuple[str, ...] = field(default=())
 
 
+def _is_registered_added_token(tokenizer: Any, tok_id: int) -> bool:
+    """True iff ``tok_id`` is an EXPLICITLY-REGISTERED added/special token.
+
+    ``len(encode(s)) == 1`` is necessary but NOT sufficient to render ``s`` as a
+    Lark special-token ref: an ordinary single BPE-merge vocabulary token (e.g.
+    ``"hello"``) is not a referenceable atomic token, and an unknown string may
+    collapse to a single ``[UNK]`` id. The grammar builder emits ``<s>`` as a
+    special-token reference that only resolves against a token the tokenizer
+    holds as an EXPLICITLY-ADDED atomic entry (the tokenizer will never split
+    such a token further, so the model can emit it as one piece). So we require
+    the id to appear in the tokenizer's added-token registry.
+
+    GROUND TRUTH (verified on the pinned Qwen3.5 tokenizer, 2026-07): its
+    ``<tool_call>``/``</tool_call>`` added tokens carry ``AddedToken.special ==
+    False`` and are NOT in ``all_special_ids`` — yet they ARE distinct atomic
+    added tokens the grammar's special-token ref resolves against (the #558
+    enforcement tests pass on exactly this tokenizer). We therefore key on
+    ADDED-TOKEN registration (``added_tokens_decoder`` membership), NOT the HF
+    ``special`` flag: gating on ``special==True`` / ``all_special_ids`` would
+    wrongly REJECT the real target's ``<tool_call>`` and disable the feature for
+    the very tokenizer it ships for. The ``special`` flag distinguishes control
+    tokens (``<|endoftext|>``) from added content tokens; both are atomic and
+    both are valid special-token-ref targets, so it is not the right gate here.
+
+    What this correctly REJECTS: an ordinary BPE token not in the added-token
+    registry (``"hello"`` -> not in ``added_tokens_decoder`` -> False). Probes
+    the added-token surface, then falls back to ``all_special_ids`` for
+    tokenizers that expose no ``added_tokens_decoder`` (older/slow). Degrades to
+    ``False`` (caller opts out) if neither is available or any raises.
+    """
+    # transformers fast tokenizers expose ``added_tokens_decoder``: {id: AddedToken}.
+    # Membership means the id is an explicitly-added atomic token (special flag
+    # irrelevant — see docstring GROUND TRUTH).
+    decoder = getattr(tokenizer, "added_tokens_decoder", None)
+    if isinstance(decoder, dict):
+        return tok_id in decoder
+    # Fallback for tokenizers without added_tokens_decoder: all_special_ids
+    # (control tokens). This path only sees special==True ids, which is fine —
+    # it is a strictly-narrower best-effort fallback, not the primary gate.
+    try:
+        special_ids = getattr(tokenizer, "all_special_ids", None)
+        if special_ids is not None:
+            return tok_id in set(special_ids)
+    except Exception:
+        pass
+    return False
+
+
+def are_single_special_tokens(tokenizer: Any, candidates: tuple[str, ...]) -> bool:
+    """True iff EVERY candidate is a DISTINCT single registered special token.
+
+    A per-family ``structure_info()`` declares its ``<...>`` sentinels as
+    special-token refs (see ``StructureInfo.sentinels``) ONLY when the model's
+    tokenizer actually encodes each one as a single special token — this is the
+    ground-truth-correction-#1 assumption (``<tool_call>``/``</tool_call>`` are
+    single special tokens in Qwen3/Hermes tokenizers). It is NOT universal: the
+    same ``hermes`` wire on a Llama-based Hermes tokenizer encodes
+    ``<tool_call>`` as ordinary multi-token text, where declaring it a
+    special-token sentinel would build an UNENFORCEABLE grammar (the model has
+    no single ``<tool_call>`` token to satisfy the ref). A family that cannot
+    prove single-token sentinels must OPT OUT (``structure_info() -> None``) and
+    fall back to today's free-form-then-parse behavior rather than emit a
+    grammar its tokenizer can never satisfy.
+
+    ``len(encode(s)) == 1`` alone is NOT enough (codex review): it also accepts
+    a string that collapses to a single ``[UNK]`` id or resolves to an ordinary
+    (non-special) vocabulary token, either of which yields an unenforceable
+    special-token grammar. So each candidate must ALSO:
+
+      * round-trip: ``decode([id]) == s`` (rejects ``[UNK]`` collapse / lossy
+        normalization — an unknown sentinel decoding to ``"<unk>"`` fails here);
+      * be an EXPLICITLY-REGISTERED added token (rejects an ordinary single
+        BPE-merge vocab token — e.g. ``"hello"`` — that is not a referenceable
+        atomic token; keys on added-token registration, NOT the HF ``special``
+        flag, because the real Qwen ``<tool_call>`` is ``special=False``);
+      * resolve to an id DISTINCT from every other candidate (rejects two
+        sentinels collapsing to the same id — e.g. both to ``[UNK]`` — which
+        would make the open/close tags grammar-indistinguishable).
+
+    Returns ``False`` (conservative: caller opts out) when the tokenizer is
+    absent or lacks ``encode``/``decode`` / raises — grammar constraint is a
+    best-effort opt-in, never a hard requirement, so an unknown or partially
+    featured tokenizer degrades safely to free-form.
+    """
+    if tokenizer is None:
+        return False
+    encode = getattr(tokenizer, "encode", None)
+    decode = getattr(tokenizer, "decode", None)
+    if encode is None or decode is None:
+        return False
+    seen_ids: set[int] = set()
+    for tok_str in candidates:
+        try:
+            ids = encode(tok_str, add_special_tokens=False)
+        except Exception:
+            # A tokenizer that rejects the probe cannot prove single-token
+            # status -> conservatively report False so the family opts out.
+            return False
+        if len(ids) != 1:
+            return False
+        tok_id = ids[0]
+        if tok_id in seen_ids:
+            return False  # two sentinels collapsed to the same id (e.g. [UNK])
+        seen_ids.add(tok_id)
+        # Round-trip: the single id must decode back to the exact candidate.
+        # Rejects [UNK] collapse and any lossy normalization.
+        try:
+            if decode([tok_id]) != tok_str:
+                return False
+        except Exception:
+            return False
+        # Must be an explicitly-registered added token, not an ordinary BPE
+        # vocab token (see _is_registered_added_token — keyed on added-token
+        # registration, not the HF ``special`` flag).
+        if not _is_registered_added_token(tokenizer, tok_id):
+            return False
+    return True
+
+
 def _lark_escape(s: str) -> str:
     """Render ``s`` as a Lark double-quoted string literal (JSON-escaped)."""
     if not s:
