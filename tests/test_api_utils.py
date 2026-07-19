@@ -17,6 +17,7 @@ from vllm_mlx.api.utils import (
     _check_legacy_string_patterns,
     _config_indicates_vlm,
     _content_to_text,
+    _local_checkpoint_has_multimodal_weights,
     _try_read_config_json,
     clean_output_text,
     extract_multimodal_content,
@@ -379,6 +380,24 @@ class TestIsMllmModelWeightsPresenceOverride:
         )
         assert is_mllm_model(str(model_dir)) is True
 
+    def test_vision_config_with_unrecognised_vision_namespace_stays_vlm(self, tmp_path):
+        """An unknown encoder prefix is insufficient evidence to force text."""
+        model_dir = self._make_model_dir(
+            tmp_path,
+            "repackaged-vlm",
+            {
+                "model_type": "qwen3_5_moe",
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "vision_config": {"hidden_size": 1152},
+            },
+            weight_names=[
+                "language_model.lm_head.weight",
+                "vision_encoder.blocks.0.weight",
+            ],
+        )
+
+        assert is_mllm_model(str(model_dir)) is True
+
     def test_audio_only_checkpoint_with_audio_weights(self, tmp_path):
         """Same principle but for the audio branch (audio_tower prefix)."""
         model_dir = self._make_model_dir(
@@ -440,72 +459,378 @@ class TestIsMllmModelWeightsPresenceOverride:
         )
         assert is_mllm_model(str(model_dir)) is False
 
+    def test_non_qwen_text_only_fork_is_text_architecture_agnostic(self, tmp_path):
+        """Round-5 REGRESSION repro (the origin/main regression).
 
-class TestIsMllmModelHubOverride:
-    """Verifies the hub config override for substring false-positives.
+        A text-only fork of a NON-Qwen VLM architecture (Gemma3) — config
+        declares ``vision_config`` but the weight index ships only language
+        tensors — must route as TEXT (``False``).  The round-3/4 code returned
+        ``None`` here (because the text-only detector recognised ONLY
+        Qwen3.5-MoE), and the local-dir fallback then force-routed it to the
+        MLLM engine, crashing on a missing vision tower.  The architecture-
+        agnostic weight-evidence rule (no vision tensors → text) restores
+        origin/main for EVERY architecture, not just Qwen.
+        """
+        model_dir = self._make_model_dir(
+            tmp_path,
+            "Gemma3-Research-Text-Fork",
+            {
+                "model_type": "gemma3",
+                "architectures": ["Gemma3ForConditionalGeneration"],
+                "vision_config": {"hidden_size": 1152},
+            },
+            weight_names=[
+                "language_model.model.embed_tokens.weight",
+                "language_model.model.layers.0.self_attn.q_proj.weight",
+                "language_model.model.norm.weight",
+                "lm_head.weight",
+            ],
+        )
+        assert is_mllm_model(str(model_dir)) is False
 
-    The legacy substring matcher catches family names like ``gemma-3`` /
-    ``gemma3`` which are correct for the vision variants (4b/12b/27b) but
-    misclassify the text-only 1B (``Gemma3ForCausalLM``, no
-    ``vision_config``). Detection now fetches just ``config.json`` from
-    the repo and lets the model's own metadata override a substring
-    false-positive — but only in the True → False direction, so repos
-    whose names lack a VLM token retain their existing text routing
-    even if their config exposes a vision branch.
-    """
+    def test_non_qwen_repackaged_vlm_with_vision_weights_is_vlm(self, tmp_path):
+        """Round-5 #1121 guard: the SAME non-Qwen config, but the weight index
+        DOES ship vision tensors → must route as VLM (``True``).  Distinguishes
+        the two opposite failure modes purely by weight evidence."""
+        model_dir = self._make_model_dir(
+            tmp_path,
+            "Gemma3-Real-VLM",
+            {
+                "model_type": "gemma3",
+                "architectures": ["Gemma3ForConditionalGeneration"],
+                "vision_config": {"hidden_size": 1152},
+            },
+            weight_names=[
+                "language_model.model.embed_tokens.weight",
+                "vision_tower.encoder.layers.0.self_attn.q_proj.weight",
+                "multi_modal_projector.mm_input_projection_weight",
+            ],
+        )
+        assert is_mllm_model(str(model_dir)) is True
+
+    def test_gemma4_vision_embedder_family_is_vlm(self, tmp_path):
+        """Round-5 prefix-audit guard: gemma-4-12B ships its vision stack as
+        ``vision_embedder`` / ``embed_vision`` / ``embed_audio`` (NOT
+        ``vision_tower``).  These prefixes were MISSING from the pre-round-5
+        list, so the architecture-agnostic "absent → text" rule would have
+        misrouted this real VLM to text.  The expanded
+        ``MULTIMODAL_TENSOR_PREFIXES`` must catch it (True)."""
+        model_dir = self._make_model_dir(
+            tmp_path,
+            "gemma-4-12B-it",
+            {
+                "model_type": "gemma4",
+                "architectures": ["Gemma4ForConditionalGeneration"],
+                "vision_config": {"hidden_size": 1152},
+            },
+            weight_names=[
+                "language_model.model.embed_tokens.weight",
+                "vision_embedder.patch_dense.weight",
+                "embed_vision.embedding_projection.weight",
+                "embed_audio.embedding_projection.weight",
+            ],
+        )
+        assert is_mllm_model(str(model_dir)) is True
+
+    def test_qwen35_moe_text_fork_still_text(self, tmp_path):
+        """Round-3 behaviour preserved: a Qwen3.5-MoE text fork (no vision
+        tensors) stays TEXT under the general rule (the former Qwen-specific
+        special-case is now subsumed)."""
+        model_dir = self._make_model_dir(
+            tmp_path,
+            "Qwen3.5-MoE-Text-Fork",
+            {
+                "model_type": "qwen3_5_moe",
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "vision_config": {"hidden_size": 1152},
+            },
+            weight_names=[
+                "language_model.model.embed_tokens.weight",
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight",
+                "language_model.model.norm.weight",
+            ],
+        )
+        assert is_mllm_model(str(model_dir)) is False
+
+    def test_qwen35_4b_alias_pin_still_text_only(self):
+        """The aliases.json ``is_text_only`` pin on qwen3.5-4b short-circuits
+        BEFORE weight inspection and must keep returning text (round-3 fix)."""
+        assert is_mllm_model("mlx-community/Qwen3.5-4B-MLX-4bit") is False
+
+    def test_legacy_weights_probe_wrapper_delegates_to_shared_metadata(self, tmp_path):
+        model_dir = self._make_model_dir(
+            tmp_path,
+            "vision-weights",
+            {"vision_config": {}},
+            ["vision_tower.blocks.0.weight"],
+        )
+
+        assert _local_checkpoint_has_multimodal_weights(model_dir) is True
+
+
+class TestIsMllmModelCachedMetadata:
+    """Cached metadata needs actual modality evidence for a new VLM route."""
+
+    @staticmethod
+    def _metadata(config):
+        from vllm_mlx.model_metadata import ModelMetadata
+
+        return ModelMetadata(config=config, chat_template=None, snapshot_dir=None)
 
     def test_text_only_config_overrides_substring_match(self, monkeypatch):
         from vllm_mlx.api import utils as utils_mod
 
-        # Substring "gemma-3" would flag this as MLLM. Hub config says
-        # Gemma3ForCausalLM (text-only) → override to False.
+        # Substring "gemma-3" would flag this as MLLM. Metadata says
+        # Gemma3ForCausalLM (text-only) → route as text.
         monkeypatch.setattr(
             utils_mod,
-            "_try_read_hub_config_json",
-            lambda name: {"architectures": ["Gemma3ForCausalLM"]},
+            "read_model_metadata",
+            lambda name: self._metadata({"architectures": ["Gemma3ForCausalLM"]}),
         )
         assert is_mllm_model("mlx-community/gemma-3-1b-it-4bit") is False
 
     def test_vlm_config_keeps_substring_match(self, monkeypatch):
         from vllm_mlx.api import utils as utils_mod
 
-        # Substring "gemma-3" matches and hub config also says VLM.
+        # Substring "gemma-3" matches and metadata also says VLM.
         monkeypatch.setattr(
             utils_mod,
-            "_try_read_hub_config_json",
-            lambda name: {
-                "architectures": ["Gemma3ForConditionalGeneration"],
-                "vision_config": {"hidden_size": 1024},
-            },
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "architectures": ["Gemma3ForConditionalGeneration"],
+                    "vision_config": {"hidden_size": 1024},
+                }
+            ),
         )
         assert is_mllm_model("mlx-community/gemma-3-27b-it-4bit") is True
 
     def test_hub_unreachable_falls_back_to_substring(self, monkeypatch):
         from vllm_mlx.api import utils as utils_mod
 
-        # Substring matches; hub call returns None (404, gated, offline).
+        # Substring matches; metadata is unavailable (offline / cold cache).
         # Should preserve the legacy True result.
-        monkeypatch.setattr(utils_mod, "_try_read_hub_config_json", lambda name: None)
+        monkeypatch.setattr(utils_mod, "read_model_metadata", lambda name: None)
         assert is_mllm_model("mlx-community/gemma-3-4b-it-4bit") is True
 
-    def test_no_substring_match_skips_hub_call(self, monkeypatch):
+    def test_metadata_detects_vlm_without_name_marker(self, monkeypatch):
         from vllm_mlx.api import utils as utils_mod
 
-        # Repos whose names don't match MLLM_PATTERNS short-circuit to
-        # False without consulting the hub — preserves existing routing
-        # for models like Qwen3.5/3.6 whose configs happen to expose a
-        # vision branch even though we've always routed them as text.
-        called = []
-
-        def spy(name):
-            called.append(name)
-            return {"vision_config": {}}
-
-        monkeypatch.setattr(utils_mod, "_try_read_hub_config_json", spy)
-        assert is_mllm_model("mlx-community/Qwen3.5-4B-MLX-4bit") is False
-        assert called == [], (
-            "hub config should not be consulted when substring rules out MLLM"
+        # A re-packaged checkpoint need not contain a historical name marker.
+        # Its cached config plus real checkpoint evidence route it correctly.
+        monkeypatch.setattr(
+            utils_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                    "vision_config": {"hidden_size": 1024},
+                }
+            ),
         )
+        monkeypatch.setattr(
+            utils_mod,
+            "checkpoint_has_multimodal_weights",
+            lambda snapshot, config: True,
+        )
+        assert is_mllm_model("publisher/research-agent-mlx") is True
+
+    def test_cached_inherited_vision_config_without_weights_stays_text(
+        self, monkeypatch
+    ):
+        from vllm_mlx.api import utils as utils_mod
+
+        monkeypatch.setattr(
+            utils_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                    "vision_config": {"hidden_size": 1024},
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            utils_mod,
+            "checkpoint_has_multimodal_weights",
+            lambda snapshot, config: None,
+        )
+
+        assert is_mllm_model("publisher/text-only-repack") is False
+
+    def test_text_only_alias_beats_cached_vision_evidence(self, monkeypatch):
+        """An alias that POSITIVELY declares ``is_text_only`` short-circuits
+        even against positive checkpoint evidence — the operator pin is
+        authoritative for a checkpoint we deliberately serve text-only."""
+        from vllm_mlx.api import utils as utils_mod
+        from vllm_mlx.model_profile import ModelProfile
+
+        text_only_profile = ModelProfile(
+            hf_path="publisher/vision-config-served-text",
+            is_text_only=True,
+        )
+        monkeypatch.setattr(
+            utils_mod,
+            "resolve_profile",
+            lambda name: text_only_profile,
+        )
+        monkeypatch.setattr(
+            utils_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                    "vision_config": {"hidden_size": 1024},
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            utils_mod,
+            "checkpoint_has_multimodal_weights",
+            lambda snapshot, config: True,
+        )
+
+        assert is_mllm_model("publisher/vision-config-served-text") is False
+
+    def test_registered_non_text_alias_yields_to_positive_vision_weights(
+        self, monkeypatch
+    ):
+        """Regression for the #1121 routing-order bug: a registered alias that
+        is NOT ``is_text_only`` and whose name carries NO legacy VLM substring
+        must still route as multimodal once the checkpoint supplies positive
+        vision weights. The bare alias entry must not override real evidence.
+
+        Before the reorder, ``if profile is not None`` short-circuited to the
+        (False) legacy name matcher BEFORE the ``verdict is True`` branch, so
+        this repackaged VLM was misrouted to the text engine. This test fails
+        against the old order and passes after evidence-priority routing.
+        """
+        from vllm_mlx.api import utils as utils_mod
+        from vllm_mlx.model_profile import ModelProfile
+
+        # A registered non-text alias (e.g. a text-family entry someone
+        # repackaged a VLM under). ``is_text_only`` is False, and the alias
+        # name has NO legacy VLM marker (``_check_legacy_string_patterns`` False).
+        non_text_profile = ModelProfile(
+            hf_path="publisher/research-agent-4b",
+            is_text_only=False,
+        )
+        monkeypatch.setattr(
+            utils_mod,
+            "resolve_profile",
+            lambda name: non_text_profile,
+        )
+        assert _check_legacy_string_patterns("publisher/research-agent-4b") is False
+        monkeypatch.setattr(
+            utils_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                    "vision_config": {"hidden_size": 1024},
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            utils_mod,
+            "checkpoint_has_multimodal_weights",
+            lambda snapshot, config: True,
+        )
+
+        assert is_mllm_model("publisher/research-agent-4b") is True
+
+    def test_curated_text_alias_beats_real_vision_weights(self, monkeypatch):
+        """FIX 1 regression: a curated ``is_text_only`` alias whose CHECKPOINT
+        genuinely ships ``vision_tower`` weights must still route as TEXT.
+
+        ``mlx-community/Qwen3.5-4B-MLX-4bit`` (the default smoke alias) is
+        curated text-only, yet its real ``model.safetensors.index.json`` carries
+        BOTH ``language_model.*`` AND ``vision_tower.*`` tensors — so
+        ``checkpoint_has_multimodal_weights`` correctly returns True on the raw
+        bytes.  A prior fix let that True win over the curated alias, flipping
+        the model to the MLLM lane and tripping the ``--pflash not supported for
+        multimodal`` guard (7 CLI serve tests went red).  The curated
+        ``is_text_only`` pin must short-circuit to text BEFORE the weight-
+        evidence path.  Fails before FIX 1 (returns True), passes after.
+        """
+        from vllm_mlx.api import utils as utils_mod
+        from vllm_mlx.model_profile import ModelProfile
+
+        curated_text_profile = ModelProfile(
+            hf_path="mlx-community/Qwen3.5-4B-MLX-4bit",
+            is_text_only=True,
+        )
+        monkeypatch.setattr(
+            utils_mod, "resolve_profile", lambda name: curated_text_profile
+        )
+        # Real checkpoint evidence: a genuine ``vision_tower.`` tensor is present
+        # (positive multimodal verdict) — the curated pin must still win.
+        monkeypatch.setattr(
+            utils_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "architectures": ["Qwen3_5ForConditionalGeneration"],
+                    "vision_config": {"hidden_size": 1024},
+                    "image_token_id": 248056,
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            utils_mod,
+            "checkpoint_has_multimodal_weights",
+            lambda snapshot, config: True,
+        )
+
+        assert is_mllm_model("mlx-community/Qwen3.5-4B-MLX-4bit") is False
+
+    def test_curated_text_alias_smoke_qwen35_4b_is_text(self):
+        """End-to-end: the shipped alias registry curates the default smoke
+        model as text, so ``is_mllm_model`` returns False through the REAL
+        ``resolve_profile`` (no monkeypatch).  This is the exact routing the
+        7 previously-red CLI serve tests depend on."""
+        assert is_mllm_model("mlx-community/Qwen3.5-4B-MLX-4bit") is False
+        assert is_mllm_model("qwen3.5-4b-4bit") is False
+
+    def test_inconclusive_verdict_is_not_promoted_by_file_existence(
+        self, monkeypatch, tmp_path
+    ):
+        """FIX 2 regression: an inconclusive checkpoint verdict (``None``) must
+        NOT be promoted to multimodal just because checkpoint files exist on
+        disk.  A cached (non-local) VLM-config snapshot whose weights are
+        inconclusive and whose name carries NO legacy VLM substring must fall
+        through to the name matcher (False), not be promoted to True.
+        """
+        from vllm_mlx.api import utils as utils_mod
+        from vllm_mlx.model_metadata import ModelMetadata
+
+        # Snapshot dir that HAS checkpoint files (so a file-existence probe
+        # would say "evidence available") but the modality verdict is None.
+        (tmp_path / "model.safetensors").write_bytes(b"\x00\x00")
+
+        def _cached_meta(name):
+            return ModelMetadata(
+                config={
+                    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                    "vision_config": {"hidden_size": 1024},
+                },
+                chat_template=None,
+                snapshot_dir=tmp_path,
+                is_local=False,
+            )
+
+        monkeypatch.setattr(utils_mod, "resolve_profile", lambda name: None)
+        monkeypatch.setattr(utils_mod, "read_model_metadata", _cached_meta)
+        monkeypatch.setattr(
+            utils_mod,
+            "checkpoint_has_multimodal_weights",
+            lambda snapshot, config: None,
+        )
+        # Name has NO legacy VLM substring.
+        assert _check_legacy_string_patterns("publisher/plain-repack") is False
+
+        # Must NOT be promoted on bare file existence — stays text (False).
+        assert is_mllm_model("publisher/plain-repack") is False
 
     def test_hub_helper_rejects_local_path_lookalikes(self):
         from vllm_mlx.api.utils import _try_read_hub_config_json

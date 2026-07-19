@@ -4,6 +4,7 @@ import logging
 
 import pytest
 
+from vllm_mlx import model_auto_config as auto_config_mod
 from vllm_mlx.model_auto_config import (
     ModelConfig,
     _deepseek_template_family,
@@ -15,6 +16,7 @@ from vllm_mlx.model_auto_config import (
     get_profile,
     warn_misbound_deepseek_v3_parser,
 )
+from vllm_mlx.model_metadata import ModelMetadata
 
 
 class TestDetectModelConfig:
@@ -2266,3 +2268,425 @@ class TestMistralFamilyToolParser:
             f"static _MISTRAL_ALIASES is {sorted(self._MISTRAL_ALIASES)}. "
             "Update both together."
         )
+
+
+class TestCheckpointMetadataFallback:
+    """Unknown HF names inherit only explicit checkpoint contracts."""
+
+    _XML_TOOLS = (
+        "{% if tools %}<tool_call><function=example><parameter=value>"
+        "x</parameter></function></tool_call>{% endif %}"
+    )
+
+    @staticmethod
+    def _metadata(config, template):
+        return ModelMetadata(
+            config=config,
+            chat_template=template,
+            snapshot_dir=None,
+        )
+
+    def test_repackaged_agents_a1_dense_routes_from_config_and_template(
+        self, monkeypatch
+    ):
+        """The #1121 4B shape needs no Agents-A1 name special case."""
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "model_type": "qwen3_5",
+                    "text_config": {"model_type": "qwen3_5_text"},
+                },
+                self._XML_TOOLS + "{% if enable_thinking %}<think>{% endif %}",
+            ),
+        )
+
+        config = detect_model_config("publisher/renamed-research-agent-4b")
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+        assert config.reasoning_parser == "qwen3"
+        assert config.is_hybrid is False
+        assert config.is_hybrid_explicit is True
+        assert config.supports_spec_decode is False
+
+    def test_repackaged_agents_a1_moe_keeps_hybrid_safety_gates(self, monkeypatch):
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({"model_type": "qwen3_5_moe"}, self._XML_TOOLS),
+        )
+
+        config = detect_model_config("publisher/renamed-research-agent-moe")
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+        assert config.reasoning_parser is None
+        assert config.is_hybrid is True
+        assert config.is_hybrid_explicit is True
+        assert config.is_moe is True
+        assert config.supports_spec_decode is False
+
+    def test_incomplete_template_is_not_advertised_as_native_tools(self, monkeypatch):
+        # The template PARSES successfully (``{% endif %}`` is present), but the
+        # XML tool contract is genuinely INCOMPLETE: it opens
+        # ``<tool_call><function=…><parameter=…>`` and never emits the closing
+        # ``</parameter></function></tool_call>`` tags. This exercises the
+        # XML closing-tag nesting checks in ``_template_uses_parameterized_xml_tools``
+        # rather than passing via a parse failure (see the assertion below that
+        # the template parses cleanly).
+        incomplete = (
+            "{% if tools %}<tool_call><function=example><parameter=value>x{% endif %}"
+        )
+        # Sanity guard: this template must PARSE (so the test is not
+        # tautologically satisfied by ``_template_output_contract`` returning
+        # None on a syntax error). If it did not parse, the missing-closing-tag
+        # logic below would never be reached.
+        assert auto_config_mod._template_output_contract(incomplete) is not None
+
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, incomplete),
+        )
+
+        # The routing helper must reject it because the closing XML tags are
+        # absent — not because parsing failed.
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(incomplete) is False
+        )
+        assert detect_model_config("publisher/unknown-tool-format") is None
+
+    def test_contract_split_across_exclusive_branches_is_not_detected(
+        self, monkeypatch
+    ):
+        # FIX 4: the opening XML fragments live in the ``{% if %}`` body and the
+        # closing fragments in the ``{% else %}`` — MUTUALLY EXCLUSIVE branches.
+        # No single reachable output path emits the full nested
+        # ``<tool_call>…</tool_call>`` contract, so flattening the whole AST
+        # (the pre-fix behaviour) would FABRICATE a match the model never
+        # renders.  Branch-local path detection must reject it.
+        split = (
+            "{% if tools %}<tool_call><function=example><parameter=value>"
+            "{% else %}</parameter></function></tool_call>{% endif %}"
+        )
+        # Sanity: the template PARSES (so rejection is about branch locality,
+        # not a syntax error), and the FLATTENED output DOES contain every tag
+        # (proving the old whole-AST flatten would have matched).
+        flat = auto_config_mod._template_output_contract(split)
+        assert flat is not None
+        flat_source = flat[0]
+        assert "<tool_call>" in flat_source and "</tool_call>" in flat_source
+
+        assert auto_config_mod._template_uses_parameterized_xml_tools(split) is False
+
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, split),
+        )
+        assert detect_model_config("publisher/split-branch-tools") is None
+
+    def test_full_contract_in_single_else_branch_is_detected(self, monkeypatch):
+        # FIX 4 counterpart: when ONE reachable branch emits the whole nested
+        # contract (here the ``{% else %}`` path), it must still be detected.
+        template = (
+            "{% if legacy %}plain text{% else %}"
+            "<tool_call><function=example><parameter=value>"
+            "x</parameter></function></tool_call>{% endif %}"
+            "{% if tools %}{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(template) is True
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, template),
+        )
+        config = detect_model_config("publisher/else-branch-tools")
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+
+    def test_tool_xml_in_uncalled_macro_is_not_detected(self, monkeypatch):
+        # FIX A (codex #3): a ``{% macro %}...{% endmacro %}`` definition emits
+        # NO output at its definition site (a macro renders only when CALLED).
+        # Tool XML inside an UNCALLED helper macro must therefore NOT enable the
+        # Hermes parser — real chat templates commonly define helper macros.
+        macro_template = (
+            "{% macro render_tools() %}"
+            "<tool_call><function=example><parameter=value>"
+            "x</parameter></function></tool_call>"
+            "{% endmacro %}Hello"
+        )
+        # Sanity: the template PARSES (rejection is about macro non-rendering,
+        # not a syntax error) and the FLATTENED whole-AST output DOES contain
+        # the full contract (proving the pre-fix ``body``-recursion would have
+        # fabricated a match).
+        flat = auto_config_mod._template_output_contract(macro_template)
+        assert flat is not None
+        assert "<tool_call>" in flat[0] and "</tool_call>" in flat[0]
+
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(macro_template)
+            is False
+        )
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, macro_template),
+        )
+        assert detect_model_config("publisher/macro-only-tools") is None
+
+    def test_tool_xml_in_set_capture_block_is_not_detected(self, monkeypatch):
+        # FIX A (codex #3): a capture-only ``{% set x %}...{% endset %}`` block
+        # (jinja2 ``AssignBlock``) captures its body INTO a variable rather than
+        # rendering it into the output stream at that site.  Tool XML inside such
+        # a capture must NOT enable the Hermes parser.
+        set_template = (
+            "{% set captured %}"
+            "<tool_call><function=example><parameter=value>"
+            "x</parameter></function></tool_call>"
+            "{% endset %}Hello"
+        )
+        # Sanity: parses cleanly and the flattened whole-AST output contains the
+        # full contract (pre-fix ``body`` recursion would have matched it).
+        flat = auto_config_mod._template_output_contract(set_template)
+        assert flat is not None
+        assert "<tool_call>" in flat[0] and "</tool_call>" in flat[0]
+
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(set_template)
+            is False
+        )
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, set_template),
+        )
+        assert detect_model_config("publisher/set-capture-tools") is None
+
+    def test_tool_xml_on_reachable_path_still_detected_after_macro_set_fix(
+        self, monkeypatch
+    ):
+        # FIX A true-positive guard: tool XML on a genuinely reachable render
+        # path (inside a rendered ``{% if tools %}``) must STILL be detected
+        # after the macro/set-capture exclusion — the fix must not over-exclude.
+        template = self._XML_TOOLS
+        assert auto_config_mod._template_uses_parameterized_xml_tools(template) is True
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, template),
+        )
+        config = detect_model_config("publisher/reachable-if-tools")
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+
+    # Raw nested XML contract (no ``{% if %}`` wrapper) for the macro tests.
+    _RAW_XML = (
+        "<tool_call><function=example><parameter=value>"
+        "x</parameter></function></tool_call>"
+    )
+
+    def test_tool_xml_in_called_macro_is_detected(self, monkeypatch):
+        # FIX #3: a macro that defines tool XML and is CALLED on a reachable
+        # render path (``{% if tools %}{{ emit() }}{% endif %}``) DOES render
+        # that XML — the round-4 uncalled-macro exclusion wrongly suppressed it,
+        # leaking unparsed tool calls.  Bounded macro-call resolution must
+        # substitute the macro body's output paths so the contract is detected.
+        called = (
+            "{% macro emit() %}"
+            + self._RAW_XML
+            + "{% endmacro %}{% if tools %}{{ emit() }}{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(called) is True
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, called),
+        )
+        config = detect_model_config("publisher/called-macro-tools")
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+
+    def test_tool_xml_in_uncalled_macro_still_not_detected(self):
+        # FIX #3 must PRESERVE the round-4 exclusion: a macro that is DEFINED
+        # but never CALLED emits nothing, so its tool XML must NOT enable the
+        # parser.
+        uncalled = (
+            "{% macro emit() %}"
+            + self._RAW_XML
+            + "{% endmacro %}{% if tools %}Hi{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(uncalled) is False
+
+    def test_nested_called_macro_is_detected(self):
+        # A macro that calls another macro (both reachable) resolves through the
+        # chain up to the recursion cap.
+        nested = (
+            "{% macro inner() %}"
+            + self._RAW_XML
+            + "{% endmacro %}{% macro outer() %}{{ inner() }}{% endmacro %}"
+            "{% if tools %}{{ outer() }}{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(nested) is True
+
+    def test_recursive_macro_does_not_hang(self):
+        # A (self-)recursive macro must terminate via the cycle guard, not loop.
+        recursive = (
+            "{% macro rec() %}"
+            + self._RAW_XML
+            + "{{ rec() }}{% endmacro %}{% if tools %}{{ rec() }}{% endif %}"
+        )
+        # Detected (the body's XML is on the first expansion) and terminates.
+        assert auto_config_mod._template_uses_parameterized_xml_tools(recursive) is True
+
+    def test_attribute_call_is_not_resolved_as_local_macro(self):
+        # ``{{ x.emit() }}`` is an attribute call, NOT a bare call to a
+        # locally-defined macro, so it must not be resolved (no false positive).
+        attr = (
+            "{% macro emit() %}"
+            + self._RAW_XML
+            + "{% endmacro %}{% if tools %}{{ x.emit() }}{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(attr) is False
+
+    def test_path_enumeration_bounded_by_cumulative_byte_budget(self):
+        # FIX #5: a template whose path COUNT stays under the cap but whose
+        # cumulative path BYTES would blow up must be bounded by the byte budget
+        # (enumeration aborts, total retained bytes stay within budget) and must
+        # not hang.
+        import time
+
+        big = "Z" * 4096
+        parts = [
+            "{% if a" + str(i) + " %}" + big + "{% else %}" + big + "{% endif %}"
+            for i in range(400)
+        ]
+        template = "".join(parts)
+        start = time.time()
+        result = auto_config_mod._template_output_paths(template)
+        elapsed = time.time() - start
+        assert result is not None
+        paths, _ = result
+        total = sum(len(p) for p in paths)
+        assert total <= auto_config_mod._MAX_TEMPLATE_OUTPUT_BYTES
+        assert elapsed < 5.0  # generous ceiling; real runs are ~0.1s
+
+    def test_generation_block_template_still_routes_tools(self, monkeypatch):
+        """A Transformers ``{% generation %}`` block around a valid
+        parameterized-XML tool contract must still be recognised.
+
+        A bare ``jinja2.Environment().parse()`` raises ``TemplateSyntaxError``
+        on the custom ``generation`` tag (registered by Transformers'
+        ``AssistantTracker`` extension), which would silently disable inference
+        (``_template_output_contract`` → None). The Transformers-compatible
+        parsing environment must accept it.
+        """
+        template = (
+            "{% if tools %}{% generation %}"
+            + self._XML_TOOLS.removeprefix("{% if tools %}").removesuffix("{% endif %}")
+            + "{% endgeneration %}{% endif %}"
+        )
+        # The bare-jinja env would reject this template; confirm the fixture is
+        # actually exercising the extension path.
+        import jinja2
+
+        with pytest.raises(jinja2.exceptions.TemplateSyntaxError):
+            jinja2.Environment().parse(template)
+
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, template),
+        )
+
+        config = detect_model_config("publisher/generation-block-agent")
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+        assert config.reasoning_parser is None
+
+    def test_loop_control_template_still_routes_tools(self, monkeypatch):
+        """Loop-control statements (``{% break %}``) — enabled in Transformers
+        via ``jinja2.ext.loopcontrols`` — must also parse without disabling
+        tool routing."""
+        template = (
+            "{% for t in tools %}<tool_call><function=example>"
+            "<parameter=value>x</parameter></function></tool_call>"
+            "{% break %}{% endfor %}"
+        )
+        import jinja2
+
+        with pytest.raises(jinja2.exceptions.TemplateSyntaxError):
+            jinja2.Environment().parse(template)
+
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, template),
+        )
+
+        config = detect_model_config("publisher/loop-control-agent")
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+
+    def test_jinja_comment_cannot_advertise_a_tool_protocol(self, monkeypatch):
+        comment = "{# tools " + self._XML_TOOLS + " #}"
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, comment),
+        )
+
+        assert detect_model_config("publisher/comment-only-template") is None
+
+    def test_jinja_comment_cannot_enable_qwen_thinking(self, monkeypatch):
+        template = self._XML_TOOLS + "{# enable_thinking <think> #}"
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({"model_type": "qwen3_5"}, template),
+        )
+
+        config = detect_model_config("publisher/comment-only-thinking")
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+        assert config.reasoning_parser is None
+
+    def test_generic_xml_template_routes_tools_without_assuming_reasoning(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, self._XML_TOOLS),
+        )
+
+        config = detect_model_config("publisher/xml-tool-agent")
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+        assert config.reasoning_parser is None
+
+    def test_known_family_has_priority_over_generic_template_fallback(
+        self, monkeypatch
+    ):
+        def unexpected_metadata_read(name):
+            raise AssertionError("known-family detection must not read metadata")
+
+        monkeypatch.setattr(
+            auto_config_mod, "read_model_metadata", unexpected_metadata_read
+        )
+
+        config = detect_model_config("Qwen/Qwen3-Coder-Next")
+
+        assert config is not None
+        assert config.tool_call_parser == "qwen3_coder_xml"
+
+    def test_cold_or_uncached_model_keeps_existing_no_profile_result(self, monkeypatch):
+        monkeypatch.setattr(auto_config_mod, "read_model_metadata", lambda name: None)
+
+        assert detect_model_config("publisher/unknown-model") is None

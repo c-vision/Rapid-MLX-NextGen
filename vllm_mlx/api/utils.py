@@ -5,10 +5,16 @@ Utility functions for text processing and model detection.
 
 import json
 import logging
-import os
 import re
-from pathlib import Path
 
+from ..model_aliases import resolve_profile
+from ..model_metadata import (
+    checkpoint_has_multimodal_weights,
+    config_indicates_multimodal,
+    read_cached_model_metadata,
+    read_local_model_metadata,
+    read_model_metadata,
+)
 from .models import Message
 
 logger = logging.getLogger(__name__)
@@ -810,201 +816,26 @@ MLLM_PATTERNS = [
 ]
 
 
-# Config.json keys that, when present, indicate a multimodal model.
-_VLM_CONFIG_KEYS = (
-    "vision_config",
-    "audio_config",
-    "vision_tower",
-    "mm_vision_tower",
-    "image_token_id",
-    "image_token_index",
-    "audio_token_id",
-    "audio_token_index",
-)
-
-# Substrings (case-insensitive) inside `architectures` entries that identify VLMs.
-# Covers both ForConditionalGeneration VLMs (Qwen2VL, LLaVA, PaliGemma, Mllama, etc.)
-# and the few VLMs that use ForCausalLM (Phi3V, Molmo, CogVLM, InternVL).
-_VLM_ARCHITECTURE_KEYWORDS = (
-    "VLForCondition",
-    "VLForCausal",
-    "VisionForCondition",
-    "VisionForCausal",
-    "MultiModalityCausalLM",
-    "Llava",
-    "Idefics",
-    "PaliGemma",
-    "Pixtral",
-    "Molmo",
-    "Phi3V",
-    "Phi4V",
-    "CogVLM",
-    "InternVL",
-    "DeepseekVL",
-    "Mllama",
-    "Gemma3ForConditional",
-    "Gemma4ForConditional",
-)
-
-# Defensive cap on config.json size to bound parsing cost.
-_MAX_CONFIG_JSON_BYTES = 1 * 1024 * 1024
-
-
 def _try_read_config_json(name_or_path: str) -> dict | None:
-    """Read config.json from a local model directory.
-
-    Returns None when the input is not a local directory, the directory has
-    no config.json, the file is too large, or it cannot be parsed.
-    """
-    try:
-        candidate = Path(name_or_path)
-    except (TypeError, ValueError):
-        return None
-
-    if not candidate.is_dir():
-        return None
-
-    config_path = candidate / "config.json"
-    if not config_path.is_file():
-        return None
-
-    try:
-        if config_path.stat().st_size > _MAX_CONFIG_JSON_BYTES:
-            return None
-        with config_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
-        return None
-
-    return data if isinstance(data, dict) else None
+    """Compatibility wrapper for local config metadata lookup."""
+    metadata = read_local_model_metadata(name_or_path)
+    return metadata.config if metadata is not None else None
 
 
 def _try_read_hub_config_json(model_name: str) -> dict | None:
-    """Read a cached config.json for an HF repo ID without going online.
-
-    Looks up the repo in the local ``huggingface_hub`` cache via
-    ``try_to_load_from_cache``. If the model has already been downloaded
-    (or even just had its config fetched), the file is on disk and we
-    can read it authoritatively. If nothing is cached, returns None —
-    the caller falls back to legacy substring matching rather than
-    making a network call. Never raises; never reaches the network.
-
-    Only runs for inputs that look like repo IDs (``owner/name``), so
-    arbitrary strings and local-path lookalikes can't accidentally
-    trigger a cache lookup.
-    """
-    if not isinstance(model_name, str) or "/" not in model_name:
-        return None
-    if model_name.startswith(("/", "./", "../", "~")):
-        return None
-
-    try:
-        from huggingface_hub import _CACHED_NO_EXIST, try_to_load_from_cache
-    except ImportError:
-        return None
-
-    try:
-        cached = try_to_load_from_cache(model_name, "config.json")
-    except Exception:
-        return None
-    if cached is None or cached is _CACHED_NO_EXIST:
-        return None
-    if not isinstance(cached, (str, os.PathLike)):
-        return None
-
-    try:
-        config_path = Path(cached)
-        if not config_path.is_file():
-            return None
-        if config_path.stat().st_size > _MAX_CONFIG_JSON_BYTES:
-            return None
-        with config_path.open(encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
-        return None
-
-    return data if isinstance(data, dict) else None
+    """Compatibility wrapper for cached HF config metadata lookup."""
+    metadata = read_cached_model_metadata(model_name)
+    return metadata.config if metadata is not None else None
 
 
 def _config_indicates_vlm(config: dict) -> bool:
-    """Inspect a parsed config.json dict for multimodal markers."""
-    archs = config.get("architectures") or []
-    if isinstance(archs, list):
-        for arch in archs:
-            if not isinstance(arch, str):
-                continue
-            arch_lower = arch.lower()
-            for keyword in _VLM_ARCHITECTURE_KEYWORDS:
-                if keyword.lower() in arch_lower:
-                    return True
-
-    for key in _VLM_CONFIG_KEYS:
-        if key in config:
-            return True
-
-    return False
+    """Compatibility wrapper for shared multimodal config inspection."""
+    return config_indicates_multimodal(config)
 
 
-# Tensor-name prefixes that indicate actual vision/audio weights live in
-# the checkpoint. Used to distinguish text-only forks of multimodal
-# architectures (where config.json declares ``vision_config`` but the
-# safetensors ship no ``vision_tower.*`` tensors) from genuine VLMs.
-# See issue #393 (Qwen3.6-35B-A3B text-only fork misrouted into MLLM
-# batched path because Qwen3.5MoeForConditionalGeneration declares
-# vision_config even when the user's safetensors are language-only).
-_MULTIMODAL_TENSOR_PREFIXES = (
-    "vision_tower",
-    "vision_model",
-    "visual.",
-    "audio_tower",
-    "audio_model",
-    "mm_projector",
-    "patch_embed.",
-)
-
-
-def _local_checkpoint_has_multimodal_weights(model_dir: Path) -> bool | None:
-    """Probe a local model dir for actual vision/audio tensor weights.
-
-    Returns:
-        ``True`` if at least one tensor name in ``model.safetensors.index.json``
-        matches a known multimodal prefix (``vision_tower``, ``visual.``,
-        ``mm_projector``, …).
-        ``False`` if the index is present, readable, and contains zero
-        such tensors — meaning the checkpoint is text-only despite
-        whatever ``config.json`` declares.
-        ``None`` when we can't authoritatively answer (no index file,
-        single-file safetensors, unreadable index). Caller should fall
-        back to the config-based decision rather than flipping it.
-
-    The single-file-safetensors branch returns ``None`` rather than
-    parsing the file header ourselves — the cost of a wrong False (text
-    routing for a real VLM → crash later on first image input) is much
-    larger than the cost of a wrong True (current behavior, the bug we
-    want to fix only for the multi-file case Tylast reported in #393).
-    """
-    index_path = model_dir / "model.safetensors.index.json"
-    if not index_path.is_file():
-        # No sharded index. Caller must rely on config-based detection.
-        return None
-    try:
-        if index_path.stat().st_size > _MAX_CONFIG_JSON_BYTES:
-            # Unreasonably large index — bail rather than guess.
-            return None
-        with index_path.open(encoding="utf-8") as f:
-            idx = json.load(f)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
-        return None
-    weight_map = idx.get("weight_map")
-    if not isinstance(weight_map, dict):
-        return None
-    for tensor_name in weight_map:
-        if not isinstance(tensor_name, str):
-            continue
-        for prefix in _MULTIMODAL_TENSOR_PREFIXES:
-            if prefix in tensor_name:
-                return True
-    return False
+def _local_checkpoint_has_multimodal_weights(model_dir) -> bool | None:
+    """Compatibility wrapper for sharded-checkpoint modality inspection."""
+    return checkpoint_has_multimodal_weights(model_dir)
 
 
 def _check_legacy_string_patterns(model_name: str) -> bool:
@@ -1020,15 +851,25 @@ def _check_legacy_string_patterns(model_name: str) -> bool:
 def is_mllm_model(model_name: str) -> bool:
     """Check if a model name or path indicates a multimodal language model.
 
-    Four complementary validations are run, in order:
+    A curated alias that POSITIVELY declares text-only serving
+    (``is_text_only`` — the #393 state-pin) is authoritative and stays on the
+    text lane even against real vision weights: it is an operator decision, with
+    text-serve coverage, to run a vision-config checkpoint through the AR text
+    lane.  A bare alias that merely defaults to the ``text`` modality does NOT
+    override real vision weights — such a repackaged VLM still routes to the
+    MLLM lane via the checkpoint-evidence path (#1121).  Otherwise, local
+    metadata is authoritative for unaliased paths.  A cached HF snapshot is
+    promoted only after it supplies positive modality evidence; this preserves
+    text routing for a partial cache that contains an inherited vision config
+    but no vision weights, and an inconclusive verdict is NEVER promoted on the
+    bare existence of checkpoint files.  The shared probe never sends a network
+    request.  It applies two checks in order:
 
-    1. Local config.json inspection: when ``model_name`` resolves to a
-       local directory containing a readable config.json, inspect the
-       model's own metadata (``architectures`` field, ``vision_config``,
-       ``audio_config``, etc.).
+    1. Config inspection: ``architectures`` / ``vision_config`` /
+       ``audio_config`` declare whether the checkpoint is multimodal.
 
-    2. Local weights-presence override: when (1) said "VLM" but the
-       directory ships a ``model.safetensors.index.json`` with NO
+    2. Weights-presence override: when the config says "VLM" but a
+       ``model.safetensors.index.json`` has NO
        multimodal tensors (``vision_tower``, ``visual.``, ``mm_projector``,
        …), the checkpoint is a text-only fork of a multimodal
        architecture. Flip the answer to False so the model loads
@@ -1039,20 +880,11 @@ def is_mllm_model(model_name: str) -> bool:
        multimodal-capable, but the user's safetensors only contain
        language tensors).
 
-    3. Legacy substring match against ``MLLM_PATTERNS``: when no local
-       config is reachable, the historical name-based heuristic decides.
-
-    4. Cached-config override (false-positive correction): when the
-       legacy substring says "MLLM" but the repo's own config (already
-       in the local HF cache from a prior download or warmup call)
-       disagrees (e.g. ``mlx-community/gemma-3-1b-it-4bit`` matches the
-       ``gemma-3`` substring yet ships as ``Gemma3ForCausalLM`` with no
-       ``vision_config``), the cached config wins and the result flips
-       to False. The cache lookup is purely local — no network call,
-       so tests don't slow down or flake on HF outages. We deliberately
-       only override the True → False direction: the False direction is
-       preserved as-is so existing text-routed models with vision-capable
-       architectures keep their routing.
+    If cached metadata has no index/header evidence, the legacy name matcher
+    remains the compatibility fallback.  During ``serve``, model download has
+    already completed before this function runs, so a re-packaged VLM such as
+    Agents-A1 has its actual checkpoint evidence available rather than relying
+    on an arbitrary repository name.
 
     Args:
         model_name: HuggingFace repo ID or local filesystem path.
@@ -1060,39 +892,69 @@ def is_mllm_model(model_name: str) -> bool:
     Returns:
         True if the model is detected as multimodal (MLLM/VLM).
     """
-    config = _try_read_config_json(model_name)
+    profile = resolve_profile(model_name)
+    # A curated alias that declares text-only serving (``is_text_only`` — the
+    # #393 state-pin) is authoritative and outranks the checkpoint's raw vision
+    # weights: it is a deliberate operator decision, with text-serve coverage,
+    # to run a vision-config checkpoint through the AR text lane.  Some upstream
+    # repackages of a Qwen3.5 text model still ship a ``vision_tower`` in the
+    # safetensors index, so the weight-evidence path below would (correctly, on
+    # the raw bytes) return True; the pin short-circuits BEFORE that path so the
+    # curated text modality wins.  A bare alias that merely defaults to the
+    # ``text`` modality is NOT short-circuited here — real vision weights still
+    # route it to the MLLM lane via the evidence path (#1121), so a repackaged
+    # VLM served under a text-family alias name is not misrouted to text.
+    if profile is not None and profile.is_text_only:
+        return False
+
+    metadata = read_model_metadata(model_name)
+    config = metadata.config if metadata is not None else None
     if config is not None:
         if not _config_indicates_vlm(config):
             return False
-        # Config says VLM. For local directories, verify the checkpoint
-        # actually carries vision/audio tensors — text-only forks of
-        # multimodal architectures (#393) ship a config that declares
-        # vision_config but no vision_tower weights, and routing them
-        # to the MLLM batched engine crashes at first request.
-        try:
-            model_dir = Path(model_name)
-        except (TypeError, ValueError):
+        verdict = checkpoint_has_multimodal_weights(metadata.snapshot_dir, config)
+        if verdict is False:
+            return False
+        # Positive checkpoint evidence is authoritative and must win over any
+        # repository-name pattern.  A registered alias only short-circuits when
+        # it POSITIVELY declares text-only (handled above via
+        # ``profile.is_text_only``); a bare alias entry must never override real
+        # vision weights, or a renamed/repackaged VLM served under an aliased
+        # text-family name would be misrouted to the text engine (#1121).
+        if verdict is True:
             return True
-        if model_dir.is_dir():
-            verdict = _local_checkpoint_has_multimodal_weights(model_dir)
-            if verdict is False:
-                return False
-            # verdict is True or None (unable to authoritatively decide);
-            # trust the config in both cases — wrong-True here means an
-            # unnecessary text-path attempt that returns a clear error,
-            # vs wrong-False which would corrupt every request silently.
-        return True
+        # An inconclusive verdict (``None`` — the checkpoint was inspected but
+        # its tensor layout is unrecognised, or there is no index/header
+        # evidence at all) routes to the NAME/LOCALITY fallback below, NOT to a
+        # forced-multimodal verdict.
+        #
+        # DELIBERATE OVERRIDE of codex round-3 #1, which asked to PRESERVE the
+        # multimodal route on an inspected-but-unknown layout.  That reverses
+        # codex round-2 #1, which demanded we "never promote an inconclusive
+        # result based solely on file existence" — the author complied and
+        # removed exactly that promotion.  Honouring round-3 #1 would
+        # re-introduce what round-2 #1 rejected (codex oscillated between the two
+        # rounds).  Both misroute directions are harmful: force-VLM crashes a
+        # text-only fork in the MLLM batched engine on a missing vision tower
+        # (#393), while force-text starves a genuine VLM of its vision path.
+        # With genuinely ambiguous evidence there is no evidentiary basis to
+        # prefer either, so the name/locality heuristic — the established
+        # rapid-mlx default — is used as the NEUTRAL tie-breaker: it decides on
+        # the repo-name signal rather than on the bare presence of files.  This
+        # note is left so a future reviewer sees the round-2↔round-3 oscillation
+        # and the reasoned choice rather than re-litigating it.
+        #
+        # The fallback itself: a registered alias or a cached remote config can
+        # be a partial metadata download, so a name without legacy MLLM evidence
+        # stays on text until positive proof.  A bare local directory with a VLM
+        # config and no index is trusted as multimodal.
+        if profile is not None:
+            return _check_legacy_string_patterns(model_name)
+        if metadata.is_local:
+            return True
+        return _check_legacy_string_patterns(model_name)
 
-    legacy = _check_legacy_string_patterns(model_name)
-    if not legacy:
-        return False
-
-    # Substring says "MLLM" — verify via the repo's own config and let it
-    # override a name-based false positive (e.g. text-only Gemma 3 1B).
-    hub_config = _try_read_hub_config_json(model_name)
-    if hub_config is not None and not _config_indicates_vlm(hub_config):
-        return False
-    return True
+    return _check_legacy_string_patterns(model_name)
 
 
 # Backwards compatibility alias

@@ -5,12 +5,12 @@ parser, throttle, or optimization flag explicitly, this module infers
 the best configuration from the model name/path pattern, with optional
 runtime enrichment from the loaded model object.
 
-Two stages:
+Three stages:
 
-1. ``detect_model_config(model_path)`` — declarative, name-regex based.
-   Runs *before* model load. Returns ``ModelConfig`` with parser
-   defaults and capability gates (e.g. whether spec decoding is safe
-   for this arch).
+1. ``detect_model_config(model_path)`` — resolves an explicit alias, then
+   known model families, then an offline checkpoint-metadata fallback.  It
+   returns ``ModelConfig`` with parser defaults and capability gates (e.g.
+   whether spec decoding is safe for this arch).
 
 2. ``enrich_model_config(cfg, model)`` — runtime probe of the loaded
    model. Used as a safety net for unrecognized hybrid models — if the
@@ -28,6 +28,7 @@ from dataclasses import replace
 from typing import Any
 
 from .model_aliases import resolve_profile
+from .model_metadata import read_model_metadata
 from .model_profile import ModelProfile
 
 logger = logging.getLogger(__name__)
@@ -658,6 +659,451 @@ def _detect_mistral_family_config(model_path: str) -> ModelConfig | None:
     return None
 
 
+def _metadata_model_types(config: dict[str, Any]) -> frozenset[str]:
+    """Return top-level and text-backbone model types from a config."""
+    types: set[str] = set()
+    for candidate in (config, config.get("text_config")):
+        if not isinstance(candidate, dict):
+            continue
+        model_type = candidate.get("model_type")
+        if isinstance(model_type, str):
+            types.add(model_type.lower())
+    return frozenset(types)
+
+
+def _chat_template_environment():
+    """Build a Jinja environment that PARSES Transformers chat templates.
+
+    Transformers compiles chat templates with a specific environment (see
+    ``transformers.utils.chat_template_utils._cached_compile_jinja_template``):
+    an ``ImmutableSandboxedEnvironment`` with ``trim_blocks``/``lstrip_blocks``
+    and ``extensions=[AssistantTracker, jinja2.ext.loopcontrols]``. Valid
+    templates therefore use constructs a bare ``jinja2.Environment`` rejects at
+    parse time — the ``{% generation %}...{% endgeneration %}`` block (a custom
+    ``generation`` tag registered by ``AssistantTracker``) and loop-control
+    statements (``{% break %}`` / ``{% continue %}``). We only ever ``.parse()``
+    the template (to extract ``TemplateData`` literals and undeclared
+    variables); we never render it. So we mirror the SAME extension set that
+    makes those constructs parse, but need not replicate the sandbox or the
+    runtime rendering hooks.
+
+    The ``_GenerationExtension`` below ports the parse behaviour of
+    Transformers' ``AssistantTracker`` (``tags = {"generation"}``; consumes the
+    block up to ``endgeneration``) so ``{% generation %}`` parses identically.
+    """
+    import jinja2
+    import jinja2.ext
+
+    class _GenerationExtension(jinja2.ext.Extension):
+        # Mirror transformers.utils.chat_template_utils.AssistantTracker: the
+        # ``generation`` tag brackets assistant-generated spans. We only need
+        # its PARSE behaviour (consume the body up to ``endgeneration``) so a
+        # template that uses it does not raise TemplateSyntaxError; the tracked
+        # output is a rendering concern we never reach.
+        tags = {"generation"}
+
+        def parse(self, parser):
+            lineno = next(parser.stream).lineno
+            body = parser.parse_statements(["name:endgeneration"], drop_needle=True)
+            return jinja2.nodes.CallBlock(
+                self.call_method("_noop"), [], [], body
+            ).set_lineno(lineno)
+
+        def _noop(self, caller):  # pragma: no cover - never rendered
+            return caller()
+
+    return jinja2.Environment(
+        extensions=[_GenerationExtension, jinja2.ext.loopcontrols]
+    )
+
+
+# Cap on the number of distinct output paths enumerated per template.  Real
+# chat templates emit a tool contract inside a single ``if``/``for`` block, so
+# a small handful of paths cover every legitimate case.  If a pathological
+# template exceeds this, path enumeration stops growing: the effect is a
+# conservative "no native-tool contract detected" (safe text fallback), never a
+# fabricated cross-branch match.
+_MAX_TEMPLATE_OUTPUT_PATHS = 256
+
+# Cumulative byte budget for path enumeration (codex #5).  The path-COUNT cap
+# above bounds the number of alternatives but NOT the total work: a large
+# template could retain up to ``_MAX_TEMPLATE_OUTPUT_PATHS`` paths each many KiB
+# long, so the concatenated material is O(paths × template_size).  Once the
+# summed length of all accumulated paths crosses this budget, enumeration
+# aborts and fails SAFE (an empty path set → "no native-tool contract
+# detected" → text fallback).  8 MiB is far above any real chat template
+# (largest observed ≈ tens of KiB) yet caps a pathological input's work.  This
+# is defensive against trusted load-time input only.
+_MAX_TEMPLATE_OUTPUT_BYTES = 8 * 1024 * 1024
+
+# Bound on macro-call resolution (FIX #3).  Reachable ``{{ macro() }}`` calls to
+# locally-defined macros are expanded so tool XML defined in a macro body and
+# CALLED on a render path is still detected — but recursion is capped to avoid
+# blowups from deep or (mutually) recursive macro chains.
+_MAX_MACRO_RESOLUTION_DEPTH = 8
+
+
+class _MacroCtx:
+    """Resolution context threaded through path analysis (FIX #3).
+
+    ``macros`` maps a locally-defined macro name to its body node list.
+    ``active`` is the set of macro names currently being expanded on this call
+    stack (cycle guard).  ``depth`` bounds total expansion nesting.  A default
+    (empty-``macros``) context makes macro resolution a no-op, so callers that
+    do not pre-collect macros keep the pre-FIX-#3 behaviour.
+    """
+
+    __slots__ = ("macros", "active", "depth")
+
+    def __init__(self, macros=None, active=None, depth=0):
+        self.macros = macros or {}
+        self.active = active or frozenset()
+        self.depth = depth
+
+
+_EMPTY_MACRO_CTX = _MacroCtx()
+
+
+def _collect_macro_bodies(node) -> dict:
+    """Map every locally-defined ``{% macro name %}`` to its body node list.
+
+    Walks the WHOLE parsed AST (macros may be defined anywhere, including inside
+    blocks) via ``find_all`` so a call reachable on a render path can be
+    resolved regardless of where the macro was declared.
+    """
+    from jinja2 import nodes
+
+    macros: dict = {}
+    for macro in node.find_all(nodes.Macro):
+        # Last definition wins, mirroring jinja2's runtime rebinding semantics.
+        macros[macro.name] = macro.body
+    return macros
+
+
+def _resolve_macro_call(node, ctx: "_MacroCtx"):
+    """If ``node`` is a bare call to a locally-defined macro, return its body's
+    output paths (bounded); otherwise return ``None``.
+
+    Recognises the reachable-call shape ``{{ emit(...) }}`` → jinja2 ``Call``
+    whose ``.node`` is a ``Name`` (``ctx='load'``) bound to a collected macro.
+    Attribute/dynamic callees (``{{ x.emit() }}``) are intentionally NOT
+    resolved — they are not locally-defined macros in the template namespace.
+    """
+    from jinja2 import nodes
+
+    if not isinstance(node, nodes.Call):
+        return None
+    callee = node.node
+    if not isinstance(callee, nodes.Name):
+        return None
+    name = callee.name
+    body = ctx.macros.get(name)
+    if body is None:
+        return None
+    # Cycle / depth guard: a macro that (transitively) calls itself, or a chain
+    # deeper than the cap, contributes an empty path rather than looping.
+    if name in ctx.active or ctx.depth >= _MAX_MACRO_RESOLUTION_DEPTH:
+        return [""]
+    child_ctx = _MacroCtx(
+        macros=ctx.macros,
+        active=ctx.active | {name},
+        depth=ctx.depth + 1,
+    )
+    return _sequence_output_paths(body, child_ctx)
+
+
+def _node_output_paths(node, ctx: "_MacroCtx" = _EMPTY_MACRO_CTX) -> list[str]:
+    """Return the possible literal-output strings a single AST node can emit.
+
+    Each returned string is the concatenation of literals along ONE reachable
+    control-flow path through ``node``.  Mutually exclusive ``{% if %}`` /
+    ``{% elif %}`` / ``{% else %}`` branches become SEPARATE alternatives — the
+    opening fragment from one branch is never concatenated with the closing
+    fragment of a sibling branch.
+
+    ``ctx`` carries the macro-resolution state (FIX #3); the default empty
+    context makes macro-call resolution a no-op.
+    """
+    from jinja2 import nodes
+
+    if isinstance(node, nodes.TemplateData):
+        return [node.data]
+    if isinstance(node, nodes.Output):
+        # ``Output.nodes`` interleaves literal ``TemplateData`` with printed
+        # expressions ``{{ ... }}``; only the literals are known statically.
+        return _sequence_output_paths(node.nodes, ctx)
+    # A reachable ``{{ macro() }}`` call to a locally-defined macro renders that
+    # macro's body INTO the output stream at this site (FIX #3).  Resolve it to
+    # the macro body's output paths so tool XML defined in a called macro is
+    # still detected.  (Uncalled macro DEFINITIONS remain empty — see the
+    # ``Macro`` branch below.)
+    resolved = _resolve_macro_call(node, ctx)
+    if resolved is not None:
+        return resolved
+    if isinstance(node, nodes.If):
+        alternatives: list[str] = []
+        alternatives.extend(_sequence_output_paths(node.body, ctx))
+        # ``elif`` chains parse as nested ``If`` nodes hanging off ``elif_``.
+        for elif_node in node.elif_:
+            alternatives.extend(_node_output_paths(elif_node, ctx))
+        if node.else_:
+            alternatives.extend(_sequence_output_paths(node.else_, ctx))
+        else:
+            # No ``else`` → the "condition false, emit nothing" path is real.
+            alternatives.append("")
+        return alternatives or [""]
+    if isinstance(node, nodes.For):
+        # A loop body may execute (emit its contract) or the loop may be empty
+        # (emit only the ``else`` block, if any).  Both are reachable paths.
+        paths = list(_sequence_output_paths(node.body, ctx))
+        paths.extend(_sequence_output_paths(node.else_, ctx) if node.else_ else [""])
+        return paths or [""]
+    if isinstance(node, (nodes.Macro, nodes.AssignBlock)):
+        # A ``{% macro %}...{% endmacro %}`` definition and a capture-only
+        # ``{% set x %}...{% endset %}`` (jinja2 ``AssignBlock``) BOTH carry a
+        # ``body`` list, but NEITHER renders that body into the output stream at
+        # this site — a ``Macro`` emits nothing until it is *called*, and an
+        # ``AssignBlock`` captures its body into a variable rather than printing
+        # it (verified: ``env.from_string("{% macro m() %}X{% endmacro %}")
+        # .render() == ""`` and the same for ``{% set x %}X{% endset %}``).
+        # Recursing into their body (as the generic ``body`` fallthrough below
+        # would) falsely enables the Hermes tool parser whenever helper macros /
+        # captures contain tool XML — a common real-template shape.  So these
+        # emit an EMPTY output path at their definition site (codex #3).  A
+        # macro's body IS accounted for when the macro is CALLED on a render
+        # path (``_resolve_macro_call`` above, FIX #3); the exclusion here only
+        # suppresses the UNCALLED definition site.
+        return [""]
+    # Transparent wrapper blocks that DO render their body into the output
+    # stream at this site: ``{% generation %}`` → ``CallBlock`` (our extension's
+    # ``_noop`` caller returns ``caller()``), ``{% filter %}`` → ``FilterBlock``,
+    # ``{% with %}`` → ``With``, ``{% block %}`` → ``Block``, plus ``Scope`` /
+    # ``OverlayScope`` / ``ScopedEvalContextModifier``.  Recurse into their body
+    # and pass the path structure through.  (``Macro`` / ``AssignBlock`` are
+    # handled above precisely because they do NOT render-through.)
+    body = getattr(node, "body", None)
+    if isinstance(body, list):
+        return _sequence_output_paths(body, ctx)
+    # Statements with no literal output (Assign, Break, Continue, bare
+    # expressions, …) contribute the empty string on every path.
+    return [""]
+
+
+def _sequence_output_paths(node_list, ctx: "_MacroCtx" = _EMPTY_MACRO_CTX) -> list[str]:
+    """Cartesian concatenation of the per-node path sets for a node sequence.
+
+    Sequential nodes are concatenated; a branching node multiplies the number
+    of accumulated paths.  Growth is bounded by ``_MAX_TEMPLATE_OUTPUT_PATHS``
+    (path count) AND ``_MAX_TEMPLATE_OUTPUT_BYTES`` (cumulative length, codex
+    #5) to keep pathological templates cheap; either cap can only DROP a
+    would-be match, never fabricate one.
+
+    The Cartesian enumeration here is intentionally STRUCTURAL — it models
+    per-node reachability (each ``If``/``For`` alternative is a real path) but
+    does NOT track branch *predicates*.  In principle two independent top-level
+    ``{% if tools %}`` / ``{% if not tools %}`` blocks could Cartesian-combine a
+    tool-call opening fragment from one with a closing fragment from the other
+    into a spuriously "reachable" contract (codex #4).  We deliberately do NOT
+    thread correlated-predicate tracking through here: no real chat template
+    splits a single tool-call wire contract across two mutually exclusive
+    top-level conditionals, and either carrying predicates or conservatively
+    rejecting cross-conditional contracts would risk FALSE NEGATIVES on genuine
+    templates that legitimately span sequential blocks.  The realistic
+    false-positive vector — tool XML in an uncalled ``{% macro %}`` or a
+    ``{% set x %}...{% endset %}`` capture — is already removed at the node
+    level in ``_node_output_paths`` (FIX A).  Predicate correlation is treated
+    as over-engineering for a template shape that does not occur in practice.
+    """
+    paths = [""]
+    for child in node_list:
+        child_paths = _node_output_paths(child, ctx)
+        if not child_paths:
+            continue
+        combined: list[str] = []
+        total_bytes = 0
+        capped = False
+        for prefix in paths:
+            for suffix in child_paths:
+                combined_path = prefix + suffix
+                combined.append(combined_path)
+                total_bytes += len(combined_path)
+                # codex #5: abort on cumulative byte budget as well as count.
+                if (
+                    len(combined) >= _MAX_TEMPLATE_OUTPUT_PATHS
+                    or total_bytes >= _MAX_TEMPLATE_OUTPUT_BYTES
+                ):
+                    capped = True
+                    break
+            if capped:
+                break
+        paths = combined
+        if capped:
+            break
+    return paths
+
+
+def _template_output_paths(
+    template: str | None,
+) -> tuple[list[str], frozenset[str]] | None:
+    """Return per-reachable-path literal outputs and declared variables.
+
+    Unlike :func:`_template_output_contract` (which flattens every
+    ``TemplateData`` node across the whole AST), this walks the parsed AST and
+    keeps each ``{% if %}``/``{% else %}`` branch as a separate output path, so
+    a contract that only appears when fragments from mutually exclusive
+    branches are concatenated is NOT reported as present on any single path.
+    """
+    if template is None:
+        return None
+    try:
+        from jinja2 import meta
+
+        parsed = _chat_template_environment().parse(template)
+        # Pre-collect locally-defined macros so reachable ``{{ macro() }}`` calls
+        # can be resolved to their bodies during path analysis (FIX #3).
+        ctx = _MacroCtx(macros=_collect_macro_bodies(parsed))
+        paths = _sequence_output_paths(parsed.body, ctx)
+        variables = frozenset(meta.find_undeclared_variables(parsed))
+    except Exception:
+        return None
+    return paths, variables
+
+
+def _template_output_contract(
+    template: str | None,
+) -> tuple[str, frozenset[str]] | None:
+    """Return literal output text and declared variables from a Jinja template.
+
+    Uses a Transformers-compatible parsing environment so valid chat templates
+    (``{% generation %}``, ``{% break %}``/``{% continue %}``) do not silently
+    disable inference by raising ``TemplateSyntaxError``.  The returned text is
+    the flattened concatenation of ALL literals (used for single-token presence
+    checks such as ``<think>``); branch-sensitive contract detection uses
+    :func:`_template_output_paths` instead.
+    """
+    if template is None:
+        return None
+    try:
+        from jinja2 import meta, nodes
+
+        parsed = _chat_template_environment().parse(template)
+        output = "".join(node.data for node in parsed.find_all(nodes.TemplateData))
+        variables = frozenset(meta.find_undeclared_variables(parsed))
+    except Exception:
+        return None
+    return output, variables
+
+
+def _path_has_nested_xml_tool_contract(source: str) -> bool:
+    """Return whether ONE output path contains the full nested XML tool contract.
+
+    The tags must appear in the exact opening→closing nesting order
+    ``<tool_call>`` → ``<function=`` → ``<parameter=`` → ``</parameter>`` →
+    ``</function>`` → ``</tool_call>`` within this single reachable path.
+    """
+    tool_start = source.find("<tool_call>")
+    function_start = source.find("<function=", tool_start + 1)
+    parameter_start = source.find("<parameter=", function_start + 1)
+    parameter_end = source.find("</parameter>", parameter_start + 1)
+    function_end = source.find("</function>", parameter_end + 1)
+    tool_end = source.find("</tool_call>", function_end + 1)
+    return (
+        tool_start != -1
+        and function_start != -1
+        and parameter_start != -1
+        and parameter_end != -1
+        and function_end != -1
+        and tool_end != -1
+    )
+
+
+def _template_uses_parameterized_xml_tools(template: str | None) -> bool:
+    """Recognise one complete, nested XML tool contract for Hermes parsing.
+
+    The complete nested contract must appear on ONE reachable output path.  A
+    template that splits the contract across mutually exclusive
+    ``{% if %}``/``{% else %}`` branches (so no single path emits the whole
+    thing) is rejected — flattening the whole AST would fabricate a match that
+    the model never actually renders.
+    """
+    result = _template_output_paths(template)
+    if result is None:
+        return False
+    paths, variables = result
+    return "tools" in variables and any(
+        _path_has_nested_xml_tool_contract(path) for path in paths
+    )
+
+
+def _template_injects_qwen_thinking(template: str | None) -> bool:
+    """Recognise Qwen's ``enable_thinking`` / ``<think>`` template contract."""
+    contract = _template_output_contract(template)
+    if contract is None:
+        return False
+    source, variables = contract
+    return "enable_thinking" in variables and "<think>" in source
+
+
+def _detect_metadata_config(model_path: str) -> ModelConfig | None:
+    """Infer a safe fallback profile from an already-downloaded checkpoint.
+
+    This is deliberately lower priority than an alias or a dedicated family
+    parser: those encode implementation-specific behavior that a generic
+    template cannot know.  For an otherwise unknown repackage, however, its
+    own template is the authoritative tool wire contract.  The probe is
+    offline-only, so detecting a profile never adds a Hub request to startup.
+    """
+    metadata = read_model_metadata(model_path)
+    if metadata is None:
+        return None
+
+    config = metadata.config or {}
+    model_types = _metadata_model_types(config)
+    settings: dict[str, Any] = {}
+    reasons: list[str] = []
+
+    if "qwen3_5_moe" in model_types:
+        settings.update(
+            is_hybrid=True,
+            is_hybrid_explicit=True,
+            is_moe=True,
+            supports_spec_decode=False,
+        )
+        reasons.append("Qwen3.5 MoE architecture")
+    elif "qwen3_5" in model_types:
+        # Dense Qwen3.5 caches contain linear-attention layers, but their
+        # hybrid scheduler path is known to wedge on Metal.  Pinning this
+        # from config matches the existing dense-Qwen aliases and prevents
+        # the runtime cache probe from silently promoting it back to hybrid.
+        settings.update(
+            is_hybrid=False,
+            is_hybrid_explicit=True,
+            supports_spec_decode=False,
+        )
+        reasons.append("dense Qwen3.5 architecture")
+
+    if _template_uses_parameterized_xml_tools(metadata.chat_template):
+        settings["tool_call_parser"] = "hermes"
+        reasons.append("parameterized XML tool template")
+        if any(
+            model_type.startswith("qwen3") for model_type in model_types
+        ) and _template_injects_qwen_thinking(metadata.chat_template):
+            settings["reasoning_parser"] = "qwen3"
+            reasons.append("Qwen thinking template")
+
+    if not settings:
+        return None
+    profile = ModelConfig(**settings)
+    _log_resolution_once(
+        model_path,
+        "Auto-detected checkpoint metadata for "
+        f"'{model_path}' → tool_call_parser={profile.tool_call_parser}, "
+        f"reasoning_parser={profile.reasoning_parser}, "
+        f"is_hybrid={profile.is_hybrid} ({', '.join(reasons)})",
+    )
+    return profile
+
+
 def detect_model_config(model_path: str) -> ModelConfig | None:
     """Detect optimal parser config from model name/path.
 
@@ -667,9 +1113,12 @@ def detect_model_config(model_path: str) -> ModelConfig | None:
        (``mlx-community/Qwen3.5-4B-MLX-4bit``), return that profile's
        config directly. This guarantees per-alias granularity for any
        optimization that varies by size/quant within a family.
-    2. **Regex fallback** (``_MODEL_PATTERNS``) — for non-aliased HF
+    2. **Known-family fallback** (``_MODEL_PATTERNS``) — for non-aliased HF
        paths the user serves directly. Coarser-grained: one pattern
        covers a whole family.
+    3. **Checkpoint metadata fallback** — for an otherwise unknown local
+       directory or already-cached HF path, infer only documented template
+       contracts and architecture safety gates.  The probe is offline-only.
 
     Args:
         model_path: Model name or path (e.g. "mlx-community/Qwen3.5-9B-4bit")
@@ -779,7 +1228,7 @@ def detect_model_config(model_path: str) -> ModelConfig | None:
             f"supports_spec_decode={config.supports_spec_decode}",
         )
         return config
-    return None
+    return _detect_metadata_config(model_path)
 
 
 # DeepSeek V3-template wire-shape parsers, by the sub-family each one
