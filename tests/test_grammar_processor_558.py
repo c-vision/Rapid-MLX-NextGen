@@ -368,7 +368,8 @@ def test_eligible_false_by_default_when_env_unset(monkeypatch):
 
 def test_eligible_true_for_reasonable_schema():
     # A normal-sized, shallow schema is eligible (opt-in enabled by the module
-    # autouse fixture). PR-3a applies no size/depth cap (that is PR-3b).
+    # autouse fixture). The PR-3b size/depth/count caps must NOT reject ordinary
+    # tools.
     from vllm_mlx.routes.chat import _tool_grammar_eligible
 
     ok = _FunctionTool(
@@ -382,6 +383,303 @@ def test_eligible_true_for_reasonable_schema():
     cfg = _CfgStub("hermes")
     req = _RequestStub(tools=[ok], tool_choice="required")
     assert _tool_grammar_eligible(cfg, req) is True
+
+
+def test_eligible_false_for_oversized_schema():
+    # codex #558-PR3 blocking (restored in PR-3b): a pathologically LARGE client
+    # schema must be rejected before it can drive an unbounded compile on the
+    # shared executor.
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_BYTES,
+        _tool_grammar_eligible,
+    )
+
+    # A schema whose serialized size blows past the cap.
+    big_props = {
+        f"field_{i}": {"type": "string", "description": "x" * 64}
+        for i in range(_TOOL_GRAMMAR_MAX_SCHEMA_BYTES // 32)
+    }
+    huge = _FunctionTool(
+        "bloat",
+        parameters={"type": "object", "properties": big_props},
+    )
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=[huge], tool_choice="required")
+    assert _tool_grammar_eligible(cfg, req) is False
+
+
+def test_eligible_false_for_unicode_escaped_oversized_schema():
+    # codex #558-PR3 blocking (round-2): ``len(str(...))`` under-counts — a
+    # Unicode / JSON-escaped char occupies more BYTES than source code points, so
+    # a schema whose CODE-POINT length is under the cap but whose escaped-byte
+    # length is over it must still be rejected. Use emoji (1 code point ->
+    # ``😀`` = 12 escaped chars) so a source that is well under the cap
+    # by ``len(str())`` blows past it by true serialized bytes.
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_BYTES,
+        _tool_grammar_eligible,
+        _tools_within_grammar_bounds,
+    )
+
+    # ~1/6 of the cap in code points, but each emoji escapes to 12 chars -> ~2x
+    # the byte cap once serialized. A naive ``len(str())`` walker would PASS this.
+    emoji_blob = "\U0001f600" * (_TOOL_GRAMMAR_MAX_SCHEMA_BYTES // 6)
+    assert len(emoji_blob) < _TOOL_GRAMMAR_MAX_SCHEMA_BYTES, (
+        "test setup: code-point length must be under the cap so only true-byte "
+        "counting rejects it"
+    )
+    tool = _FunctionTool(
+        "u",
+        parameters={"type": "object", "description": emoji_blob, "properties": {}},
+    )
+    # Direct walker + full eligibility both reject it on true serialized bytes.
+    assert _tools_within_grammar_bounds([tool]) is False
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=[tool], tool_choice="required")
+    assert _tool_grammar_eligible(cfg, req) is False
+
+
+def test_charge_scalar_rejects_giant_int_without_rendering(monkeypatch):
+    # codex #558-PR3 blocking (round-3): Python ints are ARBITRARY precision, so
+    # ``json.dumps(huge_int)`` renders an attacker-sized decimal string BEFORE
+    # the budget check — an event-loop-blocking allocation. The O(1)
+    # ``bit_length`` preflight must reject an over-budget int WITHOUT ever
+    # rendering it. Prove that DETERMINISTICALLY (no wall-clock): monkeypatch the
+    # module's ``json.dumps`` to explode if it is ever handed a large int, and
+    # use an int just past the byte cutoff (not a multi-megabyte monster).
+    from vllm_mlx.routes import chat as chat_mod
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_BYTES,
+        _BoundsExceededError,
+        _charge_json_scalar_bytes,
+        _tools_within_grammar_bounds,
+    )
+
+    _real_dumps = chat_mod.json.dumps
+
+    def _guard_dumps(obj, *a, **k):
+        # The preflight must reject an over-budget int BEFORE dumps is called.
+        # Mirror production's conservative digit lower bound ``((b-1)*3)//10 + 1``
+        # (codex #558-PR3 round-6 nit — ``bit_length // 4 + 1`` over-counts).
+        if isinstance(obj, int) and not isinstance(obj, bool):
+            _b = obj.bit_length()
+            _min = (1 if _b == 0 else ((_b - 1) * 3) // 10 + 1) + (1 if obj < 0 else 0)
+            if _min > _TOOL_GRAMMAR_MAX_SCHEMA_BYTES:
+                raise AssertionError(
+                    "json.dumps was called on an over-budget int — the "
+                    "bit_length preflight failed to reject it first (codex "
+                    "#558-PR3)"
+                )
+        return _real_dumps(obj, *a, **k)
+
+    monkeypatch.setattr(chat_mod.json, "dumps", _guard_dumps)
+
+    # An int whose minimum decimal-digit count (bit_length/4 + 1) exceeds the
+    # byte cap: rejected by the O(1) preflight, dumps never called. Chosen just
+    # past the cutoff — no multi-megabyte big-int construction.
+    over = 1 << (_TOOL_GRAMMAR_MAX_SCHEMA_BYTES * 4 + 8)  # bit_length//4 > cap
+    budget = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES]
+    with pytest.raises(_BoundsExceededError):
+        _charge_json_scalar_bytes(over, budget)  # must reject, dumps not called
+
+    # End-to-end through the tools walker: a schema carrying the over-budget int
+    # default is rejected (free-form fallback) and dumps is still never rendered.
+    tool = _FunctionTool(
+        "n",
+        parameters={
+            "type": "object",
+            "properties": {"x": {"type": "integer", "default": over}},
+        },
+    )
+    assert _tools_within_grammar_bounds([tool]) is False
+
+    # A small int is charged normally (dumps IS called, harmlessly) and fits.
+    ok = _FunctionTool(
+        "n",
+        parameters={
+            "type": "object",
+            "properties": {"x": {"type": "integer", "default": 42}},
+        },
+    )
+    assert _tools_within_grammar_bounds([ok]) is True
+
+
+def test_int_digit_lower_bound_does_not_over_reject_exactly_fitting_scalar():
+    # codex #558-PR3 round-6 nit: the O(1) int preflight must use a TRUE lower
+    # bound on decimal-digit count. ``bit_length // 4 + 1`` OVER-counts (8 and 9
+    # have bit_length 4 => it claims 2 digits though they are 1), so an int that
+    # exactly fits the remaining budget could be spuriously rejected. Prove the
+    # corrected ``((b-1)*3)//10 + 1`` bound accepts every single-digit int with a
+    # 1-byte budget, and never OVER-estimates any int's real decimal length.
+    from vllm_mlx.routes.chat import _BoundsExceededError, _charge_json_scalar_bytes
+
+    # 8 and 9 (bit_length 4) each fit a 1-byte budget — the old formula rejected.
+    for v in (0, 1, 7, 8, 9):
+        budget = [1]  # exactly one byte, the width of a single decimal digit
+        _charge_json_scalar_bytes(v, budget)  # must NOT raise
+        assert budget[0] == 0, f"{v} should consume exactly its 1 digit byte"
+
+    # The lower bound must never exceed the true decimal length for any int, so
+    # a value given a budget equal to its real rendered length always fits.
+    import json as _json
+
+    for v in (10, 99, 100, 128, 255, 999, -1, -8, -9, -100, 1 << 20, -(1 << 20)):
+        true_len = len(_json.dumps(v).encode("utf-8"))
+        budget = [true_len]
+        _charge_json_scalar_bytes(v, budget)  # exactly fits, must NOT raise
+        assert budget[0] == 0
+        # One byte short must reject (via the O(1) preflight for large ints, or
+        # the post-charge ``budget < 0`` check for small ones — never a false
+        # accept). The lower bound is conservative, so it never over-rejects the
+        # exact-fit case above but always catches a genuine overflow here.
+        tight = [true_len - 1]
+        with pytest.raises(_BoundsExceededError):
+            _charge_json_scalar_bytes(v, tight)
+
+
+def test_walker_charges_commas_between_not_before_first_member():
+    # codex #558-PR3 nit: the walker must charge a ``,`` only BETWEEN members
+    # (N members => N-1 commas), matching the compact ``json.dumps`` envelope, so
+    # a schema materially under 64 KiB is not spuriously rejected. Verify the
+    # estimate never UNDER-counts real compact bytes (safe) and does not
+    # OVER-count by more than the fixed key-quote overhead (tight).
+    import json
+
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_BYTES,
+        _BoundsExceededError,
+        _walk_size_and_depth,
+    )
+
+    # A representative multi-member object with nested list + dict.
+    obj = {
+        "name": "get_weather",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "unit": {"type": "string", "enum": ["c", "f", "k"]},
+            },
+            "required": ["city"],
+        },
+    }
+    compact_bytes = len(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+
+    # Charged cost = starting budget minus what remains after the walk.
+    budget = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES]
+    _walk_size_and_depth(obj, budget, 0)
+    charged = _TOOL_GRAMMAR_MAX_SCHEMA_BYTES - budget[0]
+
+    # The walker charges keys with the same ``"..."`` quotes ``json.dumps`` emits
+    # and exactly N-1 commas per container, so its estimate must EQUAL the compact
+    # byte count — no under-count (an oversized schema could slip the cap) and no
+    # over-count. Assert EXACT equality, not a slack bound (codex #558-PR3
+    # round-7 blocking): this fixture has 5 nonempty dicts, so the old phantom-
+    # first-member-comma bug over-charged by exactly 5 — a ``<= 8`` slack would
+    # NOT have caught it. Exact equality does: any phantom comma breaks it.
+    assert charged == compact_bytes, (
+        f"walker charged {charged} != compact {compact_bytes} — a phantom comma "
+        "or miscounted quote inflates/deflates the estimate (codex #558-PR3). "
+        "The estimate must byte-match compact json.dumps exactly."
+    )
+
+    # Exact-boundary: a single scalar just at the cap is accepted; one byte over
+    # is rejected. Build a string whose ASCII escaped length is the budget.
+    from vllm_mlx.routes.chat import _charge_json_scalar_bytes
+
+    # ``json.dumps("a"*n)`` == n + 2 (surrounding quotes). Pick n so it exactly
+    # consumes the whole budget.
+    n = _TOOL_GRAMMAR_MAX_SCHEMA_BYTES - 2
+    at_cap = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES]
+    _charge_json_scalar_bytes("a" * n, at_cap)  # exactly fits
+    assert at_cap[0] == 0
+    over = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES]
+    with pytest.raises(_BoundsExceededError):
+        _charge_json_scalar_bytes("a" * (n + 1), over)  # one byte over
+
+
+def test_eligible_false_for_overdeep_schema():
+    # codex #558-PR3 blocking (restored in PR-3b): a pathologically DEEP nested
+    # schema is rejected.
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH,
+        _tool_grammar_eligible,
+    )
+
+    # Build a schema nested well past the depth cap.
+    node: dict = {"type": "string"}
+    for _ in range(_TOOL_GRAMMAR_MAX_SCHEMA_DEPTH + 5):
+        node = {"type": "object", "properties": {"inner": node}}
+    deep = _FunctionTool("deep", parameters=node)
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=[deep], tool_choice="required")
+    assert _tool_grammar_eligible(cfg, req) is False
+
+
+def test_depth_cap_counts_containers_only_not_scalar_leaves():
+    # codex #558-PR3 round-7 nit: the depth cap counts CONTAINER (object/array)
+    # nesting only. A scalar leaf is not a nesting level, so it must never trip
+    # the cap by being one level below the deepest container — otherwise the
+    # documented container-depth cap is content-dependent (a schema whose deepest
+    # container holds a scalar would reject one level shallower than one that
+    # doesn't). Build a chain of EXACTLY ``MAX`` nested objects with a scalar leaf
+    # at the bottom: the scalar sits at container-depth ``MAX`` and must be
+    # accepted; adding ONE more container tips it over and must reject.
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH,
+        _BoundsExceededError,
+        _walk_size_and_depth,
+    )
+
+    # The cap admits container nesting for depths ``0 .. MAX`` inclusive, i.e.
+    # ``MAX + 1`` nested containers (the innermost is entered at depth ``MAX``,
+    # and ``MAX > MAX`` is false). Build exactly that many nested objects with a
+    # scalar leaf at the bottom. Under the FIXED walker the scalar leaf (visited
+    # at depth ``MAX + 1``) is exempt, so the whole chain is accepted. Under the
+    # OLD walker the scalar's depth-``MAX + 1`` check would REJECT this exact
+    # chain — the content-dependent bug this test guards.
+    n_at_cap = _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH + 1
+    at_cap: dict = {"leaf": "x"}
+    for _ in range(n_at_cap - 1):
+        at_cap = {"inner": at_cap}
+    budget = [1 << 20]  # generous size budget; we test depth, not size
+    _walk_size_and_depth(at_cap, budget, 0)  # scalar leaf at max depth: NO raise
+
+    # One additional CONTAINER pushes the innermost object past the cap: it is
+    # entered at depth ``MAX + 1`` (``> MAX``) and must reject.
+    over = {"inner": at_cap}
+    with pytest.raises(_BoundsExceededError):
+        _walk_size_and_depth(over, [1 << 20], 0)
+
+
+def test_eligible_false_for_oversized_tool_name():
+    # codex #558-PR3 blocking (restored in PR-3b): the bound must include tool
+    # NAMES, not just parameters — an oversized name is compiled into the grammar
+    # too and must count against the byte cap.
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_BYTES,
+        _tool_grammar_eligible,
+    )
+
+    huge_name = "x" * (_TOOL_GRAMMAR_MAX_SCHEMA_BYTES + 10)
+    tool = _FunctionTool(huge_name, parameters={"type": "object", "properties": {}})
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=[tool], tool_choice="required")
+    assert _tool_grammar_eligible(cfg, req) is False
+
+
+def test_eligible_false_for_too_many_tools():
+    # codex #558-PR3 blocking (restored in PR-3b): a pathological tool COUNT
+    # (huge alternation width) must be rejected before the compile.
+    from vllm_mlx.routes.chat import _TOOL_GRAMMAR_MAX_TOOLS, _tool_grammar_eligible
+
+    tools = [
+        _FunctionTool(f"tool_{i}", parameters={"type": "object", "properties": {}})
+        for i in range(_TOOL_GRAMMAR_MAX_TOOLS + 1)
+    ]
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=tools, tool_choice="required")
+    assert _tool_grammar_eligible(cfg, req) is False
 
 
 def test_offline_skip_classifies_http_status():
@@ -435,22 +733,391 @@ def test_offline_skip_classifies_http_status():
 
 
 def test_route_offload_gated_on_eligibility_in_source():
-    # The route must run the cheap gate SYNCHRONOUSLY before the off-loop
-    # compile, so no-tools / auto traffic never enters the thread offload
-    # (codex #558-PR3). Source-position tripwire — the BEHAVIORAL guarantee is
-    # proven by ``test_ineligible_request_never_enters_heavy_build_path``.
-    # PR-3a uses a simple ``asyncio.to_thread`` offload (the bounded compile
-    # pool is PR-3b).
+    # The off-loop build helper must run the cheap gate + admission SYNCHRONOUSLY
+    # before submitting, so no-tools / auto traffic and at-capacity floods never
+    # enter the thread pool (codex #558-PR3). Source-position tripwire — the
+    # BEHAVIORAL guarantees are proven by
+    # ``test_ineligible_request_never_enters_heavy_build_path``,
+    # ``test_offload_at_capacity_never_submits`` and
+    # ``test_admission_slot_not_released_until_compile_finishes_on_cancel``.
+    # The route delegates the whole thing to ``_offload_tool_grammar_build``.
     import inspect
 
     from vllm_mlx.routes import chat as chat_mod
 
-    src = inspect.getsource(chat_mod._create_chat_completion_impl)
+    # The route calls the extracted helper (which owns the gate + admission).
+    route_src = inspect.getsource(chat_mod._create_chat_completion_impl)
+    assert "_offload_tool_grammar_build(engine, cfg, request)" in route_src, (
+        "the route must delegate the off-loop build to _offload_tool_grammar_build"
+    )
+
+    src = inspect.getsource(chat_mod._offload_tool_grammar_build)
     gate = src.find("_tool_grammar_eligible(cfg, request)")
-    offload = src.find("asyncio.to_thread(")
-    assert gate != -1, "route must gate the offload on _tool_grammar_eligible"
-    assert offload != -1, "route must offload the build via asyncio.to_thread"
-    assert gate < offload, "the eligibility gate must precede the off-loop compile"
+    admit = src.find("_try_admit_tool_grammar_build()")
+    offload = src.find("_get_tool_grammar_build_executor().submit(")
+    assert gate != -1, "helper must gate the offload on _tool_grammar_eligible"
+    assert admit != -1, "helper must reserve admission via _try_admit before submit"
+    assert offload != -1, (
+        "helper must offload the build by submitting to the dedicated bounded pool"
+    )
+    assert gate < admit < offload, (
+        "eligibility gate then admission must precede the off-loop submit"
+    )
+
+
+def test_route_offload_uses_dedicated_bounded_pool_not_semaphore_in_source():
+    # codex #558-PR3 blocking (restored in PR-3b): the compile must run on a
+    # DEDICATED bounded pool (slot held until the compile finishes, survives
+    # cancel, loop-agnostic) — NOT the default executor (unbounded queue) and
+    # NOT an asyncio semaphore (permit leaks on cancel, binds to one loop).
+    # Assert the structural guarantee in the offload-helper source + module
+    # surface.
+    import inspect
+
+    from vllm_mlx.routes import chat as chat_mod
+
+    src = inspect.getsource(chat_mod._offload_tool_grammar_build)
+    assert "_get_tool_grammar_build_executor()" in src, (
+        "the helper must dispatch the compile onto the dedicated bounded pool"
+    )
+    assert "asyncio.to_thread" not in src, (
+        "the helper must NOT use asyncio.to_thread (unbounded default-executor "
+        "queue — codex #558-PR3)"
+    )
+    assert "_get_tool_grammar_build_semaphore" not in src, (
+        "the helper must NOT gate the offload on an event-loop-bound semaphore "
+        "(codex #558-PR3: permit leaks on cancel, binds to one loop)"
+    )
+    assert not hasattr(chat_mod, "_get_tool_grammar_build_semaphore"), (
+        "the loop-bound build semaphore must not exist"
+    )
+    # The slot must be released via the underlying future's done-callback, NOT a
+    # try/finally around the await (which fires on cancel while the worker still
+    # compiles — codex #558-PR3 blocking). Assert the submit + done-callback +
+    # wrap_future shape.
+    assert (
+        "add_done_callback(lambda" in src and "_release_tool_grammar_build()" in src
+    ), (
+        "the helper must release the admission slot via the future's "
+        "add_done_callback (fires only when the compile actually finishes), not "
+        "a try/finally around the await"
+    )
+    assert "asyncio.wrap_future(" in src, (
+        "the helper must await the submitted future via asyncio.wrap_future so a "
+        "cancelled await does not pre-release the admission slot"
+    )
+    # The wrapped future MUST be shielded (codex #558-PR3 round-6 blocking): a
+    # bare ``await asyncio.wrap_future(fut)`` propagates a cancelled caller into
+    # ``fut.cancel()``; if the work item is still QUEUED (all workers busy) the
+    # cancel succeeds, the done-callback releases admission, yet the dead
+    # ``_WorkItem`` still sits in the executor's unbounded queue — a submit/cancel
+    # flood grows that queue past the admission cap. ``asyncio.shield`` stops the
+    # cancel from reaching the underlying future so the compile runs (and its
+    # queue slot is reclaimed) before admission is released.
+    assert "asyncio.shield(" in src, (
+        "the helper must shield the wrapped future so a cancelled caller does not "
+        "cancel a still-queued compile and release its admission slot early "
+        "(codex #558-PR3 round-6 blocking)"
+    )
+    # The dedicated pool exists and is bounded.
+    ex = chat_mod._get_tool_grammar_build_executor()
+    assert ex._max_workers == chat_mod._TOOL_GRAMMAR_MAX_BUILD_CONCURRENCY
+
+
+def test_offload_at_capacity_never_submits():
+    # codex #558-PR3 blocking (round-2, BEHAVIORAL): the off-loop build MUST gate
+    # ``submit`` on ``_try_admit_tool_grammar_build`` — at capacity, no compile is
+    # submitted to the executor (so the unbounded submission queue can never
+    # fill), and the request falls back to free-form (None). Drive the REAL
+    # ``_offload_tool_grammar_build`` with a mock executor and assert submit is
+    # not called at capacity but IS called under capacity.
+    import asyncio
+
+    from vllm_mlx.routes import chat as chat_mod
+
+    class _MockFuture:
+        def add_done_callback(self, _cb):
+            # Invoke immediately so the admission slot is released like a real
+            # instantly-finishing compile (keeps the counter balanced).
+            _cb(self)
+
+        def result(self):
+            return None
+
+    class _MockExecutor:
+        def __init__(self):
+            self.submit_calls = 0
+
+        def submit(self, *a, **k):
+            self.submit_calls += 1
+            return _MockFuture()
+
+    mock_ex = _MockExecutor()
+    saved_ex_getter = chat_mod._get_tool_grammar_build_executor
+    saved_inflight = chat_mod._tool_grammar_inflight
+    # Patch the executor getter + the build fn (so the mock future's None result
+    # path is exercised without a real compile) and asyncio.wrap_future.
+    chat_mod._get_tool_grammar_build_executor = lambda: mock_ex
+    saved_wrap = asyncio.wrap_future
+
+    async def _fake_wrap(fut):
+        return fut.result()
+
+    cfg = _CfgStub("hermes")
+    engine = _EngineStub(tokenizer=object())
+    request = _RequestStub([_FunctionTool("get_time")], "required")
+    try:
+        asyncio.wrap_future = _fake_wrap  # type: ignore[assignment]
+
+        # AT CAPACITY: pre-fill in-flight to the cap so _try_admit refuses.
+        chat_mod._tool_grammar_inflight = chat_mod._TOOL_GRAMMAR_MAX_INFLIGHT
+        result = asyncio.run(chat_mod._offload_tool_grammar_build(engine, cfg, request))
+        assert result is None, "at capacity the offload must fall back to free-form"
+        assert mock_ex.submit_calls == 0, (
+            "at capacity the route must NOT submit to the executor — its "
+            "submission queue would otherwise grow unbounded (codex #558-PR3)"
+        )
+
+        # UNDER CAPACITY: _try_admit succeeds -> submit IS called exactly once.
+        chat_mod._tool_grammar_inflight = 0
+        asyncio.run(chat_mod._offload_tool_grammar_build(engine, cfg, request))
+        assert mock_ex.submit_calls == 1, (
+            "under capacity the eligible request must be submitted exactly once"
+        )
+        # The done-callback fired synchronously, so the slot is released.
+        assert chat_mod._tool_grammar_inflight == 0, (
+            "admission slot must be released once the compile finishes"
+        )
+    finally:
+        chat_mod._get_tool_grammar_build_executor = saved_ex_getter
+        asyncio.wrap_future = saved_wrap  # type: ignore[assignment]
+        chat_mod._tool_grammar_inflight = saved_inflight
+
+
+def test_bounded_admission_rejects_at_capacity():
+    # codex #558-PR3 blocking (restored in PR-3b): admission caps in-flight
+    # (running + queued) compiles so the executor's submission queue can't grow
+    # unbounded. Past the cap, admission is refused (request falls back to
+    # free-form).
+    from vllm_mlx.routes import chat as chat_mod
+
+    # Snapshot + reset the module counter so the test is order-independent.
+    saved = chat_mod._tool_grammar_inflight
+    chat_mod._tool_grammar_inflight = 0
+    try:
+        cap = chat_mod._TOOL_GRAMMAR_MAX_INFLIGHT
+        for _ in range(cap):
+            assert chat_mod._try_admit_tool_grammar_build() is True
+        # At capacity: further admission refused.
+        assert chat_mod._try_admit_tool_grammar_build() is False
+        # Release one -> a slot frees -> admission succeeds again.
+        chat_mod._release_tool_grammar_build()
+        assert chat_mod._try_admit_tool_grammar_build() is True
+        # Release everything we hold.
+        for _ in range(cap):
+            chat_mod._release_tool_grammar_build()
+        # Release is floored at 0 (never negative).
+        chat_mod._release_tool_grammar_build()
+        assert chat_mod._tool_grammar_inflight == 0
+    finally:
+        chat_mod._tool_grammar_inflight = saved
+
+
+def test_admission_slot_not_released_until_compile_finishes_on_cancel():
+    # codex #558-PR3 blocking (round-2/3, BEHAVIORAL against the REAL helper): a
+    # cancelled AWAIT (client disconnect) must NOT release the admission slot
+    # while the worker thread is still compiling — otherwise a disconnect flood
+    # releases slots early and more than the cap run at once. We drive the ACTUAL
+    # ``_offload_tool_grammar_build`` (not a hand-rolled copy of its mechanism):
+    # a real bounded pool runs a BLOCKED build, we cancel the coroutine
+    # mid-compile, and assert the slot stays held until the (still-running)
+    # compile finishes. If production regressed to an ``await``-level
+    # ``try/finally`` release, this test would go red.
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vllm_mlx.routes import chat as chat_mod
+
+    saved = chat_mod._tool_grammar_inflight
+    saved_ex_getter = chat_mod._get_tool_grammar_build_executor
+    chat_mod._tool_grammar_inflight = 0
+    release_gate = threading.Event()  # blocks the "compile" until we let it end
+    started = threading.Event()
+    finished = threading.Event()
+    pool = ThreadPoolExecutor(max_workers=1)
+
+    # Make the REAL helper's build block: it submits _maybe_build_tool_grammar_
+    # processor to the pool, so patch that to a blocking function. The done-
+    # callback (attached by the helper) releases the slot when this returns.
+    def _blocking_build(engine, cfg, request):
+        started.set()
+        release_gate.wait(timeout=5)
+        finished.set()
+        return None  # free-form result; we only care about the slot lifecycle
+
+    chat_mod._get_tool_grammar_build_executor = lambda: pool
+
+    async def _drive():
+        cfg = _CfgStub("hermes")
+        engine = _EngineStub(tokenizer=object())
+        request = _RequestStub([_FunctionTool("get_time")], "required")
+        # Launch the REAL helper as a task, then cancel it mid-compile.
+        task = asyncio.ensure_future(
+            chat_mod._offload_tool_grammar_build(engine, cfg, request)
+        )
+        for _ in range(600):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert started.is_set(), "the real helper never submitted the compile"
+        # A slot is reserved for the in-flight compile.
+        assert chat_mod._tool_grammar_inflight == 1
+        # Cancel the helper coroutine (client disconnect) WHILE the compile runs.
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        # The compile is STILL running (release_gate not set): the slot must
+        # still be held — a cancelled await must NOT pre-release it.
+        assert not finished.is_set(), "test setup: compile finished too early"
+        assert chat_mod._tool_grammar_inflight == 1, (
+            "admission slot was released on cancel while the compile was still "
+            "running — production must release via the future's done-callback, "
+            "not an await-level try/finally"
+        )
+        # Let the compile finish; the done-callback releases the slot.
+        release_gate.set()
+        for _ in range(600):
+            if chat_mod._tool_grammar_inflight == 0:
+                break
+            await asyncio.sleep(0.005)
+        assert chat_mod._tool_grammar_inflight == 0, (
+            "the done-callback must release the slot once the compile finishes"
+        )
+
+    try:
+        # Patch the build fn the helper submits so it blocks.
+        _orig_build = chat_mod._maybe_build_tool_grammar_processor
+        chat_mod._maybe_build_tool_grammar_processor = _blocking_build
+        try:
+            asyncio.run(_drive())
+        finally:
+            chat_mod._maybe_build_tool_grammar_processor = _orig_build
+    finally:
+        release_gate.set()
+        pool.shutdown(wait=True)
+        chat_mod._get_tool_grammar_build_executor = saved_ex_getter
+        chat_mod._tool_grammar_inflight = saved
+
+
+def test_cancelled_caller_does_not_cancel_a_queued_compile():
+    # codex #558-PR3 round-6 blocking (BEHAVIORAL): the round-6 bug is specific to
+    # a QUEUED work item — all workers busy, a second compile sits in the pool's
+    # internal queue. A bare ``await asyncio.wrap_future(fut)`` would, on caller
+    # cancel, call ``fut.cancel()``; for a still-queued future that SUCCEEDS,
+    # firing the done-callback (releasing admission) while the dead ``_WorkItem``
+    # lingers in the executor's unbounded queue. We drive the REAL helper with a
+    # 1-worker pool: worker A is blocked, request B is therefore QUEUED, we cancel
+    # B's coroutine, and assert B's underlying future was NOT cancelled (shielded)
+    # and B's admission slot stays held until B actually runs+finishes.
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vllm_mlx.routes import chat as chat_mod
+
+    saved = chat_mod._tool_grammar_inflight
+    saved_ex_getter = chat_mod._get_tool_grammar_build_executor
+    saved_build = chat_mod._maybe_build_tool_grammar_processor
+    chat_mod._tool_grammar_inflight = 0
+
+    a_started = threading.Event()
+    a_gate = threading.Event()  # holds worker A (and thus the single worker) busy
+    b_ran = threading.Event()
+    pool = ThreadPoolExecutor(max_workers=1)  # forces B to QUEUE behind A
+    chat_mod._get_tool_grammar_build_executor = lambda: pool
+
+    def _build(engine, cfg, request):
+        # Distinguish A (first) from B (second) by a per-request marker.
+        if getattr(request, "_which", None) == "A":
+            a_started.set()
+            a_gate.wait(timeout=5)
+            return None
+        b_ran.set()
+        return None
+
+    async def _drive():
+        cfg = _CfgStub("hermes")
+        engine = _EngineStub(tokenizer=object())
+        req_a = _RequestStub([_FunctionTool("get_time")], "required")
+        req_a._which = "A"
+        req_b = _RequestStub([_FunctionTool("get_time")], "required")
+        req_b._which = "B"
+
+        task_a = asyncio.ensure_future(
+            chat_mod._offload_tool_grammar_build(engine, cfg, req_a)
+        )
+        for _ in range(600):
+            if a_started.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert a_started.is_set(), "worker A never occupied the single pool slot"
+
+        # B is admitted + submitted, but the single worker is busy on A, so B's
+        # work item sits QUEUED. Both slots reserved.
+        task_b = asyncio.ensure_future(
+            chat_mod._offload_tool_grammar_build(engine, cfg, req_b)
+        )
+        await asyncio.sleep(0.05)
+        assert chat_mod._tool_grammar_inflight == 2, (
+            "both A (running) and B (queued) should hold admission slots"
+        )
+        assert not b_ran.is_set(), "B must still be QUEUED behind the busy worker"
+
+        # Client B disconnects: cancel B's coroutine while its compile is QUEUED.
+        task_b.cancel()
+        try:
+            await task_b
+        except asyncio.CancelledError:
+            pass
+        # THE BUG: without shield, B's queued future would be cancelled here and
+        # its slot released while the dead work item lingers in the queue. With
+        # shield, B's slot stays held and B still runs when the worker frees up.
+        assert chat_mod._tool_grammar_inflight == 2, (
+            "a cancelled caller must NOT release a still-queued compile's slot "
+            "(codex #558-PR3 round-6 blocking)"
+        )
+        assert not b_ran.is_set(), "B should not have run yet (A still blocks)"
+
+        # Release A; the single worker then drains the still-live B, whose done-
+        # callback releases BOTH slots. B genuinely ran (was not cancelled).
+        a_gate.set()
+        await task_a
+        for _ in range(600):
+            if chat_mod._tool_grammar_inflight == 0:
+                break
+            await asyncio.sleep(0.005)
+        assert b_ran.is_set(), (
+            "the shielded queued compile B must still run to completion, not be "
+            "cancelled out of the queue"
+        )
+        assert chat_mod._tool_grammar_inflight == 0, (
+            "both slots must be released once both compiles finish"
+        )
+
+    try:
+        chat_mod._maybe_build_tool_grammar_processor = _build
+        try:
+            asyncio.run(_drive())
+        finally:
+            chat_mod._maybe_build_tool_grammar_processor = saved_build
+    finally:
+        a_gate.set()
+        pool.shutdown(wait=True)
+        chat_mod._get_tool_grammar_build_executor = saved_ex_getter
+        chat_mod._tool_grammar_inflight = saved
 
 
 @pytest.mark.parametrize(
@@ -1126,6 +1793,113 @@ def test_broken_processor_reports_is_broken_and_masks_nothing():
         tg.allocate_token_bitmask = orig_alloc
 
 
+def test_rejected_committed_token_drops_constraint_and_stops_masking():
+    # codex #558-PR3 nit: a matcher that REJECTS an already-sampled+committed
+    # token is desynced from the real output stream. The processor DROPS the
+    # constraint (a controlled FAIL-OPEN fallback) — latch ``_aborted``, stop
+    # consuming into the invalid matcher, and stop imposing a (garbage) mask,
+    # returning logits UNCHANGED so downstream free-form parsing owns the
+    # request. This is deliberately fail-open, NOT fail-closed: masking from a
+    # desynced matcher would be strictly worse, and this whole module is
+    # best-effort (missing extra / bad grammar / unsupported tokenizer all
+    # degrade to free-form, never an error). Uses fakes for EVERY llguidance
+    # primitive the processor touches (LLMatcher + the three bitmask fns), so it
+    # runs UNCONDITIONALLY in base CI — no ``llguidance`` extra required (codex
+    # #558-PR3 nit).
+    import mlx.core as mx
+    import numpy as np
+
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _RejectingMatcher:
+        """Accepts the first committed token, then rejects everything after."""
+
+        def __init__(self, *a, **k):
+            self.n_consumed = 0
+            self.n_fills = 0
+
+        def get_error(self):
+            return None  # compiled fine
+
+        def consume_token(self, tok_id):
+            self.n_consumed += 1
+            # Accept the first generated token, reject the second (simulating a
+            # matcher that desyncs from an already-committed token).
+            return self.n_consumed <= 1
+
+        def is_stopped(self):
+            return False
+
+        def reset(self):
+            self.n_consumed = 0
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    import vllm_mlx.api.tool_grammar as tg
+
+    orig_matcher = tg.LLMatcher
+    orig_alloc = tg.allocate_token_bitmask
+    orig_fill = tg.fill_next_token_bitmask
+    orig_apply = tg.apply_token_bitmask
+
+    fills = {"n": 0}
+
+    def _spy_fill(matcher, bitmask, row):
+        fills["n"] += 1
+
+    def _mask_all(logits, bitmask):
+        # A "real" mask would zero out most tokens; return a sentinel that is
+        # clearly different from the unchanged logits so we can prove masking
+        # did NOT run after the abort.
+        return mx.full(logits.shape, -1.0, dtype=logits.dtype)
+
+    tg.LLMatcher = _RejectingMatcher
+    tg.allocate_token_bitmask = lambda n, v: None
+    tg.fill_next_token_bitmask = _spy_fill
+    tg.apply_token_bitmask = _mask_all
+    try:
+        proc = GrammarLogitsProcessor(_FakeLLTok(), "ok-grammar", tokenizer=None)
+        assert proc.is_broken() is False
+
+        # Step 1: baseline the prompt (1 token), then feed the first generated
+        # token — accepted, matcher masks (fill runs, mask applied).
+        proc(mx.array([1]), mx.zeros((1, 8)))  # prompt baseline
+        out1 = proc(mx.array([1, 2]), mx.zeros((1, 8)))
+        assert proc._aborted is False, "first committed token was wrongly rejected"
+        assert np.array_equal(np.array(out1), np.full((1, 8), -1.0)), (
+            "an accepted token must still be masked (constraint active)"
+        )
+        fills_before_abort = fills["n"]
+
+        # Step 2: feed the second generated token — the matcher rejects it, so
+        # the processor must latch ``_aborted`` and return logits UNCHANGED.
+        logits2 = mx.zeros((1, 8))
+        out2 = proc(mx.array([1, 2, 3]), logits2)
+        assert proc._aborted is True, "rejected committed token must latch _aborted"
+        assert np.array_equal(np.array(out2), np.array(logits2)), (
+            "after abort, the mask must NOT be applied (logits unchanged)"
+        )
+        # No new fill happened on the aborting step (short-circuit before mask).
+        assert fills["n"] == fills_before_abort, (
+            "the mask branch must be skipped once aborted"
+        )
+
+        # Step 3: any subsequent call also stays dropped (logits unchanged).
+        logits3 = mx.zeros((1, 8))
+        out3 = proc(mx.array([1, 2, 3, 4]), logits3)
+        assert np.array_equal(np.array(out3), np.array(logits3))
+
+        # reset() clears the abort latch so the processor can be reused.
+        proc.reset()
+        assert proc._aborted is False
+    finally:
+        tg.LLMatcher = orig_matcher
+        tg.allocate_token_bitmask = orig_alloc
+        tg.fill_next_token_bitmask = orig_fill
+        tg.apply_token_bitmask = orig_apply
+
+
 def test_forced_prefix_block_is_gated_on_grammar_absence():
     # codex #558-PR3: the forced assistant prefix and the grammar are mutually
     # exclusive — combining them baselines the injected prefix away and
@@ -1139,7 +1913,7 @@ def test_forced_prefix_block_is_gated_on_grammar_absence():
     from vllm_mlx.routes import chat as chat_mod
 
     src = inspect.getsource(chat_mod._create_chat_completion_impl)
-    glp_pos = src.find("_maybe_build_tool_grammar_processor")
+    glp_pos = src.find("_glp = await _offload_tool_grammar_build(")
     prefix_gate = src.find("if _glp is None and request.tools")
     assert glp_pos != -1, "grammar processor build call not found in route"
     assert prefix_gate != -1, (
