@@ -605,22 +605,63 @@ def _constrain_tools_opted_out() -> bool:
     )
 
 
+def _tool_parser_supports_grammar(cfg) -> bool:
+    """Cheap capability probe: is the configured tool parser grammar-CAPABLE?
+
+    #1144: a parser is grammar-capable only when it overrides ``structure_info``
+    to emit a wire triple — declared at the class level via the
+    ``ToolParser.SUPPORTS_GRAMMAR`` marker (default ``False`` on the ABC; ``True``
+    on hermes/qwen). A non-capable parser is NEVER decoder-constrained
+    (``_maybe_build_tool_grammar_processor`` returns ``None`` → free-form), so
+    the constrained path — including the #561 oversized-schema HTTP 400 — must
+    not treat it as active.
+
+    Resolving the class is a cached dict lookup (the parser module is imported
+    once at model load), and ``supports_grammar`` is a class-level check, so this
+    stays a light synchronous probe with no instantiation and no tokenizer. An
+    UNKNOWN parser name (``KeyError`` from the manager) is treated as NOT
+    grammar-capable (free-form) — the same non-breaking fallback the heavy build
+    path already takes. Any OTHER failure (a broken import/registry for a known
+    parser) is NOT swallowed here (codex #1149): failing open would silently drop
+    both the grammar constraint and the #561 oversized-schema enforcement for a
+    genuinely-configured parser, so it propagates to surface the real bug.
+    """
+    name = getattr(cfg, "tool_call_parser", None)
+    if not name:
+        return False
+    from ..tool_parsers import ToolParserManager
+
+    try:
+        parser_cls = ToolParserManager.get_tool_parser(name)
+    except KeyError:
+        return False  # unknown / unregistered parser name -> free-form.
+    return bool(parser_cls.supports_grammar())
+
+
 def _tool_grammar_constraint_active(cfg, request) -> bool:
     """True iff the constrained-tool-calling path is ACTIVE for this request.
 
     Checks everything EXCEPT the schema-size/depth/count bound: the operator has
-    not opted out, tools are present, a family parser is configured, and
-    ``tool_choice`` resolves to a constrainable mode (auto / required / named —
-    ``"none"`` and a malformed object form normalize to ``None`` and are NOT
+    not opted out, tools are present, a family parser is configured AND that
+    parser is grammar-CAPABLE (#1144 — its ``structure_info`` can produce a wire
+    triple; a non-capable parser is never constrained so its path is inactive),
+    and ``tool_choice`` resolves to a constrainable mode (auto / required / named
+    — ``"none"`` and a malformed object form normalize to ``None`` and are NOT
     constrained). Deliberately excludes the bounds check so the caller can
-    distinguish an oversized schema (→ HTTP 400 under #561) from a genuinely
-    inactive path (→ free-form).
+    distinguish an oversized schema (→ HTTP 400 under #561, grammar-capable
+    parsers only) from a genuinely inactive path (→ free-form).
     """
     if _constrain_tools_opted_out():
         return False
     if not getattr(request, "tools", None) or not getattr(
         cfg, "tool_call_parser", None
     ):
+        return False
+    # #1144: gate on parser grammar-CAPABILITY, not merely on a parser being
+    # set. A non-grammar-capable parser (``structure_info`` is the ABC default →
+    # None) would fall back to free-form anyway, so an oversized schema must NOT
+    # 400 for it — only grammar-capable parsers (hermes/qwen) keep the #561 400.
+    if not _tool_parser_supports_grammar(cfg):
         return False
     return (
         _normalize_tool_choice_for_grammar(getattr(request, "tool_choice", None))

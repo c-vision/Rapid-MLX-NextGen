@@ -794,6 +794,155 @@ def test_reasonable_schema_no_400_on_active_path(monkeypatch):
     assert _enforce_tool_grammar_bounds_or_400(cfg, req) is None
 
 
+# --------------------------------------------------------------------------
+# #1144: the oversized -> 400 decision is gated on parser grammar-CAPABILITY,
+# not merely on ``tool_call_parser`` being set. A grammar-capable parser
+# (hermes/qwen, ``structure_info`` -> wire triple) keeps the #561 400; a
+# non-grammar-capable parser (ABC default ``structure_info`` -> None) was never
+# going to be decoder-constrained, so an oversized schema falls back to FREE-FORM
+# instead of 400.
+# --------------------------------------------------------------------------
+# A registered parser that does NOT override ``structure_info`` (grammar-incapable).
+_NON_GRAMMAR_PARSER = "deepseek_v3"
+
+
+def test_supports_grammar_probe_matches_capability():
+    # The cheap route probe reports True only for grammar-capable parsers.
+    from vllm_mlx.routes.chat import _tool_parser_supports_grammar
+
+    assert _tool_parser_supports_grammar(_CfgStub("hermes")) is True
+    assert _tool_parser_supports_grammar(_CfgStub("qwen")) is True
+    assert _tool_parser_supports_grammar(_CfgStub(_NON_GRAMMAR_PARSER)) is False
+    # Unknown / unset parser name -> not capable (free-form), never raises.
+    assert _tool_parser_supports_grammar(_CfgStub("no_such_parser_xyz")) is False
+    assert _tool_parser_supports_grammar(_CfgStub(None)) is False
+
+
+@pytest.mark.parametrize("parser", ["hermes", "qwen"])
+@pytest.mark.parametrize("choice", ["required", "auto", None])
+def test_oversized_schema_still_400_for_grammar_capable_parser(
+    monkeypatch, parser, choice
+):
+    # #561 regression guard (#1144): a grammar-CAPABLE parser keeps the hard 400
+    # on an oversized schema across every constrainable tool_choice.
+    from fastapi import HTTPException
+
+    from vllm_mlx.routes.chat import _enforce_tool_grammar_bounds_or_400
+
+    monkeypatch.setenv("RAPID_MLX_CONSTRAIN_TOOLS", "1")
+    cfg = _CfgStub(parser)
+    req = _RequestStub(tools=[_oversized_tool()], tool_choice=choice)
+    with pytest.raises(HTTPException) as ei:
+        _enforce_tool_grammar_bounds_or_400(cfg, req)
+    assert ei.value.status_code == 400
+    assert "grammar-compile bounds" in str(ei.value.detail)
+
+
+@pytest.mark.parametrize("choice", ["required", "auto", None])
+def test_oversized_schema_falls_back_for_non_grammar_parser(monkeypatch, choice):
+    # #1144 core fix: a non-grammar-capable parser (structure_info -> None) with
+    # an oversized schema must NOT 400 — it was never going to be constrained, so
+    # it falls back to free-form exactly like the pre-#558 behavior.
+    from vllm_mlx.routes.chat import (
+        _enforce_tool_grammar_bounds_or_400,
+        _tool_grammar_constraint_active,
+    )
+
+    monkeypatch.setenv("RAPID_MLX_CONSTRAIN_TOOLS", "1")
+    cfg = _CfgStub(_NON_GRAMMAR_PARSER)
+    req = _RequestStub(tools=[_oversized_tool()], tool_choice=choice)
+    # Path is inactive for a non-grammar parser, so no 400 (free-form fallback).
+    assert _tool_grammar_constraint_active(cfg, req) is False
+    assert _enforce_tool_grammar_bounds_or_400(cfg, req) is None
+
+
+@pytest.mark.parametrize("choice", ["required", "auto", None])
+def test_normal_schema_free_form_for_non_grammar_parser(monkeypatch, choice):
+    # #1144: a non-grammar-capable parser with a normal in-bounds schema stays
+    # free-form — never eligible for the constrained offload, never 400.
+    from vllm_mlx.routes.chat import (
+        _enforce_tool_grammar_bounds_or_400,
+        _tool_grammar_eligible,
+    )
+
+    monkeypatch.setenv("RAPID_MLX_CONSTRAIN_TOOLS", "1")
+    cfg = _CfgStub(_NON_GRAMMAR_PARSER)
+    ok = _FunctionTool(
+        "get_weather",
+        parameters={"type": "object", "properties": {"city": {"type": "string"}}},
+    )
+    req = _RequestStub(tools=[ok], tool_choice=choice)
+    assert _tool_grammar_eligible(cfg, req) is False
+    assert _enforce_tool_grammar_bounds_or_400(cfg, req) is None
+
+
+def test_supports_grammar_marker_declared_for_in_tree_parsers():
+    # In-tree DISCOVERABILITY guard (#1149 codex): the explicit
+    # ``SUPPORTS_GRAMMAR`` marker itself must match the ``structure_info``
+    # override across ALL registered parsers, so the grep-able capability list
+    # stays honest — a new grammar-capable in-tree parser can't ship WITHOUT the
+    # marker (which would rot the list), and a non-capable parser can't ship a
+    # stale ``True`` (spurious 400s). NB: this asserts the marker DIRECTLY, not
+    # the derived ``supports_grammar()`` — the runtime inference net (next test)
+    # would otherwise mask a missing marker and make this a tautology.
+    #
+    # SCOPE (#1149 codex): restrict to IN-TREE parser classes (module under
+    # ``vllm_mlx.tool_parsers``). An out-of-tree parser MAY legitimately override
+    # ``structure_info`` WITHOUT the marker and still work via the inference net
+    # (proven in ``test_supports_grammar_infers_capability_without_marker``), so
+    # asserting the marker on it would contradict that compatibility contract.
+    from vllm_mlx.tool_parsers import ToolParserManager
+    from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParser
+
+    names = ToolParserManager.list_registered()
+    assert names, "no tool parsers registered"
+    checked = 0
+    for name in names:
+        cls = ToolParserManager.get_tool_parser(name)
+        if not cls.__module__.startswith("vllm_mlx.tool_parsers"):
+            continue  # out-of-tree parser: covered by the inference net, not the marker
+        checked += 1
+        overrides_structure_info = cls.structure_info is not ToolParser.structure_info
+        assert bool(cls.SUPPORTS_GRAMMAR) == overrides_structure_info, (
+            f"{cls.__name__} (parser '{name}'): SUPPORTS_GRAMMAR marker="
+            f"{cls.SUPPORTS_GRAMMAR} but structure_info overridden="
+            f"{overrides_structure_info}; declare the marker to match (#1144)"
+        )
+    assert checked, "no in-tree tool parsers checked"
+
+
+def test_supports_grammar_infers_capability_without_marker():
+    # Runtime ROBUSTNESS net (#1149 codex): an out-of-tree parser that overrides
+    # ``structure_info`` but OMITS the marker is STILL grammar-capable via
+    # structural inference — no silent regression of grammar / #561 enforcement.
+    # A plain parser (no override, no marker) is NOT capable. This exercises the
+    # inference branch independently of the in-tree marker guard above.
+    from vllm_mlx.tool_parsers import ToolParserManager
+    from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParser
+
+    class _OverrideNoMarker(ToolParser):
+        EXPECTED_WIRE_FORMATS = ("tool_call_json",)
+
+        def extract_tool_calls(self, model_output, request=None):
+            return None
+
+        def structure_info(self):
+            return lambda name: None
+
+    class _PlainNoOverride(ToolParser):
+        EXPECTED_WIRE_FORMATS = ("tool_call_json",)
+
+        def extract_tool_calls(self, model_output, request=None):
+            return None
+
+    assert _OverrideNoMarker.SUPPORTS_GRAMMAR is False  # marker deliberately unset
+    assert _OverrideNoMarker.supports_grammar() is True  # inferred from override
+    assert _PlainNoOverride.supports_grammar() is False
+    # And the concrete in-tree capable parsers report capable.
+    assert ToolParserManager.get_tool_parser("hermes").supports_grammar() is True
+    assert ToolParserManager.get_tool_parser("qwen").supports_grammar() is True
+
+
 def test_offline_skip_classifies_http_status():
     # codex #558-PR3 blocking: only TRANSIENT signals skip; a permanent 4xx
     # (bad creds / deleted artifact / invalid revision) must FAIL, not silently

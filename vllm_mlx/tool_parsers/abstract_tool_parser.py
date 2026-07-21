@@ -150,6 +150,54 @@ class ToolParser(ABC):
     # reading-the-source archeology.
     EXPECTED_WIRE_FORMATS: tuple[str, ...] = ()
 
+    # Explicit opt-in marker for decoder-level grammar-constraint capability
+    # (#558 / #1144). Grammar-CAPABLE means the parser overrides
+    # ``structure_info`` to return a ``name -> StructureInfo`` wire triple.
+    # hermes + qwen set this to ``True`` for DISCOVERABILITY (grep-able list of
+    # grammar-capable families); it is NOT the sole source of truth —
+    # ``supports_grammar`` also INFERS capability from the ``structure_info``
+    # override, so an out-of-tree parser that overrides ``structure_info``
+    # without knowing about this marker still gets grammar + #561 enforcement
+    # (codex #1149: a marker-only gate would silently regress such parsers).
+    SUPPORTS_GRAMMAR: bool = False
+
+    @classmethod
+    def supports_grammar(cls) -> bool:
+        """Cheap class-level probe: is this parser grammar-CAPABLE (#558/#1144)?
+
+        Returns ``True`` iff the parser can be decoder-constrained — i.e. it
+        overrides ``structure_info`` to emit a wire triple (inferred
+        structurally so no parser can silently regress by omitting a marker), OR
+        it explicitly opts in via ``SUPPORTS_GRAMMAR``. A non-capable parser
+        (the ABC default: no override, marker ``False``) always falls back to
+        free-form-then-parse regardless of schema size, so an oversized schema
+        for it must NOT be rejected with HTTP 400 (#1144) — it was never going
+        to be constrained. The check needs neither instantiation nor a
+        tokenizer (class-attribute + class-level function-identity comparison),
+        so the synchronous route gate stays cheap.
+
+        DELIBERATELY class-level (#1144 mandates a cheap probe, "DO NOT invent a
+        heavy probe"): capability is a family/class property, NOT the per-request
+        result of ``structure_info()``. A grammar-capable family whose
+        ``structure_info()`` is tokenizer-GATED to ``None`` at runtime (e.g.
+        hermes on a non-Qwen tokenizer where ``<tool_call>`` is multi-token) is
+        still reported capable here, so an oversized schema for it keeps the #561
+        HTTP 400 — the SAME behavior as before this change and exactly what #1144
+        says to preserve for grammar-capable parsers (remedy:
+        ``RAPID_MLX_CONSTRAIN_TOOLS=0``). Resolving the true runtime result would
+        require instantiating the parser with the tokenizer on the event loop —
+        the heavy probe #1144 forbids. Only NON-capable families change (#1144:
+        oversized -> free-form instead of 400).
+
+        Returns:
+            True if this parser class supports grammar constraint.
+        """
+        if cls.SUPPORTS_GRAMMAR:
+            return True
+        # Structural inference: capable iff ``structure_info`` is overridden
+        # from the ABC default (which returns ``None`` — free-form).
+        return cls.structure_info is not ToolParser.structure_info
+
     @classmethod
     def supports_native_format(cls) -> bool:
         """

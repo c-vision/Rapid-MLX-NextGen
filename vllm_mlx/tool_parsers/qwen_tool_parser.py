@@ -55,6 +55,12 @@ class QwenToolParser(ToolParser):
 
     _GRAMMAR_SENTINELS = ("<tool_call>", "</tool_call>")
 
+    # Grammar-CAPABLE (#558/#1144): overrides ``structure_info`` below. The
+    # class-level marker lets the route gate decide the constrained path is
+    # reachable without instantiating the parser (an oversized schema still
+    # 400s here, per #561, rather than silently dropping the guarantee).
+    SUPPORTS_GRAMMAR: bool = True
+
     def structure_info(self):
         """Grammar-constraint wire triple for the qwen ``<tool_call>`` JSON
         body (#558). Qwen shares the hermes ``<tool_call>…</tool_call>`` wire:
