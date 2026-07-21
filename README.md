@@ -222,6 +222,14 @@ Top three things that go wrong:
 
 Rapid-MLX ships **opt-in anonymous telemetry** (off by default; explicit `rapid-mlx telemetry enable` required). No prompts, completions, paths, IPs, or API keys are ever collected. → [What we do and don't collect](https://rapidmlx.com/docs/telemetry.html)
 
+### 🚀 Contributors
+
+Every avatar here shipped something in rapid-mlx — model support, tool-call parsers, fixes, docs, and benchmark submissions. Thank you.
+
+<a href="https://github.com/raullenchai/Rapid-MLX/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=raullenchai/Rapid-MLX" alt="rapid-mlx contributors" />
+</a>
+
 ### Star History
 
 <a href="https://star-history.com/#raullenchai/Rapid-MLX&Date">
