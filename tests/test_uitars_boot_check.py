@@ -112,10 +112,15 @@ def test_require_mlx_vlm_or_exit_prints_hint_and_exits(monkeypatch, capsys):
 def test_require_mlx_vlm_or_exit_is_noop_when_installed(monkeypatch):
     """When ``mlx_vlm`` IS installed (or its spec is fakable), the
     guard returns silently — no SystemExit, no stderr output."""
-    from vllm_mlx.models.mllm import require_mlx_vlm_or_exit
+    from vllm_mlx.models.mllm import VisionRuntimeStatus, require_mlx_vlm_or_exit
 
-    # Force the probe to report True without touching sys.modules.
-    monkeypatch.setattr("vllm_mlx.models.mllm.mlx_vlm_available", lambda: True)
+    # Force the runtime probe to report OK without touching sys.modules.
+    # ``require_mlx_vlm_or_exit`` now branches on ``vision_runtime_status()``
+    # directly (single authoritative probe), so patch that.
+    monkeypatch.setattr(
+        "vllm_mlx.models.mllm.vision_runtime_status",
+        lambda: (VisionRuntimeStatus.OK, None),
+    )
 
     # Must not raise SystemExit.
     require_mlx_vlm_or_exit("ui-tars-1.5-7b-4bit")
