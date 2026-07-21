@@ -14,7 +14,14 @@
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
   <a href="https://support.apple.com/en-us/HT211814"><img src="https://img.shields.io/badge/Apple_Silicon-M1%20|%20M2%20|%20M3%20|%20M4-black.svg?logo=apple" alt="Apple Silicon"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/raullenchai/Rapid-MLX/actions/workflows/ci.yml"><img src="https://github.com/raullenchai/Rapid-MLX/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/raullenchai/Rapid-MLX/stargazers"><img src="https://img.shields.io/github/stars/raullenchai/Rapid-MLX?style=social" alt="GitHub stars"></a>
+  <a href="https://github.com/raullenchai/Rapid-MLX/graphs/contributors"><img src="https://img.shields.io/github/contributors/raullenchai/Rapid-MLX?color=orange" alt="Contributors"></a>
+  <a href="https://github.com/raullenchai/Rapid-MLX/commits/main"><img src="https://img.shields.io/github/last-commit/raullenchai/Rapid-MLX?color=orange" alt="Last commit"></a>
+  <a href="https://deepwiki.com/raullenchai/Rapid-MLX"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
 </p>
 
 <p align="center">
