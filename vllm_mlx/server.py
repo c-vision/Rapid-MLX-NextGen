@@ -333,6 +333,108 @@ async def _shutdown_save_prefix_cache() -> None:
     await asyncio.to_thread(_save_prefix_cache_to_disk)
 
 
+def _do_tool_grammar_warmup(tokenizer, parser_cls) -> bool:
+    """Pre-build the llguidance ``LLTokenizer`` (+ warm the grammar path).
+
+    CPU-ONLY and idempotent, safe to run on a worker thread: it touches only
+    llguidance's Rust surface, never an MLX GPU op, so it does not trip the
+    per-thread MLX stream gotcha (#170) that forbids GPU evals off the step
+    thread. The dominant cost this hoists off the first request is the
+    ``LLTokenizer`` build — a ~1s, vocab-scale operation llguidance's own docs
+    flag "expensive … should be cached". ``get_lltokenizer`` memoizes it on the
+    tokenizer, so building it here means the first real tool-call request hits a
+    warm cache instead of paying ~1s inline. Returns True if the tokenizer warmed.
+    """
+    from .api.tool_grammar import (
+        build_tool_grammar,
+        get_lltokenizer,
+        get_request_matcher,
+    )
+
+    lltok = get_lltokenizer(tokenizer)
+    if lltok is None:
+        return False
+    # Also warm the grammar-build + compiled-matcher path (module imports, the
+    # Lark->grammar compile, one automaton construction) with a trivial 0-arg
+    # tool so the first real request's setup is fully hot. Per-request schemas
+    # differ, so we cannot pre-compile a client's specific grammar — the win is
+    # the shared LLTokenizer above; this just primes the rest of the code path.
+    try:
+        parser = parser_cls(tokenizer=tokenizer)
+        warm_tools = [
+            {
+                "name": "_rapid_mlx_warmup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            }
+        ]
+        grammar = build_tool_grammar(warm_tools, "required", parser)
+        if grammar is not None:
+            get_request_matcher(lltok, grammar)
+    except Exception:
+        # Non-fatal: the LLTokenizer (the expensive part) is already warm. Log
+        # the secondary grammar-path priming failure rather than swallowing it
+        # silently, so a real defect here is diagnosable (codex #1155 nit).
+        logger.warning(
+            "Tool-grammar warmup: LLTokenizer built, but grammar-path priming "
+            "failed (non-fatal — first real request re-primes it)",
+            exc_info=True,
+        )
+    return True
+
+
+async def _warmup_tool_grammar(engine) -> None:
+    """Startup warmup for grammar-constrained tool calling (#558).
+
+    Gated so it only fires when the server is actually configured for
+    grammar-capable tool calling: a ``tool_call_parser`` is set, the parser
+    class opts into ``SUPPORTS_GRAMMAR``, and the llguidance stack is importable.
+    Any other case returns immediately (a text-only or non-grammar deploy pays
+    nothing at boot). The heavy build runs via ``asyncio.to_thread`` so the ~1s
+    LLTokenizer construction never blocks the event loop. Fully non-fatal.
+    """
+    cfg = get_config()
+    parser_name = getattr(cfg, "tool_call_parser", None)
+    if not parser_name:
+        return
+    try:
+        from .api.tool_grammar import HAS_LL_TOKENIZER, HAS_LLGUIDANCE
+    except Exception:
+        return
+    if not (HAS_LLGUIDANCE and HAS_LL_TOKENIZER):
+        return
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is None:
+        return
+    try:
+        from .tool_parsers import ToolParserManager
+
+        parser_cls = ToolParserManager.get_tool_parser(parser_name)
+    except Exception:
+        return
+    if not getattr(parser_cls, "SUPPORTS_GRAMMAR", False):
+        return
+    # Run the warmup on the loop's default thread pool and AWAIT it (the ~1s
+    # build runs off the event loop, so the loop stays responsive; startup waits
+    # for it the same way it already waits for ``generate_warmup``'s Metal-shader
+    # compile above). We deliberately impose NO timeout / background thread: a
+    # ``wait_for`` cannot cancel ``to_thread`` (the worker keeps running), and a
+    # detached daemon thread is untracked at shutdown (codex #1155). The warmup is
+    # a bounded, single-flighted CPU build that cannot realistically hang, so the
+    # simplest correct shape is a plain awaited ``to_thread`` — no orphaned worker
+    # to manage, and a genuine llguidance defect surfaces as a normal startup
+    # error rather than being masked by a timeout.
+    warmed = await asyncio.to_thread(_do_tool_grammar_warmup, tokenizer, parser_cls)
+    if warmed:
+        logger.info(
+            "Tool-grammar warmup complete (LLTokenizer pre-built for parser %r)",
+            parser_name,
+        )
+
+
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
     global _engine, _mcp_manager
@@ -447,6 +549,19 @@ async def lifespan(app: FastAPI):
             logger.debug(f"Warmup failed (non-fatal): {e}")
         _warmup_secs = _time.monotonic() - _warmup_start
         logger.info(f"Warmup complete ({_warmup_secs:.1f}s)")
+
+    # Tool-grammar warmup (#558): the FIRST grammar-constrained tool call
+    # otherwise pays a one-time ~1s llguidance ``LLTokenizer`` build on the
+    # request path (measured on gpt-oss-20b: ~1.7s cold first tool-call vs
+    # ~0.37s warm — distinct schemas AFTER the first are already warm, so the
+    # cost is the shared tokenizer build, not per-schema compile). Pre-build it
+    # at startup, off the event loop, so no user request eats the cold-start.
+    # Self-gates to grammar-capable tool deployments and is non-fatal.
+    if _engine is not None:
+        try:
+            await _warmup_tool_grammar(_engine)
+        except Exception as _e:
+            logger.debug(f"Tool-grammar warmup failed (non-fatal): {_e}")
 
     # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
     if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
