@@ -18,6 +18,7 @@ mutation) so the suite runs identically on every Python and every OS.
 from __future__ import annotations
 
 import importlib
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -446,15 +447,16 @@ def test_overall_exit_code_zero_with_only_warnings():
 # ---------------------------------------------------------------------------
 
 
-def test_run_all_returns_all_eight_sections():
-    """run_all() must emit exactly the eight sections the spec mandates,
-    in the spec order. Test pins the order so future drift is loud."""
+def test_run_all_returns_all_sections():
+    """run_all() must emit exactly the sections the spec mandates, in the spec
+    order. Test pins the order so future drift is loud."""
     report = eh.run_all()
     titles = [s.title for s in report.sections]
     expected = [
         "System",
         "Python",
         "Required Packages",
+        "Updates",
         "Optional Packages",
         "HuggingFace Cache",
         "Network",
@@ -530,3 +532,140 @@ def test_env_health_public_exports():
     pkg = importlib.import_module("vllm_mlx.doctor")
     for name in ("run_all", "Report", "Section", "Check", "CheckStatus"):
         assert hasattr(pkg, name), f"vllm_mlx.doctor missing {name}"
+
+
+# ---------------------------------------------------------------------------
+# Section: Updates (version freshness)
+# ---------------------------------------------------------------------------
+
+
+def test_updates_up_to_date_marks_ok():
+    section = eh.section_updates(
+        installed=lambda: "0.10.15",
+        fetch_latest=lambda: "0.10.15",
+    )
+    row = section.checks[0]
+    assert row.status is eh.CheckStatus.OK
+    assert "up to date" in row.label
+
+
+def test_update_available_marks_warn_with_upgrade_command():
+    info = mock.Mock(upgrade_command="brew upgrade rapid-mlx", method="brew")
+    section = eh.section_updates(
+        installed=lambda: "0.10.12",
+        fetch_latest=lambda: "0.10.15",
+        install_info=info,
+    )
+    row = section.checks[0]
+    assert row.status is eh.CheckStatus.WARN
+    assert "update available: 0.10.15" in row.label
+    assert "brew upgrade rapid-mlx" in row.label
+
+
+def test_updates_offline_marks_warn_never_fail():
+    section = eh.section_updates(
+        installed=lambda: "0.10.15",
+        fetch_latest=lambda: None,
+    )
+    row = section.checks[0]
+    assert row.status is eh.CheckStatus.WARN
+    # Air-gapped doctor must never escalate the update check to a hard fail.
+    assert all(c.status is not eh.CheckStatus.FAIL for c in section.checks)
+
+
+def test_updates_unknown_installed_version_marks_warn():
+    section = eh.section_updates(
+        installed=lambda: None,
+        fetch_latest=lambda: "0.10.15",
+    )
+    row = section.checks[0]
+    assert row.status is eh.CheckStatus.WARN
+    assert "unknown" in row.label
+
+
+@pytest.mark.parametrize(
+    "installed,latest",
+    [
+        ("0.10", "0.10.15"),  # installed unparseable (too few components)
+        ("0.10.15", "0.11.0rc1"),  # latest unparseable (rc suffix)
+        ("0.10.15.dev3", "0.10.16.dev1"),  # both dev builds
+    ],
+)
+def test_updates_unparseable_version_marks_warn_not_up_to_date(installed, latest):
+    """A version ``_parse_version`` can't order (dev/rc/short) must NOT
+    silently green-light "up to date" — that falsely reassures a user who
+    may well be behind. It downgrades to ⚠ like every other uncertain
+    branch, and never to a hard fail."""
+    section = eh.section_updates(
+        installed=lambda: installed,
+        fetch_latest=lambda: latest,
+    )
+    row = section.checks[0]
+    assert row.status is eh.CheckStatus.WARN
+    assert "up to date" not in row.label
+    assert all(c.status is not eh.CheckStatus.FAIL for c in section.checks)
+
+
+# ---------------------------------------------------------------------------
+# Section: Shell Integration — shadowed / duplicate installs
+# ---------------------------------------------------------------------------
+
+
+def test_shadowed_install_marks_warn(tmp_path: Path):
+    section = eh.section_shell_integration(
+        which=lambda name: (
+            "/opt/homebrew/bin/rapid-mlx" if name == "rapid-mlx" else None
+        ),
+        rcs=[tmp_path / "missing.zshrc"],
+        find_all=lambda: [
+            "/opt/homebrew/bin/rapid-mlx",
+            "/Users/x/.local/bin/rapid-mlx",
+        ],
+    )
+    shadow_row = next(c for c in section.checks if "shadowed" in c.label)
+    assert shadow_row.status is eh.CheckStatus.WARN
+    assert "2 places" in shadow_row.label
+    assert ".local/bin/rapid-mlx" in shadow_row.label
+
+
+def test_single_install_has_no_shadow_warn(tmp_path: Path):
+    section = eh.section_shell_integration(
+        which=lambda name: (
+            "/opt/homebrew/bin/rapid-mlx" if name == "rapid-mlx" else None
+        ),
+        rcs=[tmp_path / "missing.zshrc"],
+        find_all=lambda: ["/opt/homebrew/bin/rapid-mlx"],
+    )
+    assert not any("shadowed" in c.label for c in section.checks)
+
+
+def test_rapid_mlx_on_path_dedupes_by_resolved_target(tmp_path: Path):
+    """A symlink to the same binary is one install; a distinct binary is two."""
+    d1, d2, d3 = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+    for d in (d1, d2, d3):
+        d.mkdir()
+    real = d1 / "rapid-mlx"
+    real.write_text("#!/bin/sh\n")
+    real.chmod(0o755)
+    (d2 / "rapid-mlx").symlink_to(real)  # same target → deduped
+    other = d3 / "rapid-mlx"
+    other.write_text("#!/bin/sh\n")
+    other.chmod(0o755)
+
+    path_env = os.pathsep.join(str(d) for d in (d1, d2, d3))
+    found = eh._rapid_mlx_on_path(path_env=path_env)
+    assert found == [str(real), str(other)]
+
+
+def test_rapid_mlx_on_path_empty_component_is_cwd(tmp_path: Path, monkeypatch):
+    """An empty PATH component means the current directory (shutil.which
+    semantics). A ``./rapid-mlx`` shadow must be surfaced, not skipped."""
+    cli = tmp_path / "rapid-mlx"
+    cli.write_text("#!/bin/sh\n")
+    cli.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+
+    # Leading empty component ("" before the sep) resolves to cwd.
+    found = eh._rapid_mlx_on_path(path_env=os.pathsep + "/nonexistent-doctor-dir")
+    resolved = [os.path.realpath(p) for p in found]
+    assert os.path.realpath(str(cli)) in resolved

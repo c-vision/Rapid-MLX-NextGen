@@ -508,6 +508,76 @@ def section_required_packages() -> Section:
     return s
 
 
+def section_updates(
+    *,
+    installed: Callable[[], str | None] | None = None,
+    fetch_latest: Callable[[], str | None] | None = None,
+    install_info: object | None = None,
+) -> Section:
+    """Is the installed rapid-mlx the latest release?
+
+    Best-effort and network-bounded — reuses ``_version_check``'s 2 s timeout and
+    cache-first fetch, and warms the same cache the CLI's staleness banner reads.
+    Never fatal: an unknown installed version or an unreachable endpoint
+    downgrades to ⚠ (like the HF network probe), so ``doctor`` never exits
+    non-zero just because the machine is offline.
+    """
+    s = Section("Updates")
+    from vllm_mlx import _version_check as vc
+
+    cur = (installed or vc._installed_version)()
+    if not cur:
+        s.add(
+            "installed rapid-mlx version unknown",
+            CheckStatus.WARN,
+            detail="_installed_version() returned None",
+        )
+        return s
+
+    latest = (fetch_latest or vc.get_latest_version)()
+    if latest is None:
+        s.add(
+            f"rapid-mlx {cur} — couldn't reach the update endpoint (offline?)",
+            CheckStatus.WARN,
+            detail="version endpoint unreachable; freshness check skipped",
+        )
+        return s
+
+    pc, pl = vc._parse_version(cur), vc._parse_version(latest)
+    if pc is None or pl is None:
+        # One side is a dev/rc/git-describe build ``_parse_version`` won't
+        # touch (e.g. ``0.10.15.dev3``, ``0.11.0rc1``, ``0.10``). We can't
+        # order them, so DON'T fall through to a green "up to date" — that
+        # would falsely reassure a user who might well be behind. Downgrade
+        # to ⚠ like every other uncertain branch in this section.
+        s.add(
+            f"rapid-mlx {cur} — can't compare against latest {latest} "
+            "(unrecognized version format); freshness check skipped",
+            CheckStatus.WARN,
+            detail=(
+                f"installed={cur} latest={latest} "
+                f"parsed_installed={pc} parsed_latest={pl}"
+            ),
+        )
+    elif pl > pc:
+        info = install_info if install_info is not None else vc.detect_install_method()
+        cmd = getattr(info, "upgrade_command", None) or "rapid-mlx upgrade"
+        s.add(
+            f"update available: {latest} (installed {cur}) — run `{cmd}`",
+            CheckStatus.WARN,
+            detail=(
+                f"installed={cur} latest={latest} method={getattr(info, 'method', '?')}"
+            ),
+        )
+    else:
+        s.add(
+            f"rapid-mlx {cur} is up to date",
+            CheckStatus.OK,
+            detail=f"installed={cur} latest={latest}",
+        )
+    return s
+
+
 def section_optional_packages() -> Section:
     s = Section("Optional Packages")
     for dist, label, hint in OPTIONAL_PACKAGES:
@@ -790,14 +860,41 @@ def _argcomplete_hook_present(
     return False, None
 
 
+def _rapid_mlx_on_path(path_env: str | None = None) -> list[str]:
+    """Every ``rapid-mlx`` executable on PATH, in PATH order, deduped by resolved
+    target. More than one distinct target means competing installs — e.g. a
+    ``curl | bash`` copy in ``~/.local/bin`` shadowing a Homebrew one — where the
+    first on PATH silently wins and upgrades to the others do nothing.
+    """
+    raw = os.environ.get("PATH", "") if path_env is None else path_env
+    seen: set[str] = set()
+    out: list[str] = []
+    for d in raw.split(os.pathsep):
+        # An empty PATH component means the current directory on POSIX, which
+        # is exactly how ``shutil.which()`` (the function that picks the
+        # *active* rapid-mlx above) resolves it. Skipping it would let a
+        # ``./rapid-mlx`` shadow slip past this very check — the kind of
+        # competing install it exists to surface — so map "" → os.curdir
+        # instead of dropping it.
+        directory = d or os.curdir
+        cand = os.path.join(directory, "rapid-mlx")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            target = os.path.realpath(cand)
+            if target not in seen:
+                seen.add(target)
+                out.append(cand)
+    return out
+
+
 def section_shell_integration(
     *,
     which: Callable[[str], str | None] | None = None,
     rcs: list[Path] | None = None,
+    find_all: Callable[[], list[str]] | None = None,
 ) -> Section:
     """Verify the CLI is on PATH and argcomplete is wired up.
 
-    ``which`` and ``rcs`` are dependency-injected for tests.
+    ``which``, ``rcs`` and ``find_all`` are dependency-injected for tests.
     """
     s = Section("Shell Integration")
     which_fn = which or shutil.which
@@ -809,6 +906,15 @@ def section_shell_integration(
             CheckStatus.OK,
             detail=f"path={cli_path}",
         )
+        installs = (find_all or _rapid_mlx_on_path)()
+        if len(installs) > 1:
+            active, shadowed = installs[0], installs[1:]
+            s.add(
+                f"rapid-mlx installed in {len(installs)} places — {active} wins on "
+                f"$PATH, {', '.join(shadowed)} shadowed; remove the extra install(s)",
+                CheckStatus.WARN,
+                detail=f"active={active} shadowed={shadowed}",
+            )
     else:
         s.add(
             "rapid-mlx NOT on $PATH",
@@ -878,6 +984,7 @@ _SECTION_BUILDERS = (
     section_system,
     section_python,
     section_required_packages,
+    section_updates,
     section_optional_packages,
     section_hf_cache,
     section_network,
