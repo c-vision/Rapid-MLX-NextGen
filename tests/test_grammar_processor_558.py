@@ -35,9 +35,12 @@ _requires_llguidance = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def _opt_in_constrain_tools(monkeypatch):
-    """PR-3a ships the constraint OPT-IN (``RAPID_MLX_CONSTRAIN_TOOLS`` defaults
-    to off). These runtime tests exercise the ENABLED path, so turn it on for
-    the module. The explicit kill-switch test overrides this back to ``"0"``.
+    """#558 PR-5 ships the constraint DEFAULT-ON (``RAPID_MLX_CONSTRAIN_TOOLS``
+    is now an OPT-OUT toggle). These runtime tests exercise the ENABLED path;
+    pin the env to ``"1"`` explicitly so the module is deterministic regardless
+    of ambient env (the default-on behavior with the var ABSENT is proven
+    separately in ``test_eligible_true_by_default_when_env_unset``). The explicit
+    kill-switch tests override this back to ``"0"``.
     """
     monkeypatch.setenv("RAPID_MLX_CONSTRAIN_TOOLS", "1")
 
@@ -237,12 +240,21 @@ def test_normalize_required_is_enum_not_named():
     assert _normalize_tool_choice_for_grammar("required") == {"mode": "required"}
 
 
-@pytest.mark.parametrize("value", ["auto", "none", None])
-def test_normalize_auto_none_unconstrained(value):
-    # PR-3 scope: auto (PR-5-owned) and none both fall through to free-form.
+@pytest.mark.parametrize("value", ["auto", None])
+def test_normalize_auto_and_unset_are_auto_mode(value):
+    # PR-5: auto (and unset/None, auto by default) map to the constrainable
+    # ``{"mode": "auto"}`` — the optional-call auto grammar, NOT free-form.
     from vllm_mlx.routes.chat import _normalize_tool_choice_for_grammar
 
-    assert _normalize_tool_choice_for_grammar(value) is None
+    assert _normalize_tool_choice_for_grammar(value) == {"mode": "auto"}
+
+
+def test_normalize_none_is_unconstrained():
+    # ``"none"`` = the model sees no tools (the #445 handler drops them). No
+    # grammar at all -> ``None``.
+    from vllm_mlx.routes.chat import _normalize_tool_choice_for_grammar
+
+    assert _normalize_tool_choice_for_grammar("none") is None
 
 
 def test_normalize_named_object_form():
@@ -258,10 +270,12 @@ def test_normalize_named_object_form():
 def test_normalize_bare_tool_name_string_is_never_named():
     # Deferred codex #2: a bare string that happens to equal a tool name is
     # an INVALID tool_choice enum, not a named selection. It must NOT be read
-    # as a named choice (that requires the object form). -> unconstrained.
+    # as a named choice (that requires the object form). Under PR-5 an
+    # unrecognized bare string falls through to AUTO (the model may still call
+    # or decline), NOT to a named/forced choice.
     from vllm_mlx.routes.chat import _normalize_tool_choice_for_grammar
 
-    assert _normalize_tool_choice_for_grammar("get_time") is None
+    assert _normalize_tool_choice_for_grammar("get_time") == {"mode": "auto"}
 
 
 def test_normalize_tool_named_required_only_via_object_form():
@@ -322,14 +336,25 @@ def test_eligible_false_when_no_parser():
     assert _tool_grammar_eligible(cfg, req) is False
 
 
-@pytest.mark.parametrize("choice", ["auto", "none", None])
-def test_eligible_false_for_auto_none(choice):
-    # auto (PR-5-owned) and none must NOT enter the thread-pool offload.
+def test_eligible_false_for_none(choice="none"):
+    # ``"none"`` (model sees no tools) must NOT enter the thread-pool offload.
     from vllm_mlx.routes.chat import _tool_grammar_eligible
 
     cfg = _CfgStub("hermes")
     req = _RequestStub(tools=[_FunctionTool("get_time")], tool_choice=choice)
     assert _tool_grammar_eligible(cfg, req) is False
+
+
+@pytest.mark.parametrize("choice", ["auto", None])
+def test_eligible_true_for_auto_and_unset(choice):
+    # PR-5 default-on: auto (and unset/None, auto by default) IS a constrainable
+    # mode and MUST be eligible — the auto-path grammar is the whole point of
+    # PR-5. Previously (PR-3/4) auto short-circuited to free-form.
+    from vllm_mlx.routes.chat import _tool_grammar_eligible
+
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=[_FunctionTool("get_time")], tool_choice=choice)
+    assert _tool_grammar_eligible(cfg, req) is True
 
 
 def test_eligible_true_for_required_and_named():
@@ -342,10 +367,10 @@ def test_eligible_true_for_required_and_named():
     assert _tool_grammar_eligible(cfg, _RequestStub(tools, named)) is True
 
 
-@pytest.mark.parametrize("value", ["0", "off", "false", "no", "", "2"])
-def test_eligible_false_when_env_not_opted_in(monkeypatch, value):
-    # PR-3a is OPT-IN: only the exact ``1``/``on``/``true`` values enable the
-    # constraint. Anything else (including an unrecognized value) leaves it off.
+@pytest.mark.parametrize("value", ["0", "off", "false", "OFF", "False", " 0 "])
+def test_eligible_false_when_explicitly_opted_out(monkeypatch, value):
+    # PR-5 is DEFAULT-ON / OPT-OUT: only the explicit ``0``/``off``/``false``
+    # values (case-insensitive, whitespace-trimmed) disable the constraint.
     from vllm_mlx.routes.chat import _tool_grammar_eligible
 
     monkeypatch.setenv("RAPID_MLX_CONSTRAIN_TOOLS", value)
@@ -354,16 +379,29 @@ def test_eligible_false_when_env_not_opted_in(monkeypatch, value):
     assert _tool_grammar_eligible(cfg, req) is False
 
 
-def test_eligible_false_by_default_when_env_unset(monkeypatch):
-    # PR-3a ships OFF by default: with the env var ABSENT the constraint does
-    # not activate (client-schema DoS-hardening is PR-3b; default-on is gated
-    # on it). Overrides the module autouse opt-in fixture by deleting the var.
+@pytest.mark.parametrize("value", ["1", "on", "true", "yes", "", "2"])
+def test_eligible_true_for_non_optout_values(monkeypatch, value):
+    # PR-5 OPT-OUT: anything that is NOT ``0``/``off``/``false`` leaves the
+    # constraint ON — including unrecognized values and the empty string (the
+    # denylist is narrow by design).
+    from vllm_mlx.routes.chat import _tool_grammar_eligible
+
+    monkeypatch.setenv("RAPID_MLX_CONSTRAIN_TOOLS", value)
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=[_FunctionTool("get_time")], tool_choice="required")
+    assert _tool_grammar_eligible(cfg, req) is True
+
+
+def test_eligible_true_by_default_when_env_unset(monkeypatch):
+    # PR-5 ships ON by default: with the env var ABSENT the constraint activates.
+    # Overrides the module autouse opt-in fixture by deleting the var to prove
+    # the true unset default, not the fixture-forced ``"1"``.
     from vllm_mlx.routes.chat import _tool_grammar_eligible
 
     monkeypatch.delenv("RAPID_MLX_CONSTRAIN_TOOLS", raising=False)
     cfg = _CfgStub("hermes")
     req = _RequestStub(tools=[_FunctionTool("get_time")], tool_choice="required")
-    assert _tool_grammar_eligible(cfg, req) is False
+    assert _tool_grammar_eligible(cfg, req) is True
 
 
 def test_eligible_true_for_reasonable_schema():
@@ -680,6 +718,80 @@ def test_eligible_false_for_too_many_tools():
     cfg = _CfgStub("hermes")
     req = _RequestStub(tools=tools, tool_choice="required")
     assert _tool_grammar_eligible(cfg, req) is False
+
+
+# --------------------------------------------------------------------------
+# #561: oversized schema on the ACTIVE (default-on) constrained path is a HARD
+# HTTP 400 — we do NOT silently drop the structural guarantee. The legacy
+# free-form fallback survives ONLY on the explicit opt-OUT path.
+# --------------------------------------------------------------------------
+def _oversized_tool():
+    from vllm_mlx.routes.chat import _TOOL_GRAMMAR_MAX_SCHEMA_BYTES
+
+    big_props = {
+        f"field_{i}": {"type": "string", "description": "x" * 64}
+        for i in range(_TOOL_GRAMMAR_MAX_SCHEMA_BYTES // 32)
+    }
+    return _FunctionTool(
+        "bloat", parameters={"type": "object", "properties": big_props}
+    )
+
+
+@pytest.mark.parametrize("choice", ["required", "auto", None])
+def test_oversized_schema_raises_400_on_active_path(monkeypatch, choice):
+    # #561 operator decision: an oversized schema under the active constraint
+    # (default-on, tools + parser + a constrainable tool_choice) is a hard 400 —
+    # covers required AND the new auto path.
+    from fastapi import HTTPException
+
+    from vllm_mlx.routes.chat import _enforce_tool_grammar_bounds_or_400
+
+    monkeypatch.setenv("RAPID_MLX_CONSTRAIN_TOOLS", "1")
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=[_oversized_tool()], tool_choice=choice)
+    with pytest.raises(HTTPException) as ei:
+        _enforce_tool_grammar_bounds_or_400(cfg, req)
+    assert ei.value.status_code == 400
+    assert "grammar-compile bounds" in str(ei.value.detail)
+
+
+@pytest.mark.parametrize("value", ["0", "off", "false"])
+def test_oversized_schema_falls_back_when_opted_out(monkeypatch, value):
+    # When the operator has explicitly opted OUT, the legacy free-form fallback
+    # is preserved — an oversized schema must NOT 400 (backward compat).
+    from vllm_mlx.routes.chat import _enforce_tool_grammar_bounds_or_400
+
+    monkeypatch.setenv("RAPID_MLX_CONSTRAIN_TOOLS", value)
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=[_oversized_tool()], tool_choice="required")
+    # No raise — returns None (free-form fallback path).
+    assert _enforce_tool_grammar_bounds_or_400(cfg, req) is None
+
+
+@pytest.mark.parametrize("choice", ["none"])
+def test_oversized_schema_no_400_for_none_choice(monkeypatch, choice):
+    # ``"none"`` is not a constrainable mode (the model sees no tools), so the
+    # active path is inactive and an oversized schema does not 400.
+    from vllm_mlx.routes.chat import _enforce_tool_grammar_bounds_or_400
+
+    monkeypatch.setenv("RAPID_MLX_CONSTRAIN_TOOLS", "1")
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=[_oversized_tool()], tool_choice=choice)
+    assert _enforce_tool_grammar_bounds_or_400(cfg, req) is None
+
+
+def test_reasonable_schema_no_400_on_active_path(monkeypatch):
+    # A normal, in-bounds schema must NOT 400 on the active path.
+    from vllm_mlx.routes.chat import _enforce_tool_grammar_bounds_or_400
+
+    monkeypatch.setenv("RAPID_MLX_CONSTRAIN_TOOLS", "1")
+    cfg = _CfgStub("hermes")
+    ok = _FunctionTool(
+        "get_weather",
+        parameters={"type": "object", "properties": {"city": {"type": "string"}}},
+    )
+    req = _RequestStub(tools=[ok], tool_choice="auto")
+    assert _enforce_tool_grammar_bounds_or_400(cfg, req) is None
 
 
 def test_offline_skip_classifies_http_status():
@@ -1125,15 +1237,18 @@ def test_cancelled_caller_does_not_cancel_a_queued_compile():
     [
         ([_FunctionTool("get_time")], "required", "0"),  # opted out
         ([], "required", "1"),  # no tools
-        ([_FunctionTool("get_time")], "auto", "1"),  # unconstrained choice
         ([_FunctionTool("get_time")], "none", "1"),  # unconstrained choice
+        # NOTE (#558 PR-5): ``auto`` is NO LONGER ineligible — it is a
+        # constrainable mode (auto-path grammar). It intentionally reaches the
+        # build path now, so it is covered by the auto-mode enforcement tests in
+        # test_tool_grammar_558.py, not here.
     ],
 )
 def test_ineligible_request_never_enters_heavy_build_path(
     monkeypatch, tools, tool_choice, env
 ):
     # codex #558-PR3 blocking (behavioral, not source-string): an INELIGIBLE
-    # request (opted out, no tools, or auto/none) must NEVER reach the
+    # request (opted out, no tools, or "none") must NEVER reach the
     # client-schema grammar compile. ``_maybe_build_tool_grammar_processor``
     # re-runs the gate, so booby-trap ``build_tool_grammar`` to explode — if the
     # gate short-circuits (as it must), it's never called and we get ``None``;

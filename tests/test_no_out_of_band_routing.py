@@ -375,15 +375,14 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # a model, parser, or routing tier; identical semantic shape
         # to ``RAPID_MLX_PREFIX_CACHE_SHUTDOWN_BUDGET`` above.
         "RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC",
-        # #558 PR-3a grammar-constrained tool-calling opt-in toggle. A
-        # per-feature ON/OFF switch, NOT a routing decision. Defaults OFF in
-        # PR-3a (client-schema DoS-hardening is PR-3b); when set to
-        # ``1``/``on``/``true`` the chat route builds the per-request
-        # ``GrammarLogitsProcessor`` for explicit ``tool_choice`` (required /
-        # named), else it falls back to today's free-form-then-parse behavior.
-        # It never selects a model, parser, or tier — which model loads, which
-        # tool parser fires, which tier engages is all unchanged; it only
-        # decides whether an already-chosen explicit tool call is
+        # #558 grammar-constrained tool-calling toggle. A per-feature ON/OFF
+        # switch, NOT a routing decision. DEFAULT-ON as of PR-5 (opt-OUT with
+        # ``0``/``off``/``false``); when active the chat route builds the
+        # per-request ``GrammarLogitsProcessor`` for a constrainable
+        # ``tool_choice`` (required / named / auto), else it falls back to
+        # today's free-form-then-parse behavior. It never selects a model,
+        # parser, or tier — which model loads, which tool parser fires, which
+        # tier engages is all unchanged; it only decides whether a tool call is
         # structurally masked. Read only by
         # ``routes/chat.py::_tool_grammar_eligible``.
         "RAPID_MLX_CONSTRAIN_TOOLS",

@@ -258,11 +258,14 @@ def test_lark_single_call_forces_exactly_one_tag():
     assert "start: (tag_0 | tag_1) tag_end" in lark
     assert "start: (tag_0 | tag_1)+ tag_end" not in lark
     assert "start: (tag_0 | tag_1)* tag_end" not in lark
-    # single_call does not override auto's zero-or-more (auto never sets it, but
-    # be explicit that auto stays ``*`` even if single_call were passed).
-    assert "start: (tag_0 | tag_1)* tag_end" in build_tool_lark(
-        TOOLS, "auto", infos, single_call=True
-    )
+    # auto + single_call (parallel_tool_calls=False) -> ZERO-OR-ONE (codex
+    # #558-PR5): auto may still emit NO call, but AT MOST one. Not ``*`` (would
+    # allow ≥2 calls despite the client's parallel cap) and not ``+`` (auto is
+    # never forced to call).
+    auto_single = build_tool_lark(TOOLS, "auto", infos, single_call=True)
+    assert "start: (tag_0 | tag_1)? tag_end" in auto_single
+    assert "start: (tag_0 | tag_1)* tag_end" not in auto_single
+    assert "start: (tag_0 | tag_1)+ tag_end" not in auto_single
 
 
 def test_named_choice_narrows_to_single_forced_tag():
@@ -544,6 +547,144 @@ def test_bad_enum_value_is_rejected(tok, lltok):
         '<tool_call>\n{"name": "get_weather", "arguments": {"city": "P", "unit": "kelvin',
     )
     assert accepted < total, "invalid enum value was NOT rejected by the grammar"
+
+
+# --------------------------------------------------------------------------
+# PR-5: AUTO-MODE PARITY (the #1 regression guard). ``tool_choice="auto"`` (and
+# unset/None, which defaults to auto) is now CONSTRAINED by the optional-call
+# ``(...)* tag_end`` grammar: the model MAY emit a structurally-correct tool
+# call, OR it MAY emit plain text and call NO tool. Auto must NEVER force a call
+# — forcing one turns auto into required, the exact regression that breaks
+# parity with the base (unconstrained) model. These two enforcement probes pin
+# BOTH directions offline (no VLM):
+#   (a) a tool-needed derivation — a well-formed call — is accepted + terminal
+#       under the auto grammar (same structural enforcement as required-mode);
+#   (b) a no-tool-needed derivation — plain text with no call — is accepted +
+#       terminal under the auto grammar, and (contrast) NON-terminal under the
+#       required grammar (which forces a call). (b) is the auto-vs-required
+#       discriminator: if auto ever forced a call, plain text would not reach an
+#       accepting state and this test would fail.
+# --------------------------------------------------------------------------
+@_requires_llguidance
+def test_auto_mode_accepts_a_structured_tool_call(tok, lltok):
+    # (a) When the model DOES decide to call under auto, a well-formed tool call
+    # is accepted in full and terminates — auto still structurally enforces the
+    # call it chose to make.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    grammar = build_tool_grammar(TOOLS, "auto", _HermesStubParser())
+    assert grammar is not None
+    accepted, total, accepting = _consume(
+        grammar,
+        lltok,
+        tok,
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>',
+    )
+    assert accepted == total, (
+        f"auto-mode rejected a valid tool call ({accepted}/{total})"
+    )
+    assert accepting, "a complete tool call is not terminal under the auto grammar"
+
+
+@_requires_llguidance
+def test_auto_mode_permits_plain_text_without_forcing_a_call(tok, lltok):
+    # (b) THE regression guard: with tools available and tool_choice=auto, plain
+    # text that calls NO tool must be accepted AND terminal — auto lets the model
+    # decline the tool. The SAME plain text must be NON-terminal under required
+    # (required forces a call), proving auto != required.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    plain = "The sea is calm and wide, a mirror to the evening sky."
+
+    auto = build_tool_grammar(TOOLS, "auto", _HermesStubParser())
+    assert auto is not None
+    a_accepted, a_total, a_accepting = _consume(auto, lltok, tok, plain)
+    assert a_accepted == a_total, (
+        f"auto-mode rejected plain text ({a_accepted}/{a_total}) — auto must not "
+        "reject a no-tool-call response"
+    )
+    assert a_accepting, (
+        "plain text is not an accepting (terminal) state under auto — auto "
+        "FORCED a call (the #1 regression: auto degenerated into required)"
+    )
+
+    # Contrast: required-mode must NOT accept the same plain text as terminal.
+    required = build_tool_grammar(TOOLS, "required", _HermesStubParser())
+    assert required is not None
+    _, _, r_accepting = _consume(required, lltok, tok, plain)
+    assert not r_accepting, (
+        "required-mode wrongly treated plain text as terminal — required must "
+        "force at least one tool call"
+    )
+
+
+@_requires_llguidance
+def test_auto_mode_rejects_a_malformed_tool_call(tok, lltok):
+    # Auto is not "anything goes": once the model COMMITS to a call (emits the
+    # ``<tool_call>`` trigger) the schema is still enforced. A hallucinated tool
+    # name inside an opened call is rejected — the structural guarantee holds for
+    # the call the model chose to start.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    grammar = build_tool_grammar(TOOLS, "auto", _HermesStubParser())
+    accepted, total, _ = _consume(
+        grammar, lltok, tok, '<tool_call>\n{"name": "get_stockquote'
+    )
+    assert accepted < total, (
+        "auto-mode did not enforce the schema on an opened tool call "
+        "(hallucinated tool name was accepted)"
+    )
+
+
+@_requires_llguidance
+def test_auto_mode_single_call_is_zero_or_one(tok, lltok):
+    # AUTO + parallel_tool_calls=False (single_call=True) -> ZERO-OR-ONE grammar
+    # (``(...)?``): the model may emit NO call, or AT MOST one — never two (codex
+    # #558-PR5). This is the enforcement proof behind the string-level quantifier
+    # test: the ``?`` quantifier must (a) accept zero calls, (b) accept one call,
+    # and (c) REJECT a second call the client's parallel cap forbade.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    grammar = build_tool_grammar(TOOLS, "auto", _HermesStubParser(), single_call=True)
+    assert grammar is not None
+
+    one_call = (
+        '<tool_call>\n{"name": "get_weather", "arguments": '
+        '{"city": "Paris"}}\n</tool_call>'
+    )
+
+    # (a) ZERO calls — plain text with no call — is accepted AND terminal (auto
+    # never forces a call, single_call or not).
+    z_accepted, z_total, z_accepting = _consume(
+        grammar, lltok, tok, "The sky is a quiet grey this morning."
+    )
+    assert z_accepted == z_total, (
+        f"auto+single_call rejected a no-call plain-text response "
+        f"({z_accepted}/{z_total})"
+    )
+    assert z_accepting, (
+        "auto+single_call treated plain text as non-terminal — it must permit "
+        "ZERO calls"
+    )
+
+    # (b) EXACTLY one call is accepted AND terminal.
+    o_accepted, o_total, o_accepting = _consume(grammar, lltok, tok, one_call)
+    assert o_accepted == o_total, (
+        f"auto+single_call rejected a single valid call ({o_accepted}/{o_total})"
+    )
+    assert o_accepting, "auto+single_call: one complete call is not terminal"
+
+    # (c) A SECOND call is REJECTED — the ``?`` quantifier caps at one, and the
+    # trailing ``tag_end`` (a byte-regex ``TAG_TEXT``) cannot match the second
+    # call's ``<tool_call>`` SPECIAL token, so the grammar masks it (this is the
+    # parallel_tool_calls=False cap the old ``*`` auto grammar violated).
+    two_calls = one_call + "\n" + one_call
+    t_accepted, t_total, _ = _consume(grammar, lltok, tok, two_calls)
+    assert t_accepted < t_total, (
+        "auto+single_call accepted a SECOND tool call — parallel_tool_calls="
+        "False cap not enforced on the auto path (zero-or-more instead of "
+        "zero-or-one)"
+    )
 
 
 # --------------------------------------------------------------------------

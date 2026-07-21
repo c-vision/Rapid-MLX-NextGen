@@ -285,9 +285,9 @@ def _forced_tool_call_prefix(parser_name: str | None, function_name: str) -> str
 def _normalize_tool_choice_for_grammar(tool_choice) -> dict | None:
     """Normalize an OpenAI ``tool_choice`` into a collision-safe tagged form.
 
-    Returns ``{"mode": "required"}`` or ``{"mode": "named", "name": <str>}``
-    for the two constrained-in-PR-3 modes, or ``None`` to skip grammar
-    constraint (``"auto"`` / ``"none"`` / anything unrecognized).
+    Returns ``{"mode": "required"}``, ``{"mode": "named", "name": <str>}``, or
+    ``{"mode": "auto"}`` for the three constrainable modes, or ``None`` to skip
+    grammar constraint entirely (``"none"`` / a malformed object form).
 
     WHY A TAGGED FORM (deferred codex #2 — string collision): per the OpenAI
     spec ``tool_choice`` is EITHER a string enum (``"auto" | "required" |
@@ -295,18 +295,22 @@ def _normalize_tool_choice_for_grammar(tool_choice) -> dict | None:
     tool NAME only ever appears inside the object form — never as a bare
     string. So a tool literally named ``"required"`` (or ``"auto"`` /
     ``"none"``) under ``tool_choice="auto"`` must be treated as AUTO (the tool
-    stays available, unconstrained), and selecting it requires the object form
+    stays available; the AUTO grammar lets the model choose to call it or not),
+    and selecting it requires the object form
     ``{"type":"function","function":{"name":"required"}}``. Discriminating on
     SHAPE here — bare string vs object — before any comparison against tool
     names makes the string-enum path and the named-tool path structurally
     unable to collide. The tool name is only ever read out of the object.
 
-    PR-3 SCOPE: only ``"required"`` and the named object form are constrained.
-    ``"auto"`` deliberately returns ``None`` (unconstrained — the auto-path
-    grammar is PR-5, paused pending operator greenlight), and ``"none"``
+    PR-5 SCOPE (auto default-on): ``"required"`` and the named object form are
+    constrained to force a call; ``"auto"`` and ``None``/absent (auto by
+    default) map to ``{"mode": "auto"}`` — the auto-path grammar (a free
+    text/reasoning prefix OR a structurally-correct tool_call) that the model
+    may satisfy with ZERO calls, so auto NEVER forces a call (that would turn
+    auto into required — the #1 regression this path guards against). ``"none"``
     returns ``None`` (the model sees no tools; the #445 route handler already
-    drops ``request.tools``). ``None``/absent ``tool_choice`` is auto by
-    default -> also ``None`` here.
+    drops ``request.tools``). A malformed object form (no usable name) also
+    degrades to ``None`` — free-form, rather than fabricating a constraint.
     """
     # Object form is the ONLY place a tool name appears: a named choice.
     if isinstance(tool_choice, dict):
@@ -320,12 +324,19 @@ def _normalize_tool_choice_for_grammar(tool_choice) -> dict | None:
                 name = fn.get("name")
                 if isinstance(name, str) and name:
                     return {"mode": "named", "name": name}
+        # Malformed object form (no usable name) -> free-form (unchanged).
         return None
-    # Bare-string enum path (or None). Only ``"required"`` is constrained in
-    # PR-3; ``"auto"``/``"none"``/None all fall through to free-form.
+    # Bare-string enum path (or None/unset).
     if tool_choice == "required":
         return {"mode": "required"}
-    return None
+    if tool_choice == "none":
+        # ``none`` = the model sees no tools; the #445 route handler already
+        # drops ``request.tools`` upstream. No grammar at all.
+        return None
+    # ``"auto"``, ``None``/absent (auto by default), or any unrecognized bare
+    # string -> AUTO. The auto-path grammar is optional-call: the model may emit
+    # plain text (possibly with reasoning) and never call a tool.
+    return {"mode": "auto"}
 
 
 # Bound the client-controlled grammar compile (codex #558-PR3 blocking, restored
@@ -576,40 +587,103 @@ def _tools_within_grammar_bounds(tools) -> bool:
     return True
 
 
-def _tool_grammar_eligible(cfg, request) -> bool:
-    """Cheap synchronous gate: could this request possibly get a grammar?
+def _constrain_tools_opted_out() -> bool:
+    """True iff the operator has EXPLICITLY disabled constrained tool-calling.
 
-    Runs the trivial checks (env opt-in, tools present, a family parser
-    configured, ``tool_choice`` in the PR-3a constrained set, and a schema
-    size/depth/count bound) with NO heavy imports and NO grammar/tokenizer
-    construction. The route calls this on the event loop so the vast majority of
-    traffic — requests without tools, and ``"auto"``/``"none"`` choices —
-    short-circuits WITHOUT ever entering the thread pool. Only an eligible
-    request pays the ``run_in_executor`` offload for the actual (possibly ~1s
-    cold) build (codex #558-PR3).
-
-    OPT-IN: ``RAPID_MLX_CONSTRAIN_TOOLS`` defaults to OFF. PR-3b restores the
-    client-schema size/depth/count DoS caps and the bounded compile-pool
-    admission (resource-hardening). Because the compile still runs on
-    client-controlled schema input, the default stays OFF — an operator opts in
-    explicitly (``RAPID_MLX_CONSTRAIN_TOOLS=1``/``on``/``true``). Flipping the
-    default to on remains gated on PR-5 (with the auto path).
+    #558 PR-5 flips the default to ON. ``RAPID_MLX_CONSTRAIN_TOOLS`` is now an
+    OPT-OUT toggle: only the explicit values ``0`` / ``off`` / ``false`` (case-
+    insensitive, whitespace-trimmed) disable the feature; an absent var — or any
+    other value — leaves it ON. When opted out the chat route restores the
+    legacy free-form-then-parse behavior for tool calls, including the #561
+    oversized-schema free-form fallback (no HTTP 400).
     """
-    if os.environ.get("RAPID_MLX_CONSTRAIN_TOOLS", "0") not in ("1", "on", "true"):
+    return os.environ.get("RAPID_MLX_CONSTRAIN_TOOLS", "1").strip().lower() in (
+        "0",
+        "off",
+        "false",
+    )
+
+
+def _tool_grammar_constraint_active(cfg, request) -> bool:
+    """True iff the constrained-tool-calling path is ACTIVE for this request.
+
+    Checks everything EXCEPT the schema-size/depth/count bound: the operator has
+    not opted out, tools are present, a family parser is configured, and
+    ``tool_choice`` resolves to a constrainable mode (auto / required / named —
+    ``"none"`` and a malformed object form normalize to ``None`` and are NOT
+    constrained). Deliberately excludes the bounds check so the caller can
+    distinguish an oversized schema (→ HTTP 400 under #561) from a genuinely
+    inactive path (→ free-form).
+    """
+    if _constrain_tools_opted_out():
         return False
     if not getattr(request, "tools", None) or not getattr(
         cfg, "tool_call_parser", None
     ):
         return False
-    if (
+    return (
         _normalize_tool_choice_for_grammar(getattr(request, "tool_choice", None))
-        is None
-    ):
+        is not None
+    )
+
+
+def _tool_grammar_eligible(cfg, request) -> bool:
+    """Cheap synchronous gate: could this request possibly get a grammar?
+
+    Runs the trivial checks (env not opted out, tools present, a family parser
+    configured, ``tool_choice`` in the constrainable set, and a schema
+    size/depth/count bound) with NO heavy imports and NO grammar/tokenizer
+    construction. The route calls this on the event loop so the vast majority of
+    traffic — requests without tools, and ``"none"`` choices — short-circuits
+    WITHOUT ever entering the thread pool. Only an eligible request pays the
+    ``run_in_executor`` offload for the actual (possibly ~1s cold) build (codex
+    #558-PR3).
+
+    DEFAULT-ON (#558 PR-5): ``RAPID_MLX_CONSTRAIN_TOOLS`` defaults to ON; an
+    operator opts OUT explicitly (``0``/``off``/``false``). The auto path is now
+    live — ``"auto"`` (and unset/``None``) is a constrainable mode via the
+    optional-call auto grammar. An oversized schema is NOT silently dropped here
+    when the constraint is active: it stays ineligible for the OFFLOAD (so we
+    never enter the compile pool), but the route raises HTTP 400 via
+    ``_enforce_tool_grammar_bounds_or_400`` (#561) rather than falling back —
+    the free-form fallback is reserved for the explicit opt-OUT path.
+    """
+    if not _tool_grammar_constraint_active(cfg, request):
         return False
     # Reject an oversized/over-nested/over-count client schema before it can
     # drive an unbounded compile on the shared executor (codex #558-PR3 blocking,
-    # restored in PR-3b). A rejected request falls back to free-form.
+    # restored in PR-3b). When the constraint is active this returning False is
+    # paired with a route-level HTTP 400 (#561), not a silent free-form fallback.
     return _tools_within_grammar_bounds(getattr(request, "tools", None))
+
+
+def _enforce_tool_grammar_bounds_or_400(cfg, request) -> None:
+    """#561: reject an oversized tool schema with HTTP 400 on the active path.
+
+    Operator DECISION (2026-07): under the DEFAULT-ON constrained tool-calling
+    path an oversized / over-deep / over-count tool schema must NOT silently
+    lose its structural guarantee. When the constraint is ACTIVE (operator has
+    not opted out, tools + parser + a constrainable ``tool_choice``) and the
+    schema exceeds the grammar-compile bounds, raise HTTP 400 so the caller sees
+    the failure explicitly. The legacy free-form fallback survives ONLY on the
+    explicit opt-OUT path (``_tool_grammar_constraint_active`` returns False),
+    preserving backward-compatible behavior for operators who disable the
+    feature.
+    """
+    if not _tool_grammar_constraint_active(cfg, request):
+        return  # opted out / no tools / no parser / "none" — legacy free-form.
+    if not _tools_within_grammar_bounds(getattr(request, "tools", None)):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "tool schema exceeds grammar-compile bounds "
+                f"(max {_TOOL_GRAMMAR_MAX_TOOLS} tools, "
+                f"{_TOOL_GRAMMAR_MAX_SCHEMA_BYTES} bytes, "
+                f"depth {_TOOL_GRAMMAR_MAX_SCHEMA_DEPTH}); reduce the tool "
+                "schema or set RAPID_MLX_CONSTRAIN_TOOLS=0 to fall back to "
+                "free-form tool calling."
+            ),
+        )
 
 
 def _maybe_build_tool_grammar_processor(engine, cfg, request):
@@ -630,7 +704,7 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
 
     choice = _normalize_tool_choice_for_grammar(getattr(request, "tool_choice", None))
     if choice is None:  # pragma: no cover - _tool_grammar_eligible already gated
-        return None  # auto / none / unrecognized -> unconstrained (PR-5 owns auto)
+        return None  # "none" / malformed object form -> no grammar (free-form)
 
     try:
         from ..api.tool_grammar import (
@@ -687,15 +761,19 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
                 }
             flat_tools.append({"name": name, "parameters": params})
 
-        # For a NAMED choice, narrow to the single target tool BEFORE building.
-        # We then always pass ``tool_choice="required"`` to the builder over
-        # the (narrowed or full) tool list. This sidesteps the builder's own
-        # name-string path entirely: a tool literally named ``"required"`` can
-        # never be misread as the ``required`` enum, because we resolve the
-        # target from the tagged form's ``name`` and feed the builder a
-        # narrowed list + the ``"required"`` quantifier (forces exactly one of
-        # the listed tools). ``named`` over a 1-element list == a single forced
-        # tool; ``required`` over the full list == one-or-more of any tool.
+        # Select the builder quantifier from the tagged mode (#558 PR-5):
+        #   * ``auto``     -> pass ``"auto"``: the (...)* grammar, may emit ZERO
+        #     calls (free text / reasoning) OR one-or-more structured calls. The
+        #     model is never FORCED to call — this is the auto-path semantics.
+        #   * ``required`` -> pass ``"required"``: the (...)+ grammar forces ≥1.
+        #   * ``named``    -> narrow to the single target tool BELOW, then pass
+        #     ``"required"`` over the 1-element list == a single forced tool.
+        #
+        # For NAMED we sidestep the builder's own name-string path entirely: a
+        # tool literally named ``"required"``/``"auto"`` can never be misread as
+        # an enum, because we resolve the target from the tagged form's ``name``
+        # and feed the builder a narrowed list + the ``"required"`` quantifier.
+        builder_choice = "auto" if choice["mode"] == "auto" else "required"
         if choice["mode"] == "named":
             target = choice["name"]
             narrowed = [t for t in flat_tools if t["name"] == target]
@@ -706,12 +784,21 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
                 return None
             flat_tools = narrowed
 
-        # OpenAI ``parallel_tool_calls=False`` -> force EXACTLY ONE call so the
-        # grammar matches the downstream single-call cap (codex #558-PR3). A
-        # NAMED choice is already single-tool but could still emit ≥2 calls to
-        # the same tool without this; ``required`` could emit calls to several
-        # tools. Only an explicit ``False`` narrows to exactly-one (``True`` /
-        # unset keep the one-or-more ``required`` grammar, per OpenAI semantics).
+        # OpenAI ``parallel_tool_calls=False`` -> the model may call AT MOST ONE
+        # tool. We honour it in EVERY mode, including ``auto`` (codex #558-PR5):
+        #   * required/named + False -> EXACTLY ONE call (the builder drops the
+        #     ``+`` quantifier); a NAMED choice is already single-tool but could
+        #     still emit ≥2 calls to the same tool without this, and ``required``
+        #     could emit calls to several tools.
+        #   * auto + False -> ZERO-OR-ONE call (the builder uses ``?`` instead of
+        #     ``*``). Auto's own semantics are "may call zero"; ``parallel_tool_
+        #     calls=False`` adds "if calling, at most one" — the combination is
+        #     zero-or-one, NOT the zero-or-more ``*`` auto would otherwise use.
+        #     Ignoring ``False`` for auto (the old ``and choice["mode"] != "auto"``
+        #     guard) let a no-parallel auto request still emit multiple calls,
+        #     contradicting the client's explicit cap.
+        # ``True`` / unset keep the mode's default quantifier (auto ``*`` /
+        # required ``+``), per OpenAI semantics.
         single_call = getattr(request, "parallel_tool_calls", None) is False
 
         # Reasoning-tolerant grammar (design §5 path A, #558 PR-4). Bake the
@@ -730,7 +817,7 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
         )
         grammar = build_tool_grammar(
             flat_tools,
-            "required",
+            builder_choice,
             parser,
             single_call=single_call,
             reasoning_sentinels=reasoning_sentinels,
@@ -803,6 +890,22 @@ async def _offload_tool_grammar_build(engine, cfg, request):
     if not _tool_grammar_eligible(cfg, request):
         return None
     if not _try_admit_tool_grammar_build():
+        # DELIBERATE AVAILABILITY DEGRADE (NOT fail-closed) — codex #558-PR5.
+        # The bounded compile-admission pool is saturated, so this request falls
+        # back to the pre-#558 free-form tool-parsing path instead of being
+        # rejected. Free-form here is the SAME behavior as the operator opt-out /
+        # base engine (no NEW failure mode under load), which we prefer over
+        # fail-closed's hurt to availability. We LOG it (WARNING, not silent) so
+        # the degrade is observable — an operator seeing this frequently should
+        # raise ``_TOOL_GRAMMAR_MAX_INFLIGHT``. The structural guarantee is
+        # therefore best-effort under saturation, not an unconditional promise
+        # (see the policy comment at the chat-route call site).
+        logger.warning(
+            "tool-grammar: compile-admission pool full (>= %d in-flight); "
+            "request degrades to free-form tool parsing (availability policy — "
+            "raise the compile-pool cap if this is frequent)",
+            _TOOL_GRAMMAR_MAX_INFLIGHT,
+        )
         return None
     try:
         fut = _get_tool_grammar_build_executor().submit(
@@ -2593,18 +2696,26 @@ async def _create_chat_completion_impl(
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
-    # Grammar-constrained tool calling (#558 PR-3). When the request carries
-    # ``tools``, a family parser that declares a ``structure_info``, and an
-    # EXPLICIT ``tool_choice`` of ``"required"`` or a named function, build a
+    # Grammar-constrained tool calling (#558, DEFAULT-ON as of PR-5). When the
+    # request carries ``tools``, a family parser that declares a
+    # ``structure_info``, and a constrainable ``tool_choice`` — ``"required"`` /
+    # a named function / ``"auto"`` (incl. unset, auto by default) — build a
     # per-request ``GrammarLogitsProcessor`` that structurally constrains a
     # completed tool call to name a real tool and satisfy its JSON schema in the
-    # family wire format. OPT-IN via env ``RAPID_MLX_CONSTRAIN_TOOLS`` (defaults
-    # OFF; set to 1/on/true). PR-3b hardens the opt-in path with client-schema
-    # size/depth/count DoS caps + a bounded compile pool with admission control.
-    # ``tool_choice="auto"`` stays UNCONSTRAINED (the auto-path grammar is PR-5,
-    # paused). Falls back to today's free-form-then-parse when opted out, the
-    # parser opts out (returns None), or llguidance/tokenizer is unavailable —
-    # non-breaking, no default change.
+    # family wire format. DEFAULT-ON via env ``RAPID_MLX_CONSTRAIN_TOOLS`` — an
+    # operator opts OUT with 0/off/false. PR-3b hardens the path with
+    # client-schema size/depth/count DoS caps + a bounded compile pool with
+    # admission control.
+    #
+    # AUTO-PATH SEMANTICS (#558 PR-5): ``tool_choice="auto"`` is now CONSTRAINED
+    # by an optional-call grammar — free text/reasoning prefix OR a structurally
+    # correct tool_call — so the model may choose to emit plain text and call NO
+    # tool. Auto NEVER forces a call (that is ``required``). ``"none"`` still
+    # sees no tools. Falls back to today's free-form-then-parse when the operator
+    # opts out, the parser opts out (returns None), or llguidance/tokenizer is
+    # unavailable. #561: an oversized schema on the ACTIVE path is a hard HTTP
+    # 400 (enforced just below) — the free-form fallback for oversized schemas
+    # survives only on the explicit opt-OUT path.
     #
     # Built BEFORE the forced-prefix block below because the two are mutually
     # exclusive: when the grammar is active it already forces + fully
@@ -2622,7 +2733,30 @@ async def _create_chat_completion_impl(
     # lives in ``_offload_tool_grammar_build`` so the admission gate is directly
     # testable (codex #558-PR3). Returns ``None`` (free-form fallback) whenever
     # the request is ineligible, admission is at capacity, or the build fails.
+    #
+    # #561: reject an oversized/over-deep/over-count schema with HTTP 400 BEFORE
+    # the offload when the constraint is active (default-on). This must run
+    # before ``_offload_tool_grammar_build`` — the offload treats an oversized
+    # schema as ineligible and returns ``None`` (silent free-form), which under
+    # default-on would drop the structural guarantee the operator asked for.
+    _enforce_tool_grammar_bounds_or_400(cfg, request)
     _glp = await _offload_tool_grammar_build(engine, cfg, request)
+    # DELIBERATE AVAILABILITY POLICY (codex #558-PR5 override, NOT fail-closed):
+    # a ``None`` here degrades this request to the pre-#558 free-form
+    # tool-parsing path. That degrade is reserved for exactly two families of
+    # cause — (1) the operator/family OPTED OUT or the request is ineligible
+    # (``RAPID_MLX_CONSTRAIN_TOOLS=0`` / no tools / unsupported family / bounds
+    # already 400'd above), and (2) an INTERNAL transient — the bounded
+    # compile-admission pool is saturated, or the grammar/tokenizer build failed.
+    # We do NOT fail closed on (2): free-form is the same behavior as the base
+    # engine (no NEW under-load failure mode, users keep a smooth experience),
+    # whereas rejecting the request would introduce one. The trade-off: on the
+    # NORMAL path the guarantee is 100% constrained, but under compile-pool
+    # saturation or an internal build failure it is BEST-EFFORT — it degrades to
+    # free-form (identical to opt-out), and every such degrade is LOGGED
+    # (WARNING for admission-full in ``_offload_tool_grammar_build``; ERROR for a
+    # grammar/matcher compile failure in ``_maybe_build_tool_grammar_processor``)
+    # so the degrade is observable, not a silent guarantee hole.
     if _glp is not None:
         chat_kwargs["grammar_logits_processor"] = _glp
 

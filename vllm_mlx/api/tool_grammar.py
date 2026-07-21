@@ -386,18 +386,24 @@ def build_tool_lark(
 
     Ports the ``StructTag.to_grammar`` layout (``start: (tag_0|...)*
     tag_end``) but with special-token-aware begin/end rendering (see module
-    docstring). ``tool_choice`` selects the repetition quantifier:
+    docstring). ``tool_choice`` × ``single_call`` select the repetition
+    quantifier:
 
       * ``auto``                        -> ``(...)*``  (may emit zero calls)
+      * ``auto`` + ``single_call``      -> ``(...)?``  (ZERO-OR-ONE call)
       * ``required`` / a function name  -> ``(...)+``  (design R1: ≥1 forced)
+      * ``required`` + ``single_call``  -> ``(...)``   (EXACTLY ONE call)
 
-    ``single_call=True`` (OpenAI ``parallel_tool_calls=False``) forces EXACTLY
-    ONE call — the alternation carries NO repetition quantifier, so the model
-    must emit exactly one tag and stop. This overrides the ``required`` ``+``
-    (``auto`` never sets ``single_call`` — a zero-or-one grammar would still let
-    ``auto`` emit no call, which the ``*`` already allows). Without this the
-    ``required`` grammar could emit multiple calls even when the client
-    explicitly disabled parallel calls (codex #558-PR3).
+    ``single_call=True`` (OpenAI ``parallel_tool_calls=False``) means "if the
+    model calls a tool, at most ONE call". For ``required``/named that is
+    EXACTLY ONE (no repetition quantifier). For ``auto`` — which may always emit
+    ZERO calls — it is ZERO-OR-ONE (``?``): auto's "may call zero" combined with
+    no-parallel's "at most one" (codex #558-PR5). Auto with ``single_call``
+    therefore drops the ``*`` down to ``?`` rather than staying zero-or-more —
+    honouring the client's explicit parallel cap on the auto path too. Without
+    this cap the ``required`` grammar could emit multiple calls, and the ``auto``
+    grammar could emit ≥2 calls, even when the client disabled parallel calls
+    (codex #558-PR3 / PR-5).
 
     ``"none"`` must NOT reach this function — ``none`` produces no grammar at
     all (the model sees no tools, design §4); passing it here is a caller
@@ -510,10 +516,16 @@ def build_tool_lark(
                 f"sentinel (trigger={si.trigger!r}, sentinels={si.sentinels!r})"
             )
 
-    # auto -> zero-or-more (may emit no call); single_call -> exactly one (no
-    # quantifier); everything else forces ≥1.
+    # Quantifier = (auto/required) × (parallel_tool_calls):
+    #   * auto,     parallel OK   -> ``*``  zero-or-more (may emit no call / many)
+    #   * auto,     single_call   -> ``?``  ZERO-OR-ONE (auto's "may call zero" ∧
+    #                               no-parallel's "at most one" — codex #558-PR5;
+    #                               NOT ``*``, which would let auto emit ≥2 calls
+    #                               despite the client's parallel_tool_calls=False)
+    #   * required, single_call   -> ``""`` EXACTLY ONE (parallel_tool_calls=False)
+    #   * required, parallel OK   -> ``+``  one-or-more (design R1: ≥1 forced)
     if tool_choice == "auto":
-        quant = "*"
+        quant = "?" if single_call else "*"
     elif single_call:
         quant = ""  # exactly one tag: parallel_tool_calls=False
     else:
