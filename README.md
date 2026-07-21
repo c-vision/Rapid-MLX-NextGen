@@ -1,7 +1,5 @@
 <img width="1600" height="800" alt="banner" src="https://github.com/user-attachments/assets/f3743bb7-7287-4b24-ac97-a7037974396f" />
 
-<h1 align="center">Rapid-MLX</h1>
-
 <p align="center">
   <strong>The fastest local AI engine for Apple Silicon.</strong>
   <br>
@@ -31,10 +29,6 @@
     <a href="https://models.rapidmlx.com/">Model mirror</a> ·
     <a href="https://rapidmlx.com/desktop">Desktop app</a>
   </sub>
-</p>
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/raullenchai/Rapid-MLX/main/docs/assets/demo.gif" alt="Rapid-MLX demo — install, serve Gemma 4, chat, tool calling" width="700">
 </p>
 
 ---
@@ -227,6 +221,12 @@ Top three things that go wrong:
 → [All troubleshooting entries](https://rapidmlx.com/docs/troubleshooting.html) (OOM, empty responses, slow TTFT, port taken, shell completion, HF cache, and more)
 
 ---
+
+## See it in action
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/raullenchai/Rapid-MLX/main/docs/assets/demo.gif" alt="Rapid-MLX demo — install, serve Gemma 4, chat, tool calling" width="700">
+</p>
 
 ## Community & Contributing
 
