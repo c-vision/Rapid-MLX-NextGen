@@ -1326,3 +1326,160 @@ def test_named_function_outside_tools_returns_422(monkeypatch):
         f"BLOCKING REGRESSION: _synthesize_forced_tool_call was called "
         f"with ghost target; calls={synth_calls!r}"
     )
+
+
+# ── #1142: system-message suffix injection on list-of-blocks content ──
+#
+# ``_inject_suffix`` (one of the ``_TOOL_USE_*_SUFFIX`` strings) used to be
+# appended with a bare ``content + _inject_suffix``. When the system message
+# arrives in the OpenAI *structured* form — ``content`` is a list of content
+# blocks, e.g. ``[{"type": "text", "text": "..."}]`` — and the request goes
+# down the MLLM path (``model_dump`` preserves the list), that expression is
+# ``list + str`` → ``TypeError: can only concatenate list (not "str") to
+# list`` → a hard HTTP 500 on the first tool-use request. Observed in the
+# wild with smolagents × gemma4. The fix normalizes the append per content
+# shape (``_append_tool_use_suffix``): a list gets a trailing text block.
+
+
+class _MLLMToolCallingEngine(_ToolCallingEngine):
+    """MLLM variant of ``_ToolCallingEngine`` (``is_mllm = True``).
+
+    On the MLLM path the route builds ``messages`` via ``model_dump`` and
+    therefore preserves list-of-blocks ``content`` verbatim (the non-MLLM
+    path flattens it to a ``str`` in ``extract_multimodal_content``). This
+    is the only path that exercises the #1142 ``list + str`` crash.
+    """
+
+    is_mllm = True
+
+
+def _system_content(messages):
+    """Return the (single) system message's ``content`` from what the engine
+    saw, tolerating dict or Pydantic-model message shapes."""
+    sys_msgs = [
+        m
+        for m in messages
+        if (m.get("role") if isinstance(m, dict) else getattr(m, "role", None))
+        == "system"
+    ]
+    assert sys_msgs, "expected a system message to survive to the engine"
+    m = sys_msgs[0]
+    return m["content"] if isinstance(m, dict) else m.content
+
+
+def test_list_of_blocks_system_content_with_tools_returns_200_not_500():
+    """#1142 core regression: a system message with list-of-blocks content
+    plus a tools array must NOT 500. Pre-fix the suffix injection did
+    ``list + str`` → TypeError → 500; post-fix the suffix is appended as a
+    trailing text block and the request succeeds (200)."""
+    engine = _MLLMToolCallingEngine()
+    client = _make_client(engine)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "You are a helpful assistant."}
+                    ],
+                },
+                {"role": "user", "content": "What's the weather in Paris?"},
+            ],
+            "tools": _TOOLS_FIXTURE,
+            "max_tokens": 32,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    # The suffix must land as an appended trailing text block, leaving the
+    # original block intact and the content shape a list (never a str+list
+    # concatenation, which is what crashed).
+    content = _system_content(engine.last_messages)
+    assert isinstance(content, list), (
+        f"expected list-of-blocks content to stay a list, got {type(content)}"
+    )
+    assert content[0]["text"] == "You are a helpful assistant."
+    joined = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+    assert "you MUST use the appropriate tool" in joined, (
+        f"tool-use suffix not appended; content={content!r}"
+    )
+
+
+def test_list_of_blocks_system_content_required_choice_returns_200():
+    """The ``required`` suffix variant (a different, longer ``str``) must
+    also append cleanly onto list-of-blocks content — same #1142 site,
+    different injected suffix string."""
+    engine = _MLLMToolCallingEngine()
+    client = _make_client(engine)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "Sys."}],
+                },
+                {"role": "user", "content": "weather?"},
+            ],
+            "tools": _TOOLS_FIXTURE,
+            "tool_choice": "required",
+            "max_tokens": 32,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    content = _system_content(engine.last_messages)
+    assert isinstance(content, list)
+    joined = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+    assert "MUST call one of the provided tools" in joined, (
+        f"required suffix not appended; content={content!r}"
+    )
+
+
+def test_plain_str_system_content_still_appends_suffix_inline():
+    """Regression guard: the ``str`` fast path must be unchanged — the
+    suffix is concatenated inline, content stays a plain ``str``."""
+    engine = _MLLMToolCallingEngine()
+    client = _make_client(engine)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "weather?"},
+            ],
+            "tools": _TOOLS_FIXTURE,
+            "max_tokens": 32,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    content = _system_content(engine.last_messages)
+    assert isinstance(content, str)
+    assert content.startswith("You are a helpful assistant.")
+    assert "you MUST use the appropriate tool" in content
+
+
+def test_append_tool_use_suffix_handles_all_content_shapes():
+    """Unit coverage for the ``_append_tool_use_suffix`` normalizer: every
+    legal content shape must append the suffix without raising."""
+    from vllm_mlx.service.helpers import _append_tool_use_suffix
+
+    suffix = "\n\nSUFFIX"
+
+    # str → inline concat
+    assert _append_tool_use_suffix("base", suffix) == "base" + suffix
+
+    # list → trailing text block appended, original untouched
+    original = [{"type": "text", "text": "hi"}]
+    out = _append_tool_use_suffix(original, suffix)
+    assert out == [{"type": "text", "text": "hi"}, {"type": "text", "text": suffix}]
+    assert original == [{"type": "text", "text": "hi"}], "input list was mutated"
+
+    # None / absent → suffix becomes the content
+    assert _append_tool_use_suffix(None, suffix) == suffix
+
+    # unexpected shape → coerced to text, never raises
+    assert _append_tool_use_suffix(123, suffix) == "123" + suffix

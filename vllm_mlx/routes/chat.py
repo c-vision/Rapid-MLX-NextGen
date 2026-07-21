@@ -74,6 +74,7 @@ from ..service.helpers import (
     _TOOL_USE_REQUIRED_SUFFIX,
     _TOOL_USE_SYSTEM_SUFFIX,
     SSE_RESPONSE_HEADERS,
+    _append_tool_use_suffix,
     _apply_reasoning_cutoff_notice,
     _build_usage,
     _check_admission_or_503,
@@ -2572,10 +2573,25 @@ async def _create_chat_completion_impl(
                     m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
                 )
                 if role == "system":
+                    # ``content`` may be a plain ``str`` OR a list of content
+                    # blocks (OpenAI structured form, preserved by the MLLM
+                    # ``model_dump`` path). ``list + str`` would raise and 500
+                    # the request (#1142); normalize the append per-shape.
                     if isinstance(m, dict):
-                        messages[i] = {**m, "content": m["content"] + _inject_suffix}
+                        messages[i] = {
+                            **m,
+                            "content": _append_tool_use_suffix(
+                                m.get("content"), _inject_suffix
+                            ),
+                        }
                     else:
-                        messages[i]["content"] = m["content"] + _inject_suffix
+                        # Non-dict message (Pydantic model / attr object):
+                        # read + write via attribute, not subscript, so the
+                        # append is symmetric with the dict branch and can't
+                        # itself raise ``TypeError`` (``m`` is ``messages[i]``).
+                        m.content = _append_tool_use_suffix(
+                            getattr(m, "content", None), _inject_suffix
+                        )
                     break
         else:
             system_msg = {"role": "system", "content": _inject_suffix.strip()}

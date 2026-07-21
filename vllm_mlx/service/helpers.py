@@ -19,6 +19,7 @@ import uuid
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from fastapi import HTTPException
 from starlette.requests import Request
@@ -1517,6 +1518,39 @@ def _tool_use_required_named_suffix(name: str) -> str:
         "any other tool. Call this exact tool immediately with your best guess "
         "of the arguments. A text-only response is INVALID for this request."
     )
+
+
+def _append_tool_use_suffix(content: Any, suffix: str) -> Any:
+    """Append a tool-use system ``suffix`` (always a ``str``) to a system
+    message's ``content``, tolerating every legal OpenAI content shape.
+
+    ``content`` may be:
+
+    - a plain ``str`` (the legacy / OpenAI simple form) → ``str + str``.
+    - a ``list`` of content-block dicts (OpenAI structured form, e.g.
+      ``[{"type": "text", "text": "..."}]``) → append a trailing text block
+      so the downstream chat-template renderer concatenates it after the
+      existing blocks. This is the shape that reaches the MLLM path
+      (``model_dump`` preserves list content), where a naive ``content +
+      suffix`` would raise ``TypeError: can only concatenate list (not
+      "str") to list`` and 500 the request (#1142). Observed in the wild
+      with smolagents × gemma4, which emits list-of-blocks system content.
+    - ``None`` / absent → the suffix becomes the whole content.
+    - any other shape → coerced to text and concatenated rather than crash.
+
+    Returns a new value; the input ``content`` is never mutated in place.
+    """
+    if content is None:
+        return suffix
+    if isinstance(content, str):
+        return content + suffix
+    if isinstance(content, list):
+        # Append a trailing text block instead of ``list + str``. Copy the
+        # list so the caller's original message object is left untouched.
+        return [*content, {"type": "text", "text": suffix}]
+    # Unknown/unexpected shape — degrade to a text concatenation so a
+    # malformed request can never hard-500 at the injection site.
+    return f"{content}{suffix}"
 
 
 # ── Resolution helpers ─────────────────────────────────────────────
