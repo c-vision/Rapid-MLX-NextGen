@@ -110,6 +110,22 @@ dependencies = [
     # tool calling. Soft-imported at runtime; the legacy custom state
     # machine remains the fallback if the dep is unavailable.
     "openai-harmony>=0.0.8",
+    # llguidance — grammar-constrained decoding engine (native MLX Metal
+    # mask kernel via ``llguidance.mlx``). PROMOTED FROM THE [guided] EXTRA
+    # TO CORE in 0.10.15 (#558 fix-slot follow-up to PR-5). Rationale: #558
+    # PR-5 made grammar-constrained tool-calling DEFAULT-ON in 0.10.14, but a
+    # fresh-venv dogfood proved ``pip install rapid-mlx`` does NOT pull
+    # llguidance (it lived only in [guided]) — so default-on silently
+    # degraded to free-form for naive users ("on in name, off in reality":
+    # ``routes/chat.py::_maybe_build_tool_grammar_processor`` returns None
+    # when ``get_lltokenizer`` finds no llguidance, falling back to
+    # free-form-then-parse). Promoting to core makes default-on genuinely
+    # constrained out-of-the-box. Wheel/site-packages cost is a few MB
+    # (well within G12's +25 MB budget). The defensive ``HAS_LLGUIDANCE`` /
+    # ``is_guided_available()`` guards in api/guided.py + api/tool_grammar.py
+    # are RETAINED as defense-in-depth (a broken/incompatible install still
+    # degrades gracefully rather than crashing).
+    "llguidance>=1.7.6",
 ]
 
 [project.optional-dependencies]
@@ -272,6 +288,16 @@ vllm = [
 # kernel (llguidance.mlx); it interprets JSON Schema natively ($defs/$ref/
 # anyOf/enum/numeric-bounds/additionalProperties). Replaced outlines[mlxlm]
 # in 0.10 — see vllm_mlx/api/guided.py.
+#
+# NOTE (0.10.15, #558 fix-slot): llguidance was PROMOTED TO CORE
+# ``[project].dependencies`` above so default-on grammar-constrained
+# tool-calling (#558 PR-5) actually works out-of-the-box. This extra is
+# RETAINED (still pins llguidance explicitly) purely for backward compat so
+# ``pip install 'rapid-mlx[guided]'`` — the historical install path printed
+# in guided.py's degrade warning and referenced across docs — keeps
+# resolving. It is now effectively a no-op superset of core. Follows the
+# codebase's established duplicate-pin convention (mlx-vlm is likewise
+# repeated across [vision]/[dflash]/[all]/[test]/[dev]).
 guided = [
     "llguidance>=1.7.6",
 ]

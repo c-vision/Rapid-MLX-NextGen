@@ -1289,3 +1289,127 @@ def test_deepseek_r1_prefilled_think_template_is_tolerated(lltok):
         "DeepSeek-R1 prefilled-<think> generated stream was rejected — the "
         "required tool call would be blocked on DeepSeek-R1"
     )
+
+
+# ---------------------------------------------------------------------------
+# 0.10.15 fix-slot regression lock-in (#558): llguidance is a CORE dependency.
+# ---------------------------------------------------------------------------
+# #558 PR-5 shipped grammar-constrained tool-calling DEFAULT-ON (0.10.14), but a
+# fresh-venv dogfood proved ``pip install rapid-mlx`` did NOT pull llguidance —
+# it lived only in the ``[guided]`` extra — so the default-on path silently
+# degraded to free-form for naive users (``_maybe_build_tool_grammar_processor``
+# returns None when ``get_lltokenizer`` finds no llguidance). The 0.10.15 fix
+# promotes llguidance to core ``[project].dependencies``. These structural tests
+# lock that in so a future refactor cannot demote it back to extra-only and
+# silently re-break default-on out-of-the-box. They carry NO optional dependency
+# (parse pyproject.toml only), so they ALWAYS run — never skipped.
+def _load_pyproject():
+    import sys
+    from pathlib import Path
+
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:  # pragma: no cover — 3.10 floor
+        import tomli as tomllib
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as fh:
+        return tomllib.load(fh)
+
+
+def _find_llguidance_requirement(dep_strings):
+    """Return the parsed ``Requirement`` whose CANONICAL name is exactly
+    ``llguidance`` (or ``None``). Uses ``packaging.requirements.Requirement``
+    so a look-alike like ``llguidance-fake`` cannot satisfy the check
+    (codex #558 fix-slot: a bare ``startswith('llguidance')`` matched
+    ``llguidance-fake`` and never verified the version floor).
+    """
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    for dep in dep_strings:
+        req = Requirement(dep)
+        if canonicalize_name(req.name) == "llguidance":
+            return req
+    return None
+
+
+def _has_lower_bound_at_least(specifier_set, floor="1.7.6"):
+    """True iff ``specifier_set`` GUARANTEES every allowed version is >= floor.
+
+    Codex #1146 round-2: a ``.contains("1.7.5") is False`` style check is not a
+    real floor — ``>=1.0,!=1.7.5`` excludes exactly 1.7.5 yet still admits 1.7.4,
+    and an EMPTY specifier admits everything. We instead require an explicit
+    lower-bound clause (``>=`` / ``==`` / ``~=``) whose own floor is >= the
+    target, which rigorously proves no version below ``floor`` can resolve.
+    """
+    from packaging.version import Version
+
+    floor_v = Version(floor)
+    for spec in specifier_set:
+        if spec.operator in (">=", "==", "~=") and Version(spec.version) >= floor_v:
+            return True
+    return False
+
+
+def test_llguidance_is_core_dependency():
+    """llguidance MUST be in core ``[project].dependencies`` (not only the
+    ``[guided]`` extra), pinned to a ``>=1.7.6`` floor, so default-on
+    constrained tool-calling (#558 PR-5) works out-of-the-box on a bare
+    ``pip install rapid-mlx``.
+    """
+    core_deps = _load_pyproject()["project"]["dependencies"]
+    req = _find_llguidance_requirement(core_deps)
+    assert req is not None, (
+        "llguidance is missing from core [project].dependencies. Default-on "
+        "grammar-constrained tool-calling (#558 PR-5) needs it out-of-the-box; "
+        "with it only in the [guided] extra, a bare `pip install rapid-mlx` "
+        "silently degrades default-on to free-form (the 0.10.14 regression). "
+        f"Got core deps: {core_deps!r}"
+    )
+    # The core pin must be UNCONDITIONAL (no environment marker). A marker like
+    # ``; python_version < "3"`` or ``; platform_system == "Linux"`` would
+    # exclude some supported Python/platform, so a bare ``pip install rapid-mlx``
+    # there would NOT receive llguidance and default-on would silently regress
+    # to free-form on that environment (codex #1146 round-3).
+    assert req.marker is None, (
+        "llguidance core dep must be UNCONDITIONAL (no environment marker); got "
+        f"marker {str(req.marker)!r} — that would exclude some supported "
+        "Python/platform and silently re-break default-on there."
+    )
+    # The floor must be at least 1.7.6 — the minimum that ships the native
+    # llguidance.mlx Metal mask kernel the runtime relies on. Assert an explicit
+    # >=1.7.6 lower-bound clause so no version below it can ever resolve.
+    assert _has_lower_bound_at_least(req.specifier), (
+        f"llguidance core pin {str(req.specifier)!r} must floor at >=1.7.6 "
+        "(an explicit >=/==/~= lower bound of at least 1.7.6)"
+    )
+
+
+def test_guided_extra_still_resolves():
+    """The ``[guided]`` extra is retained for backward compat (historical
+    install path ``pip install 'rapid-mlx[guided]'`` printed in guided.py's
+    degrade warning + docs). Assert it still exists and still pins llguidance
+    (>=1.7.6) so that install path keeps working even though llguidance is now
+    core.
+    """
+    extras = _load_pyproject()["project"]["optional-dependencies"]
+    assert "guided" in extras, (
+        "pyproject.toml dropped the [guided] extra. Keep it as a "
+        "backward-compat alias so `pip install 'rapid-mlx[guided]'` still "
+        "resolves — that command is printed in guided.py's degrade warning."
+    )
+    req = _find_llguidance_requirement(extras["guided"])
+    assert req is not None, (
+        f"[guided] extra must still pin llguidance; got {extras['guided']!r}"
+    )
+    assert req.marker is None, (
+        "[guided] llguidance pin must be UNCONDITIONAL (no environment marker); "
+        f"got marker {str(req.marker)!r} — a marked pin would leave "
+        "`pip install 'rapid-mlx[guided]'` without llguidance on some supported "
+        "environment."
+    )
+    assert _has_lower_bound_at_least(req.specifier), (
+        f"[guided] llguidance pin {str(req.specifier)!r} must floor at >=1.7.6 "
+        "(an explicit >=/==/~= lower bound of at least 1.7.6)"
+    )
