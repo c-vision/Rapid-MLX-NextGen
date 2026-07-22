@@ -688,6 +688,79 @@ class Gemma4ToolParser(ToolParser):
 
     EXPECTED_WIRE_FORMATS = ("gemma4_native", "calling_tool_text")
 
+    # Grammar-CAPABLE (#558 E4): overrides ``structure_info`` below to emit the
+    # gemma4 native arg body (``arg_style="gemma4"``). The three wire markers are
+    # single special tokens on the target tokenizer (verified on
+    # ``mlx-community/gemma-4-e2b-it-4bit``): ``<|tool_call>`` (id 48),
+    # ``<tool_call|>`` (id 49), and the string-value marker ``<|"|>`` (id 52). The
+    # inner ``call:`` / ``{`` / ``}`` / ``,`` / ``KEY:`` framing is ordinary text,
+    # emitted as byte literals by the grammar builder.
+    _GRAMMAR_SENTINELS = ("<|tool_call>", "<tool_call|>", '<|"|>')
+
+    SUPPORTS_GRAMMAR: bool = True
+
+    # AUTO stays free-form (#558 E4). gemma4 routes reasoning through a channel
+    # grammar (``<|channel>thought\n...<channel|>``) whose ``<|channel>`` /
+    # ``<channel|>`` are SPECIAL tokens (ids 100/101); the #558 auto grammar's bare
+    # ``TAG_TEXT`` byte-regex free prefix cannot match a special token, so it would
+    # reject the model's pre-call reasoning at token 0 whenever it thinks first.
+    # gemma4's reasoning parser exposes no ``start_token``/``end_token``, so the
+    # reasoning-tolerant prefix (path A) is not wired for it either. The
+    # ``required``/named modes still build a grammar below (forced first call sits
+    # at the trigger — a forced tool call is exactly what those modes ask for).
+    TOOL_GRAMMAR_AUTO_SAFE: bool = False
+
+    def structure_info(self):
+        """Grammar-constraint wire triple for the gemma4 native tool call (#558 E4).
+
+        Extends #558 grammar constraint to the Gemma-4 wire. The model emits
+        (verified byte-for-byte against this model's ``chat_template.jinja``)::
+
+            <|tool_call>call:NAME{k1:<|"|>str<|"|>,k2:5,k3:true}<tool_call|>
+
+        The ARGUMENTS are a comma-separated ``key:VALUE`` body (NOT a JSON object),
+        so we return a ``StructureInfo`` with ``arg_style="gemma4"``: the builder
+        emits DICTSORT-ordered ``key:VALUE`` pairs, string values wrapped in the
+        ``<|"|>`` marker, bare scalars/booleans, ``%json`` objects/arrays, and an
+        alternation for enums (see ``tool_grammar._emit_gemma4_arg_body``). Those
+        surface forms are exactly what ``_scan_gemma4_tool_calls`` /
+        ``_Gemma4ArgumentParser`` round-trip back into JSON ``arguments``.
+
+        ``<|tool_call>`` / ``<tool_call|>`` / ``<|"|>`` are single special tokens
+        on the gemma4 tokenizer, declared as ``sentinels``; the trigger is
+        ``<|tool_call>`` (dedicated to tool calls — never emitted in plain prose,
+        so the forced grammar's trigger-first shape is sound). OPT OUT (return
+        ``None`` -> free-form fallback) unless the tokenizer proves all three are
+        single special tokens — a special-token sentinel on a tokenizer that splits
+        them into text would build an unenforceable grammar. Grammar constraint is
+        a best-effort opt-in, never a hard requirement.
+        """
+        from vllm_mlx.api.tool_grammar import (
+            StructureInfo,
+            are_single_special_tokens,
+        )
+
+        if not are_single_special_tokens(self.model_tokenizer, self._GRAMMAR_SENTINELS):
+            return None
+
+        def _info(name: str):
+            # The tool NAME is a bare identifier inside ``call:NAME{`` (NOT a JSON
+            # string — gemma4 does not quote it), emitted raw as a byte literal by
+            # the builder. ``begin`` starts with the ``<|tool_call>`` trigger
+            # (builder invariant); the ``{`` opens the arg body and the matching
+            # ``}`` closes it in ``end``.
+            begin = f"<|tool_call>call:{name}{{"
+            end = "}<tool_call|>"
+            return StructureInfo(
+                begin=begin,
+                end=end,
+                trigger="<|tool_call>",
+                sentinels=self._GRAMMAR_SENTINELS,
+                arg_style="gemma4",
+            )
+
+        return _info
+
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
         self._emitted_tool_count = 0
