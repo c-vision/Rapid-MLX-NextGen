@@ -2411,20 +2411,33 @@ def serve_command(args):
     # Qwen3.6 aliases, ``"off"`` everywhere else) is materialized into
     # ``args.pflash``. The resolved value then flows through the same
     # validation path the user-explicit case takes.
-    from .api.utils import is_mllm_model
+    from .api.utils import resolve_serving_lane
     from .pflash import (
         config_from_args,
         resolve_pflash_mode_default,
         validate_model_support,
     )
 
-    args.pflash = resolve_pflash_mode_default(args, model_name=args.model)
+    # Resolve the FINAL serving lane ONCE (the model is already downloaded by
+    # ``_ensure_model_downloaded`` above, so the offline probes have real
+    # evidence). PFlash defaulting and ``validate_model_support`` must both see
+    # the effective lane, NOT the raw multimodal classification: a hybrid VLM
+    # that auto-downgrades to the text-only lane is PFlash-capable there,
+    # exactly as an explicit ``--text-only`` run would be (#352 dogfood P1-②).
+    _serve_is_mllm, _ = resolve_serving_lane(
+        args.model,
+        force_mllm=getattr(args, "mllm", False),
+        force_text=getattr(args, "no_mllm", False),
+    )
+    args.pflash = resolve_pflash_mode_default(
+        args, model_name=args.model, is_multimodal=_serve_is_mllm
+    )
     try:
         pflash_config = config_from_args(args)
         validate_model_support(
             pflash_config,
             model_name=args.model,
-            is_mllm=getattr(args, "mllm", False) or is_mllm_model(args.model),
+            is_mllm=_serve_is_mllm,
         )
     except ValueError as e:
         print(f"Error: {e}")
@@ -4070,7 +4083,6 @@ def bench_command(args):
 
     from mlx_lm import load
 
-    from .api.utils import is_mllm_model as _bench_is_mllm_model
     from .engine_core import AsyncEngineCore, EngineConfig
     from .pflash import config_from_args as _pflash_config_from_args
     from .pflash import resolve_pflash_mode_default as _pflash_resolve_default
@@ -4104,13 +4116,40 @@ def bench_command(args):
     # bench previously skipped this check, so ``rapid-mlx bench
     # --pflash always <mllm-alias>`` would admit a combo PFlash
     # explicitly rejects elsewhere).
-    args.pflash = _pflash_resolve_default(args, model_name=args.model)
+    # ``bench`` has no MLLM/continuous-batching lane: it ALWAYS loads the text
+    # model via ``mlx_lm.load`` and drives ``AsyncEngineCore`` with it (see
+    # ``run_benchmark`` below — there is no ``force_text``/``force_mllm`` engine
+    # surface here the way ``serve``'s ``BatchedEngine`` has). So the effective
+    # bench lane is text for EVERY model, hybrid or not — there is no MLLM lane
+    # here for which PFlash would be unavailable. PFlash defaulting AND
+    # validation therefore use ``is_mllm=False`` unconditionally: an ordinary
+    # (non-hybrid) VLM resolves to ``is_mllm=True`` on the serve path, but here
+    # that would wrongly reject PFlash options as if an MLLM lane were in use
+    # (#352 dogfood P1-②; codex NIT #1178). We still resolve the lane to surface
+    # the hybrid auto-downgrade for lane attribution, and to keep a future
+    # reader from "fixing" this by wiring an MLLM lane that would crash on the
+    # hybrid backbone (GatedDeltaNet vs BatchKVCache, GH #352).
+    from .api.utils import resolve_serving_lane as _bench_resolve_serving_lane
+
+    _, _bench_auto_text_fallback = _bench_resolve_serving_lane(
+        args.model,
+        force_mllm=getattr(args, "mllm", False),
+        force_text=getattr(args, "no_mllm", False),
+    )
+    if _bench_auto_text_fallback:
+        print(
+            f"Note: {args.model!r} is a hybrid VLM — benching on the text-only "
+            "mlx-lm lane, matching 'serve' auto-downgrade (#352)."
+        )
+    args.pflash = _pflash_resolve_default(
+        args, model_name=args.model, is_multimodal=False
+    )
     try:
         bench_pflash_config = _pflash_config_from_args(args)
         _bench_pflash_validate(
             bench_pflash_config,
             model_name=args.model,
-            is_mllm=getattr(args, "mllm", False) or _bench_is_mllm_model(args.model),
+            is_mllm=False,
         )
     except ValueError as e:
         print(f"Error: {e}")

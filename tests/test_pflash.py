@@ -242,6 +242,66 @@ class TestResolvePFlashModeDefault:
         mode = resolve_pflash_mode_default(self._ns(None), model_name="qwen3.5-4b-4bit")
         assert mode == "always"
 
+    def test_verified_alias_default_branch_emits_log_without_error(self, caplog):
+        # Regression guard for the module-level ``logger`` binding: the
+        # verified-alias default path calls ``logger.info(...)`` and must
+        # resolve cleanly (a stray NameError here would break the exact code
+        # this PR touches). Assert the branch both returns "always" AND emits
+        # its INFO line, so the logging call is provably exercised.
+        import logging as _logging
+
+        with caplog.at_level(_logging.INFO, logger="vllm_mlx.pflash"):
+            mode = resolve_pflash_mode_default(
+                self._ns(None), model_name="qwen3.5-4b-4bit"
+            )
+        assert mode == "always"
+        assert any(
+            "pflash_tier=verified" in rec.message and "qwen3.5-4b-4bit" in rec.message
+            for rec in caplog.records
+        ), "verified-alias default branch did not emit its INFO log"
+
+    def test_multimodal_suppression_log_does_not_advise_a_flag_that_errors(
+        self, caplog
+    ):
+        # codex #2 nit on #1178: the multimodal-suppression log must NOT tell
+        # the user to "Pass --pflash always" as an override — that flag is
+        # rejected downstream by validate_model_support for the MLLM lane. The
+        # message should keep the user's mental model correct instead.
+        import logging as _logging
+
+        with caplog.at_level(_logging.INFO, logger="vllm_mlx.pflash"):
+            mode = resolve_pflash_mode_default(
+                self._ns(None), model_name="qwen3.5-4b-4bit", is_multimodal=True
+            )
+        assert mode == "off"
+        msgs = [rec.message for rec in caplog.records if "multimodal" in rec.message]
+        assert msgs, "multimodal-suppression branch did not emit its INFO log"
+        joined = " ".join(msgs)
+        assert "Pass --pflash always to override" not in joined
+        # It should instead signal that PFlash is unavailable / an override errors.
+        assert "unavailable" in joined and "rejected" in joined
+
+    def test_verified_alias_multimodal_suppresses_always(self):
+        # A verified alias that ALSO routes multimodally (a vision-config
+        # Qwen3.6-27B checkpoint is both) must NOT auto-enable PFlash — the
+        # MLLM lane is rejected by validate_model_support, so the naive
+        # default-serve command would otherwise die on a --pflash flag the
+        # user never set (#352 dogfood P1-②). The caller passes the same
+        # is_mllm verdict it feeds validate_model_support.
+        mode = resolve_pflash_mode_default(
+            self._ns(None), model_name="qwen3.5-4b-4bit", is_multimodal=True
+        )
+        assert mode == "off"
+
+    def test_explicit_always_wins_even_when_multimodal(self):
+        # is_multimodal only suppresses the AUTO tier default; an explicit
+        # --pflash always still wins (and is then rejected loudly downstream
+        # by validate_model_support — the user asked for it).
+        mode = resolve_pflash_mode_default(
+            self._ns("always"), model_name="qwen3.5-4b-4bit", is_multimodal=True
+        )
+        assert mode == "always"
+
     def test_unknown_alias_with_no_flag_defaults_to_off(self):
         # qwen3-0.6b-4bit is an explicit non-Qwen3.5/3.6 entry; its
         # default pflash_tier is "unknown".

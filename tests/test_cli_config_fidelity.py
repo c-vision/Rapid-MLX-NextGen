@@ -149,7 +149,7 @@ def test_audit_detects_synthetic_drift(tmp_path):
     )
 
 
-def test_load_model_prefill_step_size_back_compat_translation():
+def test_load_model_prefill_step_size_back_compat_translation(monkeypatch):
     """back-compat — load_model(prefill_step_size=X) must still be ACCEPTED
     (no TypeError) and must translate the value into scheduler_config so it
     actually takes effect this time. Pre-0.6.52 it was a silent no-op (#400).
@@ -163,6 +163,11 @@ def test_load_model_prefill_step_size_back_compat_translation():
 
     from vllm_mlx import server
     from vllm_mlx.scheduler import SchedulerConfig
+
+    # ``dummy-model`` is a placeholder — stub the config-materialization seam so
+    # the routing fail-fast doesn't preempt the translation block under test
+    # (#1178). The engine stub below halts right after the translation anyway.
+    monkeypatch.setattr(server, "_ensure_routing_config", lambda name: None)
 
     # Signature must still accept the kwarg.
     sig = inspect.signature(server.load_model)

@@ -2272,11 +2272,17 @@ def test_param_is_bool_handles_pep604_unions():
     assert not _param_is_bool(_param_with(inspect.Parameter.empty, default=None))
 
 
-def test_hybrid_overrides_mutually_exclusive_in_load_model():
+def test_hybrid_overrides_mutually_exclusive_in_load_model(monkeypatch):
     """server.load_model raises ValueError if both --force-hybrid and
     --no-hybrid are passed. Second line of defense — CLI also rejects
     via sys.exit(2), but load_model is a public entry point too."""
+    import vllm_mlx.server as srv
     from vllm_mlx.server import load_model
+
+    # This test drives the routing block with a placeholder repo id — stub the
+    # config-materialization seam so it doesn't fail-fast on the (uncached)
+    # "fake/model" before reaching the flag-conflict guard under test (#1178).
+    monkeypatch.setattr(srv, "_ensure_routing_config", lambda name: None)
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         load_model(
@@ -2286,10 +2292,15 @@ def test_hybrid_overrides_mutually_exclusive_in_load_model():
         )
 
 
-def test_spec_decode_overrides_mutually_exclusive_in_load_model():
+def test_spec_decode_overrides_mutually_exclusive_in_load_model(monkeypatch):
     """server.load_model raises ValueError if both --force-spec-decode
     and --no-spec-decode are passed."""
+    import vllm_mlx.server as srv
     from vllm_mlx.server import load_model
+
+    # Placeholder repo id — stub the config-materialization seam (see the
+    # sibling hybrid test) so the fail-fast doesn't preempt the guard (#1178).
+    monkeypatch.setattr(srv, "_ensure_routing_config", lambda name: None)
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         load_model(
@@ -2297,6 +2308,99 @@ def test_spec_decode_overrides_mutually_exclusive_in_load_model():
             force_spec_decode=True,
             no_spec_decode=True,
         )
+
+
+def test_server_main_no_mllm_skips_routing_config_fail_fast(monkeypatch):
+    """BLOCKING (#1178 codex r5): standalone ``python -m vllm_mlx.server`` must
+    NOT run the config-materialization fail-fast when the user passes an
+    explicit lane flag. ``_ensure_routing_config``'s own error advertises
+    ``--no-mllm`` as the escape hatch, so running it BEFORE consulting the flag
+    would deny the very bypass it names when the config cannot be fetched. With
+    ``--no-mllm`` the lane is already decided (text) and ``resolve_serving_lane``
+    short-circuits without reading config, so ``_ensure_routing_config`` must be
+    skipped entirely — mirroring ``load_model()``'s flag-first order.
+    """
+    from vllm_mlx import cli as _cli
+    from vllm_mlx import server
+    from vllm_mlx.config import get_config
+
+    # Snapshot the globals ``main()`` mutates so the writes don't leak into
+    # sibling tests (mirrors test_audio_route_registration_gate).
+    cfg = get_config()
+    cfg_snapshot = {
+        a: getattr(cfg, a, None)
+        for a in (
+            "tool_call_parser",
+            "reasoning_parser",
+            "reasoning_parser_name",
+            "enable_auto_tool_choice",
+            "enable_tool_logits_bias",
+            "model_name",
+            "model_alias",
+        )
+    }
+    server_snapshot = {
+        a: getattr(server, a, None)
+        for a in (
+            "_tool_call_parser",
+            "_reasoning_parser",
+            "_reasoning_parser_name",
+            "_enable_auto_tool_choice",
+            "_enable_tool_logits_bias",
+            "_model_name",
+            "_model_alias",
+        )
+    }
+
+    called = {"ensure_routing_config": False}
+
+    def _spy_ensure(name):
+        # Simulate the fail-fast: an uncached config that cannot materialize.
+        called["ensure_routing_config"] = True
+        raise RuntimeError("config unmaterializable — MUST be skipped w/ --no-mllm")
+
+    seen: dict[str, object] = {}
+
+    def _stub_load_model(*_a, **kw):
+        seen["force_text"] = kw.get("force_text")
+        seen["force_mllm"] = kw.get("force_mllm")
+
+    monkeypatch.setattr(server, "_ensure_routing_config", _spy_ensure)
+    monkeypatch.setattr(server, "load_model", _stub_load_model)
+    monkeypatch.setattr(_cli, "_port_preflight_or_die", lambda *_a, **_kw: None)
+
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "run", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        "vllm_mlx._version_check.prompt_upgrade_if_available", lambda: False
+    )
+    monkeypatch.setattr(
+        "vllm_mlx._version_check.print_staleness_warning_if_any", lambda: None
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "vllm_mlx.server",
+            "--model",
+            "some/uncached-hybrid-vlm-4bit",
+            "--no-mllm",
+        ],
+    )
+    try:
+        # Must NOT raise the fail-fast; boots on the (explicit) text lane.
+        server.main()
+        assert called["ensure_routing_config"] is False, (
+            "_ensure_routing_config must be SKIPPED when --no-mllm is set — "
+            "otherwise an unmaterializable config denies the --no-mllm bypass"
+        )
+        assert seen.get("force_text") is True
+        assert seen.get("force_mllm") is False
+    finally:
+        for attr, value in cfg_snapshot.items():
+            setattr(cfg, attr, value)
+        for attr, value in server_snapshot.items():
+            setattr(server, attr, value)
 
 
 def _post_sop_forwarded_kwargs() -> frozenset[str]:

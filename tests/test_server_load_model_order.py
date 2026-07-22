@@ -86,6 +86,227 @@ def test_load_model_enables_native_tool_format_when_parser_supports_it(monkeypat
     assert server._engine.preserve_native_tool_format is True
 
 
+def _stub_routing_globals(monkeypatch, server):
+    """Neutralize the load_model globals that the routing tests don't exercise."""
+    monkeypatch.setattr(server, "BatchedEngine", _StubEngine)
+    monkeypatch.setattr(server, "_engine", None, raising=False)
+    monkeypatch.setattr(server, "_enable_auto_tool_choice", False, raising=False)
+    monkeypatch.setattr(server, "_tool_call_parser", None, raising=False)
+    monkeypatch.setattr(server, "_reasoning_parser_name", None, raising=False)
+    monkeypatch.setattr(server, "_reasoning_parser", None, raising=False)
+    monkeypatch.setattr(server, "_tool_parser_instance", None, raising=False)
+    monkeypatch.setattr(server, "_mcp_manager", None, raising=False)
+    monkeypatch.setattr(server, "_enable_tool_logits_bias", False, raising=False)
+    monkeypatch.setattr(server, "_model_alias", None, raising=False)
+
+
+def test_load_model_materializes_config_before_hybrid_routing_probe(
+    monkeypatch, caplog
+):
+    """BLOCKING (#1178 codex): the hybrid→text-only fallback probe reads the
+    checkpoint config from the local cache. On a first-time uncached remote
+    startup that config is absent, so the probe must run AFTER the model is
+    materialized — otherwise a hybrid VLM probes "not hybrid" and is routed
+    into the MLLM engine that cannot serve it (#352).
+
+    Simulate exactly that race: the hybrid backbone is only "visible" once
+    ``_ensure_routing_config`` has run. Assert the engine is still built for
+    the text lane (``force_text=True``), proving the materialize-then-probe
+    ordering holds — and that the automatic fallback is NOT reported as an
+    explicit ``--no-mllm``.
+    """
+    import logging
+
+    from vllm_mlx import server
+    from vllm_mlx.api import utils as api_utils
+
+    _stub_routing_globals(monkeypatch, server)
+
+    state = {"materialized": False}
+
+    def _fake_ensure(model_name):
+        state["materialized"] = True
+
+    monkeypatch.setattr(server, "_ensure_routing_config", _fake_ensure)
+    # A multimodal checkpoint whose hybrid backbone only becomes visible once
+    # its config has been materialized (i.e. after the download).
+    monkeypatch.setattr(api_utils, "is_mllm_model", lambda name: True)
+    monkeypatch.setattr(
+        api_utils, "mllm_backbone_is_hybrid", lambda name: state["materialized"]
+    )
+
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.server"):
+        server.load_model("some/uncached-hybrid-vlm-4bit")
+
+    assert server._engine is not None
+    # Materialization ran before the probe → hybrid detected → text lane.
+    assert server._engine.kwargs.get("force_text") is True, (
+        "auto-fallback to the text lane must fire once config is materialized"
+    )
+    # force_mllm must remain False (auto mode, no explicit flag).
+    assert server._engine.kwargs.get("force_mllm") is False
+    joined = " ".join(rec.message for rec in caplog.records)
+    # Diagnostics attribute the reason to the automatic downgrade, NOT --no-mllm.
+    assert "auto-downgraded to the text-only" in joined
+    assert "Force text-only mode enabled via --no-mllm flag" not in joined
+
+
+def test_load_model_genuine_vlm_stays_on_mllm_lane(monkeypatch):
+    """A multimodal checkpoint with a NON-hybrid backbone (gemma-4 shape) must
+    keep its MLLM routing — the auto-fallback fires only for hybrid backbones,
+    so a working VLM is never downgraded."""
+    from vllm_mlx import server
+    from vllm_mlx.api import utils as api_utils
+
+    _stub_routing_globals(monkeypatch, server)
+    monkeypatch.setattr(server, "_ensure_routing_config", lambda name: None)
+    monkeypatch.setattr(api_utils, "is_mllm_model", lambda name: True)
+    monkeypatch.setattr(api_utils, "mllm_backbone_is_hybrid", lambda name: False)
+
+    server.load_model("some/genuine-vlm-4bit")
+
+    assert server._engine is not None
+    # No downgrade → force_text stays False; BatchedEngine does its own MLLM
+    # auto-detection from there.
+    assert server._engine.kwargs.get("force_text") is False
+
+
+def test_ensure_routing_config_raises_when_prefetch_does_not_materialize(monkeypatch):
+    """BLOCKING (#1178 codex r4): ``_ensure_routing_config`` must NOT swallow a
+    prefetch failure and let the caller route on a guess. If, after the
+    prefetch attempt, the checkpoint config is still absent, the MLLM-vs-text
+    probe would fall back to "not hybrid" and misroute a hybrid VLM into the
+    crashing MLLM engine (#352). Assert it fails fast with an actionable error
+    instead.
+    """
+    from vllm_mlx import cli as cli_mod
+    from vllm_mlx import model_metadata as mm
+    from vllm_mlx import server
+
+    # Uncached remote repo id (not a local path → os.path.exists False).
+    model = "some/uncached-and-unmaterializable-4bit"
+    # Config NEVER becomes readable, even after the prefetch runs.
+    monkeypatch.setattr(mm, "read_model_metadata", lambda name: None)
+    called = {"prefetch": False}
+
+    original_err = OSError("network unreachable")
+
+    def _failing_prefetch(name):
+        called["prefetch"] = True  # ran, but errored + put no config on disk
+        raise original_err
+
+    monkeypatch.setattr(cli_mod, "_ensure_model_downloaded", _failing_prefetch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        server._ensure_routing_config(model)
+
+    assert called["prefetch"] is True, "prefetch must be attempted before failing"
+    msg = str(excinfo.value)
+    assert model in msg
+    # Actionable: names the routing consequence and the escape hatches.
+    assert "--no-mllm" in msg
+    assert "#352" in msg
+    # NIT (#1178 codex r5): the real prefetch cause is preserved via chaining,
+    # not discarded.
+    assert excinfo.value.__cause__ is original_err
+
+
+def test_ensure_routing_config_warns_when_prefetch_errors_but_config_lands(
+    monkeypatch, caplog
+):
+    """NIT (#1178 codex r5): if the prefetch raises a concrete error (auth /
+    network / partial download) but config.json is present afterward, don't
+    silently discard that error — resolve the lane (config is readable) but
+    surface the original cause at WARNING so a later weight-load failure is
+    attributable."""
+    import logging
+
+    from vllm_mlx import cli as cli_mod
+    from vllm_mlx import model_metadata as mm
+    from vllm_mlx import server
+
+    state = {"materialized": False}
+    monkeypatch.setattr(
+        mm,
+        "read_model_metadata",
+        lambda name: object() if state["materialized"] else None,
+    )
+
+    def _partial_prefetch(name):
+        # config.json lands, but the download errors out (weights incomplete).
+        state["materialized"] = True
+        raise OSError("connection reset mid-download")
+
+    monkeypatch.setattr(cli_mod, "_ensure_model_downloaded", _partial_prefetch)
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.server"):
+        # Config is readable afterward → no raise.
+        server._ensure_routing_config("some/partially-downloaded-4bit")
+
+    joined = " ".join(rec.message for rec in caplog.records)
+    assert "connection reset mid-download" in joined
+    assert "partially downloaded" in joined
+
+
+def test_ensure_routing_config_succeeds_when_prefetch_materializes(monkeypatch):
+    """Happy path for the first-time uncached startup: config is absent, the
+    prefetch materializes it, and ``_ensure_routing_config`` returns cleanly."""
+    from vllm_mlx import cli as cli_mod
+    from vllm_mlx import model_metadata as mm
+    from vllm_mlx import server
+
+    state = {"materialized": False}
+    monkeypatch.setattr(
+        mm,
+        "read_model_metadata",
+        lambda name: object() if state["materialized"] else None,
+    )
+
+    def _fake_prefetch(name):
+        state["materialized"] = True
+
+    monkeypatch.setattr(cli_mod, "_ensure_model_downloaded", _fake_prefetch)
+
+    # Must not raise.
+    server._ensure_routing_config("some/uncached-but-fetchable-4bit")
+    assert state["materialized"] is True
+
+
+def test_ensure_routing_config_skips_prefetch_when_config_already_readable(monkeypatch):
+    """Warm cache / local checkpoint: config already readable → no download is
+    attempted (keeps warm starts and the unit suite fully offline)."""
+    from vllm_mlx import cli as cli_mod
+    from vllm_mlx import model_metadata as mm
+    from vllm_mlx import server
+
+    monkeypatch.setattr(mm, "read_model_metadata", lambda name: object())
+
+    def _must_not_run(name):  # pragma: no cover - asserted never called
+        raise AssertionError("prefetch must be skipped when config is readable")
+
+    monkeypatch.setattr(cli_mod, "_ensure_model_downloaded", _must_not_run)
+
+    server._ensure_routing_config("mlx-community/Qwen3.5-9B-4bit")
+
+
+def test_ensure_routing_config_propagates_disk_gate_systemexit(monkeypatch):
+    """The intentional hard disk-space gate (``SystemExit``) from the prefetch
+    must propagate unchanged — it is a fail-fast, not a swallowable hiccup."""
+    from vllm_mlx import cli as cli_mod
+    from vllm_mlx import model_metadata as mm
+    from vllm_mlx import server
+
+    monkeypatch.setattr(mm, "read_model_metadata", lambda name: None)
+
+    def _disk_gate(name):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(cli_mod, "_ensure_model_downloaded", _disk_gate)
+
+    with pytest.raises(SystemExit):
+        server._ensure_routing_config("some/uncached-4bit")
+
+
 def test_load_model_infers_programmatic_max_tokens_explicit(monkeypatch):
     from vllm_mlx import server
     from vllm_mlx.config import get_config, reset_config

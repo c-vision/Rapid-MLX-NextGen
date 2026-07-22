@@ -961,6 +961,109 @@ def is_mllm_model(model_name: str) -> bool:
 is_vlm_model = is_mllm_model
 
 
+def mllm_backbone_is_hybrid(model_name: str) -> bool:
+    """True when a checkpoint's *language* backbone is hybrid/linear-attention.
+
+    A hybrid backbone (Qwen3.5/3.6 GatedDeltaNet ``linear_attention`` layers,
+    Mamba/recurrent state-space blocks, …) produces ``ArraysCache`` layers that
+    the MLLM continuous-batching engine cannot assemble into a ``BatchKVCache``
+    — it needs standard ``KVCache`` / ``RotatingKVCache`` (GitHub #352). A
+    genuine VLM whose backbone is plain / sliding attention (Gemma-4, Qwen3-VL)
+    returns False and keeps its multimodal routing.
+
+    The signal is the checkpoint config alone — the ``text_config.layer_types``
+    list and recurrent ``model_type`` markers — so this is offline, never loads
+    weights, and never hits the network. A missing/unreadable config returns
+    False (unknown → no fallback), matching the conservative contract of
+    :func:`is_mllm_model`: this probe only ever *adds* a text-lane fallback for a
+    demonstrably-incompatible backbone, never removes multimodal routing from a
+    checkpoint we cannot positively classify as hybrid.
+
+    Args:
+        model_name: HuggingFace repo ID or local filesystem path.
+
+    Returns:
+        True if the language backbone uses linear-attention / recurrent layers.
+    """
+    metadata = read_model_metadata(model_name)
+    config = metadata.config if metadata is not None else None
+    if not isinstance(config, dict):
+        return False
+    text_cfg = config.get("text_config")
+    if not isinstance(text_cfg, dict):
+        text_cfg = config
+
+    # Per-layer attention markers: GatedDeltaNet declares ``linear_attention``
+    # entries interleaved with ``full_attention``; Mamba/recurrent blocks label
+    # their own layers. Sliding-window attention (``sliding_attention``) is NOT
+    # hybrid — it still uses a RotatingKVCache the MLLM engine handles.
+    layer_types = text_cfg.get("layer_types")
+    if isinstance(layer_types, list) and any(
+        isinstance(lt, str)
+        and any(tok in lt.lower() for tok in ("linear", "mamba", "recurrent"))
+        for lt in layer_types
+    ):
+        return True
+
+    # Whole-model recurrent / state-space architectures that don't enumerate
+    # per-layer types (pure Mamba, RecurrentGemma, Qwen3-Next linear stack).
+    for mt in (text_cfg.get("model_type"), config.get("model_type")):
+        if isinstance(mt, str) and any(
+            tok in mt.lower() for tok in ("mamba", "recurrent", "qwen3_next")
+        ):
+            return True
+    return False
+
+
+def resolve_serving_lane(
+    model_name: str, *, force_mllm: bool = False, force_text: bool = False
+) -> tuple[bool, bool]:
+    """Decide the FINAL serving lane for a model, resolving the automatic
+    hybrid→text-only fallback up front so every consumer (PFlash defaulting,
+    ``validate_model_support``, engine selection, diagnostics) agrees on one
+    answer.
+
+    Returns ``(is_mllm_lane, auto_text_fallback)``:
+
+    * ``is_mllm_lane`` — True iff the model will actually be served on the
+      MLLM/VLM continuous-batching lane. This is the verdict PFlash defaulting
+      and ``validate_model_support`` must use — NOT the raw ``is_mllm_model``
+      checkpoint classification — so a checkpoint that auto-downgrades to the
+      text lane is treated as text (PFlash-capable) everywhere, exactly as an
+      explicit ``--text-only`` run would be.
+    * ``auto_text_fallback`` — True iff a multimodal checkpoint was
+      *automatically* routed to the text-only lane because its language
+      backbone is hybrid/linear-attention (ArraysCache, incompatible with MLLM
+      continuous batching — GitHub #352). Kept DISTINCT from an explicit
+      ``--no-mllm``/``force_text`` so diagnostics can say "auto-downgraded"
+      rather than falsely claim the user passed ``--no-mllm``.
+
+    Explicit flags win: ``force_text`` → text lane (no auto-fallback marker),
+    ``force_mllm`` → MLLM lane (the engine may still reject a hybrid backbone
+    with its own #352 error — the operator asked for it, so they get the flag
+    they set named in the message).
+
+    The two probes are offline and read the checkpoint config from the local
+    cache. Callers MUST materialize that config first (the model download must
+    have completed — see ``_ensure_model_downloaded``) so the probes have real
+    evidence instead of a name-pattern guess; otherwise a first-time uncached
+    hybrid VLM would probe "not hybrid" and be routed into the crashing MLLM
+    engine (#352 dogfood P1-②).
+    """
+    if force_text:
+        return (False, False)
+    if force_mllm:
+        return (True, False)
+    if not is_mllm_model(model_name):
+        return (False, False)
+    # Auto-routed to the MLLM lane by its vision weights — but a
+    # hybrid/linear-attention backbone cannot be served there; downgrade to the
+    # text-only lane and mark it as an automatic fallback.
+    if mllm_backbone_is_hybrid(model_name):
+        return (False, True)
+    return (True, False)
+
+
 def decode_inline_tool_call_arguments(messages: list[dict]) -> None:
     """Decode `tool_calls[].function.arguments` from JSON string to dict in-place.
 
