@@ -2957,6 +2957,10 @@ class BatchedEngine(BaseEngine):
                 temperature=temperature,
             )
         except Exception as e:
+            # ``generate_json`` already degrades every failure — compile-reject
+            # (structural validity is settled at the route boundary) and
+            # transient guided failure alike — to ``None``. This stays only as a
+            # last-resort guard for a wiring failure in the setup above.
             logger.error(f"Guided generation error: {e}")
             return None
 

@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
+from ..api.errors import CHAT_RESPONSE_FORMAT_PARAM
 from ..api.models import (
     AssistantMessage,
     ChatCompletionChoice,
@@ -48,6 +49,7 @@ from ..api.tool_calling import (
     convert_tools_for_template,
     extract_json_schema_for_guided,
     is_strict_json_schema,
+    nonstrict_json_schema_boundary_error,
     parse_json_output,
     validate_output_against_schema,
 )
@@ -2425,6 +2427,24 @@ async def _create_chat_completion_impl(
     # structure enforcement — client received unconstrained prose
     # without any signal.
     _validate_response_format(request.response_format)
+
+    # ROUTE-BOUNDARY schema validation (0.10.16 dogfood P1-③), the SINGLE
+    # structural-validation point shared with /v1/responses via
+    # ``nonstrict_json_schema_boundary_error``. A structurally-invalid
+    # ``response_format.json_schema.schema`` is a deterministic CLIENT fault and
+    # must return 400 on EVERY path — BEFORE the guided-capability check, any
+    # fallback, or engine dispatch, and regardless of stream/non-stream. Without
+    # this gate a NON-strict json_schema request on a guided-UNSUPPORTED engine
+    # (``supports_guided_generation=False``) never reaches the guided layer and
+    # silently degrades to an unconstrained HTTP 200 — the exact P1-③ hole.
+    # Strict requests are handled by the more specific ``invalid_strict_schema``
+    # pre-flight below. Downstream ``generate_json`` does NO structural re-check
+    # (validate-once); it owns only the operational-failure path.
+    _boundary_err = nonstrict_json_schema_boundary_error(
+        request.response_format, CHAT_RESPONSE_FORMAT_PARAM
+    )
+    if _boundary_err is not None:
+        raise HTTPException(status_code=400, detail=_boundary_err)
 
     # --- Detailed request logging ---
     n_msgs = len(request.messages)

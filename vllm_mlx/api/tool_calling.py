@@ -1252,3 +1252,51 @@ def is_strict_json_schema(
         return spec.get("strict") is True
 
     return False
+
+
+def nonstrict_json_schema_boundary_error(
+    response_format: ResponseFormat | dict[str, Any] | None,
+    param: str,
+) -> dict[str, Any] | None:
+    """The SINGLE route-boundary structural-validation gate (0.10.16 P1-③).
+
+    Every response-format route (chat, responses) calls this ONCE, as the first
+    thing it does with a ``response_format``, BEFORE the guided-capability
+    check / fallback / engine dispatch and regardless of stream/non-stream. It
+    returns the canonical OpenAI-shaped 400 ``invalid_response_format_schema``
+    error-detail dict when a NON-strict json_schema's schema is structurally
+    invalid, else ``None``. The route raises ``HTTPException(400, detail)`` on a
+    non-``None`` result.
+
+    Why non-strict only: a structurally-invalid STRICT json_schema is caught by
+    each route's more specific ``invalid_strict_schema`` pre-flight, so this
+    gate skips strict to avoid a duplicate check with a less-specific code. The
+    non-strict path had NO structural validation before this — an invalid
+    non-strict schema on a ``supports_guided_generation=False`` engine never
+    reached the guided layer and silently degraded to an unconstrained HTTP 200
+    (the P1-③ hole).
+
+    ``param`` is the surface-correct field locator
+    (``response_format.json_schema.schema`` for chat,
+    ``text.format.schema`` for responses). Returns ``None`` when there is
+    nothing to validate (no json_schema, or no extractable schema — the
+    response-format SHAPE gate rejects empty schemas elsewhere) or the schema is
+    structurally valid. This is a dependency-light pure function (no fastapi),
+    so it unit-tests without a client and callers own the HTTP raise.
+    """
+    # Imported here (not at module top) to keep the dependency-free ``errors``
+    # module's re-export graph simple; both symbols are lightweight.
+    from .errors import GuidedSchemaCompileError, guided_schema_compile_error_detail
+
+    if response_format is None or is_strict_json_schema(response_format):
+        return None
+    schema = extract_json_schema_for_guided(response_format)
+    if not schema:
+        return None
+    ok, reason = check_schema_validity(schema)
+    if ok:
+        return None
+    return guided_schema_compile_error_detail(
+        GuidedSchemaCompileError(reason or "invalid JSON Schema document"),
+        param=param,
+    )

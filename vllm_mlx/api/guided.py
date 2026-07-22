@@ -28,7 +28,24 @@ Two constraint modes are supported, matching the two the OpenAI
 import logging
 from typing import Any
 
+# ``GuidedSchemaCompileError`` originally lived in THIS module; it now lives in
+# the dependency-free ``errors`` module (so the app-startup exception handler
+# and route modules can reference it without triggering native MLX / llguidance
+# init). Re-imported here — it is both used below (``_decode_constrained``
+# raises it) and kept importable as ``vllm_mlx.api.guided.GuidedSchemaCompileError``
+# for backward compatibility. The 400-envelope builder and the param-stamp
+# helper live in ``errors`` and are imported directly from there by consumers.
+#
+# NOTE: deliberately NO ``__all__`` — this module has long exported its public
+# names (``GuidedGenerator``, ``generate_with_schema``, ``is_guided_available``,
+# ``json_schema_to_pydantic``, ``LLMatcher`` …) implicitly via
+# ``from vllm_mlx.api.guided import *``. Adding an ``__all__`` would silently
+# hide every name not listed, breaking existing ``import *`` consumers; leaving
+# it off keeps all module-level public names exported.
+from .errors import GuidedSchemaCompileError
+
 logger = logging.getLogger(__name__)
+
 
 # MUST install the MLX hardware-compat shim BEFORE the `mlx_lm` import below.
 # Even though the import is inside a `try`, the body still runs at module
@@ -332,11 +349,24 @@ class GuidedGenerator:
              the same cache.
 
         Returns the decoded text ONLY when the grammar reached an accepting
-        (fully-satisfied) state; ``None`` otherwise — i.e. if the grammar
-        failed to compile, the tokenizer was unavailable, generation was
-        truncated by ``max_tokens`` mid-object, or a token was rejected
-        mid-parse. An incomplete result is never returned to the caller,
-        which treats ``None`` as guided-unavailable (strict-mode 422).
+        (fully-satisfied) state; ``None`` otherwise — i.e. if the tokenizer
+        was unavailable, generation was truncated by ``max_tokens``
+        mid-object, or a token was rejected mid-parse. An incomplete result is
+        never returned to the caller, which treats ``None`` as an OPERATIONAL
+        guided failure: under strict mode the route surfaces a sanitized 502
+        ``strict_schema_violation`` (a server-side inability to honor the
+        constraint), and under non-strict mode it degrades to a best-effort
+        unconstrained 200.
+
+        Raises ``GuidedSchemaCompileError`` when llguidance rejects the grammar
+        at matcher construction. ``generate_json`` CATCHES it and degrades to
+        ``None`` — the SAME operational path as above (strict 502 / non-strict
+        best-effort 200), NOT a 400: the structural validity of the caller
+        schema is already settled UPSTREAM at the route boundary, so a rejection
+        that reaches this layer is an operational llguidance failure on an
+        already-valid schema, not a caller fault. The dedicated exception type
+        is retained only so the rejection is distinguishable in logs from a
+        benign truncated-parse ``None``.
         """
         from mlx_lm.models.cache import make_prompt_cache
 
@@ -352,8 +382,23 @@ class GuidedGenerator:
         matcher = LLMatcher(lltok, grammar)
         err = matcher.get_error()
         if err:
+            # A non-empty error here means llguidance rejected the grammar at
+            # matcher construction (e.g. an invalid JSON-schema ``type``).
+            # Raise rather than returning ``None`` so it is DISTINGUISHABLE
+            # from a benign guided-unavailable / truncated-parse ``None`` (that
+            # ``None`` previously let the engine swallow the failure into a
+            # silent unconstrained fallback). The CLASSIFICATION of this signal
+            # — genuine client-invalid schema (→ HTTP 400) vs an operational
+            # llguidance failure on a structurally-valid schema (→ 502) — is
+            # NOT decided here: structural validity is already settled ONCE at
+            # the route boundary (``nonstrict_json_schema_boundary_error`` for
+            # non-strict, the strict pre-flight for strict), so any error that
+            # reaches this layer is treated as OPERATIONAL by ``generate_json``
+            # (returns ``None`` → strict raises 502, non-strict best-effort).
+            # This layer only reports that llguidance could not build the
+            # matcher.
             logger.error("llguidance grammar/compile error: %s", err)
-            return None
+            raise GuidedSchemaCompileError(str(err))
 
         vocab = lltok.vocab_size
         bitmask = allocate_token_bitmask(1, vocab)
@@ -450,8 +495,9 @@ class GuidedGenerator:
         # is True iff the matcher is in a state where the grammar is fully
         # satisfied and could terminate here. If we fell out of the loop on
         # ``max_tokens`` with an unclosed object, the parse is incomplete —
-        # return None so the caller degrades to guided-unavailable / 422
-        # rather than leaking a truncated JSON fragment.
+        # return None so the caller degrades on the OPERATIONAL path (strict →
+        # sanitized 502, non-strict → best-effort 200) rather than leaking a
+        # truncated JSON fragment.
         if not generated or not matcher.is_accepting():
             return None
         return tokenizer.decode(generated)
@@ -493,9 +539,23 @@ class GuidedGenerator:
         valid JSON *array* where the schema required an object. The dict is
         handed to llguidance directly.
         """
-        try:
-            import json as _json
+        import json as _json
 
+        # STRUCTURAL VALIDATION HAPPENS ONCE, AT THE ROUTE BOUNDARY
+        # (``nonstrict_json_schema_boundary_error`` for non-strict +
+        # ``check_schema_validity`` strict pre-flight). Any schema reaching this
+        # method is therefore already structurally VALID, so this layer does NO
+        # structural re-check (validate-once — no duplicate work, nothing run on
+        # the event-loop/executor thread twice). Consequently EVERY failure in
+        # this block is OPERATIONAL — a serialization edge case, an
+        # unsupported-but-valid construct, a tokenizer/model-compat issue, an
+        # internal compiler limit, or a truncated parse — NOT a caller fault.
+        # All arms degrade to ``None``, which the engine turns into the
+        # operational path (strict → sanitized 502, non-strict → best-effort
+        # unconstrained 200), NEVER a 400. ``json.dumps`` is kept INSIDE the
+        # ``try`` so a serialization failure follows that same graceful ``None``
+        # path rather than escaping as an unhandled error.
+        try:
             schema_str = _json.dumps(json_schema)
             grammar = LLMatcher.grammar_from_json_schema(
                 schema_str,
@@ -507,7 +567,19 @@ class GuidedGenerator:
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
+        except GuidedSchemaCompileError:
+            # llguidance rejected the (structurally-valid) schema LAZILY at
+            # matcher construction (``matcher.get_error()``) → operational.
+            logger.error(
+                "guided decode: llguidance rejected a structurally-valid schema "
+                "(operational) — degrading to the runtime-failure path (None), "
+                "not a 400."
+            )
+            return None
         except Exception:
+            # Any other runtime/decode failure (incl. an eager ``ValueError``
+            # from ``grammar_from_json_schema``) stays a graceful ``None``
+            # (operational / guided-unavailable) for best-effort callers.
             logger.exception("Guided generation failed")
             return None
 
@@ -589,5 +661,9 @@ def generate_with_schema(
             temperature=temperature,
         )
     except Exception as e:
+        # ``generate_json`` already degrades EVERY failure (compile-reject
+        # included) to ``None`` internally, so nothing schema-specific escapes
+        # here; this stays only as a last-resort guard for a wiring failure in
+        # ``GuidedGenerator`` construction.
         logger.error(f"generate_with_schema failed: {e}")
         return None

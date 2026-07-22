@@ -24,6 +24,7 @@ from collections.abc import AsyncIterator, Mapping
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
+from ..api.errors import RESPONSES_TEXT_FORMAT_PARAM
 from ..api.models import (
     AssistantMessage,
     ChatCompletionChoice,
@@ -58,6 +59,7 @@ from ..api.tool_calling import (
     convert_tools_for_template,
     extract_json_schema_for_guided,
     is_strict_json_schema,
+    nonstrict_json_schema_boundary_error,
     validate_output_against_schema,
 )
 from ..api.utils import (
@@ -377,6 +379,17 @@ async def create_response(request: Request):
         # Counter tick mirrors the chat-route gate so the operator
         # dashboards see uniform traffic shape across both surfaces.
         _rf = getattr(openai_request, "response_format", None)
+        # ROUTE-BOUNDARY schema validation (0.10.16 dogfood P1-③), the SAME
+        # single structural-validation gate the chat route uses. /v1/responses
+        # only guides STRICT json_schema, so a NON-strict json_schema with an
+        # invalid schema would otherwise skip validation entirely and silently
+        # degrade to a 200 with unconstrained output. Strict requests are
+        # handled by the more specific ``invalid_strict_schema`` gate below.
+        _boundary_err = nonstrict_json_schema_boundary_error(
+            _rf, RESPONSES_TEXT_FORMAT_PARAM
+        )
+        if _boundary_err is not None:
+            raise HTTPException(status_code=400, detail=_boundary_err)
         if is_strict_json_schema(_rf):
             _schema = extract_json_schema_for_guided(_rf)
             incr_strict_request()
@@ -911,6 +924,11 @@ async def _non_stream(
             k: v for k, v in chat_kwargs.items() if k != "raise_on_failure"
         }
         try:
+            # Structural validity of the (strict) schema is already settled at
+            # the route boundary above, so constructing the guided coroutine
+            # here cannot surface a caller-schema fault; any operational failure
+            # is caught by the ``except Exception`` 502 arm below (and on the
+            # await path further down).
             _guided_coro = engine.generate_with_schema(
                 messages=messages,
                 json_schema=_strict_schema,
