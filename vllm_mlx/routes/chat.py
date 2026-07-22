@@ -791,6 +791,7 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
             GrammarLogitsProcessor,
             build_tool_grammar,
             get_lltokenizer,
+            model_stop_token_ids,
             resolve_reasoning_sentinels,
         )
         from ..tool_parsers import ToolParserManager
@@ -914,11 +915,21 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
         # boundaries. So we pass ``reasoning_end_token=None`` — the grammar's
         # reasoning-tolerant free prefix is the correct and only reasoning lever
         # for triggered structural tags (matches vLLM's same-step exception).
+        # Re-admit the model's stop/eos tokens at accepting grammar states so a
+        # forced (required/named) call TERMINATES after one call instead of
+        # looping (0.10.16 dogfood P1-①). Without this, a family whose learned
+        # turn-terminator is not the tokenizer's single grammar-EOS — Gemma-4
+        # ends a tool-call turn with ``<turn|>`` / ``<|tool_response>``, not
+        # ``<eos>`` — can never emit a stop under the mask and repeats the
+        # identical call until ``max_tokens``. Qwen/gpt-oss are unaffected (their
+        # terminator is already grammar-allowed at the accepting state).
+        stop_ids = model_stop_token_ids(tokenizer)
         processor = GrammarLogitsProcessor(
             lltok,
             grammar,
             reasoning_end_token=None,
             tokenizer=tokenizer,
+            stop_token_ids=stop_ids,
         )
         # A broken matcher (grammar failed to compile) masks NOTHING. Returning
         # it here would set ``grammar_logits_processor`` on the request, which

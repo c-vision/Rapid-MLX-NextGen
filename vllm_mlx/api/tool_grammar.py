@@ -2168,6 +2168,46 @@ def build_tool_grammar(
     return _compile_lark_cached(lark)
 
 
+def model_stop_token_ids(tokenizer: Any) -> tuple[int, ...]:
+    """Collect the model's stop/eos token ids from a tokenizer (0.10.16 P1-①).
+
+    Unions the same surfaces the scheduler's ``_get_stop_tokens`` reads so the
+    ``GrammarLogitsProcessor`` re-admits EXACTLY the ids that will actually halt
+    generation:
+
+      * ``_eos_token_ids`` — mlx-lm ``TokenizerWrapper``'s curated set, grown at
+        load by ``augment_eos_token_ids_from_generation_config`` to include the
+        chat-template terminators declared in ``generation_config.json``'s
+        ``eos_token_id`` list (Gemma-4 ``<turn|>`` id 106 / ``<|tool_response>``
+        id 50, Qwen3 ``<|endoftext|>``, Llama-3 ``<|eot_id|>``, …).
+      * ``eos_token_id`` — the singular HF surface (int or list).
+      * ``eos_token_ids`` — the plural processor surface.
+      * the Rapid-MLX extras stash (``_rapid_extra_eos_token_ids``) for raw HF
+        tokenizers whose ``eos_token_ids`` property rejects assignment.
+
+    Returns a sorted tuple (possibly empty — the processor then behaves exactly
+    as before this change)."""
+    ids: set[int] = set()
+    if tokenizer is None:
+        return ()
+    wrapper_ids = getattr(tokenizer, "_eos_token_ids", None)
+    if wrapper_ids:
+        ids.update(int(t) for t in wrapper_ids)
+    single = getattr(tokenizer, "eos_token_id", None)
+    if single is not None:
+        if isinstance(single, (list, set, tuple)):
+            ids.update(int(t) for t in single)
+        else:
+            ids.add(int(single))
+    plural = getattr(tokenizer, "eos_token_ids", None)
+    if plural is not None and isinstance(plural, (list, set, tuple)):
+        ids.update(int(t) for t in plural)
+    extras = getattr(tokenizer, "_rapid_extra_eos_token_ids", None)
+    if extras:
+        ids.update(int(t) for t in extras)
+    return tuple(sorted(ids))
+
+
 # --------------------------------------------------------------------------
 # Runtime logits processor (design §3.3 / §5). Mirrors the
 # ``MiniMaxToolLogitsProcessor.__call__(token_ids, logits)`` signature the
@@ -2205,6 +2245,7 @@ class GrammarLogitsProcessor:
         *,
         reasoning_end_token: str | None = None,
         tokenizer: Any = None,
+        stop_token_ids: Any = None,
     ):
         self._lltok = lltokenizer
         # Reuse a cached compiled-grammar TEMPLATE (deep-copied per request) so
@@ -2229,6 +2270,37 @@ class GrammarLogitsProcessor:
         self._reasoning_end_token = reasoning_end_token
         self._reasoning_ended = reasoning_end_token is None
         self._tokenizer = tokenizer
+        # MODEL STOP/EOS tokens re-admitted at accepting states (0.10.16 dogfood
+        # P1-①). llguidance's compiled grammar terminates on the tokenizer's
+        # SINGLE ``eos_token``. That is correct for families whose learned turn-
+        # terminator IS that token (Qwen ``<|im_end|>`` == tokenizer eos) or is
+        # the tool-call ``end`` literal the grammar already consumes (gpt-oss
+        # harmony ``<|call|>`` is one of ``generation_config.eos_token_id``). It
+        # BREAKS Gemma-4: the model ends a tool-call turn with ``<turn|>`` (id
+        # 106) or ``<|tool_response>`` (id 50) — special tokens the grammar's
+        # ``TAG_TEXT: /(.|\n)*/`` byte-regex tail CANNOT match, and which are NOT
+        # the tokenizer eos ``<eos>`` (id 1) llguidance treats as the grammar
+        # terminator. So after ONE complete call every one of the model's real
+        # turn-terminators is masked; under the ``required``/named ``(tag)+``
+        # grammar the only unmasked structural continuation is another
+        # ``<|tool_call>`` and the model emits the identical call forever (never
+        # reaching ``finish_reason="tool_calls"`` without a ``max_tokens`` cap).
+        # We therefore re-admit the model's stop tokens WHENEVER the matcher is
+        # in an ACCEPTING state (grammar structurally complete → a call already
+        # emitted for ``required``, or zero-or-more satisfied for ``auto``), so
+        # the model can stop naturally — exactly how Qwen/gpt-oss already do. The
+        # ``is_accepting`` gate preserves ``required``'s force-≥1 guarantee: the
+        # start state is NON-accepting, so stop tokens stay masked until the
+        # first call completes.
+        stop_ids = sorted(
+            {int(t) for t in (stop_token_ids or ()) if 0 <= int(t) < self._vocab}
+        )
+        self._stop_ids: tuple[int, ...] = tuple(stop_ids)
+        self._stop_ids_arr = None
+        if self._stop_ids:
+            import mlx.core as mx
+
+            self._stop_ids_arr = mx.array(self._stop_ids)
         # mlx-lm passes the FULL cumulative token sequence each step (see class
         # docstring). ``_prompt_len`` is the baseline captured on the first
         # call; ``_committed`` tracks how many of the cumulative ids have been
@@ -2354,8 +2426,8 @@ class GrammarLogitsProcessor:
             head = apply_token_bitmask(logits[..., : self._vocab], self._bitmask)
             tail_shape = (*logits.shape[:-1], model_vocab - self._vocab)
             tail = mx.full(tail_shape, -float("inf"), dtype=logits.dtype)
-            return mx.concatenate([head, tail], axis=-1)
-        if model_vocab < self._vocab:
+            out = mx.concatenate([head, tail], axis=-1)
+        elif model_vocab < self._vocab:
             # Inverse case (codex #558-PR3): the TOKENIZER carries added tokens
             # beyond the model's narrower output head. The bitmask is packed to
             # the full tokenizer vocab (``ceil(vocab/32)`` int32 words), so
@@ -2366,8 +2438,49 @@ class GrammarLogitsProcessor:
             # words is safe. ``apply_token_bitmask`` reads only ``batch`` rows
             # (no vocab-width assert), so the model-width prefix mask is enough.
             words = (model_vocab + 31) // 32
-            return apply_token_bitmask(logits, self._bitmask[..., :words])
-        return apply_token_bitmask(logits, self._bitmask)
+            out = apply_token_bitmask(logits, self._bitmask[..., :words])
+        else:
+            out = apply_token_bitmask(logits, self._bitmask)
+        return self._readmit_stop_tokens_if_accepting(out, logits)
+
+    def _readmit_stop_tokens_if_accepting(self, out: Any, logits: Any) -> Any:
+        """Un-mask the model's stop/eos tokens when the grammar could terminate.
+
+        See ``__init__`` for the Gemma-4 root cause (0.10.16 dogfood P1-①): a
+        family whose learned turn-terminator is neither the tokenizer's single
+        grammar-EOS nor the tool-call ``end`` literal can never emit a stop token
+        under the mask, so ``tool_choice="required"`` loops the same call forever.
+        Whenever the matcher ``is_accepting()`` — the grammar is structurally
+        complete and MAY end here — we restore the ORIGINAL (unmasked) logits for
+        exactly the model's stop token columns, letting the sampler pick one and
+        terminate. The gate is essential: in a NON-accepting state (e.g. before
+        the mandatory first ``required`` call, or mid-call) the stop tokens stay
+        masked, preserving the force-≥1 and shape guarantees. A no-op for
+        families that already terminate cleanly (their stop token is already
+        grammar-allowed at the accepting state, so restoring its finite logit
+        changes nothing)."""
+        if self._stop_ids_arr is None:
+            return out
+        try:
+            if not self._matcher.is_accepting():
+                return out
+        except Exception:  # pragma: no cover - defensive; matcher API is stable
+            return out
+        idx = self._stop_ids_arr
+        width = out.shape[-1]
+        # Defensive width clamp: ``_stop_ids`` is already bounded by the tokenizer
+        # vocab at construction, but the model head can be NARROWER than the
+        # tokenizer (``model_vocab < self._vocab`` branch above) — never index a
+        # stop id past the actual logits width.
+        if self._stop_ids[-1] >= width:
+            import mlx.core as mx
+
+            clamped = [t for t in self._stop_ids if t < width]
+            if not clamped:
+                return out
+            idx = mx.array(clamped)
+        out[..., idx] = logits[..., idx]
+        return out
 
     def reset(self) -> None:
         self._matcher.reset()

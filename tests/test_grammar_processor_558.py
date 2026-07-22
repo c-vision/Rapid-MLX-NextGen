@@ -1688,6 +1688,125 @@ def test_processor_negative_controls_over_prompt(tok, hermes_grammar, lltok):
     ), "invalid enum value was NOT blocked"
 
 
+def _row_after_full_call(proc, lltok, tok, prompt_ids, gen_text):
+    """Baseline over ``prompt_ids``, feed a full valid call, and return the
+    masked-logits row at the (accepting) state that follows the last token."""
+    import mlx.core as mx
+    import numpy as np
+
+    vocab = lltok.vocab_size
+    gen_ids = tok.encode(gen_text, add_special_tokens=False)
+    cumulative = list(prompt_ids)
+    proc(mx.array(cumulative), mx.zeros((1, vocab)))  # first call = prompt baseline
+    cumulative.extend(gen_ids)
+    masked = proc(mx.array(cumulative), mx.zeros((1, vocab)))
+    return np.array(masked[0])
+
+
+def _is_allowed(row, tid):
+    import math
+
+    v = float(row[tid])
+    return math.isfinite(v) and v > -1e30
+
+
+@_requires_llguidance
+def test_stop_token_readmitted_only_at_accepting_state(tok, hermes_grammar, lltok):
+    """0.10.16 dogfood P1-①: a forced ``required`` grammar must let the model
+    TERMINATE after one call. The mechanism is the Gemma-4 failure in miniature:
+    a model whose learned turn-terminator is a special token that is neither the
+    grammar's single EOS nor a grammar literal is masked out at the accepting
+    state, so under ``(tag)+`` it can only ever emit ANOTHER call — an infinite
+    loop. ``GrammarLogitsProcessor`` now re-admits the model's stop tokens when —
+    and ONLY when — the matcher ``is_accepting()``, so the model can stop like
+    Qwen/gpt-oss already do.
+
+    We use ``<|im_start|>`` as the stand-in stop token: a real special token on
+    this tokenizer that is NOT part of the hermes tool grammar and NOT the
+    grammar EOS (``<|im_end|>``), so the byte-regex ``TAG_TEXT`` tail can never
+    match it. It is therefore masked at EVERY grammar state unless our
+    re-admission fires."""
+    import mlx.core as mx
+    import numpy as np
+
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    stop_id = tok.convert_tokens_to_ids("<|im_start|>")
+    assert isinstance(stop_id, int) and stop_id >= 0, (
+        "expected <|im_start|> to be a single special token id on this tokenizer"
+    )
+    eos_id = tok.convert_tokens_to_ids("<|im_end|>")
+
+    prompt_ids = tok.encode("Weather please.", add_special_tokens=False)
+    call = '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>'
+
+    # (1) WITH the stop id re-admitted: masked BEFORE the call (start state is
+    # NON-accepting for required ``+``), un-masked AFTER a complete call.
+    proc = GrammarLogitsProcessor(
+        lltok, hermes_grammar, tokenizer=tok, stop_token_ids=[stop_id]
+    )
+    start_row = np.array(
+        proc(mx.array(list(prompt_ids)), mx.zeros((1, lltok.vocab_size)))[0]
+    )
+    assert not _is_allowed(start_row, stop_id), (
+        "stop token was re-admitted BEFORE the mandatory first call — the "
+        "is_accepting gate is broken and required's force-≥1 guarantee is lost"
+    )
+    # The trigger IS forced open at the start (proves the grammar is live here).
+    trigger_id = tok.convert_tokens_to_ids("<tool_call>")
+    if isinstance(trigger_id, int) and trigger_id >= 0:
+        assert _is_allowed(start_row, trigger_id), "forced trigger was masked at start"
+
+    end_row = _row_after_full_call(proc, lltok, tok, prompt_ids, call)
+    assert _is_allowed(end_row, stop_id), (
+        "stop token was NOT re-admitted after a complete call — a Gemma-4-style "
+        "model could never terminate and would loop the same call forever"
+    )
+
+    # (2) CONTROL: identical processor WITHOUT stop_token_ids keeps the special
+    # token masked at the same accepting state — proving the re-admission (not
+    # the grammar itself) is what un-masks it, and that we did not widen the
+    # grammar's own accepted language.
+    proc_no_stop = GrammarLogitsProcessor(lltok, hermes_grammar, tokenizer=tok)
+    end_row_ctrl = _row_after_full_call(proc_no_stop, lltok, tok, prompt_ids, call)
+    assert not _is_allowed(end_row_ctrl, stop_id), (
+        "special token was allowed at the accepting state WITHOUT re-admission — "
+        "the grammar language changed unexpectedly"
+    )
+    # The grammar EOS is (and stays) allowed at the accepting state either way —
+    # this is exactly why Qwen/gpt-oss already terminate and are not regressed.
+    if isinstance(eos_id, int) and eos_id >= 0:
+        assert _is_allowed(end_row_ctrl, eos_id), (
+            "grammar EOS was not allowed at the accepting state — baseline "
+            "termination for eos==grammar-eos families regressed"
+        )
+
+
+def test_model_stop_token_ids_unions_all_surfaces():
+    """The helper unions every eos surface the scheduler halts on (0.10.16
+    P1-①), so the processor re-admits EXACTLY the ids that end generation."""
+    from vllm_mlx.api.tool_grammar import model_stop_token_ids
+
+    class _Tok:
+        _eos_token_ids = {1, 106}
+        eos_token_id = [1, 50]
+        eos_token_ids = (106,)
+        _rapid_extra_eos_token_ids = (50, 999)
+
+    assert model_stop_token_ids(_Tok()) == (1, 50, 106, 999)
+    assert model_stop_token_ids(None) == ()
+
+    class _Singular:
+        eos_token_id = 2
+
+    assert model_stop_token_ids(_Singular()) == (2,)
+
+    class _Empty:
+        pass
+
+    assert model_stop_token_ids(_Empty()) == ()
+
+
 @_requires_llguidance
 def test_named_grammar_constrains_to_single_tool(tok, lltok):
     # A NAMED choice narrows to one tool. Building the grammar over a
