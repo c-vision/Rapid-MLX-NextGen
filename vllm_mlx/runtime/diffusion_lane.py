@@ -685,8 +685,10 @@ class DiffusionEngine(BaseEngine):
         except BaseException as e:  # noqa: BLE001 — propagate to caller
             self._load_error = RuntimeError(
                 "DiffusionEngine failed to import its mlx / mlx-vlm "
-                "dependencies. Install or upgrade: "
-                "`pip install -U 'mlx-vlm>=0.6.3'`. "
+                "dependencies. Install the vision stack: "
+                "`pip install 'rapid-mlx[vision]'` (or, pinned to stay "
+                "compatible with rapid-mlx's transformers pin, "
+                "`pip install 'mlx-vlm==0.6.3'`). "
                 f"Underlying error: {e}"
             )
             self._ready.set()

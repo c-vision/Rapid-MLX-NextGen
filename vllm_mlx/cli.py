@@ -2302,6 +2302,40 @@ def serve_command(args):
     if prompt_upgrade_if_available():
         sys.exit(0)
 
+    # Finding ⑥ (0.10.16 dogfood): a "weightless stub" cache — config.json
+    # present but ``model*.safetensors`` absent (a warm cache commonly holds
+    # ~20 Gemma-4 repos in exactly this state, from a metadata-only config
+    # probe or an interrupted pull) — LOOKS cached, so ``serve`` eats a
+    # surprise multi-GB download with no upfront signal. Surface a one-line
+    # notice BEFORE the prefetch. Purely informational and unconditional
+    # (fires even in non-TTY / RAPID_MLX_AUTO_PULL=1 runs where the B2
+    # confirmation gate self-skips); it does NOT gate or change the download
+    # (that stays with ``_ensure_model_downloaded``). Best-effort — a
+    # diagnostic must never break serve.
+    try:
+        from vllm_mlx._download_gate import weightless_stub_notice
+        from vllm_mlx.model_aliases import resolve_model as _resolve_model
+
+        # Canonicalize alias → ``org/repo`` BEFORE probing the cache. A
+        # shorthand alias (``gemma-4-12b``) has its config-only stub on disk
+        # under the RESOLVED HF id, so probing the raw alias string would
+        # miss the cache dir and the notice would silently no-op for the
+        # common naive-user invocation. ``resolve_model`` is idempotent for
+        # already-resolved ids / local paths, and mirrors the resolution the
+        # download path (``_ensure_model_downloaded`` on ``args.model``)
+        # relies on.
+        _probe_model = _resolve_model(args.model)
+        _stub_notice = weightless_stub_notice(_probe_model)
+        if _stub_notice:
+            # stderr + flush: in the exact non-TTY / RAPID_MLX_AUTO_PULL=1
+            # case this notice targets, block-buffered stdout may never
+            # flush before the multi-GB download + server lifetime, leaving
+            # the warning invisible. stderr is line-buffered/unbuffered and
+            # is the correct stream for an operational warning anyway.
+            print(_stub_notice, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
     # Pre-fetch the model via the R2 mirror (with HF fallback) BEFORE the
     # heavy server boot. Without this, ``serve`` falls into
     # ``mlx_lm.load`` → ``huggingface_hub.snapshot_download`` directly and
