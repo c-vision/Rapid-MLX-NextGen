@@ -246,7 +246,10 @@ def require_mlx_vlm_or_exit(model_name: str) -> None:
         print(
             f"error: model {model_name!r} is a vision/multimodal alias and "
             f"requires the optional `mlx-vlm` dependency (shipped with the "
-            f"[vision] extra).\n" + VLM_EXTRA_INSTALL_HINT,
+            f"[vision] extra).\n" + VLM_EXTRA_INSTALL_HINT + "\n"
+            "Or, if this checkpoint has a text-capable backbone and you only "
+            "need text output, `--no-mllm` boots the text-only lane straight "
+            "from the base wheel (no mlx-vlm, drops image/vision input).",
             file=sys.stderr,
         )
     sys.exit(2)

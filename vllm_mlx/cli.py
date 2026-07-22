@@ -2137,6 +2137,36 @@ def _resolve_hybrid_cache_entries(
     return explicit_value
 
 
+def _serve_will_run_on_mllm_lane(args) -> bool:
+    """Whether ``serve`` will actually run this model on the MLLM/VLM
+    continuous-batching lane — the ONLY lane that needs the optional
+    ``mlx-vlm`` runtime (shipped behind the ``[vision]`` extra).
+
+    Delegates to #1178's :func:`resolve_serving_lane` so the boot-time
+    ``[vision]``-required guard agrees with the load-time routing decision.
+    A multimodal alias whose LANGUAGE backbone is hybrid/linear-attention
+    (Qwen3.6 GatedDeltaNet) auto-downgrades to the text-only mlx-lm lane and
+    never touches mlx-vlm, so it must NOT be pushed into a ~1 GB ``[vision]``
+    install. A genuine VLM (non-hybrid backbone, e.g. qwen3-vl) stays on the
+    MLLM lane and still needs it. ``--mllm`` / ``--no-mllm`` are honoured via
+    ``resolve_serving_lane``'s explicit-flag short-circuits.
+
+    The probe reads the cached checkpoint config offline (no network, no
+    weight load). On a first-time uncached start the config isn't
+    materialized yet, so the hybrid probe answers "not hybrid" and the model
+    keeps the SAFE ``[vision]``-required default — the guard's error message
+    then points at ``--no-mllm`` for a text-capable backbone.
+    """
+    from .api.utils import resolve_serving_lane
+
+    is_mllm_lane, _auto_text_fallback = resolve_serving_lane(
+        args.model,
+        force_mllm=getattr(args, "mllm", False),
+        force_text=getattr(args, "no_mllm", False),
+    )
+    return is_mllm_lane
+
+
 def serve_command(args):
     """Start the OpenAI-compatible server."""
     import logging
@@ -2190,17 +2220,27 @@ def serve_command(args):
     # path BEFORE the missing-dep error surfaced (deep ImportError
     # after weight download + alias resolution). Probe here so the
     # operator sees an actionable hint before the long download starts.
-    # Honors ``--mllm`` force-on AND the alias-name / HF-path probe
-    # used downstream by ``pflash.validate_model_support``. The
-    # ``--no-mllm`` escape hatch (force_text in load_model) bypasses
-    # this guard, matching the engine-side semantics.
-    if not getattr(args, "no_mllm", False):
-        from .api.utils import is_mllm_model as _boot_is_mllm
+    #
+    # 0.10.16 dogfood follow-up (④): consult the SAME resolved-lane signal
+    # the engine uses (#1178 ``resolve_serving_lane`` + ``_auto_text_
+    # fallback``) instead of the raw ``is_mllm_model`` classification. A
+    # multimodal alias whose LANGUAGE backbone is hybrid/linear-attention
+    # (Qwen3.6 GatedDeltaNet) auto-downgrades to the text-only mlx-lm lane
+    # and NEVER touches mlx-vlm — forcing a base-wheel user into a ~1 GB
+    # ``[vision]`` install for a model that then serves text-only was the
+    # dogfood pain point. ``_serve_will_run_on_mllm_lane`` is True only when
+    # the model will actually run on the MLLM lane, so:
+    #   * genuine VLM (qwen3-vl, non-hybrid backbone) → still requires it,
+    #   * hybrid-backbone VLM (qwen3.6) → boots text-only from the base wheel,
+    #   * ``--mllm`` force-on / ``--no-mllm`` escape hatch → honoured by
+    #     ``resolve_serving_lane``, matching the engine-side semantics.
+    # An uncached checkpoint (config not yet materialized) probes "not
+    # hybrid" and keeps the SAFE ``[vision]``-required default; the guard's
+    # message points at ``--no-mllm`` for a text-capable backbone.
+    if _serve_will_run_on_mllm_lane(args):
+        from .models.mllm import require_mlx_vlm_or_exit
 
-        if getattr(args, "mllm", False) or _boot_is_mllm(args.model):
-            from .models.mllm import require_mlx_vlm_or_exit
-
-            require_mlx_vlm_or_exit(args.model)
+        require_mlx_vlm_or_exit(args.model)
 
     # R6-H4 (Eva 0.8.7 dogfood): same boot-guard shape for audio aliases.
     # ``mlx-audio`` lives behind the ``[audio]`` extra; pre-fix
@@ -3922,7 +3962,11 @@ def _run_submit_flow(
                     "  Or, if you only need text inference (smaller "
                     "footprint, ~16 MB vs ~450 MB):"
                 )
-                print("    pip install --no-deps 'mlx-vlm>=0.6.1'")
+                # Pinned to ==0.6.3 to match VLM_EXTRA_INSTALL_HINT (0.10.16
+                # dogfood ⑤): an unpinned mlx-vlm resolves to the current
+                # PyPI latest, which pulls transformers 5.14.x and violates
+                # rapid-mlx's own ``transformers<5.13`` core pin.
+                print("    pip install --no-deps 'mlx-vlm==0.6.3'")
                 print()
             else:
                 print(f"  Error loading model: {e}")

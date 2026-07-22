@@ -62,6 +62,35 @@ def test_boot_guard_absent_hint_names_pinned_install(monkeypatch, capsys):
     assert "mlx-vlm>=0.6.3" not in err
 
 
+def test_gemma4_load_fallback_hint_is_pinned():
+    """The Gemma-4-specific ``serve``/``chat`` load-fallback hint (printed
+    when mlx-lm can't import the Gemma-4 architecture classes on a base
+    wheel) must pin the bare mlx-vlm text-only install to ``==0.6.3`` too.
+
+    Pre-fix this site still printed ``pip install --no-deps 'mlx-vlm>=0.6.1'``
+    — an unpinned lower bound that resolves to the current PyPI latest and
+    violates rapid-mlx's ``transformers<5.13`` core pin (0.10.16 dogfood ⑤,
+    the site #1175 missed). Scan the CLI source so a future edit can't
+    silently regress this last user-facing hint back to the unpinned form.
+    """
+    import pathlib
+
+    import vllm_mlx.cli as cli_mod
+
+    source = pathlib.Path(cli_mod.__file__).read_text()
+
+    # The text-only footprint fallback must be pinned...
+    assert "pip install --no-deps 'mlx-vlm==0.6.3'" in source, (
+        "Gemma-4 load-fallback hint must pin mlx-vlm==0.6.3 to match "
+        "VLM_EXTRA_INSTALL_HINT (0.10.16 dogfood ⑤)."
+    )
+    # ...and no CLI hint may use the conflict-producing unpinned lower bound.
+    assert "mlx-vlm>=0.6.1" not in source, (
+        "cli.py still recommends the unpinned 'mlx-vlm>=0.6.1' which pulls "
+        "transformers 5.14.x and breaks the transformers<5.13 core pin."
+    )
+
+
 def test_diffusion_lane_import_error_hint_is_pinned(monkeypatch):
     """DiffusionEngine's dependency-import failure (Gemma 4 DLM path) points
     at the extra + a PINNED mlx-vlm, dropping the old ``-U 'mlx-vlm>=0.6.3'``
