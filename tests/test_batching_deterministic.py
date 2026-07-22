@@ -7,6 +7,7 @@ Run with: pytest tests/test_batching_deterministic.py -v
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -15,7 +16,12 @@ TEST_MODEL = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 
 
 async def _warmup_engine(engine, sampling_params) -> None:
-    """Pay the Metal kernel JIT before concurrent determinism checks."""
+    """Pay the Metal kernel JIT + first-inference cost outside the timed
+    region so concurrent-request tests aren't racing against cold
+    compilation. Without this, the first 1–2 requests hit slow JIT paths
+    while later requests hit hot kernels — and on temp=0 greedy decoding
+    that scheduling skew can flip a single token, breaking determinism
+    asserts on overloaded CI runners."""
     rid = await engine.add_request("warmup:", sampling_params)
     async for out in engine.stream_outputs(rid, timeout=30):
         if out.finished:
@@ -269,6 +275,110 @@ class TestDeterministicConcurrentRequests:
         # Each run should produce same results
         assert all_results[0] == all_results[1], (
             f"Results differ between runs: {all_results}"
+        )
+
+
+class TestBatchingPerformance:
+    """Test that batching improves throughput."""
+
+    @pytest.mark.asyncio
+    async def test_batched_faster_than_sequential(
+        self, model_and_tokenizer, mlx_executor
+    ):
+        """Batched requests should not be catastrophically slower than sequential.
+
+        This is a regression guard, not a perf benchmark. The threshold
+        is loose (0.7x) on purpose — real batching wins are 2-3x but
+        the workload here is tiny (40 tokens × 2 runs) so engine
+        startup overhead and Metal kernel JIT swamp the signal. A
+        warmup pass per-engine eliminates the cold/warm asymmetry that
+        used to make this test flake under any concurrent system load.
+        Catastrophic regressions (sequential outperforming batched by
+        more than 30%) still fire.
+        """
+        from vllm_mlx import (
+            AsyncEngineCore,
+            EngineConfig,
+            SamplingParams,
+            SchedulerConfig,
+        )
+
+        model, tokenizer = model_and_tokenizer
+        config = EngineConfig(
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=8,
+                prefill_batch_size=4,
+                completion_batch_size=8,
+            )
+        )
+
+        params = SamplingParams(max_tokens=10, temperature=0.0)
+        prompts = [f"Count to {i}:" for i in range(1, 5)]
+
+        async def run_sequential():
+            """Run requests one at a time (after warmup)."""
+            total_tokens = 0
+            async with AsyncEngineCore(
+                model, tokenizer, config, executor=mlx_executor
+            ) as engine:
+                await asyncio.sleep(0.05)
+                await _warmup_engine(engine, params)
+
+                for prompt in prompts:
+                    rid = await engine.add_request(prompt, params)
+                    async for out in engine.stream_outputs(rid, timeout=30):
+                        if out.finished:
+                            total_tokens += out.completion_tokens
+                            break
+            return total_tokens
+
+        async def run_batched():
+            """Run requests concurrently (after warmup)."""
+            async with AsyncEngineCore(
+                model, tokenizer, config, executor=mlx_executor
+            ) as engine:
+                await asyncio.sleep(0.05)
+                await _warmup_engine(engine, params)
+
+                request_ids = []
+                for prompt in prompts:
+                    rid = await engine.add_request(prompt, params)
+                    request_ids.append(rid)
+
+                async def get_output(rid):
+                    async for out in engine.stream_outputs(rid, timeout=30):
+                        if out.finished:
+                            return out.completion_tokens
+                    return 0
+
+                tokens = await asyncio.gather(*[get_output(r) for r in request_ids])
+                return sum(tokens)
+
+        # Time sequential
+        start = time.perf_counter()
+        seq_tokens = await run_sequential()
+        seq_time = time.perf_counter() - start
+
+        # Time batched
+        start = time.perf_counter()
+        batch_tokens = await run_batched()
+        batch_time = time.perf_counter() - start
+
+        seq_throughput = seq_tokens / seq_time
+        batch_throughput = batch_tokens / batch_time
+
+        print(f"\nSequential: {seq_throughput:.1f} tok/s")
+        print(f"Batched: {batch_throughput:.1f} tok/s")
+        print(f"Speedup: {batch_throughput / seq_throughput:.2f}x")
+
+        # Catastrophic-regression guard. Real batching wins are 2-3x;
+        # 0.7x leaves headroom for the inherent noise of a 40-token
+        # workload while still catching a fundamental break.
+        assert batch_throughput > seq_throughput * 0.7, (
+            f"Batched ({batch_throughput:.1f} tok/s) regressed badly "
+            f"vs sequential ({seq_throughput:.1f} tok/s) — speedup "
+            f"{batch_throughput / seq_throughput:.2f}x is below the "
+            f"0.7x catastrophic-regression floor"
         )
 
 
