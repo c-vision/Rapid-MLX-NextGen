@@ -134,6 +134,79 @@ class Qwen3CoderToolParser(ToolParser):
     SUPPORTS_NATIVE_TOOL_FORMAT = True
     EXPECTED_WIRE_FORMATS = ("qwen3_coder_xml_named", "tool_call_xml_body")
 
+    # Grammar-CAPABLE (#558 "做全"): overrides ``structure_info`` below to emit
+    # the Qwen3-Coder XML arg body. Only ``<tool_call>``/``</tool_call>`` are
+    # single special tokens on the Qwen3-Coder tokenizer (verified on
+    # ``mlx-community/Qwen3-Coder-Next-4bit``: ids 151657 / 151658); the inner
+    # ``<function=`` / ``<parameter=`` / ``</parameter>`` / ``</function>``
+    # markers are ordinary MULTI-token text, emitted as byte literals by the
+    # grammar builder.
+    _GRAMMAR_SENTINELS = ("<tool_call>", "</tool_call>")
+
+    SUPPORTS_GRAMMAR: bool = True
+
+    def structure_info(self):
+        """Grammar-constraint wire triple for the Qwen3-Coder XML tool call (#558).
+
+        Extends #558 grammar constraint from the JSON-body families
+        (hermes / qwen / harmony) to the Qwen3-Coder XML wire. The model emits
+        (verified byte-for-byte against this model's ``chat_template.jinja``)::
+
+            <tool_call>
+            <function=NAME>
+            <parameter=KEY>
+            VALUE
+            </parameter>
+            ...
+            </function>
+            </tool_call>
+
+        The ARGUMENTS are an XML body, NOT a JSON object, so we return a
+        ``StructureInfo`` with ``arg_style="xml"``: the builder emits one
+        ``<parameter=KEY>\\nVALUE\\n</parameter>`` block per schema property, each
+        VALUE constrained per its sub-schema (raw text for strings, ``%json`` for
+        scalars / objects / arrays, an alternation for enums) — see
+        ``vllm_mlx.api.tool_grammar._emit_xml_arg_body``. Those surface forms are
+        exactly what ``_parse_xml_function_call`` / ``_convert_param_value``
+        round-trip back into JSON ``arguments``.
+
+        ``<tool_call>`` / ``</tool_call>`` are single special tokens on the
+        Qwen3-Coder tokenizer, declared as ``sentinels`` (rendered as Lark
+        special-token refs); the trigger is ``<tool_call>``. The inner
+        ``<function=`` / ``<parameter=`` markers are ordinary text (byte
+        literals).
+
+        As on hermes / qwen / harmony, OPT OUT (return ``None`` -> free-form
+        fallback) unless the tokenizer proves both sentinels are single special
+        tokens — a special-token sentinel on a tokenizer that encodes
+        ``<tool_call>`` as multi-token text would build an unenforceable grammar.
+        Grammar constraint is a best-effort opt-in, never a hard requirement.
+        """
+        from vllm_mlx.api.tool_grammar import (
+            StructureInfo,
+            are_single_special_tokens,
+        )
+
+        if not are_single_special_tokens(self.model_tokenizer, self._GRAMMAR_SENTINELS):
+            return None
+
+        def _info(name: str):
+            # The tool NAME is a bare identifier inside the ``<function=NAME>``
+            # header (NOT a JSON string — Qwen3-Coder does not quote it), emitted
+            # raw as a byte literal by the builder. ``begin`` starts with the
+            # ``<tool_call>`` trigger (builder invariant).
+            begin = f"<tool_call>\n<function={name}>\n"
+            end = "</function>\n</tool_call>"
+            return StructureInfo(
+                begin=begin,
+                end=end,
+                trigger="<tool_call>",
+                sentinels=self._GRAMMAR_SENTINELS,
+                arg_style="xml",
+            )
+
+        return _info
+
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
 
