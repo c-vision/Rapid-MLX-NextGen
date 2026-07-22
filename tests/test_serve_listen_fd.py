@@ -272,6 +272,13 @@ def stub_heavy_serve_deps(monkeypatch):
     from vllm_mlx.middleware import auth as auth_mod
 
     monkeypatch.setattr(auth_mod, "configure_rate_limiter", lambda *a, **kw: None)
+    # ``install_request_logging_middleware`` also calls ``app.add_middleware``
+    # — same "after an application has started" failure as CORS (#1167).
+    from vllm_mlx.middleware import request_logging as reqlog_mod
+
+    monkeypatch.setattr(
+        reqlog_mod, "install_request_logging_middleware", lambda *a: None
+    )
     return monkeypatch
 
 
