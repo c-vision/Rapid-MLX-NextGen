@@ -1698,5 +1698,21 @@
     "reasoning_parser": null,
     "is_hybrid": false,
     "supports_spec_decode": false
+  },
+  "minicpm5-1b-4bit": {
+    "hf_path": "openbmb/MiniCPM5-1B-MLX",
+    "tool_call_parser": "minicpm",
+    "reasoning_parser": "qwen3",
+    "is_hybrid": false,
+    "is_moe": false,
+    "supports_spec_decode": false
+  },
+  "minicpm5-1b-optiq-4bit": {
+    "hf_path": "mlx-community/MiniCPM5-1B-OptiQ-4bit",
+    "tool_call_parser": "minicpm",
+    "reasoning_parser": "qwen3",
+    "is_hybrid": false,
+    "is_moe": false,
+    "supports_spec_decode": false
   }
 }

@@ -35,6 +35,7 @@ from vllm_mlx.model_aliases import (
     VALID_SUFFIX_TIERS,
     list_profiles,
 )
+from vllm_mlx.model_auto_config import detect_model_config
 from vllm_mlx.reasoning import list_parsers as list_reasoning_parsers
 from vllm_mlx.tool_parsers import ToolParserManager
 
@@ -87,6 +88,18 @@ def _raw_aliases() -> dict[str, dict | str]:
 def _alias_ids() -> list[str]:
     """Stable alias name list for ``parametrize`` IDs."""
     return sorted(_raw_aliases().keys())
+
+
+def test_minicpm5_aliases_pin_the_verified_native_xml_contract() -> None:
+    """The two #1139 artifacts share MiniCPM5's native tool-call wire format."""
+    profiles = list_profiles()
+    for alias in ("minicpm5-1b-4bit", "minicpm5-1b-optiq-4bit"):
+        profile = profiles[alias]
+        assert profile.tool_call_parser == "minicpm"
+        assert profile.reasoning_parser == "qwen3"
+        assert profile.supports_spec_decode is False
+        assert detect_model_config(alias) == profile
+        assert detect_model_config(profile.hf_path) == profile
 
 
 # =============================================================================

@@ -92,6 +92,10 @@ MATRIX_EXEMPT: dict[str, str] = {
     "functionary": "TODO: add Functionary-medium model to golden_models",
     "xlam": "TODO: add xLAM model to golden_models",
     "seed_oss": "TODO: add Seed-OSS model to golden_models",
+    "minicpm": (
+        "TODO(#1139): add MiniCPM5 to the live matrix when capacity permits; "
+        "its native XML wire format is covered by parser and stream-parity tests."
+    ),
     "hy_v3": (
         "TODO: add Hy3-preview-4bit to golden_models once we secure a "
         "192 GB+ M3 Ultra CI slot (166 GB weights, Ultra-only launch; "

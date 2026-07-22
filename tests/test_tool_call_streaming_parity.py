@@ -144,6 +144,13 @@ def _extract_stream(parser_name: str, text: str) -> list:
 # concrete example).
 # --------------------------------------------------------------------------
 PARITY_FIXTURES: list = [
+    # MiniCPM5 — documented native XML without a <tool_call> wrapper.
+    (
+        "minicpm",
+        "minicpm_native",
+        '<function name="read_file"><param name="path">/etc/hostname</param></function>',
+        [("read_file", {"path": "/etc/hostname"})],
+    ),
     # hermes — JSON body inside <tool_call>...</tool_call>
     (
         "hermes",

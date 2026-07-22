@@ -65,6 +65,7 @@ from .hy_v3_tool_parser import HyV3ToolParser
 from .kimi_tool_parser import KimiToolParser
 from .lfm_tool_parser import LfmToolParser
 from .llama_tool_parser import LlamaToolParser
+from .minicpm_tool_parser import MiniCPMToolParser
 from .minimax_tool_parser import MiniMaxToolParser
 from .mistral_tool_parser import MistralToolParser
 from .nemotron_tool_parser import NemotronToolParser
@@ -96,6 +97,7 @@ __all__ = [
     "Glm47ToolParser",
     "HarmonyToolParser",
     "HyV3ToolParser",
+    "MiniCPMToolParser",
     "MiniMaxToolParser",
     "SeedOssToolParser",
     "DeepSeekV3ToolParser",

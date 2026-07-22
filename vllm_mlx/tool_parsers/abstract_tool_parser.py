@@ -98,6 +98,8 @@ class ExtractedToolCallInformation:
 #                           ``<tool_call>NAME</arg_value>`` malformed-close
 #                           fallback for 4-bit numerical noise on the
 #                           preview checkpoint.
+#   minicpm_native        — <function name="NAME"><param name="KEY">VALUE
+#                           </param></function>  (MiniCPM5 XML tool contract)
 WIRE_FORMAT_LABELS: frozenset[str] = frozenset(
     {
         "tool_call_json",
@@ -122,6 +124,7 @@ WIRE_FORMAT_LABELS: frozenset[str] = frozenset(
         "qwen3_coder_xml_named",
         "ui_tars_action",
         "hy3_native",
+        "minicpm_native",
     }
 )
 
