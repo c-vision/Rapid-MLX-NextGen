@@ -225,6 +225,7 @@ def test_complete_chat_with_mcp_runs_standard_tool_loop(monkeypatch):
         ]
     )
     payloads = []
+    tool_progress = []
 
     def _post(_url, json, timeout):
         assert timeout == 10
@@ -245,6 +246,7 @@ def test_complete_chat_with_mcp_runs_standard_tool_loop(monkeypatch):
         },
         runtime,
         timeout_s=10,
+        on_tool_call=tool_progress.append,
     )
 
     assert answer == "The file says hello."
@@ -263,6 +265,7 @@ def test_complete_chat_with_mcp_runs_standard_tool_loop(monkeypatch):
         "tool_call_id": "call-1",
         "content": '{"content":"hello"}',
     }
+    assert tool_progress == ["files__read"]
 
 
 def test_complete_chat_with_mcp_preserves_reasoning_and_normalizes_calls(monkeypatch):
@@ -791,8 +794,9 @@ def test_chat_command_owns_mcp_runtime_without_configuring_serve(monkeypatch, ca
         def close(self):
             self.closed = True
 
-    def _complete(base_url, payload, runtime, timeout_s):
+    def _complete(base_url, payload, runtime, timeout_s, on_tool_call):
         loop_payloads.append((base_url, deepcopy(payload), runtime, timeout_s))
+        on_tool_call("files__read")
         return "done", {"completion_tokens": 1, "finish_reason": "stop"}
 
     monkeypatch.setattr("vllm_mlx.chat_mcp.ChatMCPRuntime", _Runtime)
@@ -810,7 +814,9 @@ def test_chat_command_owns_mcp_runtime_without_configuring_serve(monkeypatch, ca
     assert loop_payloads[0][1]["messages"] == [
         {"role": "user", "content": "use a tool"}
     ]
-    assert "done" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "using files.read…" in output
+    assert "done" in output
 
     assert created[0].closed is True
     cleanup_callbacks[0]()

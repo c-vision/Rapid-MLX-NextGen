@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import logging
 import re
 import sys
 import threading
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, contextmanager
+from pathlib import Path
 from typing import Any
 
 from anyio.abc import TaskStatus
@@ -28,6 +30,35 @@ from .mcp.types import MCPServerConfig, MCPTool, MCPTransport
 
 _OPENAI_FUNCTION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAX_SHUTDOWN_SECONDS = 5.0
+_OPTIONAL_COMPONENT_WARNINGS = {
+    "Could not fetch prompts: Method not found",
+    "Could not fetch resources: Method not found",
+}
+
+
+class _OptionalComponentWarningFilter(logging.Filter):
+    """Hide SDK noise for optional MCP capabilities chat does not consume."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage() not in _OPTIONAL_COMPONENT_WARNINGS
+
+
+@contextmanager
+def _quiet_optional_component_warnings():
+    """Temporarily filter known ClientSessionGroup capability-probe noise."""
+
+    loggers = (
+        logging.getLogger(),
+        logging.getLogger("mcp.client.session_group"),
+    )
+    warning_filter = _OptionalComponentWarningFilter()
+    for logger in loggers:
+        logger.addFilter(warning_filter)
+    try:
+        yield
+    finally:
+        for logger in loggers:
+            logger.removeFilter(warning_filter)
 
 
 class ChatMCPRuntime:
@@ -177,10 +208,11 @@ class ChatMCPRuntime:
                 try:
                     await group.__aenter__()
                     try:
-                        await asyncio.wait_for(
-                            group.connect_to_server(_server_parameters(server)),
-                            timeout=server.timeout,
-                        )
+                        with _quiet_optional_component_warnings():
+                            await asyncio.wait_for(
+                                group.connect_to_server(_server_parameters(server)),
+                                timeout=server.timeout,
+                            )
                     except BaseException:
                         await _close_group(
                             group,
@@ -351,6 +383,12 @@ def _server_parameters(server: MCPServerConfig):
     if server.transport == MCPTransport.STDIO:
         env = get_default_environment()
         env.update(server.env or {})
+        if Path(server.command or "").name == "npx" and not any(
+            key.lower() == "npm_config_loglevel" for key in env
+        ):
+            # npm may print cold-install progress to stdout, which is the
+            # JSON-RPC transport for stdio MCP servers.
+            env["npm_config_loglevel"] = "silent"
         return StdioServerParameters(
             command=server.command or "",
             args=server.args or [],

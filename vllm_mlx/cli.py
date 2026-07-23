@@ -5576,6 +5576,7 @@ def _complete_chat_with_mcp(
     timeout_s: int,
     *,
     max_rounds: int = 8,
+    on_tool_call=None,
 ) -> tuple[str, dict]:
     """Run the chat agent loop with MCP tools using non-streaming responses.
 
@@ -5670,6 +5671,8 @@ def _complete_chat_with_mcp(
         messages.append(assistant_message)
         for position, tool_call in enumerate(normalized_calls):
             try:
+                if on_tool_call is not None:
+                    on_tool_call(tool_call["function"]["name"])
                 messages.extend(mcp_runtime.execute_tool_calls([tool_call]))
             except BaseException:
                 for pending_call in normalized_calls[position:]:
@@ -6408,11 +6411,18 @@ def chat_command(args):
                         metrics=metrics,
                     )
                 else:
+
+                    def _show_mcp_tool_call(name: str) -> None:
+                        display_name = name.replace("__", ".", 1)
+                        sys.stdout.write(f"{DIM}using {display_name}…{RESET}\n  ")
+                        sys.stdout.flush()
+
                     assistant, metrics = _complete_chat_with_mcp(
                         base_url,
                         payload,
                         mcp_runtime,
                         timeout_s=args.response_timeout,
+                        on_tool_call=_show_mcp_tool_call,
                     )
                     reasoning = metrics.get("reasoning_content")
                     if reasoning:

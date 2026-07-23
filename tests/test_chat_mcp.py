@@ -5,12 +5,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from types import SimpleNamespace
 
 import pytest
 
-from vllm_mlx.chat_mcp import ChatMCPRuntime, _server_parameters
+from vllm_mlx.chat_mcp import (
+    ChatMCPRuntime,
+    _quiet_optional_component_warnings,
+    _server_parameters,
+)
 from vllm_mlx.mcp.types import MCPServerConfig, MCPTransport
 
 
@@ -394,6 +399,45 @@ def test_server_parameters_use_official_sdk_types():
     assert sse_params.url == "http://localhost:9999/sse"
     assert sse_params.timeout == 12
     assert sse_params.sse_read_timeout == 300
+
+
+def test_server_parameters_keep_npx_bootstrap_output_off_protocol():
+    quiet = _server_parameters(
+        MCPServerConfig(
+            name="filesystem",
+            command="/opt/homebrew/bin/npx",
+            args=["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+        )
+    )
+    assert quiet.env["npm_config_loglevel"] == "silent"
+
+    explicit = _server_parameters(
+        MCPServerConfig(
+            name="filesystem",
+            command="npx",
+            args=["server"],
+            env={"NPM_CONFIG_LOGLEVEL": "warn"},
+        )
+    )
+    assert explicit.env["NPM_CONFIG_LOGLEVEL"] == "warn"
+    assert "npm_config_loglevel" not in explicit.env
+
+
+def test_optional_component_warning_filter_keeps_actionable_warnings(caplog):
+    sdk_logger = logging.getLogger("mcp.client.session_group")
+    with (
+        caplog.at_level(logging.WARNING),
+        _quiet_optional_component_warnings(),
+    ):
+        # MCP 1.28 uses logging.warning directly; keep the named-logger path
+        # covered too so a future SDK cleanup cannot reintroduce the noise.
+        logging.warning("Could not fetch prompts: Method not found")
+        sdk_logger.warning("Could not fetch resources: Method not found")
+        sdk_logger.warning("Could not fetch prompts: permission denied")
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "Could not fetch prompts: permission denied"
+    ]
 
 
 def test_runtime_thread_is_dedicated_to_chat(tmp_path):
