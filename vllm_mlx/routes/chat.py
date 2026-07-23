@@ -2246,6 +2246,21 @@ def _template_generation_prefix(engine, messages, tools, enable_thinking) -> str
     return delta
 
 
+def _valid_head_width(obj) -> int | None:
+    """``weight.shape[0]`` (the vocab dim) if ``obj`` looks like an output-head
+    weight, else ``None``. Still the vocab dim under quantization (qwen3-4bit's
+    ``embed_tokens.weight`` is ``(vocab, packed_hidden)``)."""
+    shape = getattr(obj, "shape", None)
+    if (
+        shape is not None
+        and len(shape) >= 1
+        and isinstance(shape[0], int)
+        and shape[0] > 0
+    ):
+        return int(shape[0])
+    return None
+
+
 def _actual_output_head_width(model) -> int | None:
     """The model's TRUE logits width — the vocab dimension (rows) of the output
     projection weight — or ``None`` if it cannot be inspected.
@@ -2254,31 +2269,51 @@ def _actual_output_head_width(model) -> int | None:
     (codex R12: the declared ``config.vocab_size`` can differ from the real
     lm-head width; validate against the actual head so a processor is never
     installed — and the post-hoc cap never suppressed — for a ``</think>`` id the
-    head cannot emit). Tries the untied ``lm_head`` first, then the tied
-    embedding projected via ``as_linear`` (qwen3 and most MLX text models), each
-    time reading ``weight.shape[0]`` — still the vocab dim under quantization
-    (qwen3-4bit's ``embed_tokens.weight`` is ``(vocab, packed_hidden)``).
+    head cannot emit). Reads ``weight.shape[0]`` off the untied ``lm_head`` or the
+    tied ``embed_tokens`` (qwen3 and most MLX text models).
+
+    Resolution is by STRUCTURED fixed paths only — the canonical head locations
+    across the model families we serve: a flat mlx-lm text model exposes
+    ``lm_head``/``model.lm_head`` (untied) or ``model.embed_tokens`` (tied); a
+    multimodal-capable wrapper (qwen3_5, gemma3n, …) nests these under
+    ``language_model[.model]``. The #1185 regression was exactly a MISSING fixed
+    path — qwen3.5's tied head at ``language_model.model.embed_tokens.weight`` —
+    now covered below.
+
+    We deliberately do NOT tree-walk for a head by module name: a module named
+    ``lm_head`` anywhere in the tree is not necessarily the TEXT output head (a
+    vision/draft/MTP head can share the name), and validating ``</think>``
+    against the wrong head's width is unsound (codex). An unrecognized nesting
+    therefore returns ``None`` → ``_engine_output_vocab_size`` declines → the
+    budget falls back to the safe post-hoc cap (correct, just no decode-time
+    force until that family's fixed path is added). All ``lm_head`` (untied,
+    authoritative) paths are probed before any ``embed_tokens`` (tied) path so an
+    untied head is never shadowed by a differing-width input embedding.
     """
     if model is None:
         return None
+
     for path in (
+        # untied output projection — authoritative — shallow → deep
         ("lm_head", "weight"),
-        ("model", "embed_tokens", "weight"),
+        ("model", "lm_head", "weight"),
+        ("language_model", "lm_head", "weight"),
+        ("language_model", "model", "lm_head", "weight"),
+        # tied: output head == input embedding — shallow → deep (mirrors the
+        # lm_head group, incl. BOTH language_model[.model] wrapper layouts)
         ("embed_tokens", "weight"),
+        ("model", "embed_tokens", "weight"),
+        ("language_model", "embed_tokens", "weight"),
+        ("language_model", "model", "embed_tokens", "weight"),
     ):
         obj = model
         for attr in path:
             obj = getattr(obj, attr, None)
             if obj is None:
                 break
-        shape = getattr(obj, "shape", None)
-        if (
-            shape is not None
-            and len(shape) >= 1
-            and isinstance(shape[0], int)
-            and shape[0] > 0
-        ):
-            return int(shape[0])
+        width = _valid_head_width(obj)
+        if width is not None:
+            return width
     return None
 
 
