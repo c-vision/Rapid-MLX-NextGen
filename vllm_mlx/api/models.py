@@ -1578,14 +1578,10 @@ class ChatCompletionRequest(BaseModel):
     # accepted (no Pydantic drop) but not yet forwarded — see
     # ``_resolve_enable_thinking`` in service/helpers.py for precedence.
     chat_template_kwargs: dict | None = None
-    # Per-request cap on reasoning tokens (upstream vLLM PR #20859 backport).
-    # Semantic: force-close the ``<think>`` channel after N reasoning tokens
-    # are emitted; subsequent model output is routed to the final/content
-    # channel. DIFFERENT from the global ``thinking_token_budget`` which
-    # additively extends ``max_tokens`` headroom for reasoning models — this
-    # is a SUBTRACTIVE cap that gates how long the model is allowed to
-    # think before answering. Distinct from ``max_tokens`` (which caps the
-    # overall completion length). ``None`` = no cap, model decides.
+    # reasoning_max_tokens — caps the THINKING portion only (tokens inside
+    # ``<think>...</think>``); the model then answers. Does NOT bound the
+    # answer — pair with ``max_tokens`` for total length. None = no reasoning
+    # cap.
     reasoning_max_tokens: int | None = None
     # R10-H5 (R9-H3 carry) — OpenAI ``reasoning_effort`` knob. Declared
     # so Pydantic stops silently dropping it (sven r10-R1 + vlad r10-R1

@@ -197,6 +197,26 @@ response = client.chat.completions.create(
 )
 ```
 
+## Controlling Reasoning Length
+
+Reasoning models can think for a while before answering. Two request parameters bound this:
+
+- **`reasoning_max_tokens`** — caps the *thinking* portion. Once the model has produced this many tokens inside `<think>...</think>`, thinking is closed and the model moves on to its answer. It does **not** limit the answer.
+- **`max_tokens`** — caps the *total* response (thinking + answer).
+
+Use `reasoning_max_tokens` to stop a model from over-thinking, and pair it with `max_tokens` to bound the whole reply:
+
+```json
+{
+  "model": "default",
+  "messages": [{"role": "user", "content": "Explain quantum entanglement"}],
+  "reasoning_max_tokens": 256,
+  "max_tokens": 1024
+}
+```
+
+If `reasoning_max_tokens` is unset, the model decides how long to think.
+
 ## Backward Compatibility
 
 When `--reasoning-parser` is not specified, the server behaves as before:
@@ -276,6 +296,7 @@ curl http://localhost:8000/v1/chat/completions \
 ### Truncated reasoning
 
 - Increase `--max-tokens` if the model is hitting the token limit mid-thought
+- If you set `reasoning_max_tokens`, thinking is capped there — see [Controlling Reasoning Length](#controlling-reasoning-length)
 
 ## Related
 
