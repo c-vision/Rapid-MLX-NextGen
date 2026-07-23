@@ -10,6 +10,7 @@ pass it through — including when it's ``None``.
 """
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
@@ -100,6 +101,496 @@ def test_run_vision_encoding_preserves_extra_kwargs_alongside_pixel_values():
     assert "pixel_values" in model.last_call_kwargs
     assert model.last_call_kwargs["pixel_values"] is None
     assert "token_type_ids" in model.last_call_kwargs
+
+
+# ---------------------------------------------------------------------------
+# Chunked text-only prefill — issue #1187, Problem B
+# ---------------------------------------------------------------------------
+#
+# A VLM served on the MLLM path prefills a text-only prompt (e.g. a "test"
+# message expanded to ~20k tokens by a large Hermes tool schema) through the
+# language model. Doing that in a single forward materializes activations for
+# every position AND projects logits over every position
+# (``[1, seqlen, vocab]``, vocab 262144) — ~20 GB transient on gemma-4-26b,
+# enough to max out a 48 GB M4 Max. The fix prefills the prompt prefix in
+# bounded chunks (``min(prefill_step_size, 2048)``), evaluating only the KV
+# cache state per chunk (mlx prunes the unused lm_head projection), then runs
+# a single last-token forward for the ``[1, 1, vocab]`` logits actually
+# sampled. Measured end-to-end on gemma-4-26b: 35.2 GB → 18.4 GB peak, ~2x
+# faster, identical sampled token. Images are excluded (pixel features must
+# stay aligned with placeholder tokens in one vision-merge forward).
+
+
+class _ChunkRecordingModel:
+    """VLM stub recording every forward's (seqlen, kwargs). Returns
+    full-sequence ``LanguageModelOutput``-shaped logits so the generator's
+    ``hasattr(output, "logits")`` branch and last-token slice are exercised."""
+
+    def __init__(self, vocab: int = 8):
+        self.calls: list[tuple[int, dict]] = []
+        self.vocab = vocab
+        self.language_model = object()
+
+    def __call__(self, input_ids, cache=None, **kwargs):
+        seqlen = input_ids.shape[1]
+        self.calls.append((seqlen, kwargs))
+
+        class _Out:
+            pass
+
+        out = _Out()
+        out.logits = mx.zeros((1, seqlen, self.vocab))
+        return out
+
+
+class _FakeCache:
+    """Minimal KV-cache stand-in exposing an evaluable ``.state`` and
+    counting how many times the chunk barrier reads it."""
+
+    def __init__(self):
+        self.state_reads = 0
+
+    @property
+    def state(self):
+        self.state_reads += 1
+        return mx.zeros((1,))
+
+
+def _make_bare_generator(prefill_step_size: int, model) -> MLLMBatchGenerator:
+    """Construct just enough of a generator for ``_run_vision_encoding``
+    (reads ``self.model`` / ``self.prefill_step_size`` only)."""
+    gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    gen.model = model
+    gen.language_model = getattr(model, "language_model", model)
+    gen.prefill_step_size = prefill_step_size
+    return gen
+
+
+def _make_ids_request(n_tokens: int, *, pixel_values=None, image_grid_thw=None):
+    return MLLMBatchRequest(
+        uid=0,
+        request_id="r0",
+        prompt="x",
+        max_tokens=8,
+        input_ids=mx.arange(n_tokens, dtype=mx.int32),
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+        extra_kwargs={},
+    )
+
+
+def test_run_vision_encoding_chunks_text_only_prefill():
+    """A long text-only prompt is prefilled in ``min(step, 2048)`` chunks
+    plus a final single-token forward; nothing is projected over the whole
+    prompt."""
+    model = _ChunkRecordingModel()
+    gen = _make_bare_generator(prefill_step_size=22000, model=model)
+    cache = [_FakeCache()]
+
+    logits = gen._run_vision_encoding(_make_ids_request(5000), cache=cache)
+
+    prefix_seqlens = [c[0] for c in model.calls[:-1]]
+    last_seqlen, last_kwargs = model.calls[-1]
+    # prefix = 4999 tokens, chunk = min(22000, 2048) = 2048 → 2048, 2048, 903
+    assert prefix_seqlens == [2048, 2048, 903]
+    # Every chunk is text-only (pixel_values explicitly None for the strict
+    # Gemma signatures) — never the full prompt in one shot.
+    assert all(c[1].get("pixel_values", "MISSING") is None for c in model.calls[:-1])
+    # Final forward is a single token that carries no image.
+    assert last_seqlen == 1
+    assert last_kwargs.get("pixel_values", "MISSING") is None
+    # Returned logits are the last position only, so callers never touch a
+    # ``[1, seqlen, vocab]`` tensor.
+    assert logits.shape == (1, 1, model.vocab)
+    # The per-chunk barrier read the cache state at least once per chunk.
+    assert cache[0].state_reads >= len(prefix_seqlens)
+
+
+def test_run_vision_encoding_chunk_respects_smaller_prefill_step_size():
+    """An operator who set a *smaller* ``--prefill-step-size`` (memory-tight
+    box) gets chunks no larger than they asked for."""
+    model = _ChunkRecordingModel()
+    gen = _make_bare_generator(prefill_step_size=512, model=model)
+    cache = [_FakeCache()]
+
+    gen._run_vision_encoding(_make_ids_request(1500), cache=cache)
+
+    # prefix = 1499, chunk = min(512, 2048) = 512 → 512, 512, 475
+    assert [c[0] for c in model.calls[:-1]] == [512, 512, 475]
+    assert model.calls[-1][0] == 1
+
+
+def test_run_vision_encoding_image_request_is_not_chunked():
+    """Image requests keep the single vision-merge forward (pixel features
+    must stay aligned with their placeholder tokens)."""
+    model = _ChunkRecordingModel()
+    gen = _make_bare_generator(prefill_step_size=22000, model=model)
+    pixels = mx.zeros((1, 3, 4, 4))
+    cache = [_FakeCache()]
+
+    gen._run_vision_encoding(_make_ids_request(5000, pixel_values=pixels), cache=cache)
+
+    # Exactly one forward over the whole prompt, pixel_values passed through.
+    assert len(model.calls) == 1
+    assert model.calls[0][0] == 5000
+    assert model.calls[0][1].get("pixel_values") is pixels
+
+
+def test_run_vision_encoding_no_cache_keeps_single_forward_for_long_text():
+    """Without a cache the split is impossible (no KV to carry prefix state),
+    so even a long text-only prompt stays a single forward."""
+    model = _ChunkRecordingModel()
+    gen = _make_bare_generator(prefill_step_size=2048, model=model)
+
+    gen._run_vision_encoding(_make_ids_request(5000), cache=None)
+
+    assert len(model.calls) == 1
+    assert model.calls[0][0] == 5000
+
+
+def test_run_vision_encoding_chunks_with_all_valid_attention_mask():
+    """A processor-shaped text-only request — the realistic case where
+    ``mlx_vlm.prepare_inputs`` returns a one-row, all-valid ``attention_mask``
+    — still takes the chunked path. ``attention_mask`` is a *separate* request
+    field (``_preprocess_request`` excludes it from ``extra_kwargs``), so it
+    does NOT trip the ``no_extra_kwargs`` gate; it is simply dropped from the
+    chunked forwards, which is lossless for an all-valid, single-request mask
+    (mlx-lm's own text prefill likewise passes no mask and relies on the
+    causal mask). Regression guard: without this, a reviewer might assume the
+    mask disables the memory fix — it must not."""
+    model = _ChunkRecordingModel()
+    gen = _make_bare_generator(prefill_step_size=22000, model=model)
+    req = _make_ids_request(5000)
+    # Processor supplies a one-row, all-valid mask (a separate field, not in
+    # extra_kwargs). extra_kwargs stays empty, exactly as _preprocess_request
+    # builds it for a text-only prompt.
+    req.attention_mask = mx.ones((1, 5000), dtype=mx.int32)
+    assert req.extra_kwargs == {}
+    cache = [_FakeCache()]
+
+    logits = gen._run_vision_encoding(req, cache=cache)
+
+    # Still chunked (prompt > one chunk), NOT a single full-prompt forward.
+    prefix_seqlens = [c[0] for c in model.calls[:-1]]
+    assert prefix_seqlens == [2048, 2048, 903]
+    assert model.calls[-1][0] == 1
+    assert logits.shape == (1, 1, model.vocab)
+    # The all-valid mask is dropped on the chunked path (no per-chunk mask).
+    assert all("attention_mask" not in c[1] for c in model.calls)
+
+
+def test_chunking_falls_back_to_single_forward_with_partial_attention_mask():
+    """A NON-all-valid mask (e.g. left-padding, or a reused cache entry with a
+    shorter valid span) must NOT be dropped — dropping it on the chunked path
+    would silently change attention semantics and corrupt the logits. Such a
+    request keeps the single forward, which passes the mask through intact."""
+    model = _ChunkRecordingModel()
+    gen = _make_bare_generator(prefill_step_size=22000, model=model)
+    req = _make_ids_request(5000)
+    # First 3 positions masked out (0 = do-not-attend) → carries information.
+    mask = mx.concatenate(
+        [mx.zeros((1, 3), dtype=mx.int32), mx.ones((1, 4997), dtype=mx.int32)],
+        axis=1,
+    )
+    req.attention_mask = mask
+    cache = [_FakeCache()]
+
+    gen._run_vision_encoding(req, cache=cache)
+
+    # One forward over the whole prompt, the partial mask forwarded intact.
+    # (``_run_vision_encoding`` nulls ``request.attention_mask`` afterwards, so
+    # compare against the captured object, not the reset field.)
+    assert len(model.calls) == 1
+    assert model.calls[0][0] == 5000
+    assert model.calls[0][1].get("attention_mask") is mask
+
+
+def test_chunking_falls_back_to_single_forward_with_extra_kwargs():
+    """If a processor ever emits sequence-aligned extra kwargs (e.g.
+    ``token_type_ids``) for a text-only request, we must NOT chunk (we would
+    silently drop or mis-slice them) — fall back to the single forward that
+    forwards ``kwargs`` intact."""
+    model = _ChunkRecordingModel()
+    gen = _make_bare_generator(prefill_step_size=22000, model=model)
+    req = _make_ids_request(5000)
+    req.extra_kwargs = {"token_type_ids": mx.zeros((1, 5000), dtype=mx.int32)}
+    cache = [_FakeCache()]
+
+    gen._run_vision_encoding(req, cache=cache)
+
+    # One forward over the whole prompt, extra kwargs preserved.
+    assert len(model.calls) == 1
+    assert model.calls[0][0] == 5000
+    assert "token_type_ids" in model.calls[0][1]
+
+
+def test_run_vision_encoding_single_token_uses_single_forward():
+    """A 1-token prompt has no prefix to chunk; it stays on the single
+    forward (no empty-prefix forward is ever submitted)."""
+    model = _ChunkRecordingModel()
+    gen = _make_bare_generator(prefill_step_size=2048, model=model)
+
+    gen._run_vision_encoding(_make_ids_request(1), cache=[_FakeCache()])
+
+    assert len(model.calls) == 1
+    assert model.calls[0][0] == 1
+
+
+def test_run_vision_encoding_short_text_prompt_uses_single_forward():
+    """A prompt that fits inside one chunk keeps the *original* single
+    forward — no second forward, no per-chunk ``mx.eval``/``mx.clear_cache``
+    barrier on the hot path. Chunking only engages once the prompt is longer
+    than one chunk, where the un-chunked activations + full-sequence logits
+    would actually spike memory (#1187 B). This guards the latency of the
+    common short-prompt case against the chunking added for long prompts."""
+    model = _ChunkRecordingModel()
+    gen = _make_bare_generator(prefill_step_size=22000, model=model)
+    cache = [_FakeCache()]
+
+    # 100 tokens << chunk = min(22000, 2048) = 2048 → single forward.
+    gen._run_vision_encoding(_make_ids_request(100), cache=cache)
+
+    assert len(model.calls) == 1
+    assert model.calls[0][0] == 100
+    # No barrier ran, so the cache state was never force-evaluated.
+    assert cache[0].state_reads == 0
+
+
+# ---------------------------------------------------------------------------
+# Numerical equivalence — chunked prefill must match the single forward.
+#
+# `_TinyCausalLM` is a real (tiny) causal transformer using mlx-lm's own
+# `KVCache` / `RotatingKVCache` + causal-mask helper, so the chunked path
+# actually computes and retains prefix K/V. We compare the last-position
+# logits, the cache offset, the sampled token, AND a following decode step
+# against a single-forward reference — including a `RotatingKVCache` whose
+# window is smaller than the prompt, which forces sliding-window rotation
+# across chunk boundaries (the case #1187's gemma-4 mix relies on).
+# ---------------------------------------------------------------------------
+
+
+class _TinyCausalLM:
+    """Minimal real causal LM (embedding + N attention layers + tied-free
+    output) driven by mlx-lm caches, for chunk-vs-single equivalence checks."""
+
+    def __init__(
+        self, vocab: int = 48, dim: int = 32, n_heads: int = 4, n_layers: int = 2
+    ):
+        mx.random.seed(0)
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.scale = self.head_dim**-0.5
+        self.n_layers = n_layers
+        self.embed = nn.Embedding(vocab, dim)
+        self.wq = [nn.Linear(dim, dim, bias=False) for _ in range(n_layers)]
+        self.wk = [nn.Linear(dim, dim, bias=False) for _ in range(n_layers)]
+        self.wv = [nn.Linear(dim, dim, bias=False) for _ in range(n_layers)]
+        self.wo = [nn.Linear(dim, dim, bias=False) for _ in range(n_layers)]
+        self.norm = nn.RMSNorm(dim)
+        self.out = nn.Linear(dim, vocab, bias=False)
+        self.language_model = self
+        for m in [
+            self.embed,
+            self.norm,
+            self.out,
+            *self.wq,
+            *self.wk,
+            *self.wv,
+            *self.wo,
+        ]:
+            mx.eval(m.parameters())
+
+    def __call__(self, input_ids, cache=None, **kwargs):
+        from mlx_lm.models.base import create_attention_mask
+
+        B, L = input_ids.shape
+        h = self.embed(input_ids)
+        mask = create_attention_mask(h, cache[0] if cache else None)
+        for i in range(self.n_layers):
+            c = cache[i] if cache is not None else None
+            q = (
+                self.wq[i](h)
+                .reshape(B, L, self.n_heads, self.head_dim)
+                .transpose(0, 2, 1, 3)
+            )
+            k = (
+                self.wk[i](h)
+                .reshape(B, L, self.n_heads, self.head_dim)
+                .transpose(0, 2, 1, 3)
+            )
+            v = (
+                self.wv[i](h)
+                .reshape(B, L, self.n_heads, self.head_dim)
+                .transpose(0, 2, 1, 3)
+            )
+            if c is not None:
+                k, v = c.update_and_fetch(k, v)
+            o = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=mask
+            )
+            o = o.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            h = h + self.wo[i](o)
+
+        class _Out:
+            pass
+
+        out = _Out()
+        out.logits = self.out(self.norm(h))
+        return out
+
+
+def _make_caches(kind: str, n_layers: int):
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    if kind == "kv":
+        return [KVCache() for _ in range(n_layers)]
+    max_size = int(kind.split(":")[1])
+    return [RotatingKVCache(max_size=max_size) for _ in range(n_layers)]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "kv",  # plain growing cache
+        "rot:64",  # rotating window larger than prompt → no rotation
+        "rot:16",  # rotating window < prompt → forces sliding-window rotation
+    ],
+)
+def test_chunked_prefill_matches_single_forward_numerically(kind):
+    """Chunked prefill (via the real `_run_vision_encoding`) produces the same
+    last-token logits, cache offset, sampled token, and next-decode logits as
+    a single forward — for plain and rotating KV caches (#1187 B)."""
+    n_layers = 2
+    model = _TinyCausalLM(n_layers=n_layers)
+    # Small chunk to force multiple prefix chunks (prefix=39 → 8,8,8,8,7).
+    gen = _make_bare_generator(prefill_step_size=8, model=model)
+    n = 40  # < vocab (48) so every token id is valid
+    # Same ids the chunked request uses (``_make_ids_request`` → ``arange(n)``),
+    # so both paths run on identical input.
+    ids = mx.arange(n, dtype=mx.int32)
+
+    # Single-forward reference. Materialize the logits BEFORE the decode step
+    # below mutates the cache in place (rotating caches write K/V in place, so
+    # a still-lazy logits graph would otherwise read post-decode state).
+    single_cache = _make_caches(kind, n_layers)
+    single_last = model(ids[None, :], cache=single_cache).logits[:, -1, :]
+    mx.eval(single_last)
+
+    # Chunked prefill through the production method.
+    chunked_cache = _make_caches(kind, n_layers)
+    chunked_last = gen._run_vision_encoding(_make_ids_request(n), cache=chunked_cache)[
+        :, -1, :
+    ]
+    mx.eval(chunked_last)
+
+    def _offset(c):
+        o = c.offset
+        return o.item() if hasattr(o, "item") else o
+
+    # Cache filled to the same absolute length by both paths (captured BEFORE
+    # the decode step below advances it).
+    assert _offset(single_cache[0]) == _offset(chunked_cache[0]) == n
+
+    # One decode step on top of each post-prefill cache.
+    next_tok = mx.argmax(single_last, axis=-1).reshape(1, 1)
+    dec_single = model(next_tok, cache=single_cache).logits[:, -1, :]
+    dec_chunked = model(next_tok, cache=chunked_cache).logits[:, -1, :]
+    mx.eval(dec_single, dec_chunked)
+
+    # Last-token logits agree within fp32 attention-reduction noise.
+    assert mx.allclose(single_last, chunked_last, atol=1e-4, rtol=1e-4)
+    # Sampled token is identical.
+    assert mx.argmax(single_last, -1).item() == mx.argmax(chunked_last, -1).item()
+    # And decoding continues identically from the chunk-built cache.
+    assert mx.allclose(dec_single, dec_chunked, atol=1e-4, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Memory — the chunked path must not materialize `[1, seqlen, vocab]` logits,
+# while still genuinely computing (and retaining) the prefix K/V.
+# ---------------------------------------------------------------------------
+
+
+class _KVWritingProjModel:
+    """Big-vocab stub that (a) writes input-dependent K/V into a real cache so
+    `mx.eval(cache.state)` forces the prefix computation, and (b) projects
+    `[1, seqlen, vocab]` logits so peak memory reflects whether the caller
+    projected the whole prompt or just the last token."""
+
+    def __init__(self, hidden: int, vocab: int, n_heads: int = 4):
+        self.embed = nn.QuantizedEmbedding(vocab, hidden, group_size=64, bits=4)
+        self.wkv = nn.Linear(hidden, hidden, bias=False)
+        self.n_heads = n_heads
+        self.head_dim = hidden // n_heads
+        self.vocab = vocab
+        self.language_model = self
+        mx.eval(self.embed.parameters(), self.wkv.parameters())
+
+    def __call__(self, input_ids, cache=None, **kwargs):
+        B, L = input_ids.shape
+        h = self.embed(input_ids)  # input-dependent hidden
+        if cache is not None:
+            kv = (
+                self.wkv(h)
+                .reshape(B, L, self.n_heads, self.head_dim)
+                .transpose(0, 2, 1, 3)
+            )
+            for c in cache:
+                c.update_and_fetch(kv, kv)  # store input-dependent K/V
+
+        class _Out:
+            pass
+
+        out = _Out()
+        out.logits = self.embed.as_linear(h)  # [1, seqlen, vocab]
+        return out
+
+
+def test_chunked_prefill_avoids_full_sequence_logits_materialization():
+    """The chunked path must not materialize a `[1, seqlen, vocab]` logits
+    tensor, while still computing the prefix K/V (a real `KVCache` whose
+    `.state` `mx.eval` forces). Peak is compared against the single-forward
+    (no-cache) path on the SAME method (#1187 B)."""
+    from mlx_lm.models.cache import KVCache
+
+    hidden, vocab, n = 128, 32768, 4096
+    model = _KVWritingProjModel(hidden, vocab)
+    gen = _make_bare_generator(prefill_step_size=2048, model=model)
+
+    # Chunked (real KVCache) FIRST → prefix K/V computed per chunk, prefix
+    # logits pruned, only `[1, 1, vocab]` evaled. Measured first so no residual
+    # from the single path pollutes it.
+    cache = [KVCache()]
+    mx.clear_cache()
+    mx.reset_peak_memory()
+    l_chunked = gen._run_vision_encoding(_make_ids_request(n), cache=cache)
+    chunked_shape = l_chunked.shape
+    mx.eval(l_chunked[:, -1, :])
+    # The prefix K/V really was materialized (offset advanced to n-1 over the
+    # prefix chunks + 1 for the last-token forward = n).
+    off = cache[0].offset
+    assert (off.item() if hasattr(off, "item") else off) == n
+    peak_chunked = mx.get_peak_memory()
+    del l_chunked
+    mx.clear_cache()
+
+    # Single forward (cache=None) → full `[1, n, vocab]` logits materialized
+    # because slicing `[:, -1, :]` does not prune the lm_head matmul.
+    mx.reset_peak_memory()
+    l_single = gen._run_vision_encoding(_make_ids_request(n), cache=None)
+    single_shape = l_single.shape
+    mx.eval(l_single[:, -1, :])
+    peak_single = mx.get_peak_memory()
+
+    assert single_shape == (1, n, vocab)
+    assert chunked_shape == (1, 1, vocab)
+    # The single path's transient is dominated by the `[1, n, vocab]` fp32
+    # matmul output (~0.5 GB here); the chunked path never allocates it.
+    full_logits_bytes = n * vocab * 4
+    assert peak_single - peak_chunked > full_logits_bytes * 0.4, (
+        f"chunked peak {peak_chunked} not meaningfully below single "
+        f"{peak_single} (expected ≥{full_logits_bytes * 0.4:.0f} B lower)"
+    )
 
 
 # ---------------------------------------------------------------------------
