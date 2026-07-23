@@ -513,12 +513,11 @@ def test_friendly_error_on_missing_vision_tensors(monkeypatch):
     class _FakeMlxVlm:
         @staticmethod
         def load(_name):
-            raise ValueError(
-                "Missing 60 parameters: \n"
-                "vision_tower.blocks.27.attn.proj.bias,\n"
-                "vision_tower.blocks.27.attn.proj.weight,\n"
-                "vision_tower.blocks.27.attn.qkv.bias."
-            )
+            # Mirror mlx's exact strict-load format: `Missing N parameters:`
+            # header where N equals the number of `,\n`-joined names, list
+            # terminated by a single `.`. All 60 names are vision-tower tensors.
+            names = [f"vision_tower.blocks.{i}.attn.proj.weight" for i in range(60)]
+            raise ValueError("Missing 60 parameters: \n" + ",\n".join(names) + ".")
 
     class _FakeMlxVlmUtils:
         @staticmethod
@@ -535,17 +534,151 @@ def test_friendly_error_on_missing_vision_tensors(monkeypatch):
         with pytest.raises(RuntimeError) as excinfo:
             inst.load()
 
+        # The raise is a TextOnlyCheckpointError — a RuntimeError subclass so
+        # this `pytest.raises(RuntimeError)` still holds, but a DEDICATED type
+        # so the engine can degrade on THIS condition alone (auto text-only
+        # fallback) and let every other load failure propagate.
+        assert isinstance(excinfo.value, mllm_mod.TextOnlyCheckpointError), (
+            "Missing-vision-tower load failure must raise the typed "
+            f"TextOnlyCheckpointError; got {type(excinfo.value).__name__}"
+        )
+        assert excinfo.value.missing_count == 60, (
+            "Typed error must carry the parsed missing-tensor count for the "
+            f"engine's degrade log; got {excinfo.value.missing_count!r}"
+        )
         msg = str(excinfo.value)
         assert "--no-mllm" in msg, (
             f"Friendly error must mention --no-mllm; got: {msg!r}"
         )
         assert "#393" in msg, "Friendly error must reference #393 for searchability"
-        assert "60 vision tensors missing" in msg, (
-            "Friendly error must surface the count from the underlying error"
+        assert "60 multimodal tensors missing" in msg, (
+            "Friendly error must surface the count from the underlying error "
+            "with modality-neutral wording (the allowlist accepts audio too)"
         )
     finally:
         # Restore original mlx_vlm so subsequent tests aren't poisoned.
         sys.modules["mlx_vlm"] = real_mlx_vlm
+
+
+def test_mixed_vision_and_language_missing_does_not_degrade(monkeypatch):
+    """A checkpoint missing BOTH vision AND language-backbone tensors is
+    genuinely incomplete — the text lane can't serve it either — so
+    MLLMModel.load() must NOT classify it as text-only. It must re-raise the
+    RAW ValueError (never the typed TextOnlyCheckpointError), so the engine
+    surfaces the real corruption instead of masking it behind an auto-degrade
+    that fails again, more confusingly, in the text lane. Guards the codex
+    BLOCKING finding on PR #1189: the classifier keys on ALL missing weights
+    being multimodal, not just ANY vision name appearing."""
+    import importlib
+    import sys
+
+    try:
+        importlib.import_module("mlx_vlm")
+    except ImportError:
+        pytest.skip("mlx_vlm not installed (vision extra)")
+
+    from vllm_mlx.models import mllm as mllm_mod
+
+    real_mlx_vlm = sys.modules["mlx_vlm"]
+
+    class _FakeMlxVlm:
+        @staticmethod
+        def load(_name):
+            # Vision tensors AND a language-backbone tensor are both absent:
+            # this is corruption, not a text-only fork.
+            raise ValueError(
+                "Missing 3 parameters: \n"
+                "language_model.model.layers.5.mlp.gate_proj.weight,\n"
+                "vision_tower.blocks.27.attn.proj.weight,\n"
+                "vision_tower.blocks.27.attn.qkv.bias."
+            )
+
+    class _FakeMlxVlmUtils:
+        @staticmethod
+        def load_config(_name):
+            return {}
+
+    monkeypatch.setitem(sys.modules, "mlx_vlm", _FakeMlxVlm)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", _FakeMlxVlmUtils)
+
+    inst = mllm_mod.MLXMultimodalLM(model_name="fake/corrupt-vlm")
+
+    try:
+        with pytest.raises(ValueError) as excinfo:
+            inst.load()
+        # Must be the RAW ValueError, NOT the typed degrade signal.
+        assert not isinstance(excinfo.value, mllm_mod.TextOnlyCheckpointError), (
+            "A checkpoint missing language-backbone weights must NOT be "
+            "classified as text-only; the raw ValueError has to propagate so "
+            "the engine reports genuine corruption instead of auto-degrading."
+        )
+        assert "language_model.model.layers.5" in str(excinfo.value), (
+            "The original missing-parameter detail must survive so operators "
+            "can see WHICH weights are missing."
+        )
+    finally:
+        sys.modules["mlx_vlm"] = real_mlx_vlm
+
+
+def test_missing_param_name_parser_and_multimodal_partition():
+    """Unit-level cover for the two helpers the degrade decision rests on:
+    `_parse_missing_param_names` recovers the individual tensor names from
+    mlx's `",\\n".join(sorted(...))` + trailing-`.` format, and
+    `_all_missing_are_multimodal` is True ONLY when every name is a
+    vision/audio/projector tensor (empty / any-language → False, fail safe)."""
+    from vllm_mlx.models import mllm as mllm_mod
+
+    pure_vision = (
+        "Missing 2 parameters: \n"
+        "embed_vision.embedding_projection.weight,\n"
+        "vision_tower.encoder.layers.0.mlp.down_proj.weight."
+    )
+    names = mllm_mod._parse_missing_param_names(pure_vision)
+    assert names == [
+        "embed_vision.embedding_projection.weight",
+        "vision_tower.encoder.layers.0.mlp.down_proj.weight",
+    ]
+    assert mllm_mod._all_missing_are_multimodal(names) is True
+
+    mixed_msg = (
+        "Missing 2 parameters: \n"
+        "language_model.model.norm.weight,\n"
+        "vision_tower.encoder.layers.0.mlp.down_proj.weight."
+    )
+    mixed_names = mllm_mod._parse_missing_param_names(mixed_msg)
+    assert mllm_mod._all_missing_are_multimodal(mixed_names) is False
+
+    # mlx's declared count is recovered and, for a well-formed message, equals
+    # the number of listed names (the completeness invariant the degrade gate
+    # cross-checks so a partial parse fails safe).
+    assert mllm_mod._parse_missing_count(pure_vision) == len(names) == 2
+    assert mllm_mod._parse_missing_count(mixed_msg) == len(mixed_names) == 2
+
+    # Unparseable / unrelated error shape → empty / None → not-degradable.
+    assert mllm_mod._parse_missing_param_names("some other error") == []
+    assert mllm_mod._parse_missing_count("some other error") is None
+    assert mllm_mod._all_missing_are_multimodal([]) is False
+
+    # Segment-aware matching (precision): a language-backbone weight whose
+    # SEGMENT merely CONTAINS an allowlisted token as a substring
+    # (``visual_proj`` ⊃ ``visual``, ``connector_gate`` ⊃ ``connector``) must
+    # NOT be misclassified as multimodal — else an all-language missing set
+    # could trigger an invalid degrade. A bare substring test would misfire.
+    assert mllm_mod._name_is_multimodal_tensor("vision_tower.encoder.0.weight")
+    assert mllm_mod._name_is_multimodal_tensor("model.visual.blocks.0.attn.weight")
+    assert mllm_mod._name_is_multimodal_tensor("model.embed_vision.proj.weight")
+    assert not mllm_mod._name_is_multimodal_tensor(
+        "language_model.model.layers.0.self_attn.visual_proj.weight"
+    )
+    assert not mllm_mod._name_is_multimodal_tensor(
+        "language_model.model.layers.0.connector_gate.weight"
+    )
+    assert mllm_mod._all_missing_are_multimodal(
+        ["vision_tower.a.weight", "model.visual.b.weight"]
+    )
+    assert not mllm_mod._all_missing_are_multimodal(
+        ["vision_tower.a.weight", "model.layers.0.visual_proj.weight"]
+    )
 
 
 def _flag_in_add_argument_calls(source: str, flag: str) -> bool:
@@ -2790,3 +2923,169 @@ def test_friendly_error_does_not_swallow_unrelated_valueerror(monkeypatch):
         # detection means we may not have imported it.
         if real_mlx_vlm is not None:
             sys.modules["mlx_vlm"] = real_mlx_vlm
+
+
+# ---------------------------------------------------------------------------
+# Automatic text-only degrade (#1187 / #393).
+#
+# A vision-config checkpoint whose safetensors carry no usable vision tower
+# must NOT abort startup. mlx-vlm's strict weight load is the authoritative
+# signal (the routing detector reads the index/config, which still declare
+# vision, so it cannot catch a broken quant or an index that lists vision
+# tensors the shards don't contain — e.g. gemma-4 OptiQ). On that specific
+# failure the engine auto-degrades to the text lane, exactly as --no-mllm
+# would, instead of raising. Every OTHER load failure still propagates.
+# ---------------------------------------------------------------------------
+
+
+async def test_start_mllm_degrades_to_text_on_missing_vision_tower(monkeypatch):
+    """``_start_mllm`` catches ``TextOnlyCheckpointError`` and hands off to the
+    text lane: ``is_mllm`` flips to False and the mllm loader is torn down."""
+    from vllm_mlx.engine import batched as batched_mod
+    from vllm_mlx.models import mllm as mllm_mod
+
+    class _FakeTextOnlyMLLM:
+        def __init__(self, model_name, trust_remote_code=True):
+            self.model_name = model_name
+
+        def load(self):
+            raise mllm_mod.TextOnlyCheckpointError(
+                "MLLM load failed (356 vision tensors missing): this "
+                "checkpoint is text-only despite its multimodal config. "
+                "Re-run with --no-mllm ... Tracked in #393.",
+                missing_count=356,
+            )
+
+    # The import inside ``_start_mllm`` resolves the symbol at call time, so
+    # patching the module attribute is sufficient.
+    monkeypatch.setattr(mllm_mod, "MLXMultimodalLM", _FakeTextOnlyMLLM)
+
+    # AUTO-detected MLLM routing (NOT --mllm): the checkpoint's config declared
+    # vision so ``is_mllm_model`` routed it here. Simulate that verdict without
+    # a real config on disk. ``_force_mllm`` stays False so the degrade fires.
+    engine = batched_mod.BatchedEngine("fake/gemma4-optiq-4bit")
+    engine._is_mllm = True
+    assert engine._force_mllm is False, "precondition: auto-detected, not forced"
+
+    import sys
+
+    called = {"start_llm": 0}
+    exc_state = {}
+
+    async def _fake_start_llm():
+        called["start_llm"] += 1
+        # Capture whether an exception is still being HANDLED when the text
+        # lane loads. It must NOT be — the fallback runs outside the ``except``
+        # so the failed MLLM load's traceback (which pins mlx-vlm's whole
+        # weights dict + partial model) is released BEFORE the text model
+        # allocates, or the two coexist and can OOM a RAM-tight box.
+        exc_state["info"] = sys.exc_info()
+
+    monkeypatch.setattr(engine, "_start_llm", _fake_start_llm)
+
+    await engine._start_mllm()
+
+    assert called["start_llm"] == 1, (
+        "missing vision tower must degrade to the text lane, not abort"
+    )
+    assert exc_state["info"] == (None, None, None), (
+        "text-lane load must run OUTSIDE the except block (no active exception "
+        "pinning the failed vision load's ~weights-sized memory)"
+    )
+    assert engine.is_mllm is False, (
+        "engine must report text-only after the degrade so every "
+        "engine.is_mllm consumer (chat routes, /v1/models) stays consistent"
+    )
+    assert engine._model_load_executor is None, (
+        "the mllm-step loader thread must be shut down before the text "
+        "lane spins up its own executor (no leaked thread)"
+    )
+
+
+async def test_explicit_force_mllm_does_not_degrade(monkeypatch):
+    """``--mllm`` is a deliberate demand for the vision lane. A missing vision
+    tower must HARD-FAIL for that operator (surfacing --no-mllm as the fix),
+    never silently degrade behind their back — only AUTO-detected routing
+    degrades. The loader thread is still torn down so nothing leaks."""
+    from vllm_mlx.engine import batched as batched_mod
+    from vllm_mlx.models import mllm as mllm_mod
+
+    class _FakeTextOnlyMLLM:
+        def __init__(self, model_name, trust_remote_code=True):
+            pass
+
+        def load(self):
+            raise mllm_mod.TextOnlyCheckpointError(
+                "MLLM load failed (356 vision tensors missing): ... "
+                "Re-run with --no-mllm ... Tracked in #393.",
+                missing_count=356,
+            )
+
+    monkeypatch.setattr(mllm_mod, "MLXMultimodalLM", _FakeTextOnlyMLLM)
+
+    engine = batched_mod.BatchedEngine("fake/gemma4-optiq-4bit", force_mllm=True)
+
+    called = {"start_llm": 0}
+
+    async def _fake_start_llm():
+        called["start_llm"] += 1
+
+    monkeypatch.setattr(engine, "_start_llm", _fake_start_llm)
+
+    with pytest.raises(mllm_mod.TextOnlyCheckpointError) as excinfo:
+        await engine._start_mllm()
+
+    assert "--no-mllm" in str(excinfo.value), (
+        "explicit --mllm hard-fail must point the operator at the escape hatch"
+    )
+    assert called["start_llm"] == 0, "explicit --mllm must NOT auto-degrade"
+    assert engine.is_mllm is True, "explicit --mllm keeps the vision-lane verdict"
+    assert engine._model_load_executor is None, "loader thread must still be torn down"
+
+
+async def test_start_mllm_does_not_degrade_on_unrelated_load_error(monkeypatch):
+    """A load failure that is NOT a missing-vision-tower degrade signal (e.g.
+    corrupt weights, unsupported arch, OOM) must propagate unchanged — the
+    degrade path is scoped to ``TextOnlyCheckpointError`` alone, never a bare
+    RuntimeError, so genuine errors are never masked as a silent text fallback.
+    """
+    from vllm_mlx.engine import batched as batched_mod
+    from vllm_mlx.models import mllm as mllm_mod
+
+    class _FakeBrokenMLLM:
+        def __init__(self, model_name, trust_remote_code=True):
+            pass
+
+        def load(self):
+            raise RuntimeError("CUDA OOM / corrupt safetensors header")
+
+    monkeypatch.setattr(mllm_mod, "MLXMultimodalLM", _FakeBrokenMLLM)
+
+    # AUTO-detected routing — the mode where a degrade COULD happen — so this
+    # proves the scoping (TextOnlyCheckpointError only), not just that a forced
+    # lane never degrades.
+    engine = batched_mod.BatchedEngine("fake/genuinely-broken")
+    engine._is_mllm = True
+
+    called = {"start_llm": 0}
+
+    async def _fake_start_llm():
+        called["start_llm"] += 1
+
+    monkeypatch.setattr(engine, "_start_llm", _fake_start_llm)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await engine._start_mllm()
+
+    assert "corrupt safetensors" in str(excinfo.value), (
+        "the original error must surface, not a text-fallback message"
+    )
+    assert called["start_llm"] == 0, "must NOT degrade on an unrelated error"
+    assert engine.is_mllm is True, "engine modality must be unchanged on a real error"
+    # The mllm-step worker must be torn down on EVERY failed load, not only
+    # the degrade path — otherwise an unrelated error orphans the executor
+    # thread (codex BLOCKING). ``_start_mllm`` shuts it down and clears the ref.
+    assert engine._model_load_executor is None, (
+        "the mllm-step ThreadPoolExecutor must be shut down and cleared even "
+        "when the load failure is not a degrade signal, or its worker thread leaks"
+    )
