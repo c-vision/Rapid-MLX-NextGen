@@ -104,6 +104,20 @@ class DeepSeekV3ToolParser(ToolParser):
     SUPPORTS_NATIVE_TOOL_FORMAT = True
     EXPECTED_WIRE_FORMATS = ("deepseek_native",)
 
+    # Grammar-capable (#558 E1 / #1144): this parser overrides ``structure_info``
+    # to emit the DeepSeek-V3 section-wrapper wire triple, so declare the marker
+    # to MATCH the override (the marker-consistency check requires it, and it
+    # keeps the #561 oversized-schema route on the constrained path).
+    SUPPORTS_GRAMMAR: bool = True
+
+    # The section-wrapper wire folds the whole <｜tool▁calls▁begin｜>…<｜tool▁calls▁end｜>
+    # envelope into each call's structure_info begin/end, so a repeated grammar tag
+    # yields back-to-back sections — a shape this parser's single-envelope scanner
+    # (_envelope_bounds) drops after the first section. The grammar is therefore
+    # sound ONLY when it can emit at most one call; build_tool_grammar opts out
+    # (free-form) when >1 call is possible. See TOOL_GRAMMAR_SECTION_WRAPPER gate.
+    TOOL_GRAMMAR_SECTION_WRAPPER = True
+
     TOOL_CALLS_START = "<｜tool▁calls▁begin｜>"
     TOOL_CALLS_END = "<｜tool▁calls▁end｜>"
     TOOL_CALL_START = "<｜tool▁call▁begin｜>"
@@ -129,6 +143,90 @@ class DeepSeekV3ToolParser(ToolParser):
         self.tool_calls_end_token_id = self.vocab.get(self.TOOL_CALLS_END)
         self.tool_call_start_token_id = self.vocab.get(self.TOOL_CALL_START)
         self.tool_call_end_token_id = self.vocab.get(self.TOOL_CALL_END)
+
+    def structure_info(self):
+        """Grammar-constraint wire triple for the DeepSeek-V3 section-wrapper (#558 E1).
+
+        Extends #558 constraint coverage to the DeepSeek-V3 "function-typed,
+        JSON-fenced" tool-call wire (copied VERBATIM from SGLang's
+        ``deepseekv3_detector.structure_info``)::
+
+            <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME
+            ```json
+            {args}
+            ```<｜tool▁call▁end｜><｜tool▁calls▁end｜>
+
+        SGLang folds the SECTION envelope (``<｜tool▁calls▁begin｜>`` /
+        ``<｜tool▁calls▁end｜>``) AND the per-call envelope
+        (``<｜tool▁call▁begin｜>`` / ``<｜tool▁call▁end｜>``) into EACH single
+        call's ``begin``/``end``. Repeating the per-tool tag therefore repeats a
+        whole section — this is SGLang's own section-wrapper behavior, so no
+        change to ``build_tool_lark`` is needed. The tool NAME lives in the
+        header (``function<sep>NAME``), a bare identifier emitted as a byte
+        literal; the body is a single JSON object between the ``\\n```json\\n``
+        and ``\\n``` fences, constrained by the tool's JSON Schema via ``%json``
+        (the ``"json"`` default ``arg_style``).
+
+        The five envelope tokens are declared ``sentinels`` (rendered as Lark
+        special-token refs). As on hermes/qwen/harmony, OPT OUT (return ``None``
+        -> free-form-then-parse) unless the tokenizer proves every sentinel is a
+        single special token.
+
+        AT-MOST-ONE-CALL ONLY (``TOOL_GRAMMAR_SECTION_WRAPPER``): because the
+        whole SECTION envelope is folded into EACH call's ``begin``/``end``, a
+        repeated grammar tag emits BACK-TO-BACK sections
+        (``<begin>c1<end><begin>c2<end>``) — a shape this parser's single-envelope
+        scanner (``_envelope_bounds`` / ``_iter_block_bodies``) drops after the
+        first section. So the grammar is sound ONLY on the at-most-one-call path
+        (``parallel_tool_calls=False`` -> ``single_call=True``:
+        required/named/auto emitting EXACTLY-ONE / ZERO-OR-ONE). When >1 call is
+        possible (``single_call=False``) ``build_tool_grammar`` OPTS OUT via the
+        section-wrapper gate and falls back to free-form-then-parse — where the
+        unconstrained model emits its canonical one-section-N-calls wire, which
+        this parser DOES handle. True multi-call section-wrapper grammar support
+        (a builder that repeats only the per-call envelope inside ONE section) is
+        a tracked follow-up.
+
+        WHICH CHECKPOINTS THIS ENGAGES (release-note nuance): the fullwidth-pipe
+        envelope markers are single special tokens ONLY on the original
+        DeepSeek-V3 / R1 tokenizers (ids 128806–128814), so the grammar engages
+        for those. Checkpoints that carry the V3 chat_template but ship a **Qwen
+        tokenizer** — e.g. ``DeepSeek-R1-0528-Qwen3-8B`` and the
+        ``DeepSeek-R1-Distill-Qwen-*`` family — render those same markers as
+        ordinary MULTI-token text, so ``are_single_special_tokens`` is False and
+        this method correctly OPTS OUT to ``None`` (free-form-then-parse). E1
+        therefore constrains real DeepSeek-V3/R1 and is a safe, non-regressive
+        no-op on the Qwen-tokenizer distills.
+        """
+        from vllm_mlx.api.tool_grammar import (
+            StructureInfo,
+            are_single_special_tokens,
+        )
+
+        sentinels = (
+            self.TOOL_CALLS_START,
+            self.TOOL_CALL_START,
+            self.TOOL_SEP,
+            self.TOOL_CALL_END,
+            self.TOOL_CALLS_END,
+        )
+        if not are_single_special_tokens(self.model_tokenizer, sentinels):
+            return None
+
+        def _info(name: str):
+            begin = (
+                f"{self.TOOL_CALLS_START}{self.TOOL_CALL_START}"
+                f"{_V3_TYPE_TAG}{self.TOOL_SEP}{name}\n```json\n"
+            )
+            end = f"\n```{self.TOOL_CALL_END}{self.TOOL_CALLS_END}"
+            return StructureInfo(
+                begin=begin,
+                end=end,
+                trigger=self.TOOL_CALLS_START,
+                sentinels=sentinels,
+            )
+
+        return _info
 
     # -----------------------------------------------------------------
     # Block-wise scanner.
