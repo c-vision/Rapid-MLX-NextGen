@@ -459,9 +459,14 @@ class BaseEngine(ABC):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         enable_thinking: bool | None = None,
+        add_generation_prompt: bool = True,
     ) -> str:
         """Render the chat prompt for ``messages`` + ``tools`` without
         starting generation.
+
+        ``add_generation_prompt`` (default True) toggles the assistant
+        generation prefix so the reasoning-budget seed probe can diff two
+        renders to isolate the template-added prefix.
 
         Called by ``routes/chat.py`` for cloud-routing token estimation
         and for eager streaming chat-template validation (so template

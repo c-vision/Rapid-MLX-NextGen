@@ -2159,6 +2159,254 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             _release_admission_unless_committed(engine, _commit_state[0])
 
 
+def _effective_posthoc_reasoning_cap(sampling_kwargs: dict, request) -> int | None:
+    """Return the post-hoc reasoning-token cap for the postprocessor, or
+    ``None`` when the generation-time thinking-budget processor owns this
+    request.
+
+    #558 SINGLE MECHANISM: when the chat route built a
+    ``reasoning_budget_logits_processor`` (a text-parser family whose
+    ``</think>`` is a single token, with a resolved budget), the thinking span
+    is force-closed AT DECODE TIME — so the post-hoc char-count trim in the
+    postprocessor MUST NOT also run, or it would double-count / re-inject a
+    second close marker. Both postprocessor construction sites (non-stream in
+    ``_create_chat_completion_impl``, streaming in ``stream_chat_completion``)
+    route their cap through here so the "generation-time budget XOR post-hoc
+    cap" invariant has ONE definition and can never drift between the two paths.
+    Every request WITHOUT a budget processor (channel-routed families that keep
+    the post-hoc cap, no cap set, or thinking-off) falls back to the request's
+    ``reasoning_max_tokens`` — the pre-#558 behaviour, unchanged.
+    """
+    if sampling_kwargs.get("reasoning_budget_logits_processor") is not None:
+        return None
+    return getattr(request, "reasoning_max_tokens", None)
+
+
+def _template_generation_prefix(engine, messages, tools, enable_thinking) -> str | None:
+    """Return the TEMPLATE-added generation-prefix delta for ``messages``.
+
+    The seed decision (does the budget start already inside a ``<think>`` span?)
+    must trust ONLY what the chat TEMPLATE appends for the new assistant turn —
+    never raw conversation content — so a ``<think>`` a USER typed cannot
+    mis-seed the budget (codex). We isolate that prefix EXACTLY by diffing two
+    renders against the template's own generation boundary (the
+    ``add_generation_prompt`` flag every HF chat template honours):
+
+      * ``full`` — render WITH the assistant generation prompt (what decode
+        actually starts from).
+      * ``base`` — render the SAME conversation WITHOUT the generation prompt.
+
+    In the normal case ``full`` STARTS WITH ``base`` (toggling the generation
+    prompt only APPENDS the assistant header; it never rewrites history), so the
+    delta ``full[len(base):]`` is EXACTLY the template-added generation prefix
+    for the REAL content — assistant header plus a prefilled ``<think>`` iff the
+    template opens one. Because the delta is obtained by SUBTRACTION, not by
+    matching a guessed suffix, a short generic prefix (e.g. ``"\\n"``) can never
+    spuriously validate against a longer real one (codex R10 #1: the old
+    ``full.endswith(probe_delta)`` check accepted ``"\\n"`` when the real prefix
+    was ``"<think>\\n"``), and any ``<think>`` the user typed lives in ``base``
+    too and cancels out of the delta (immune to injection). No content is ever
+    substituted, so content-dependent templates render with their real inputs.
+
+    Returns ``None`` (caller retains the post-hoc cap) when the last message's
+    content is not a plain string (``build_prompt`` is text-only), ``messages``
+    is empty (nothing rendered), ``full`` does not start with ``base`` (a
+    template that restructures when the generation prompt toggles — the prefix
+    can't be isolated cleanly, so be safe), or the delta is empty.
+    """
+    if not messages:
+        # Nothing was rendered — a prefill template must NOT be mistaken for an
+        # emit one (which would install a never-starting processor that still
+        # suppresses the post-hoc cap). Decline (codex R10 #3).
+        return None
+    last = messages[-1]
+    content = last.get("content") if isinstance(last, dict) else None
+    if not isinstance(content, str):
+        return None
+    full = engine.build_prompt(
+        messages,
+        tools=tools,
+        enable_thinking=enable_thinking,
+        add_generation_prompt=True,
+    )
+    base = engine.build_prompt(
+        messages,
+        tools=tools,
+        enable_thinking=enable_thinking,
+        add_generation_prompt=False,
+    )
+    if not full.startswith(base):
+        # Template restructures when the generation prompt toggles (the added
+        # prefix is not a clean suffix of the full render) — cannot isolate the
+        # boundary, so decline rather than risk a wrong seed (codex).
+        return None
+    delta = full[len(base) :]
+    if not delta:
+        return None  # generation prompt added nothing after content — no seed
+    return delta
+
+
+def _actual_output_head_width(model) -> int | None:
+    """The model's TRUE logits width — the vocab dimension (rows) of the output
+    projection weight — or ``None`` if it cannot be inspected.
+
+    This is the AUTHORITATIVE bound the decode-time force validates against
+    (codex R12: the declared ``config.vocab_size`` can differ from the real
+    lm-head width; validate against the actual head so a processor is never
+    installed — and the post-hoc cap never suppressed — for a ``</think>`` id the
+    head cannot emit). Tries the untied ``lm_head`` first, then the tied
+    embedding projected via ``as_linear`` (qwen3 and most MLX text models), each
+    time reading ``weight.shape[0]`` — still the vocab dim under quantization
+    (qwen3-4bit's ``embed_tokens.weight`` is ``(vocab, packed_hidden)``).
+    """
+    if model is None:
+        return None
+    for path in (
+        ("lm_head", "weight"),
+        ("model", "embed_tokens", "weight"),
+        ("embed_tokens", "weight"),
+    ):
+        obj = model
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        shape = getattr(obj, "shape", None)
+        if (
+            shape is not None
+            and len(shape) >= 1
+            and isinstance(shape[0], int)
+            and shape[0] > 0
+        ):
+            return int(shape[0])
+    return None
+
+
+def _engine_output_vocab_size(engine) -> int | None:
+    """The model's output-vocab width, for the build-time ``</think>`` bounds
+    check — the ACTUAL output-head weight width (``_actual_output_head_width``),
+    or ``None`` when it cannot be inspected.
+
+    This is deliberately the WEIGHT-DERIVED width ONLY — the same number the
+    decode step's logits carry (``logits = head(hidden)`` ⇒
+    ``logits.shape[-1] == head.weight.shape[0]``). Because the build-time bounds
+    check and the decode-time force therefore validate ``</think>`` against the
+    IDENTICAL width, the decode-time out-of-range guard in ``_force_distribution``
+    is provably unreachable for any processor we install: it can only fire if a
+    later width disagrees with the head we inspected, which cannot happen when
+    both come from that one weight (codex R15).
+
+    Two rejected fallbacks, both UNSOUND for this check because they can exceed
+    the real head width and let an out-of-range force id install (suppressing the
+    post-hoc cap) only for the decode guard to then disable the budget — silently
+    leaving ``reasoning_max_tokens`` unenforced:
+      • ``len(tokenizer)`` (codex R14) — counts added specials, so ``</think>``
+        (itself an added special) is always within it: a vacuous check.
+      • declared ``config.vocab_size`` (codex R15) — a padded / over-declared
+        vocab can exceed the true head width, which is EXACTLY the mismatch that
+        would trip the decode guard.
+
+    When the head weight is not inspectable we return ``None`` and the builder
+    DECLINES (retaining the post-hoc cap; codex R11) rather than admit an
+    unverified force id. Every current text reasoning family (qwen3 tied embed,
+    gpt-oss / llama untied ``lm_head``) resolves via the weight, so the budget is
+    not declined for this reason in practice.
+    """
+    model = getattr(engine, "_model", None)
+    if model is None:
+        model = getattr(engine, "model", None)
+    return _actual_output_head_width(model)
+
+
+def _build_reasoning_budget_processor(
+    engine, request, cfg, messages, resolved_thinking
+) -> "ReasoningBudgetLogitsProcessor | None":  # noqa: F821 — forward ref
+    """Build the generation-time thinking-budget processor for this request, or
+    ``None`` (the caller then keeps the post-hoc reasoning cap).
+
+    This is the AUTHORITATIVE reasoning cap for text-parser families: once the
+    model has spent ``reasoning_max_tokens`` inside its ``<think>…</think>``
+    span, the next-token logits are OVERRIDDEN so the only sampleable token is
+    the single ``</think>`` id — the exact lever vLLM (``ThinkingBudgetState-
+    Holder``), SGLang (``ReasonerGrammarObject``) and mlx-vlm (``ThinkingBudget-
+    Criteria``) use. It REPLACES the post-hoc char-count trim: when this returns
+    a processor, ``_effective_posthoc_reasoning_cap`` suppresses the post-hoc cap
+    so the two never both run (single mechanism, one source of truth).
+
+    Called from the route ONLY once the request is committed to LOCAL generation
+    (past cloud offload) — a cloud-routed request neither installs the processor
+    nor has its post-hoc cap suppressed (codex).
+
+    Gating (each returns ``None`` → post-hoc cap retained):
+      * Thinking must be DEFINITIVELY on — ``_effective_enable_thinking`` is
+        ``True`` (mirrors what ``apply_chat_template`` does to pre-inject
+        ``<think>``). A thinking-OFF request (explicit off / coder default) OR an
+        unknown-model default (``None``) is skipped, so we never install an
+        unseeded processor that can't fire yet still suppresses the post-hoc cap
+        (guards vLLM #39130: never force a reasoning-end that cannot occur).
+      * TOOL requests opt out — a mid-span force-close could inject ``</think>``
+        after a tool-call opener and corrupt the call (vLLM #44676); a tracked
+        follow-up adds SGLang's ``think_excluded_tokens`` so the two can coexist.
+      * A request that lists ``</think>`` (or an overlapping substring) in
+        ``stop`` opts out — forcing ``</think>`` would trip that client stop AT
+        the reasoning boundary; the post-hoc cap (which appends ``</think>`` to
+        the FINAL text, not through the decode-time stop matcher) still enforces
+        the budget with no behaviour change vs pre-feature.
+      * ``build_budget_from_render`` returns ``None`` for any model whose
+        ``</think>`` is not a single token (channel-routed gpt-oss / harmony).
+
+    Whether the span is SEEDED (template prefills ``<think>``) vs EMITTED (the
+    model generates it) is derived from the TEMPLATE'S generation-prefix delta
+    (``_template_generation_prefix``), never from raw conversation content.
+    """
+    from ..api.reasoning_budget import (
+        build_budget_from_render,
+        reasoning_stop_conflicts,
+    )
+
+    if (
+        _effective_enable_thinking(resolved_thinking, cfg.model_path or cfg.model_name)
+        is not True
+    ):
+        return None
+    if getattr(request, "reasoning_max_tokens", None) is None:
+        return None
+    if request.tools:
+        return None
+    if reasoning_stop_conflicts(
+        getattr(request, "stop", None), getattr(cfg, "reasoning_parser_name", None)
+    ):
+        return None
+    try:
+        seed_suffix = _template_generation_prefix(
+            engine, messages, request.tools, resolved_thinking
+        )
+    except Exception as exc:
+        # Rendering can fail (e.g. MLLM engines reject build_prompt). Signal that
+        # with None so build_budget_from_render installs NO processor and the
+        # post-hoc cap is retained — never a non-seeded processor that would
+        # silently suppress the cap yet never fire (codex). The budget stays
+        # enforced via the post-hoc cap, so this is a legitimate fallback for some
+        # engines — but log it (debug, with model context) so a genuine rendering
+        # regression is diagnosable instead of silently degrading to post-hoc for
+        # every request (codex R16 nit).
+        logger.debug(
+            "reasoning budget: generation-prefix render failed for model=%s "
+            "(%s: %s) — falling back to the post-hoc reasoning cap",
+            getattr(cfg, "model_path", None) or getattr(cfg, "model_name", None),
+            type(exc).__name__,
+            exc,
+        )
+        seed_suffix = None
+    return build_budget_from_render(
+        getattr(engine, "tokenizer", None),
+        getattr(cfg, "reasoning_parser_name", None),
+        getattr(request, "reasoning_max_tokens", None),
+        seed_suffix,
+        vocab_size=_engine_output_vocab_size(engine),
+    )
+
+
 async def _create_chat_completion_impl(
     request: ChatCompletionRequest,
     raw_request: Request,
@@ -3052,6 +3300,16 @@ async def _create_chat_completion_impl(
                 f"[LOCAL] {new_tokens} new tokens (total {total_tokens}) "
                 f"<= threshold {cfg.cloud_router.threshold}, using local inference"
             )
+
+    # Generation-time thinking-token budget — built HERE, only once the request
+    # is committed to LOCAL generation (past the cloud-offload decision), so a
+    # cloud-routed request neither installs the processor nor has its post-hoc
+    # cap suppressed (codex). See ``_build_reasoning_budget_processor``.
+    _rblp = _build_reasoning_budget_processor(
+        engine, request, cfg, messages, resolved_thinking
+    )
+    if _rblp is not None:
+        chat_kwargs["reasoning_budget_logits_processor"] = _rblp
 
     # ``tool_choice="required"`` + ``stream=true`` is enforceable IF the
     # engine has SOME path to produce a streaming tool_call:
@@ -4349,8 +4607,9 @@ async def _create_chat_completion_impl(
             resolved_thinking, cfg.model_path or cfg.model_name
         ),
         # Per-request reasoning cap (upstream vLLM PR #20859 backport).
-        # None → back-compat no-op.
-        reasoning_max_tokens=getattr(request, "reasoning_max_tokens", None),
+        # None → back-compat no-op. Suppressed when the generation-time
+        # thinking-budget processor owns this request (#558 single mechanism).
+        reasoning_max_tokens=_effective_posthoc_reasoning_cap(chat_kwargs, request),
         # r5-D — finalize-on-truncation shared plug needs to know if
         # generation was cut short so it can re-classify an unclosed
         # think buffer as ``reasoning_content`` instead of leaking it
@@ -4681,7 +4940,11 @@ async def stream_chat_completion(
             request=request_dict,
             # Per-request reasoning cap (upstream vLLM PR #20859 backport).
             # When None the postprocessor is a no-op for the cap path.
-            reasoning_max_tokens=getattr(request, "reasoning_max_tokens", None),
+            # Suppressed when the generation-time thinking-budget processor
+            # (``kwargs["reasoning_budget_logits_processor"]``, set by the chat
+            # route into chat_kwargs and unpacked here) owns this request —
+            # #558 single mechanism, decision shared with the non-stream path.
+            reasoning_max_tokens=_effective_posthoc_reasoning_cap(kwargs, request),
         )
         processor.set_thinking_model(request.model)
         processor.reset()

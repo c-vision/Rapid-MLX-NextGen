@@ -880,6 +880,7 @@ def apply_chat_template(
     tools: list[dict] | None = None,
     enable_thinking: bool | None = None,
     model_name: str = "",
+    add_generation_prompt: bool = True,
 ) -> str:
     """Apply a chat template to messages with consistent fallback behavior.
 
@@ -896,6 +897,12 @@ def apply_chat_template(
             - None: auto-detect (True except for coder models)
         model_name: Model name string, used for auto-detection of
             ``enable_thinking`` when set to None.
+        add_generation_prompt: Whether the template should append the
+            assistant generation prefix (default True — every serving path).
+            Passed False only by the reasoning-budget seed probe
+            (``routes/chat.py::_template_generation_prefix``), which renders the
+            SAME conversation with and without the generation prompt and takes
+            the delta to isolate the template-added prefix exactly.
 
     Returns:
         The formatted prompt string.  Falls back to a plain
@@ -978,7 +985,7 @@ def apply_chat_template(
 
     template_kwargs: dict = {
         "tokenize": False,
-        "add_generation_prompt": True,
+        "add_generation_prompt": add_generation_prompt,
         "enable_thinking": enable_thinking,
     }
     if tools:

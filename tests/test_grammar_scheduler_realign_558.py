@@ -13,7 +13,7 @@ the boot warmup fell back to free-form).
 from AUTHORITATIVE per-uid state: ``uid_to_request_processors`` holds the FULL
 processor list (grammar + penalties) for EVERY live uid that carries any
 processor — grammar AND penalty-only — so a bystander's penalties survive a
-length-desync rebuild (codex #3). A ``_known_grammar_processors`` identity set
+length-desync rebuild (codex #3). A ``_known_stateful_processors`` identity set
 (with tombstones for finished-but-still-leaked grammars) scrubs leaked grammars
 from untracked slots. These tests drive that method against a stand-in
 generation batch reproducing the desync shapes — no model needed.
@@ -41,34 +41,43 @@ def _make_scheduler_stub():
     stub = SimpleNamespace(
         uid_to_request_processors={},
         _uids_with_grammar=set(),
-        _known_grammar_processors=set(),
-        _grammar_processor_objs={},
-        _grammar_tombstones=set(),
+        _uids_with_reasoning_budget={},
+        _known_stateful_processors=set(),
+        _stateful_processor_objs={},
+        _stateful_tombstones=set(),
         batch_generator=None,
     )
     stub._realign_grammar_logits_processors = (
         Scheduler._realign_grammar_logits_processors.__get__(stub, type(stub))
     )
-    stub._flush_grammar_tombstones = Scheduler._flush_grammar_tombstones.__get__(
+    stub._flush_stateful_tombstones = Scheduler._flush_stateful_tombstones.__get__(
         stub, type(stub)
     )
     stub._forget_uid_grammar = Scheduler._forget_uid_grammar.__get__(stub, type(stub))
+    stub._realign_guard_armed = Scheduler._realign_guard_armed.__get__(stub, type(stub))
+    stub._register_uid_processors = Scheduler._register_uid_processors.__get__(
+        stub, type(stub)
+    )
     return stub
 
 
-def _register(stub, uid, processors, grammar=None):
-    """Mirror the scheduler's insert-time bookkeeping.
+def _register(stub, uid, processors, grammar=None, budget=None):
+    """Register a uid through the PRODUCTION bookkeeping helper.
 
-    ``grammar=None`` registers a penalty-only uid (tracked for desync repair but
-    not a grammar). A non-None ``grammar`` also registers its identity + arms
-    the guard, exactly like the scheduler insert site.
+    Delegates to ``Scheduler._register_uid_processors`` (the exact method the
+    admission path calls) rather than hand-reproducing its writes, so these
+    tests break if the real registration drops a grammar/budget arm or a penalty
+    list (codex NIT). ``grammar=None`` registers a penalty-only uid (tracked for
+    desync repair but not a grammar). A non-None ``grammar`` also registers its
+    identity + arms the guard. A non-None ``budget`` arms the guard for a
+    generation-time reasoning-budget processor AND registers its identity in the
+    same stateful set/tombstone machinery as grammar — a leaked force-close
+    processor must be scrubbed from a foreign slot exactly like a grammar (codex).
     """
-    if processors:
-        stub.uid_to_request_processors[uid] = list(processors)
-    if grammar is not None:
-        stub._uids_with_grammar.add(uid)
-        stub._known_grammar_processors.add(id(grammar))
-        stub._grammar_processor_objs[id(grammar)] = grammar
+    request = SimpleNamespace(reasoning_budget_logits_processor=budget)
+    stub._register_uid_processors(
+        uid, request, list(processors) if processors else None, grammar
+    )
 
 
 def test_realign_repairs_stale_leading_entry():
@@ -187,7 +196,7 @@ def test_realign_untracked_uid_with_no_processors_gets_empty_slot():
 def test_realign_scrubs_finished_grammar_via_tombstone():
     # codex #1: a grammar whose owning uid already FINISHED can still linger in
     # another slot. _forget_uid_grammar TOMBSTONES it (keeps it in
-    # _known_grammar_processors) so realign still scrubs it; only once it's
+    # _known_stateful_processors) so realign still scrubs it; only once it's
     # absent from every live slot is it fully forgotten.
     glp_live = object()
     glp_dead = object()  # finished owner, but leaked into uid 9's slot
@@ -196,10 +205,10 @@ def test_realign_scrubs_finished_grammar_via_tombstone():
     _register(stub, 8, [glp_dead], glp_dead)
     # uid 8 finishes: forget tombstones glp_dead (still known + scrubbable).
     stub._forget_uid_grammar(8)
-    assert id(glp_dead) in stub._known_grammar_processors, (
+    assert id(glp_dead) in stub._known_stateful_processors, (
         "must be tombstoned, not gone"
     )
-    assert id(glp_dead) in stub._grammar_tombstones
+    assert id(glp_dead) in stub._stateful_tombstones
     # A leaked slot still carries glp_dead at uid 9's (untracked) position.
     stub.batch_generator = _FakeBatchGen(
         uids=[7, 9], logits_processors=[[glp_live], [glp_dead]]
@@ -211,9 +220,9 @@ def test_realign_scrubs_finished_grammar_via_tombstone():
     assert lp[0] == [glp_live]
     assert lp[1] == [], "a finished (tombstoned) grammar must be scrubbed"
     # Now that it's absent from every slot, the tombstone is flushed.
-    assert id(glp_dead) not in stub._known_grammar_processors
-    assert id(glp_dead) not in stub._grammar_tombstones
-    assert id(glp_dead) not in stub._grammar_processor_objs
+    assert id(glp_dead) not in stub._known_stateful_processors
+    assert id(glp_dead) not in stub._stateful_tombstones
+    assert id(glp_dead) not in stub._stateful_processor_objs
 
 
 def test_tombstone_survives_until_absent_then_flushes():
@@ -228,7 +237,7 @@ def test_tombstone_survives_until_absent_then_flushes():
     stub._forget_uid_grammar(8)  # tombstoned; uid_to_request_processors now empty
     # A stale slot still holds glp_dead at an untracked position. The guard is
     # armed by the tombstone even though uid_to_request_processors is empty.
-    assert stub._grammar_tombstones, "tombstone must arm the realign guard"
+    assert stub._stateful_tombstones, "tombstone must arm the realign guard"
     stub.batch_generator = _FakeBatchGen(uids=[9], logits_processors=[[glp_dead]])
 
     stub._realign_grammar_logits_processors()
@@ -236,7 +245,7 @@ def test_tombstone_survives_until_absent_then_flushes():
     lp = stub.batch_generator._generation_batch.logits_processors
     assert lp[0] == [], "the tombstoned grammar is scrubbed from the leaked slot"
     # Scrubbed this tick -> now absent -> flushed.
-    assert id(glp_dead) not in stub._known_grammar_processors
+    assert id(glp_dead) not in stub._known_stateful_processors
 
 
 def test_realign_noop_when_already_correct():
@@ -263,8 +272,8 @@ def test_penalty_only_uid_does_not_arm_the_guard():
 
     assert 9 in stub.uid_to_request_processors, "tracked for desync repair"
     assert 9 not in stub._uids_with_grammar, "penalty-only must NOT arm the guard"
-    assert not stub._known_grammar_processors
-    assert not stub._grammar_tombstones
+    assert not stub._known_stateful_processors
+    assert not stub._stateful_tombstones
 
 
 def test_forget_penalty_only_uid_creates_no_tombstone():
@@ -275,15 +284,15 @@ def test_forget_penalty_only_uid_creates_no_tombstone():
     stub._forget_uid_grammar(9)
 
     assert 9 not in stub.uid_to_request_processors
-    assert not stub._grammar_tombstones, "a penalty-only uid must not tombstone"
-    assert not stub._known_grammar_processors
+    assert not stub._stateful_tombstones, "a penalty-only uid must not tombstone"
+    assert not stub._known_stateful_processors
 
 
-def test_forget_uid_grammar_tombstones_then_flush_drops_state():
+def test_forget_uid_stateful_tombstones_then_flush_drops_state():
     glp = object()
     stub = _make_scheduler_stub()
     _register(stub, 1, [glp], glp)
-    assert id(glp) in stub._known_grammar_processors
+    assert id(glp) in stub._known_stateful_processors
 
     stub._forget_uid_grammar(1)
 
@@ -292,14 +301,14 @@ def test_forget_uid_grammar_tombstones_then_flush_drops_state():
     # absent from every slot.
     assert 1 not in stub.uid_to_request_processors
     assert 1 not in stub._uids_with_grammar
-    assert id(glp) in stub._known_grammar_processors, "tombstoned, not yet dropped"
-    assert id(glp) in stub._grammar_tombstones
+    assert id(glp) in stub._known_stateful_processors, "tombstoned, not yet dropped"
+    assert id(glp) in stub._stateful_tombstones
 
     # No slot holds it -> flush drops it entirely.
-    stub._flush_grammar_tombstones(present=set())
-    assert id(glp) not in stub._known_grammar_processors
-    assert id(glp) not in stub._grammar_processor_objs
-    assert id(glp) not in stub._grammar_tombstones
+    stub._flush_stateful_tombstones(present=set())
+    assert id(glp) not in stub._known_stateful_processors
+    assert id(glp) not in stub._stateful_processor_objs
+    assert id(glp) not in stub._stateful_tombstones
 
 
 def test_realign_handles_missing_generation_batch():
@@ -317,7 +326,7 @@ def test_realign_handles_empty_uids_flushes_tombstones():
     stub.batch_generator = _FakeBatchGen(uids=[], logits_processors=[])
     stub._realign_grammar_logits_processors()  # no raise
     # No live slots -> tombstone is trivially absent everywhere -> flushed.
-    assert id(glp_dead) not in stub._known_grammar_processors
+    assert id(glp_dead) not in stub._known_stateful_processors
 
 
 def test_realign_empty_uids_scrubs_stale_processor_list():
@@ -343,8 +352,185 @@ def test_realign_empty_uids_scrubs_stale_processor_list():
         "slot must be scrubbed so the next plain request cannot inherit it"
     )
     # And the tombstone is flushed now that the grammar is absent everywhere.
-    assert id(glp_dead) not in stub._known_grammar_processors
-    assert id(glp_dead) not in stub._grammar_tombstones
+    assert id(glp_dead) not in stub._known_stateful_processors
+    assert id(glp_dead) not in stub._stateful_tombstones
+
+
+# ── generation-time reasoning-budget processors ───────────────────────
+#
+# A budget processor (force-close </think>) is a per-request logits processor
+# with the same desync exposure as a grammar: mlx-lm's positional list drops it
+# when a no-processor request finishes while the budget request is mid-flight.
+# Observed live on qwen3-0.6b: a plain greedy request preceding a budget request
+# left the budget inert (the </think> was never forced, reasoning ran unbounded)
+# because the budget uid did NOT arm the realign guard. So a live budget uid now
+# arms it too — its slot is rebuilt from ``uid_to_request_processors`` every tick.
+
+
+def test_realign_repairs_budget_processor_stale_leading_entry():
+    # The live-repro shape: a finished no-processor uid left a stale empty entry
+    # at index 0; the budget uid sits at index 1 but is the ONLY live uid.
+    # Realign must place the budget processor at the budget uid's real position.
+    rblp = object()
+    stub = _make_scheduler_stub()
+    _register(stub, 42, [rblp], budget=rblp)
+    stub.batch_generator = _FakeBatchGen(uids=[42], logits_processors=[[], [rblp]])
+
+    stub._realign_grammar_logits_processors()
+
+    lp = stub.batch_generator._generation_batch.logits_processors
+    assert len(lp) == 1, "logits_processors must be realigned to len(uids)"
+    assert lp[0] == [rblp], "the budget processor must land at its uid's index"
+
+
+def test_realign_preserves_budget_processor_on_length_desync():
+    # A budget request (uid 7) batched with a plain request (uid 9). A stale
+    # entry length-desyncs the positional list — the budget processor must NOT
+    # be zeroed off its uid (the exact bug: reasoning ran unbounded).
+    rblp = object()
+    stub = _make_scheduler_stub()
+    _register(stub, 7, [rblp], budget=rblp)
+    stub.batch_generator = _FakeBatchGen(
+        uids=[7, 9], logits_processors=[[], [rblp], []]
+    )
+
+    stub._realign_grammar_logits_processors()
+
+    lp = stub.batch_generator._generation_batch.logits_processors
+    assert len(lp) == 2, "realigned to len(uids)"
+    assert lp[0] == [rblp], "budget uid must keep its force-close processor"
+    assert lp[1] == [], "plain uid carries no processor"
+
+
+def test_realign_preserves_budget_plus_penalties_in_order():
+    # A budget uid may also carry penalties; the authoritative per-uid list keeps
+    # both in insert order (penalties first, budget appended LAST so its
+    # force-close mask has final say).
+    penalty = object()
+    rblp = object()
+    stub = _make_scheduler_stub()
+    _register(stub, 5, [penalty, rblp], budget=rblp)
+    stub.batch_generator = _FakeBatchGen(
+        uids=[5], logits_processors=[[], [penalty, rblp]]
+    )
+
+    stub._realign_grammar_logits_processors()
+
+    lp = stub.batch_generator._generation_batch.logits_processors
+    assert lp[0] == [penalty, rblp], "budget uid keeps penalty + budget in order"
+
+
+def test_realign_grammar_and_budget_coexist_on_distinct_uids():
+    # A grammar request and a budget request in the same batch each keep their
+    # own processor — neither leaks onto the other.
+    glp = object()
+    rblp = object()
+    stub = _make_scheduler_stub()
+    _register(stub, 7, [glp], grammar=glp)
+    _register(stub, 9, [rblp], budget=rblp)
+    stub.batch_generator = _FakeBatchGen(uids=[7, 9], logits_processors=[[glp], [rblp]])
+
+    stub._realign_grammar_logits_processors()
+
+    lp = stub.batch_generator._generation_batch.logits_processors
+    assert lp[0] == [glp]
+    assert lp[1] == [rblp]
+
+
+def test_realign_guard_armed_by_budget_uid_alone():
+    # Exercises the PRODUCTION arming predicate the scheduler step loop calls, so
+    # deleting the budget arm fails here (not only on live hardware). A live
+    # budget uid — with NO grammar and NO tombstone — must arm the realign.
+    rblp = object()
+    stub = _make_scheduler_stub()
+    assert stub._realign_guard_armed() is False, "empty batch: no realign"
+    _register(stub, 9, [rblp], budget=rblp)
+    assert stub._realign_guard_armed() is True, "a budget uid must arm the guard"
+    # It arms via the live-budget set, NOT as a grammar uid...
+    assert 9 in stub._uids_with_reasoning_budget
+    assert 9 not in stub._uids_with_grammar
+    # ...but its identity IS tracked in the stateful set so a leaked force-close
+    # processor can be tombstoned + scrubbed like a grammar (codex #1).
+    assert id(rblp) in stub._known_stateful_processors
+    assert not stub._stateful_tombstones, "not tombstoned while still live"
+
+
+def test_realign_guard_disarms_when_budget_processor_ended():
+    # codex R10 #4: once a budget processor has forced </think> (``_ended``) it is
+    # inert — it must STOP arming the guard so the answer-token decode loop does
+    # not pay an O(batch) slot rebuild per token. A live (not-ended) budget uid
+    # still arms; flipping ``_ended`` disarms it (no grammar / no tombstone here).
+    class _Budget:
+        def __init__(self):
+            self._ended = False
+
+    rblp = _Budget()
+    stub = _make_scheduler_stub()
+    _register(stub, 9, [rblp], budget=rblp)
+    assert stub._realign_guard_armed() is True, "active budget uid arms the guard"
+    rblp._ended = True
+    assert stub._realign_guard_armed() is False, (
+        "an ended (inert) budget processor must no longer arm the guard"
+    )
+    # Still tracked (uid live) so a later finish/leak is tombstoned + scrubbed.
+    assert 9 in stub._uids_with_reasoning_budget
+
+
+def test_realign_guard_not_armed_by_penalty_only_uid():
+    # A penalty-only uid is tracked for desync repair but MUST NOT arm the guard
+    # (perf: no O(batch) rebuild on the plain decode hot path).
+    penalty = object()
+    stub = _make_scheduler_stub()
+    _register(stub, 9, [penalty])  # penalty-only, no grammar, no budget
+    assert 9 in stub.uid_to_request_processors
+    assert stub._realign_guard_armed() is False
+
+
+def test_realign_guard_armed_by_grammar_uid():
+    glp = object()
+    stub = _make_scheduler_stub()
+    _register(stub, 7, [glp], grammar=glp)
+    assert stub._realign_guard_armed() is True
+
+
+def test_forget_budget_uid_tombstones_until_scrubbed():
+    # A finished budget uid must TOMBSTONE its force-close processor (not forget
+    # it outright): mlx-lm can leave the stateful processor in a leaked
+    # positional slot for a tick, and the tombstone keeps the realign guard armed
+    # so that slot is scrubbed before the processor is dropped (codex #1).
+    rblp = object()
+    stub = _make_scheduler_stub()
+    _register(stub, 9, [rblp], budget=rblp)
+
+    stub._forget_uid_grammar(9)
+
+    assert 9 not in stub._uids_with_reasoning_budget, "live arming cleared"
+    assert 9 not in stub.uid_to_request_processors, "per-uid state dropped"
+    # Tombstoned, NOT forgotten — the guard stays armed for the scrub tick.
+    assert id(rblp) in stub._stateful_tombstones
+    assert id(rblp) in stub._known_stateful_processors
+    assert stub._realign_guard_armed(), "tombstone keeps the guard armed"
+
+
+def test_leaked_budget_processor_scrubbed_from_foreign_slot_then_flushed():
+    # codex #1 end-to-end: budget uid 5 finishes, but mlx-lm leaves its
+    # force-close processor leaked in a stale slot alongside a later no-processor
+    # uid 6. The realign must scrub the leak (uid 6 -> []) and, once the leaked
+    # processor is absent from every slot, flush the tombstone + disarm — without
+    # this, the stateful </think> latch would force-close uid 6's output.
+    rblp = object()
+    stub = _make_scheduler_stub()
+    _register(stub, 5, [rblp], budget=rblp)
+    stub._forget_uid_grammar(5)  # uid 5 done → rblp tombstoned
+    # mlx-lm's lagging filter: rblp leaked onto uid 6's positional slot.
+    stub.batch_generator = _FakeBatchGen(uids=[6], logits_processors=[[rblp]])
+
+    stub._realign_grammar_logits_processors()
+
+    lp = stub.batch_generator._generation_batch.logits_processors
+    assert lp == [[]], "leaked force-close processor scrubbed from the foreign uid"
+    assert not stub._stateful_tombstones, "tombstone flushed once absent from slots"
+    assert not stub._realign_guard_armed(), "guard disarms after the scrub"
 
 
 if __name__ == "__main__":

@@ -1383,9 +1383,14 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         enable_thinking: bool | None = None,
+        add_generation_prompt: bool = True,
     ) -> str:
         """Render the chat prompt for ``messages`` + ``tools`` without starting
         generation.
+
+        ``add_generation_prompt`` (default True) toggles the assistant
+        generation prefix; the reasoning-budget seed probe renders twice
+        (True/False) and diffs to isolate the template-added prefix exactly.
 
         Used by:
           * Cloud routing (``routes/chat.py``) — needs the prompt to estimate
@@ -1410,6 +1415,7 @@ class BatchedEngine(BaseEngine):
             messages,
             tools=template_tools,
             enable_thinking=enable_thinking,
+            add_generation_prompt=add_generation_prompt,
         )
         prepared, _ = self._prepare_harmony_no_thinking_prompt(
             prompt,
@@ -1455,6 +1461,7 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         num_images: int = 0,
         enable_thinking: bool | None = None,
+        add_generation_prompt: bool = True,
     ) -> str:
         """Apply chat template to messages.
 
@@ -1511,6 +1518,7 @@ class BatchedEngine(BaseEngine):
             tools=tools,
             enable_thinking=enable_thinking,
             model_name=self._model_name,
+            add_generation_prompt=add_generation_prompt,
         )
 
     @staticmethod
@@ -1685,6 +1693,9 @@ class BatchedEngine(BaseEngine):
         # Grammar-constrained tool calling (#558): per-request logits
         # processor forwarded to the scheduler's request_processors slot.
         grammar_logits_processor = kwargs.pop("grammar_logits_processor", None)
+        reasoning_budget_logits_processor = kwargs.pop(
+            "reasoning_budget_logits_processor", None
+        )
         if output_router_seed is None and isinstance(prompt, str):
             # ``build_prompt(enable_thinking=False)`` is part of the public
             # engine contract and returns the prepared Harmony string. A
@@ -1709,6 +1720,7 @@ class BatchedEngine(BaseEngine):
             has_tools=has_tools,
             requires_prompt_integrity=requires_prompt_integrity,
             grammar_logits_processor=grammar_logits_processor,
+            reasoning_budget_logits_processor=reasoning_budget_logits_processor,
         )
 
         if assistant_text_prefix:
@@ -1898,6 +1910,9 @@ class BatchedEngine(BaseEngine):
         requires_prompt_integrity = bool(kwargs.pop("requires_prompt_integrity", False))
         # Grammar-constrained tool calling (#558) — streaming parity.
         grammar_logits_processor = kwargs.pop("grammar_logits_processor", None)
+        reasoning_budget_logits_processor = kwargs.pop(
+            "reasoning_budget_logits_processor", None
+        )
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
@@ -1905,6 +1920,7 @@ class BatchedEngine(BaseEngine):
             has_tools=has_tools,
             requires_prompt_integrity=requires_prompt_integrity,
             grammar_logits_processor=grammar_logits_processor,
+            reasoning_budget_logits_processor=reasoning_budget_logits_processor,
         )
         # C-01 force-abort: publish the scheduler request id (text path)
         # so the route's disconnect_guard can call abort_request directly

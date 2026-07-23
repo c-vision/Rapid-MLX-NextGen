@@ -1959,25 +1959,48 @@ class Scheduler:
         # penalty-only uid is recorded above for correct desync repair but does
         # NOT by itself arm the guard.
         self._uids_with_grammar: set[int] = set()
-        # Identity set of every grammar processor currently in flight (by
-        # ``id()``), so a slot can be scrubbed of ANY grammar processor before
-        # its uid's authoritative list is applied — this recognizes even a
-        # grammar whose owning uid already finished but that still lingers in a
-        # leaked slot. An id is dropped only once its owning uid is removed AND
-        # the processor is absent from every live batch slot (tombstoned until
-        # then; see ``_forget_uid_grammar`` + the sweep in the realign guard).
-        self._known_grammar_processors: set[int] = set()
+        # Which tracked uids carry a generation-time reasoning-budget processor
+        # (force-close </think>). Like a grammar, a budget processor is a
+        # per-request logits processor whose slot MUST stay aligned to its uid
+        # across ticks: mlx-lm's positional ``logits_processors`` list can desync
+        # when a NO-processor request finishes while this one is mid-flight,
+        # silently dropping the budget so the </think> is never forced (observed
+        # on a live model: a plain greedy request preceding a budget request left
+        # the budget inert). So a live budget uid ALSO arms the realign guard,
+        # which rebuilds every slot from ``uid_to_request_processors`` (the source
+        # of truth that already holds the budget processor). Penalty-only uids
+        # still do NOT arm it — only grammar and budget carry a hard per-token
+        # guarantee that a desync would violate.
+        #
+        # Maps uid -> budget processor (not a bare set) so the realign guard can
+        # see each processor's ``_ended`` latch: a budget processor arms the guard
+        # ONLY while it can still act (before it has forced ``</think>``). Once it
+        # is ``_ended`` (thinking closed, now emitting the answer) it is inert —
+        # keeping the guard armed for it would add an O(batch) slot rebuild to
+        # EVERY answer token for nothing (codex R10 #4). A finished uid's leaked
+        # processor is still handled: ``_forget_uid_grammar`` tombstones it, and
+        # the tombstone re-arms the guard for the scrub tick.
+        self._uids_with_reasoning_budget: dict[int, Any] = {}
+        # Identity set of every STATEFUL per-request processor currently in
+        # flight (by ``id()``) — a grammar OR a reasoning-budget force-close.
+        # Lets a slot be scrubbed of ANY such processor before its uid's
+        # authoritative list is applied — recognizing even one whose owning uid
+        # already finished but that still lingers in a leaked slot. An id is
+        # dropped only once its owning uid is removed AND the processor is absent
+        # from every live batch slot (tombstoned until then; see
+        # ``_forget_uid_grammar`` + the sweep in the realign guard).
+        self._known_stateful_processors: set[int] = set()
         # Keeps each tracked processor OBJECT alive while its ``id()`` is in the
         # set above, so Python can't reuse that id for a different object while
-        # the grammar may still sit in a batch slot (id-reuse-after-GC guard).
-        self._grammar_processor_objs: dict[int, Any] = {}
-        # Grammar processors whose owning uid has left the tracking maps but
-        # that may still linger in a leaked batch slot. Kept in
-        # ``_known_grammar_processors`` (so they're still scrubbed) until the
+        # the processor may still sit in a batch slot (id-reuse-after-GC guard).
+        self._stateful_processor_objs: dict[int, Any] = {}
+        # Stateful processors (grammar/budget) whose owning uid has left the
+        # tracking maps but that may still linger in a leaked batch slot. Kept in
+        # ``_known_stateful_processors`` (so they're still scrubbed) until the
         # realign guard confirms they're absent from every live slot, then
-        # forgotten. Closes the cleanup-ordering gap where the LAST grammar
+        # forgotten. Closes the cleanup-ordering gap where the LAST such processor
         # finishing would disarm the guard before its leaked slot was cleaned.
-        self._grammar_tombstones: set[int] = set()
+        self._stateful_tombstones: set[int] = set()
 
         # BatchGenerator - the actual batching engine
         self.batch_generator: BatchGenerator | None = None
@@ -4026,36 +4049,122 @@ class Scheduler:
             # masks the abort in the caller's exception handler.
             pass
 
+    def _register_uid_processors(
+        self,
+        uid: int,
+        request: Any,
+        request_processors: list | None,
+        grammar_lp: Any,
+    ) -> None:
+        """Record a uid's logits-processor bookkeeping at admission.
+
+        Single source of truth for the per-tick realign guard (the COUNTERPART
+        of :meth:`_forget_uid_grammar`). Both the scheduler's admission path and
+        the realign unit tests call THIS method, so a regression in the recorded
+        state (a dropped budget/grammar arm, a lost penalty list) fails a test
+        rather than only surfacing on live hardware (codex #558 NIT).
+
+        * ``uid_to_request_processors`` remembers EVERY uid that carries any
+          processor (grammar + penalties), the authoritative list the realign
+          rebuilds each slot from — immune to mlx-lm's stale-entry desync.
+        * A grammar-carrying uid also registers the grammar's identity in the
+          stateful-processor set (so a leaked slot can be scrubbed even after the
+          uid finishes) and arms the guard.
+        * A reasoning-budget uid arms the guard so its force-close ``</think>``
+          processor is realigned every tick, AND registers the budget
+          processor's identity in the SAME stateful set — a budget processor is
+          per-request stateful (a ``</think>`` force-close latch), so if a
+          finished budget uid's processor leaks into a stale positional slot
+          after cancellation/truncation it must be tombstoned and scrubbed
+          exactly like a leaked grammar (codex: track + tombstone budget like
+          grammar). Its object already lives in ``uid_to_request_processors[uid]``
+          too.
+        """
+        if request_processors:
+            self.uid_to_request_processors[uid] = list(request_processors)
+        if grammar_lp is not None:
+            self._uids_with_grammar.add(uid)
+            self._known_stateful_processors.add(id(grammar_lp))
+            # Keep the object alive so its ``id()`` can't be reused by a
+            # different object while it may still linger in a slot.
+            self._stateful_processor_objs[id(grammar_lp)] = grammar_lp
+        _rblp = getattr(request, "reasoning_budget_logits_processor", None)
+        if _rblp is not None:
+            self._uids_with_reasoning_budget[uid] = _rblp
+            # Same tombstone/scrub treatment as grammar (see docstring): register
+            # identity + keep the object alive so a leaked force-close processor
+            # is scrubbed from a foreign slot and the guard stays armed for that
+            # scrubbing tick.
+            self._known_stateful_processors.add(id(_rblp))
+            self._stateful_processor_objs[id(_rblp)] = _rblp
+
     def _forget_uid_grammar(self, uid: int) -> None:
         """Drop #558 PR-3 per-uid processor state for a uid leaving the batch.
 
         Called from the abort + finish cleanup paths. Those paths remove ``uid``
         from the generation batch's ``uids`` *before* the next tick's realign,
         but mlx-lm's own positional ``logits_processors`` filter can lag by a
-        tick and leave the just-finished grammar in a LEAKED slot. So we do NOT
-        immediately forget the grammar's identity here: we TOMBSTONE it (keep it
-        in ``_known_grammar_processors`` so the realign guard still scrubs it)
-        until the guard confirms it's absent from every live slot. Penalty-only
-        uids carry no grammar and are simply dropped.
+        tick and leave the just-finished STATEFUL processor (grammar OR
+        reasoning-budget force-close) in a LEAKED slot. So we do NOT immediately
+        forget its identity here: we TOMBSTONE it (keep it in
+        ``_known_stateful_processors`` so the realign guard stays armed and still
+        scrubs it) until the guard confirms it's absent from every live slot.
+        This is what stops a finished budget uid's force-close processor from
+        leaking onto a later no-processor request after the last budget uid
+        disarms the guard (codex). Penalty-only uids carry no stateful processor
+        and are simply dropped.
         """
         self._uids_with_grammar.discard(uid)
+        self._uids_with_reasoning_budget.pop(uid, None)
         procs = self.uid_to_request_processors.pop(uid, None)
         if not procs:
             return
-        # A grammar in this uid's list that's still referenced by ANOTHER live
-        # uid stays fully live; otherwise it becomes a tombstone — still known
-        # (and thus still scrubbable) but pending removal once no slot holds it.
-        # A request never shares its GrammarLogitsProcessor, so the cross-uid
-        # check is defensive; the tombstone is the load-bearing part.
+        # A stateful processor (grammar/budget) in this uid's list that's still
+        # referenced by ANOTHER live uid stays fully live; otherwise it becomes a
+        # tombstone — still known (and thus still scrubbable) but pending removal
+        # once no slot holds it. A request never shares its stateful processor, so
+        # the cross-uid check is defensive; the tombstone is the load-bearing part.
         still_referenced: set[int] = set()
         for plist in self.uid_to_request_processors.values():
             for p in plist:
-                if id(p) in self._known_grammar_processors:
+                if id(p) in self._known_stateful_processors:
                     still_referenced.add(id(p))
         for p in procs:
             pid = id(p)
-            if pid in self._known_grammar_processors and pid not in still_referenced:
-                self._grammar_tombstones.add(pid)
+            if pid in self._known_stateful_processors and pid not in still_referenced:
+                self._stateful_tombstones.add(pid)
+
+    def _realign_guard_armed(self) -> bool:
+        """True when the per-tick logits-processor realign must run.
+
+        Armed by any live GRAMMAR uid, a not-yet-flushed stateful tombstone, or
+        any reasoning-BUDGET uid whose processor is still ACTIVE (has not yet
+        forced ``</think>``). All carry a HARD per-token guarantee (a constrained
+        tool call / a pending forced ``</think>``) that mlx-lm's positional
+        ``logits_processors`` desync would silently violate, so their slots must
+        be rebuilt from ``uid_to_request_processors`` every tick.
+
+        A budget processor that has already ``_ended`` (thinking closed; now
+        emitting the answer) is INERT — it returns logits unchanged — so it no
+        longer needs its slot realigned, and keeping the guard armed for it would
+        add an O(batch) rebuild to every remaining ANSWER token for no benefit
+        (codex R10 #4). Disarming is safe: if such an inert processor later leaks
+        into a foreign slot, applying it is a no-op, and when its uid finishes
+        ``_forget_uid_grammar`` tombstones it — which re-arms the guard for the
+        scrub tick. Penalty-only uids never arm it (plain decode hot path).
+
+        This is the single source of truth for the arming condition so it can be
+        unit-tested directly (a deleted budget arm fails a test rather than only
+        surfacing on live hardware).
+        """
+        return bool(
+            self._uids_with_grammar
+            or self._stateful_tombstones
+            or any(
+                not getattr(p, "_ended", False)
+                for p in self._uids_with_reasoning_budget.values()
+            )
+        )
 
     def _realign_grammar_logits_processors(self) -> None:
         """Rebuild the generation batch's ``logits_processors`` aligned to uids.
@@ -4078,7 +4187,7 @@ class Scheduler:
             re-inserted).
           * A uid we do NOT track genuinely has no processors, so its slot is
             ``[]``. This also scrubs any grammar processor (by identity, via the
-            ``_known_grammar_processors`` set — which still contains tombstoned
+            ``_known_stateful_processors`` set — which still contains tombstoned
             grammars whose owning uid finished, closing the cleanup-ordering
             gap) that leaked into that slot via a desync.
 
@@ -4096,7 +4205,7 @@ class Scheduler:
             # #558-PR3 nit): otherwise a finished grammar's processor + matcher
             # state would be retained indefinitely across an idle period where
             # the batch object itself is absent.
-            self._flush_grammar_tombstones(present=set())
+            self._flush_stateful_tombstones(present=set())
             return
         uids = getattr(bg, "uids", None)
         if not uids:
@@ -4111,7 +4220,7 @@ class Scheduler:
             existing = getattr(bg, "logits_processors", None)
             if existing:
                 bg.logits_processors = []
-            self._flush_grammar_tombstones(present=set())
+            self._flush_stateful_tombstones(present=set())
             return
         existing = getattr(bg, "logits_processors", None)
         aligned = existing is not None and len(existing) == len(uids)
@@ -4130,7 +4239,7 @@ class Scheduler:
                 # any grammar that leaked here via a desync).
                 slot = []
             for p in slot:
-                if id(p) in self._known_grammar_processors:
+                if id(p) in self._known_stateful_processors:
                     present_ids.add(id(p))
             # Detect whether this slot differs from what's there now.
             if not aligned or existing[i] != slot:
@@ -4138,9 +4247,9 @@ class Scheduler:
             rebuilt.append(slot)
         if changed:
             bg.logits_processors = rebuilt
-        self._flush_grammar_tombstones(present=present_ids)
+        self._flush_stateful_tombstones(present=present_ids)
 
-    def _flush_grammar_tombstones(self, present: set[int]) -> None:
+    def _flush_stateful_tombstones(self, present: set[int]) -> None:
         """Forget tombstoned grammar identities no longer in any live slot.
 
         A tombstone (see ``_forget_uid_grammar``) is a grammar whose owning uid
@@ -4148,12 +4257,12 @@ class Scheduler:
         slot. Once the realign guard confirms it's absent from every live slot,
         it's safe to fully drop — releasing the id-reuse guard object too.
         """
-        for pid in list(self._grammar_tombstones):
+        for pid in list(self._stateful_tombstones):
             if pid in present:
                 continue
-            self._grammar_tombstones.discard(pid)
-            self._known_grammar_processors.discard(pid)
-            self._grammar_processor_objs.pop(pid, None)
+            self._stateful_tombstones.discard(pid)
+            self._known_stateful_processors.discard(pid)
+            self._stateful_processor_objs.pop(pid, None)
 
     def _process_pending_aborts(self) -> None:
         """Drain and process pending abort requests. Called from executor thread."""
@@ -4473,6 +4582,14 @@ class Scheduler:
                         frequency_context_size=4096,
                     )
                 )
+            # Generation-time thinking-token budget (force-close </think>).
+            # Appended LAST so its force-close mask (all but </think> -> -inf)
+            # has final say over any penalty/grammar bias in the same step;
+            # it is inert (returns logits unchanged) once thinking has ended,
+            # so a chained grammar processor owns the generation phase.
+            _rblp = getattr(request, "reasoning_budget_logits_processor", None)
+            if _rblp is not None:
+                request_processors.append(_rblp)
             request_logits_processors = (
                 [request_processors] if request_processors else None
             )
@@ -4573,23 +4690,12 @@ class Scheduler:
                 self.uid_to_request_id[uid] = request.request_id
                 request.batch_uid = uid
                 request.status = RequestStatus.RUNNING
-                # #558 PR-3: remember this request's FULL processor list
-                # (grammar + penalties) by uid as the authoritative state the
-                # per-tick realign guard rebuilds from — immune to mlx-lm's
-                # stale-entry desync. We track EVERY uid that carries any
-                # processor, not just grammar ones, so a penalty-only bystander's
-                # processors survive a length-desync rebuild (they'd otherwise be
-                # zeroed). Grammar-carrying uids also register the grammar's
-                # identity (so leaked slots can be scrubbed even after the uid
-                # finishes) and arm the guard.
-                if request_processors:
-                    self.uid_to_request_processors[uid] = list(request_processors)
-                if _glp is not None:
-                    self._uids_with_grammar.add(uid)
-                    self._known_grammar_processors.add(id(_glp))
-                    # Keep the object alive so its ``id()`` can't be reused by a
-                    # different object while it may still linger in a slot.
-                    self._grammar_processor_objs[id(_glp)] = _glp
+                # #558 PR-3 / #558 budget: record this request's FULL processor
+                # list (grammar + penalties + budget) by uid as the authoritative
+                # state the per-tick realign guard rebuilds from — immune to
+                # mlx-lm's stale-entry desync. Extracted into a production helper
+                # so the realign tests exercise the SAME registration (codex NIT).
+                self._register_uid_processors(uid, request, request_processors, _glp)
                 # Attach incremental decoder for multi-byte safe streaming
                 request._decoder = IncrementalDecoder(self._actual_tokenizer)
                 # Release the prompt cache reference now that BatchGenerator
@@ -5305,7 +5411,7 @@ class Scheduler:
                     # reconstruction state used when a grammar realign fires;
                     # arming on them would run an O(batch) rebuild every token on
                     # the plain decode hot path (codex #558-PR3).
-                    if self._uids_with_grammar or self._grammar_tombstones:
+                    if self._realign_guard_armed():
                         self._realign_grammar_logits_processors()
                     raw_next = self.batch_generator.next()
                     output.has_work = True
@@ -5340,7 +5446,7 @@ class Scheduler:
                 # scrubs ``bg.logits_processors`` to ``[]`` before forgetting the
                 # tombstones — closing the leaked-slot inheritance gap (codex
                 # #558-PR3 blocking).
-                if self._grammar_tombstones and not self.running:
+                if self._stateful_tombstones and not self.running:
                     self._realign_grammar_logits_processors()
 
                 # Success - break out of retry loop

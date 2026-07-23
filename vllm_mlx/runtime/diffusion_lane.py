@@ -795,11 +795,12 @@ class DiffusionEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         enable_thinking: bool | None = None,
+        add_generation_prompt: bool = True,
     ) -> str:
         self._ensure_loaded()
         template_kwargs: dict[str, Any] = {
             "tokenize": False,
-            "add_generation_prompt": True,
+            "add_generation_prompt": add_generation_prompt,
         }
         # Only forward ``tools`` to the chat template when the active
         # alias declares a tool parser this engine can actually surface

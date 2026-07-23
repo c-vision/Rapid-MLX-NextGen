@@ -742,6 +742,7 @@ class EngineCore:
         has_tools: bool = False,
         requires_prompt_integrity: bool = False,
         grammar_logits_processor: Any | None = None,
+        reasoning_budget_logits_processor: Any | None = None,
     ) -> str:
         """
         Add a request for processing.
@@ -777,6 +778,7 @@ class EngineCore:
             has_tools=has_tools,
             requires_prompt_integrity=requires_prompt_integrity,
             grammar_logits_processor=grammar_logits_processor,
+            reasoning_budget_logits_processor=reasoning_budget_logits_processor,
         )
 
         # Throttle requests for hybrid models (GatedDeltaNet + Transformer).

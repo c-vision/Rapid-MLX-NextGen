@@ -177,6 +177,15 @@ class Request:
     # free-form-then-parse behavior (non-breaking default).
     grammar_logits_processor: Any | None = None
 
+    # Generation-time thinking-token budget (force-close ``</think>``). Optional
+    # per-request logits processor set by the chat route when
+    # ``reasoning_max_tokens`` is set, thinking is enabled, and the model's
+    # ``</think>`` resolves to a single token. Runs as a per-step logits
+    # processor (same slot mechanics as ``grammar_logits_processor``), forcing
+    # the model to close its ``<think>`` block once the budget is spent. ``None``
+    # -> the post-hoc reasoning cap in the postprocessor owns the request.
+    reasoning_budget_logits_processor: Any | None = None
+
     # PFlash prompt compression state. When pflash_metadata["compressed"]
     # is True, prompt_token_ids is the compressed list and
     # original_prompt_token_ids holds the pre-compression sequence so
