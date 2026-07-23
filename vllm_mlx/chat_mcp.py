@@ -15,9 +15,12 @@ import logging
 import re
 import sys
 import threading
+import time
+from collections.abc import Callable
 from contextlib import AsyncExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from anyio.abc import TaskStatus
 from anyio.from_thread import start_blocking_portal
@@ -34,6 +37,18 @@ _OPTIONAL_COMPONENT_WARNINGS = {
     "Could not fetch prompts: Method not found",
     "Could not fetch resources: Method not found",
 }
+
+
+@dataclass(frozen=True)
+class ChatToolEvent:
+    """One lifecycle update for a tool call owned by ``rapid-mlx chat``."""
+
+    phase: Literal["start", "finish"]
+    call_id: str
+    name: str
+    elapsed_seconds: float | None = None
+    is_error: bool | None = None
+    message: dict[str, Any] | None = None
 
 
 class _OptionalComponentWarningFilter(logging.Filter):
@@ -122,8 +137,9 @@ class ChatMCPRuntime:
     def execute_tool_calls(
         self,
         tool_calls: list[dict[str, Any]],
+        on_event: Callable[[ChatToolEvent], None] | None = None,
     ) -> list[dict[str, Any]]:
-        """Execute calls sequentially and return OpenAI ``tool`` messages."""
+        """Execute independent server lanes and return ordered tool messages."""
 
         done = threading.Event()
         with self._state_lock:
@@ -133,6 +149,7 @@ class ChatMCPRuntime:
                 self._execute_with_done,
                 tool_calls,
                 done,
+                on_event,
             )
             self._active_future = future
             self._active_done = done
@@ -269,90 +286,160 @@ class ChatMCPRuntime:
         self,
         tool_calls: list[dict[str, Any]],
         done: threading.Event,
+        on_event: Callable[[ChatToolEvent], None] | None,
     ) -> list[dict[str, Any]]:
         try:
-            return await self._execute(tool_calls)
+            return await self._execute(tool_calls, on_event)
         finally:
             done.set()
 
     async def _execute(
         self,
         tool_calls: list[dict[str, Any]],
+        on_event: Callable[[ChatToolEvent], None] | None,
     ) -> list[dict[str, Any]]:
-        messages: list[dict[str, Any]] = []
+        messages: list[dict[str, Any] | None] = [None] * len(tool_calls)
+        lanes: dict[str, list[tuple[int, dict[str, Any]]]] = {}
         for position, tool_call in enumerate(tool_calls):
-            call_id = str(tool_call.get("id") or f"call_{position}")
             function = tool_call.get("function") or {}
-            full_name = str(function.get("name") or "")
-            tool = self._tools_by_name.get(full_name)
-            arguments: dict[str, Any] = {}
+            tool = self._tools_by_name.get(str(function.get("name") or ""))
+            lane = (
+                f"server:{tool.server_name}"
+                if tool is not None
+                else f"invalid:{position}"
+            )
+            lanes.setdefault(lane, []).append((position, tool_call))
 
+        async def _run_lane(
+            calls: list[tuple[int, dict[str, Any]]],
+        ) -> None:
+            for position, tool_call in calls:
+                messages[position] = await self._execute_one(
+                    position,
+                    tool_call,
+                    on_event,
+                )
+
+        tasks = [asyncio.create_task(_run_lane(calls)) for calls in lanes.values()]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        return [message for message in messages if message is not None]
+
+    async def _execute_one(
+        self,
+        position: int,
+        tool_call: dict[str, Any],
+        on_event: Callable[[ChatToolEvent], None] | None,
+    ) -> dict[str, Any]:
+        call_id = str(tool_call.get("id") or f"call_{position}")
+        function = tool_call.get("function") or {}
+        full_name = str(function.get("name") or "")
+        tool = self._tools_by_name.get(full_name)
+        arguments: dict[str, Any] = {}
+        started = time.monotonic()
+        _emit_tool_event(
+            on_event,
+            ChatToolEvent("start", call_id, full_name),
+        )
+        content: str | None = None
+        message: dict[str, Any] | None = None
+        is_error = True
+
+        try:
+            raw_arguments = function.get("arguments", "{}")
+            parsed_arguments = (
+                json.loads(raw_arguments)
+                if isinstance(raw_arguments, str)
+                else raw_arguments
+            )
+            if not isinstance(parsed_arguments, dict):
+                raise ValueError("tool arguments must be a JSON object")
+            arguments = parsed_arguments
+            if tool is None:
+                raise ValueError(f"Unknown MCP tool: {full_name or '<empty>'}")
+
+            validate_tool_arguments(tool, arguments, strict=True)
+            self._sandbox.validate_tool_execution(
+                tool.name,
+                tool.server_name,
+                arguments,
+            )
+
+            group = self._groups[tool.server_name]
+            timeout = self._server_timeout(tool.server_name)
             try:
-                raw_arguments = function.get("arguments", "{}")
-                parsed_arguments = (
-                    json.loads(raw_arguments)
-                    if isinstance(raw_arguments, str)
-                    else raw_arguments
+                result = await asyncio.wait_for(
+                    group.call_tool(full_name, arguments),
+                    timeout=timeout,
                 )
-                if not isinstance(parsed_arguments, dict):
-                    raise ValueError("tool arguments must be a JSON object")
-                arguments = parsed_arguments
-                if tool is None:
-                    raise ValueError(f"Unknown MCP tool: {full_name or '<empty>'}")
+            except (TimeoutError, asyncio.TimeoutError) as exc:
+                raise RuntimeError(
+                    f"MCP tool {full_name!r} timed out after {timeout:g} seconds"
+                ) from exc
 
-                validate_tool_arguments(tool, arguments, strict=True)
-                self._sandbox.validate_tool_execution(
-                    tool.name,
-                    tool.server_name,
-                    arguments,
-                )
-
-                group = self._groups[tool.server_name]
-                timeout = self._server_timeout(tool.server_name)
-                try:
-                    result = await asyncio.wait_for(
-                        group.call_tool(full_name, arguments),
-                        timeout=timeout,
-                    )
-                except (TimeoutError, asyncio.TimeoutError) as exc:
-                    raise RuntimeError(
-                        f"MCP tool {full_name!r} timed out after {timeout:g} seconds"
-                    ) from exc
-
-                content = json.dumps(
-                    result.model_dump(mode="json", by_alias=True, exclude_none=True),
-                    ensure_ascii=False,
-                )
-                is_error = bool(getattr(result, "isError", False))
+            content = json.dumps(
+                result.model_dump(mode="json", by_alias=True, exclude_none=True),
+                ensure_ascii=False,
+            )
+            is_error = bool(getattr(result, "isError", False))
+            self._sandbox.record_execution(
+                tool.name,
+                tool.server_name,
+                arguments,
+                success=not is_error,
+                error_message=content if is_error else None,
+            )
+        except Exception as exc:
+            content = json.dumps({"error": str(exc)}, ensure_ascii=False)
+            if tool is not None:
                 self._sandbox.record_execution(
                     tool.name,
                     tool.server_name,
                     arguments,
-                    success=not is_error,
-                    error_message=content if is_error else None,
+                    success=False,
+                    error_message=str(exc),
                 )
-            except Exception as exc:
-                content = json.dumps({"error": str(exc)}, ensure_ascii=False)
-                if tool is not None:
-                    self._sandbox.record_execution(
-                        tool.name,
-                        tool.server_name,
-                        arguments,
-                        success=False,
-                        error_message=str(exc),
-                    )
-
-            messages.append(
-                {
+        finally:
+            if content is not None:
+                message = {
                     "role": "tool",
                     "tool_call_id": call_id,
                     "content": content,
                 }
+            _emit_tool_event(
+                on_event,
+                ChatToolEvent(
+                    "finish",
+                    call_id,
+                    full_name,
+                    elapsed_seconds=time.monotonic() - started,
+                    is_error=is_error,
+                    message=message,
+                ),
             )
-        return messages
+
+        assert message is not None
+        return message
 
     def _server_timeout(self, server_name: str) -> float:
         return self._config.servers[server_name].timeout
+
+
+def _emit_tool_event(
+    on_event: Callable[[ChatToolEvent], None] | None,
+    event: ChatToolEvent,
+) -> None:
+    if on_event is None:
+        return
+    try:
+        on_event(event)
+    except Exception:
+        logging.getLogger(__name__).exception("MCP tool event callback failed")
 
 
 async def _close_group(

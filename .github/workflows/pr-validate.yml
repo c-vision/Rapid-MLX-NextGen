@@ -64,7 +64,7 @@ jobs:
           # - test deps: mirror the test-matrix job so `full_unit` and
           #   `targeted_tests` see the same import surface they would
           #   if a contributor ran `make smoke` locally.
-          pip install pyyaml requests pip-audit ruff
+          pip install pyyaml requests pip-audit ruff rich mcp
           pip install pytest pytest-asyncio pytest-cov pydantic fastapi jsonschema httpx psutil transformers
 
       - name: Resolve PR number

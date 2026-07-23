@@ -13,6 +13,7 @@ import pytest
 
 from vllm_mlx.chat_mcp import (
     ChatMCPRuntime,
+    ChatToolEvent,
     _quiet_optional_component_warnings,
     _server_parameters,
 )
@@ -23,12 +24,17 @@ class _FakeResult:
     def __init__(self, name: str, arguments: dict):
         self.name = name
         self.arguments = arguments
+        self.isError = bool(arguments.get("is_error"))
 
     def model_dump(self, **_kwargs):
         return {
             "content": [{"type": "text", "text": f"{self.name}:{self.arguments}"}],
-            "isError": False,
+            "isError": self.isError,
         }
+
+
+class _LaneAbort(BaseException):
+    pass
 
 
 class _FakeSessionGroup:
@@ -38,6 +44,10 @@ class _FakeSessionGroup:
     call_started = threading.Event()
     call_cancelled = threading.Event()
     connect_thread_names: list[str] = []
+    active_calls = 0
+    max_active_calls = 0
+    active_calls_by_server: dict[str, int] = {}
+    max_active_calls_by_server: dict[str, int] = {}
 
     def __init__(self, component_name_hook):
         self._name_hook = component_name_hook
@@ -84,15 +94,34 @@ class _FakeSessionGroup:
 
     async def call_tool(self, name, arguments):
         self.calls.append((name, arguments))
-        if arguments.get("hang"):
-            self.call_started.set()
-            try:
-                await asyncio.Event().wait()
-            finally:
-                self.call_cancelled.set()
-        if arguments.get("raise"):
-            raise RuntimeError("tool exploded")
-        return _FakeResult(name, arguments)
+        server_name = name.split("__", 1)[0]
+        type(self).active_calls += 1
+        type(self).active_calls_by_server[server_name] = (
+            type(self).active_calls_by_server.get(server_name, 0) + 1
+        )
+        type(self).max_active_calls = max(
+            type(self).max_active_calls,
+            type(self).active_calls,
+        )
+        type(self).max_active_calls_by_server[server_name] = max(
+            type(self).max_active_calls_by_server.get(server_name, 0),
+            type(self).active_calls_by_server[server_name],
+        )
+        try:
+            if arguments.get("delay"):
+                await asyncio.sleep(arguments["delay"])
+            if arguments.get("hang"):
+                self.call_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    self.call_cancelled.set()
+            if arguments.get("raise"):
+                raise RuntimeError("tool exploded")
+            return _FakeResult(name, arguments)
+        finally:
+            type(self).active_calls -= 1
+            type(self).active_calls_by_server[server_name] -= 1
 
 
 @pytest.fixture(autouse=True)
@@ -105,6 +134,10 @@ def _fake_sdk_group(monkeypatch):
     _FakeSessionGroup.call_started = threading.Event()
     _FakeSessionGroup.call_cancelled = threading.Event()
     _FakeSessionGroup.connect_thread_names = []
+    _FakeSessionGroup.active_calls = 0
+    _FakeSessionGroup.max_active_calls = 0
+    _FakeSessionGroup.active_calls_by_server = {}
+    _FakeSessionGroup.max_active_calls_by_server = {}
     monkeypatch.setattr(
         mcp.client.session_group,
         "ClientSessionGroup",
@@ -158,7 +191,7 @@ def test_runtime_uses_sdk_groups_for_multiple_servers(tmp_path):
             "call-a",
             "call-b",
         ]
-        assert _FakeSessionGroup.calls == [
+        assert sorted(_FakeSessionGroup.calls) == [
             ("alpha__lookup", {"value": "A"}),
             ("beta__lookup", {"value": "B"}),
         ]
@@ -170,6 +203,187 @@ def test_runtime_uses_sdk_groups_for_multiple_servers(tmp_path):
     runtime.close()  # idempotent
     with pytest.raises(RuntimeError, match="closed"):
         runtime.execute_tool_calls([])
+
+
+def test_runtime_parallelizes_servers_but_serializes_each_server(tmp_path):
+    path = _write_config(
+        tmp_path,
+        {
+            "alpha": {"command": "python3", "args": ["alpha", "lookup"]},
+            "beta": {"command": "python3", "args": ["beta", "lookup"]},
+        },
+    )
+    runtime = ChatMCPRuntime(str(path))
+    try:
+        messages = runtime.execute_tool_calls(
+            [
+                {
+                    "id": "alpha-first",
+                    "function": {
+                        "name": "alpha__lookup",
+                        "arguments": {"value": "first", "delay": 0.02},
+                    },
+                },
+                {
+                    "id": "beta",
+                    "function": {
+                        "name": "beta__lookup",
+                        "arguments": {"value": "beta", "delay": 0.02},
+                    },
+                },
+                {
+                    "id": "alpha-second",
+                    "function": {
+                        "name": "alpha__lookup",
+                        "arguments": {"value": "second", "delay": 0.02},
+                    },
+                },
+            ]
+        )
+    finally:
+        runtime.close()
+
+    assert _FakeSessionGroup.max_active_calls == 2
+    assert _FakeSessionGroup.max_active_calls_by_server == {
+        "alpha": 1,
+        "beta": 1,
+    }
+    assert [message["tool_call_id"] for message in messages] == [
+        "alpha-first",
+        "beta",
+        "alpha-second",
+    ]
+    alpha_calls = [
+        arguments["value"]
+        for name, arguments in _FakeSessionGroup.calls
+        if name == "alpha__lookup"
+    ]
+    assert alpha_calls == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_cancels_sibling_lanes_when_one_aborts():
+    runtime = object.__new__(ChatMCPRuntime)
+    runtime._tools_by_name = {
+        "alpha__lookup": SimpleNamespace(server_name="alpha"),
+        "beta__lookup": SimpleNamespace(server_name="beta"),
+    }
+    first_started = asyncio.Event()
+    first_cancelled = asyncio.Event()
+
+    async def _execute_one(position, _tool_call, _on_event):
+        if position == 0:
+            first_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                first_cancelled.set()
+        await first_started.wait()
+        raise _LaneAbort
+
+    runtime._execute_one = _execute_one
+    calls = [
+        {"function": {"name": "alpha__lookup"}},
+        {"function": {"name": "beta__lookup"}},
+    ]
+
+    with pytest.raises(_LaneAbort):
+        await runtime._execute(calls, None)
+
+    assert first_cancelled.is_set()
+
+
+def test_runtime_emits_tool_start_and_finish_events(tmp_path):
+    path = _write_config(
+        tmp_path,
+        {"alpha": {"command": "python3", "args": ["alpha", "lookup"]}},
+    )
+    events: list[ChatToolEvent] = []
+    runtime = ChatMCPRuntime(str(path))
+    try:
+        [message] = runtime.execute_tool_calls(
+            [
+                {
+                    "id": "call-a",
+                    "function": {
+                        "name": "alpha__lookup",
+                        "arguments": '{"value":"A"}',
+                    },
+                }
+            ],
+            on_event=events.append,
+        )
+    finally:
+        runtime.close()
+
+    assert [(event.phase, event.call_id, event.name) for event in events] == [
+        ("start", "call-a", "alpha__lookup"),
+        ("finish", "call-a", "alpha__lookup"),
+    ]
+    assert events[0].elapsed_seconds is None
+    assert events[0].message is None
+    assert events[1].elapsed_seconds is not None
+    assert events[1].elapsed_seconds >= 0
+    assert events[1].is_error is False
+    assert events[1].message == message
+
+
+def test_runtime_finish_event_marks_mcp_errors(tmp_path):
+    path = _write_config(
+        tmp_path,
+        {"alpha": {"command": "python3", "args": ["alpha", "lookup"]}},
+    )
+    events: list[ChatToolEvent] = []
+    runtime = ChatMCPRuntime(str(path))
+    try:
+        [message] = runtime.execute_tool_calls(
+            [
+                {
+                    "id": "call-a",
+                    "function": {
+                        "name": "alpha__lookup",
+                        "arguments": '{"value":"A","is_error":true}',
+                    },
+                }
+            ],
+            on_event=events.append,
+        )
+    finally:
+        runtime.close()
+
+    assert events[-1].phase == "finish"
+    assert events[-1].is_error is True
+    assert events[-1].message == message
+
+
+def test_runtime_tool_event_callback_failure_does_not_fail_tool(tmp_path, caplog):
+    path = _write_config(
+        tmp_path,
+        {"alpha": {"command": "python3", "args": ["alpha", "lookup"]}},
+    )
+
+    def _fail(_event):
+        raise RuntimeError("renderer failed")
+
+    runtime = ChatMCPRuntime(str(path))
+    try:
+        [message] = runtime.execute_tool_calls(
+            [
+                {
+                    "id": "call-a",
+                    "function": {
+                        "name": "alpha__lookup",
+                        "arguments": '{"value":"A"}',
+                    },
+                }
+            ],
+            on_event=_fail,
+        )
+    finally:
+        runtime.close()
+
+    assert message["tool_call_id"] == "call-a"
+    assert "renderer failed" in caplog.text
 
 
 def test_runtime_keeps_healthy_server_when_another_fails(tmp_path):

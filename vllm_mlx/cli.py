@@ -5249,160 +5249,23 @@ def _stream_chat_response(
     string — chat history stores only the final answer, matching the
     OpenAI-compat split between ``content`` and ``reasoning_content``.
 
-    Plain streaming: tokens land directly in the user's terminal as they
-    arrive. We deliberately do NOT use ``rich.Live`` + ``Markdown`` here:
-    Live re-renders the panel on every refresh and, when the console's
-    cursor-overwrite path is unreliable (recordings, some terminal
-    multiplexers), each refresh appends rather than overwrites — turning
-    a 200-token response into a wall of repeated text. Live markdown
-    rendering deserves a separate, more careful effort with explicit
-    fallback detection; for now correctness wins over formatting.
+    Interactive terminals show a one-line incremental preview, then replace it
+    with one correct Rich Markdown render containing structured headings,
+    lists, links, tables, and code. Pipes, CI, dumb terminals, and
+    ``NO_COLOR`` retain byte-for-byte plain streaming.
     """
     import json
 
     import requests
 
+    from .chat_render import StreamingMarkdownRenderer, supports_rich_output
+
     DIM = "\x1b[2m"
-    BOLD = "\x1b[1m"
     RESET = "\x1b[0m"
     MAGENTA = "\x1b[35m"
-    CYAN = "\x1b[36m"
-    is_tty = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    is_tty = supports_rich_output(sys.stdout)
     in_reasoning = False
     full = ""
-
-    # ----- Streaming markdown colorer ------------------------------------
-    # Body text streams in the terminal's default color (Claude-Code-style
-    # — accents only on chrome). Inline coloring handles the markers users
-    # see most often: ``\`code\``` (cyan), ``\`\`\`fence\`\`\``` (dim cyan
-    # block), ``**bold**`` (ANSI bold), and ATX headers (``#`` … ``####``)
-    # at line start. Lists / italic stay raw so the parser stays small.
-    HEADING_STYLE = {
-        1: BOLD + CYAN,  # `# h1`     — most prominent
-        2: BOLD + MAGENTA,  # `## h2`    — secondary
-        3: BOLD,  # `### h3`   — bold only
-        4: CYAN,  # `#### h4`  — cyan
-        5: MAGENTA,  # `##### h5` — magenta
-        6: DIM,  # `###### h6`— dim
-    }
-    _state = {
-        "in_fence": False,  # inside a ``` block
-        "in_inline_code": False,  # inside a `code` span
-        "in_bold": False,  # inside **bold**
-        "in_heading": False,  # inside an ATX heading line
-        "at_line_start": True,  # cursor is at start of a logical line
-        "pending": "",  # buffered chars awaiting lookahead
-    }
-
-    def _emit_with_inline_md(piece: str) -> None:
-        if not is_tty:
-            sys.stdout.write(piece)
-            sys.stdout.flush()
-            return
-        text = _state["pending"] + piece
-        _state["pending"] = ""
-        out: list[str] = []
-        i, n = 0, len(text)
-        while i < n:
-            c = text[i]
-            # Newline closes any line-scoped span (heading) and resets the
-            # line-start anchor so the next `#`/`*`/etc. is interpreted in
-            # the right context.
-            if c == "\n":
-                if _state["in_heading"]:
-                    out.append(RESET)
-                    _state["in_heading"] = False
-                out.append("\n")
-                _state["at_line_start"] = True
-                i += 1
-                continue
-            # ATX heading: `#`..`######` followed by space at line start.
-            # We skip this inside fences (a `#` at line start there is
-            # almost always a comment, not a heading).
-            if _state["at_line_start"] and c == "#" and not _state["in_fence"]:
-                # Count consecutive `#` (1..6).
-                j = i
-                while j < n and j - i < 6 and text[j] == "#":
-                    j += 1
-                # Need to see one more char after the hashes to decide
-                # heading vs literal "###foo" — buffer if we don't have it.
-                if j == n:
-                    _state["pending"] = text[i:]
-                    break
-                hashes = j - i
-                if 1 <= hashes <= 6 and text[j] == " ":
-                    style = HEADING_STYLE.get(hashes, BOLD)
-                    out.append(style)
-                    out.append(text[i : j + 1])  # emit "## "
-                    _state["in_heading"] = True
-                    _state["at_line_start"] = False
-                    i = j + 1
-                    continue
-                # Not a heading — fall through to literal emission below.
-            if c == "`":
-                # Need 2 chars of lookahead to disambiguate ``` vs `.
-                if i + 2 >= n:
-                    _state["pending"] = text[i:]
-                    break
-                if text[i : i + 3] == "```":
-                    if _state["in_fence"]:
-                        out.append("```" + RESET)
-                        _state["in_fence"] = False
-                    else:
-                        out.append(DIM + CYAN + "```")
-                        _state["in_fence"] = True
-                    _state["at_line_start"] = False
-                    i += 3
-                    continue
-                # Single backtick.
-                if _state["in_fence"]:
-                    out.append("`")
-                elif _state["in_inline_code"]:
-                    out.append("`" + RESET)
-                    _state["in_inline_code"] = False
-                else:
-                    out.append(CYAN + "`")
-                    _state["in_inline_code"] = True
-                _state["at_line_start"] = False
-                i += 1
-                continue
-            if c == "*" and not _state["in_fence"] and not _state["in_inline_code"]:
-                if i + 1 >= n:
-                    _state["pending"] = text[i:]
-                    break
-                if text[i : i + 2] == "**":
-                    if _state["in_bold"]:
-                        out.append("**" + RESET)
-                        _state["in_bold"] = False
-                    else:
-                        out.append(BOLD + "**")
-                        _state["in_bold"] = True
-                    _state["at_line_start"] = False
-                    i += 2
-                    continue
-            out.append(c)
-            # Whitespace (other than newline, handled above) keeps the
-            # line-start anchor true so leading-indent headings still
-            # parse — e.g., a list item's child paragraph is rare here.
-            if c not in " \t":
-                _state["at_line_start"] = False
-            i += 1
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
-
-    def _close_open_md_spans() -> None:
-        if is_tty and (
-            _state["in_fence"]
-            or _state["in_inline_code"]
-            or _state["in_bold"]
-            or _state["in_heading"]
-        ):
-            sys.stdout.write(RESET)
-            sys.stdout.flush()
-        if _state["pending"]:
-            sys.stdout.write(_state["pending"])
-            sys.stdout.flush()
-            _state["pending"] = ""
 
     # ----- Repetition guard ----------------------------------------------
     # Models occasionally degenerate into the same token repeated until
@@ -5427,12 +5290,15 @@ def _stream_chat_response(
     repeat_run = 0
     repetition_aborted = False
 
-    with requests.post(
-        f"{base_url}/v1/chat/completions",
-        json=payload,
-        stream=True,
-        timeout=timeout_s,
-    ) as resp:
+    with (
+        requests.post(
+            f"{base_url}/v1/chat/completions",
+            json=payload,
+            stream=True,
+            timeout=timeout_s,
+        ) as resp,
+        StreamingMarkdownRenderer() as renderer,
+    ):
         if resp.status_code != 200:
             # With stream=True the body may still be partial / mid-chunk when
             # the server closed the socket; read defensively so we surface a
@@ -5484,7 +5350,7 @@ def _stream_chat_response(
                 sys.stdout.flush()
             if piece:
                 if in_reasoning:
-                    sys.stdout.write(f"{RESET}\n  " if is_tty else "\n")
+                    sys.stdout.write(f"{RESET}\n" if is_tty else "\n")
                     in_reasoning = False
                 # Detect repetition BEFORE emitting. If a single coalesced
                 # delta contains the cutoff inside it (server batched many
@@ -5529,10 +5395,10 @@ def _stream_chat_response(
                         seen += 1
                     prefix = piece[:pos]
                     if prefix:
-                        _emit_with_inline_md(prefix)
+                        renderer.write(prefix)
                         full += prefix
                 else:
-                    _emit_with_inline_md(piece)
+                    renderer.write(piece)
                     full += piece
                 # Char-level guard: catches no-whitespace degenerate
                 # output like ``"BarleyBarleyBarley..."`` that the
@@ -5553,7 +5419,6 @@ def _stream_chat_response(
                     repetition_aborted = True
                 if repetition_aborted:
                     break
-    _close_open_md_spans()
     if in_reasoning and is_tty:
         sys.stdout.write(RESET)
         sys.stdout.flush()
@@ -5576,7 +5441,7 @@ def _complete_chat_with_mcp(
     timeout_s: int,
     *,
     max_rounds: int = 8,
-    on_tool_call=None,
+    on_tool_event=None,
 ) -> tuple[str, dict]:
     """Run the chat agent loop with MCP tools using non-streaming responses.
 
@@ -5669,24 +5534,35 @@ def _complete_chat_with_mcp(
         if message.get("reasoning_content"):
             assistant_message["reasoning_content"] = message["reasoning_content"]
         messages.append(assistant_message)
-        for position, tool_call in enumerate(normalized_calls):
-            try:
-                if on_tool_call is not None:
-                    on_tool_call(tool_call["function"]["name"])
-                messages.extend(mcp_runtime.execute_tool_calls([tool_call]))
-            except BaseException:
-                for pending_call in normalized_calls[position:]:
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": pending_call["id"],
-                            "content": json.dumps(
-                                {"error": "Tool execution interrupted"},
-                                ensure_ascii=False,
-                            ),
-                        }
-                    )
-                raise
+        completed_messages = {}
+
+        def _handle_tool_event(event, completed=completed_messages):
+            if event.phase == "finish" and event.message is not None:
+                completed[event.call_id] = event.message
+            if on_tool_event is not None:
+                on_tool_event(event)
+
+        try:
+            messages.extend(
+                mcp_runtime.execute_tool_calls(
+                    normalized_calls,
+                    on_event=_handle_tool_event,
+                )
+            )
+        except BaseException:
+            for pending_call in normalized_calls:
+                messages.append(
+                    completed_messages.get(pending_call["id"])
+                    or {
+                        "role": "tool",
+                        "tool_call_id": pending_call["id"],
+                        "content": json.dumps(
+                            {"error": "Tool execution interrupted"},
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+            raise
 
     raise RuntimeError(f"MCP tool loop exceeded {max_rounds} rounds")
 
@@ -5736,6 +5612,7 @@ def chat_command(args):
     import subprocess
 
     from vllm_mlx._tempfile_safe import managed_tempfile_path
+    from vllm_mlx.chat_render import supports_rich_output, terminal_safe_text
 
     base_url: str
     proc = None
@@ -5747,8 +5624,8 @@ def chat_command(args):
     # swap is mid-spawn would otherwise orphan the candidate server.
     _active_procs: list[subprocess.Popen] = []
 
-    # TTY-gated ANSI palette for the chat UI. NO_COLOR is honoured.
-    _is_tty = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    # ANSI palette only when the output supports interactive formatting.
+    _is_tty = supports_rich_output(sys.stdout)
     BOLD = "\x1b[1m" if _is_tty else ""
     DIM = "\x1b[2m" if _is_tty else ""
     GREEN = "\x1b[32m" if _is_tty else ""
@@ -6398,7 +6275,7 @@ def chat_command(args):
             # Claude-Code-style turn marker: a colored bullet introduces the
             # assistant's response so the user can visually scan turn
             # boundaries when scrolling back through long conversations.
-            sys.stdout.write(f"\n  {CYAN}●{RESET} ")
+            sys.stdout.write(f"\n  {CYAN}●{RESET}\n")
             sys.stdout.flush()
             metrics: dict = {}
             start_t = time.monotonic()
@@ -6412,9 +6289,21 @@ def chat_command(args):
                     )
                 else:
 
-                    def _show_mcp_tool_call(name: str) -> None:
-                        display_name = name.replace("__", ".", 1)
-                        sys.stdout.write(f"{DIM}using {display_name}…{RESET}\n  ")
+                    def _show_mcp_tool_event(event) -> None:
+                        display_name = terminal_safe_text(event.name).replace(
+                            "__", ".", 1
+                        )
+                        if event.phase == "start":
+                            text = f"{DIM}using {display_name}…{RESET}"
+                        else:
+                            elapsed = event.elapsed_seconds or 0
+                            if event.is_error:
+                                text = f"{RED}✗ {display_name} ({elapsed:.2f}s){RESET}"
+                            else:
+                                text = (
+                                    f"{GREEN}✓ {display_name} ({elapsed:.2f}s){RESET}"
+                                )
+                        sys.stdout.write(f"  {text}\n")
                         sys.stdout.flush()
 
                     assistant, metrics = _complete_chat_with_mcp(
@@ -6422,13 +6311,14 @@ def chat_command(args):
                         payload,
                         mcp_runtime,
                         timeout_s=args.response_timeout,
-                        on_tool_call=_show_mcp_tool_call,
+                        on_tool_event=_show_mcp_tool_event,
                     )
                     reasoning = metrics.get("reasoning_content")
                     if reasoning:
-                        sys.stdout.write(f"{DIM}[thinking] {reasoning}{RESET}\n  ")
-                    sys.stdout.write(assistant)
-                    sys.stdout.flush()
+                        sys.stdout.write(f"{DIM}[thinking] {reasoning}{RESET}\n")
+                    from .chat_render import render_markdown
+
+                    render_markdown(assistant)
             except KeyboardInterrupt:
                 print(f"\n  {YELLOW}(response interrupted){RESET}\n")
                 _recover_failed_chat_turn(messages, turn_start)

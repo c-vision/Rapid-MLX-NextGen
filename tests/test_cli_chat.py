@@ -158,15 +158,33 @@ class _FakeMCPRuntime:
     def __init__(self):
         self.calls = []
 
-    def execute_tool_calls(self, calls):
+    def execute_tool_calls(self, calls, on_event=None):
         self.calls.append(calls)
-        return [
+        messages = [
             {
                 "role": "tool",
-                "tool_call_id": calls[0]["id"],
+                "tool_call_id": call["id"],
                 "content": '{"content":"hello"}',
             }
+            for call in calls
         ]
+        if on_event is not None:
+            from vllm_mlx.chat_mcp import ChatToolEvent
+
+            for call, message in zip(calls, messages, strict=True):
+                name = call["function"]["name"]
+                on_event(ChatToolEvent("start", call["id"], name))
+                on_event(
+                    ChatToolEvent(
+                        "finish",
+                        call["id"],
+                        name,
+                        elapsed_seconds=0.01,
+                        is_error=False,
+                        message=message,
+                    )
+                )
+        return messages
 
 
 def _json_response(body, status_code=200):
@@ -225,7 +243,7 @@ def test_complete_chat_with_mcp_runs_standard_tool_loop(monkeypatch):
         ]
     )
     payloads = []
-    tool_progress = []
+    tool_events = []
 
     def _post(_url, json, timeout):
         assert timeout == 10
@@ -246,7 +264,7 @@ def test_complete_chat_with_mcp_runs_standard_tool_loop(monkeypatch):
         },
         runtime,
         timeout_s=10,
-        on_tool_call=tool_progress.append,
+        on_tool_event=tool_events.append,
     )
 
     assert answer == "The file says hello."
@@ -265,7 +283,10 @@ def test_complete_chat_with_mcp_runs_standard_tool_loop(monkeypatch):
         "tool_call_id": "call-1",
         "content": '{"content":"hello"}',
     }
-    assert tool_progress == ["files__read"]
+    assert [(event.phase, event.name) for event in tool_events] == [
+        ("start", "files__read"),
+        ("finish", "files__read"),
+    ]
 
 
 def test_complete_chat_with_mcp_preserves_reasoning_and_normalizes_calls(monkeypatch):
@@ -425,10 +446,26 @@ def test_complete_chat_with_mcp_preserves_partial_multi_call_results(monkeypatch
     monkeypatch.setattr("requests.post", lambda *_args, **_kwargs: response)
 
     class _Runtime(_FakeMCPRuntime):
-        def execute_tool_calls(self, calls):
-            if calls[0]["id"] == "interrupted":
-                raise KeyboardInterrupt
-            return super().execute_tool_calls(calls)
+        def execute_tool_calls(self, calls, on_event=None):
+            from vllm_mlx.chat_mcp import ChatToolEvent
+
+            completed = {
+                "role": "tool",
+                "tool_call_id": calls[0]["id"],
+                "content": '{"content":"hello"}',
+            }
+            if on_event is not None:
+                on_event(
+                    ChatToolEvent(
+                        "finish",
+                        calls[0]["id"],
+                        calls[0]["function"]["name"],
+                        elapsed_seconds=0.01,
+                        is_error=False,
+                        message=completed,
+                    )
+                )
+            raise KeyboardInterrupt
 
     messages = [{"role": "user", "content": "run both"}]
     with pytest.raises(KeyboardInterrupt):
@@ -794,9 +831,21 @@ def test_chat_command_owns_mcp_runtime_without_configuring_serve(monkeypatch, ca
         def close(self):
             self.closed = True
 
-    def _complete(base_url, payload, runtime, timeout_s, on_tool_call):
+    def _complete(base_url, payload, runtime, timeout_s, on_tool_event):
+        from vllm_mlx.chat_mcp import ChatToolEvent
+
         loop_payloads.append((base_url, deepcopy(payload), runtime, timeout_s))
-        on_tool_call("files__read")
+        on_tool_event(ChatToolEvent("start", "call-1", "files__read"))
+        on_tool_event(ChatToolEvent("start", "call-evil", "\x1b]52;c;payload\x07"))
+        on_tool_event(
+            ChatToolEvent(
+                "finish",
+                "call-1",
+                "files__read",
+                elapsed_seconds=0.25,
+                is_error=False,
+            )
+        )
         return "done", {"completion_tokens": 1, "finish_reason": "stop"}
 
     monkeypatch.setattr("vllm_mlx.chat_mcp.ChatMCPRuntime", _Runtime)
@@ -816,6 +865,9 @@ def test_chat_command_owns_mcp_runtime_without_configuring_serve(monkeypatch, ca
     ]
     output = capsys.readouterr().out
     assert "using files.read…" in output
+    assert "using ]52;c;payload…" in output
+    assert "\x1b" not in output
+    assert "✓ files.read (0.25s)" in output
     assert "done" in output
 
     assert created[0].closed is True
@@ -1022,9 +1074,7 @@ def test_chat_command_speed_line_uses_server_token_count(monkeypatch, capsys):
 
 
 def test_stream_chat_response_renders_atx_headings(monkeypatch):
-    """ATX headings (`# h1`..`###### h6`) at line start get a colored
-    style applied across the heading line. We simulate a TTY so the
-    state machine path runs."""
+    """TTY output renders Markdown headings and inline code semantically."""
 
     class _Tty(io.StringIO):
         def isatty(self):
@@ -1041,25 +1091,63 @@ def test_stream_chat_response_renders_atx_headings(monkeypatch):
     with (
         _fake_server(canned) as (port, _payloads),
         patch.object(sys, "stdout", out_buf),
-        patch.dict("os.environ", {}, clear=False),
+        patch.dict("os.environ", {"TERM": "xterm-256color"}, clear=False),
     ):
         # Make sure NO_COLOR isn't set in the test env.
         os = __import__("os")
         os.environ.pop("NO_COLOR", None)
+        os.environ.pop("CI", None)
         full = cli._stream_chat_response(
             f"http://127.0.0.1:{port}",
             {"model": "x", "messages": [], "stream": True},
             timeout_s=10,
         )
     rendered = out_buf.getvalue()
+    final_render = rendered.rsplit("\x1b[2K", 1)[-1]
     # Plain text content survived intact.
     assert full == "# Big\n## Sub\nBody line with `code`.\n### Smaller\nTail.\n"
-    # Heading lines are wrapped in ANSI escapes.
-    assert "\x1b[" in rendered, "expected ANSI escapes on a TTY render"
-    assert "# Big" in rendered and "## Sub" in rendered
-    # Plain body line did not pick up a heading style — only inline `code`
-    # got the cyan single-backtick wrap.
-    assert "Body line with " in rendered
+    assert "# Big" in rendered  # Incremental preview before the final render.
+    # Rich terminal output styles content and removes Markdown punctuation.
+    assert "\x1b[" in final_render, "expected ANSI escapes on a TTY render"
+    assert "Big" in final_render and "Sub" in final_render
+    assert "# Big" not in final_render and "## Sub" not in final_render
+    assert "`code`" not in final_render
+    assert "Body line with " in final_render and "code" in final_render
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {"CI": "true", "TERM": "xterm-256color"},
+        {"TERM": "dumb"},
+    ],
+)
+def test_stream_chat_response_reasoning_is_plain_on_noninteractive_tty(environment):
+    """CI and dumb pseudo-TTYs must not receive direct ANSI reasoning chrome."""
+
+    class _Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    canned = [
+        {"choices": [{"delta": {"reasoning_content": "working"}}]},
+        _delta("answer"),
+    ]
+    out_buf = _Tty()
+    with (
+        _fake_server(canned) as (port, _payloads),
+        patch.object(sys, "stdout", out_buf),
+        patch.dict("os.environ", environment, clear=True),
+    ):
+        full = cli._stream_chat_response(
+            f"http://127.0.0.1:{port}",
+            {"model": "x", "messages": [], "stream": True},
+            timeout_s=10,
+        )
+
+    assert full == "answer"
+    assert out_buf.getvalue() == "[thinking] working\nanswer"
+    assert "\x1b" not in out_buf.getvalue()
 
 
 def test_chat_command_heredoc_does_not_trigger_slash_dispatch(monkeypatch):
