@@ -115,6 +115,13 @@ rapid-mlx serve qwen3.5-9b-8bit --speculative-config '{"method":"ddtree"}' --por
 rapid-mlx serve <mtp-eligible-qwen-checkpoint> \
   --speculative-config '{"method":"mtp","num_speculative_tokens":1,"disable_auto_k":true}'
 
+# MTP with a sidecar head: serve a FULL base checkpoint and pass the head
+# repo in the `model` field. The `*-mtp-4bit` aliases are sidecar HEADS
+# (~246 MB, model_type qwen3_5_mtp) — do NOT serve them directly.
+# See docs/reference/configuration.md#mtp-sidecar-heads-are-not-standalone-models
+rapid-mlx serve qwen3.6-27b-8bit \
+  --speculative-config '{"method":"mtp","model":"mlx-community/Qwen3.6-27B-MTP-4bit","num_speculative_tokens":3}'
+
 # SuffixDecoding for explicit high-overlap workloads
 rapid-mlx serve gemma-4-12b-4bit \
   --speculative-config '{"method":"suffix","num_speculative_tokens":8}'

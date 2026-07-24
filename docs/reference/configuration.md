@@ -70,10 +70,44 @@ into the same config path.
 | `{"method":"dflash"}` | Enable the DFlash single-user bridge on validated aliases. |
 | `{"method":"ddtree"}` | Enable experimental DDTree verification on validated aliases. |
 | `{"method":"mtp"}` | Enable MTP speculative decoding for checkpoints accepted by the existing MTP eligibility gate. |
-| `{"method":"mtp","model":"<sidecar>"}` | Reserved for future validated assistant sidecars. Gemma 4 sidecar MTP is currently disabled after greedy-lossless A/B failed. |
+| `{"method":"mtp","model":"<sidecar-head-repo>"}` | Attach a standalone MTP **sidecar head** (e.g. `mlx-community/Qwen3.6-27B-MTP-4bit`) to a full base checkpoint. The base must be MTP-eligible; the head repo goes in the `model` field — **not** in the `serve` positional. See [MTP sidecar heads are not standalone models](#mtp-sidecar-heads-are-not-standalone-models) below. Gemma 4 sidecar MTP remains disabled after its greedy-lossless A/B failed. |
 | `{"method":"mtp","num_speculative_tokens":3}` | Set the MTP max-K controller ceiling. |
 | `{"method":"mtp","disable_auto_k":true}` | Disable the MTP EV depth controller for fixed-K parity benches. |
 | `{"method":"suffix","num_speculative_tokens":8}` | Enable explicit SuffixDecoding for high-overlap workloads. |
+
+#### MTP sidecar heads are not standalone models
+
+The `*-mtp-4bit` aliases — `qwen3.6-27b-mtp-4bit`
+(`mlx-community/Qwen3.6-27B-MTP-4bit`) and `qwen3.6-35b-mtp-4bit`
+(`mlx-community/Qwen3.6-35B-A3B-MTP-4bit`) — resolve to **MTP sidecar
+heads**, not servable checkpoints. Each repo (~246 MB) ships only the
+multi-token-prediction module — an `fc.*` fusion projection, a single
+`layers.0.*` predictor layer, the `pre_fc_norm_embedding` /
+`pre_fc_norm_hidden` norms, and a final `norm` — with no full transformer
+to generate from. Their `config.json` `model_type` is `qwen3_5_mtp`,
+which is intentionally **not** in the MTP eligibility allowlist.
+
+Serving a head directly is rejected by design — the alias name contains
+`mtp`, but the repo is a draft head, not a model:
+
+```bash
+# Rejected: qwen3.6-27b-mtp-4bit is a sidecar head, not a servable checkpoint
+rapid-mlx serve qwen3.6-27b-mtp-4bit --speculative-config '{"method":"mtp"}'
+```
+
+Instead, serve a **full base checkpoint** and pass the head repo in the
+`model` field of `--speculative-config`, so MTP drafts against the
+attached head:
+
+```bash
+# Correct: full base checkpoint + head repo in the `model` field
+rapid-mlx serve qwen3.6-27b-8bit \
+  --speculative-config '{"method":"mtp","model":"mlx-community/Qwen3.6-27B-MTP-4bit","num_speculative_tokens":3}'
+```
+
+Pair each head with a base of the same size class: `Qwen3.6-27B-MTP-4bit`
+with a `qwen3.6-27b-*` base, and `Qwen3.6-35B-A3B-MTP-4bit` with a
+`qwen3.6-35b-*` base.
 
 ### MCP Options
 
