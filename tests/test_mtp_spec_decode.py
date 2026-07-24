@@ -1377,9 +1377,10 @@ def test_inject_mtp_support_loads_synthetic_sidecar():
 
     # Build the MTP head separately so we can capture its random-init
     # weights, write them to disk, and verify the inject loads them
-    # byte-equally. (Note: this tiny model is FP, so no quantize step
-    # — the inject's _detect_base_quantization returns None and the
-    # MTP module stays FP, matching the sidecar layout.)
+    # byte-equally. (Note: this tiny model is FP, so the sidecar ships as
+    # a metadata-less full-precision safetensors file, with no config.json
+    # and no fc.scales — the inject detects a full-precision sidecar from
+    # its tensors and keeps the MTP module FP, matching the sidecar layout.)
     args = model_a.args
     mtp_template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
     _mx.eval(mtp_template.parameters())
@@ -1389,6 +1390,8 @@ def test_inject_mtp_support_loads_synthetic_sidecar():
     with tempfile.TemporaryDirectory() as tmp:
         sidecar_path = Path(tmp) / "synthetic-mtp-head.safetensors"
         _mx.save_safetensors(str(sidecar_path), flat)
+        # Full-precision sidecar (no fc.scales, no config.json) — recognised
+        # as FP from its tensors, so the MTP module is kept full-precision.
 
         # Build a fresh model (so MTP head random init differs from
         # the persisted template), then inject with the synthetic
@@ -1453,6 +1456,9 @@ def test_inject_mtp_support_refuses_synthetic_sidecar_missing_tensor():
     with tempfile.TemporaryDirectory() as tmp:
         sidecar_path = Path(tmp) / "crippled-sidecar.safetensors"
         _mx.save_safetensors(str(sidecar_path), crippled)
+        # FP sidecar (no fc.scales): the quantization step keeps the MTP
+        # module FP, so the inject reaches the coverage check under test —
+        # which must catch the dropped tensor.
 
         fresh_model = _build_tiny_qwen3_5_text_model()
         result = inject_mtp_support(fresh_model, mtp_sidecar=str(sidecar_path))
@@ -1460,6 +1466,619 @@ def test_inject_mtp_support_refuses_synthetic_sidecar_missing_tensor():
             f"inject_mtp_support should have refused a sidecar missing {drop_key!r}, "
             f"but returned True — the coverage check has regressed."
         )
+
+
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+@pytest.mark.parametrize("group_size", [32, 64, 128])
+def test_infer_sidecar_fc_quantization_recovers_bits_and_group_size(bits, group_size):
+    """The sidecar's own tensors are the source of truth: inverting the
+    packed ``fc.weight`` / ``fc.scales`` shapes recovers the exact
+    ``(bits, group_size)`` it was quantized with — no config.json needed.
+
+    Regression anchor for the 8-bit-base + 4-bit-sidecar empty-response
+    bug: the module is quantized to match the sidecar it loads, read off
+    the sidecar tensors — not the base model, not a config proxy.
+    """
+    import mlx.core as _mx
+    import mlx.nn as _nn
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import (
+        _infer_sidecar_fc_quantization,
+    )
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    args = base.args
+    fp = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    fc_out_dims, fc_in_dims = (int(d) for d in fp.fc.weight.shape)
+
+    # Quantize a standalone Linear matching the fc — NOT the whole module,
+    # whose other layers are only ``hidden_size``-wide and can't be
+    # quantized at group_size 128 in this tiny fixture.
+    fc = _nn.Linear(fc_in_dims, fc_out_dims, bias=False)
+    qfc = _nn.QuantizedLinear.from_linear(fc, group_size, bits)
+    _mx.eval(qfc.parameters())
+    flat = {f"fc.{k}": v for k, v in dict(tree_flatten(qfc.parameters())).items()}
+    assert "fc.scales" in flat, "quantized fc should carry a scales tensor"
+
+    assert _infer_sidecar_fc_quantization(flat, fc_out_dims, fc_in_dims) == {
+        "bits": bits,
+        "group_size": group_size,
+    }
+
+
+def test_infer_sidecar_fc_quantization_full_precision_returns_none():
+    """A full-precision fc has no ``fc.scales`` tensor, so the inference
+    returns ``None`` and the caller keeps the MTP module FP — no config
+    metadata required (fixes the metadata-less-FP-sidecar regression)."""
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import _infer_sidecar_fc_quantization
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    args = base.args
+    fp = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    fc_out_dims, fc_in_dims = (int(d) for d in fp.fc.weight.shape)
+    flat = dict(tree_flatten(fp.parameters()))
+    assert "fc.scales" not in flat
+    assert _infer_sidecar_fc_quantization(flat, fc_out_dims, fc_in_dims) is None
+
+
+def test_infer_sidecar_fc_quantization_raises_on_malformed_packing():
+    """``fc.scales`` present but a packing we cannot interpret — an
+    unsupported derived width, or a missing companion ``fc.weight`` —
+    raises ``ValueError`` so the caller refuses rather than mis-pack."""
+    import mlx.core as _mx
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import _infer_sidecar_fc_quantization
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    args = base.args
+    fp = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    fc_out_dims, fc_in_dims = (int(d) for d in fp.fc.weight.shape)
+
+    # (a) shapes that invert to an unsupported width. For in=fc_in_dims,
+    # weight cols = in*7//32 and scales cols = in//32 imply bits=7 (not an
+    # MLX affine width) → ValueError.
+    packed_cols = fc_in_dims * 7 // 32
+    scale_cols = fc_in_dims // 32
+    bad = {
+        "fc.weight": _mx.zeros((fc_out_dims, packed_cols), dtype=_mx.uint32),
+        "fc.scales": _mx.zeros((fc_out_dims, scale_cols), dtype=_mx.float32),
+    }
+    with pytest.raises(ValueError):
+        _infer_sidecar_fc_quantization(bad, fc_out_dims, fc_in_dims)
+
+    # (b) scales present but the companion weight is missing entirely.
+    with pytest.raises(ValueError):
+        _infer_sidecar_fc_quantization(
+            {"fc.scales": _mx.zeros((fc_out_dims, fc_in_dims // 32))},
+            fc_out_dims,
+            fc_in_dims,
+        )
+
+    # (c) truncated quantized sidecar: a PACKED fc.weight (4-bit width)
+    # but no fc.scales. Must NOT be mistaken for full-precision (which
+    # would load a packed weight into an nn.Linear and crash later) —
+    # the shape mismatch against the FP dims raises.
+    with pytest.raises(ValueError):
+        _infer_sidecar_fc_quantization(
+            {
+                "fc.weight": _mx.zeros(
+                    (fc_out_dims, fc_in_dims * 4 // 32), dtype=_mx.uint32
+                )
+            },
+            fc_out_dims,
+            fc_in_dims,
+        )
+
+    # A correctly-shaped FP fc.weight with no scales is fine (returns None).
+    assert (
+        _infer_sidecar_fc_quantization(
+            {"fc.weight": _mx.zeros((fc_out_dims, fc_in_dims), dtype=_mx.float32)},
+            fc_out_dims,
+            fc_in_dims,
+        )
+        is None
+    )
+
+
+def test_inject_quantizes_mtp_to_sidecar_bits_not_base_bits(tmp_path):
+    """Regression: an 8-bit base paired with a 4-bit MTP sidecar must
+    quantize the MTP module to the SIDECAR's 4 bits, not the base's 8.
+
+    Before the fix, the MTP module was quantized to the *base* model's
+    bit-width; loading the differently-packed sidecar tensors left the
+    ``fc`` layer's packed ``weight`` inconsistent with its ``bits``
+    attribute, so ``mx.quantized_matmul`` raised at the first MTP draft
+    step — surfacing to the client as an intermittent EMPTY response
+    (``prompt_tokens=0``) once the depth controller began speculating.
+    Mirrors the shipped pairing ``Qwen3.6-27B-MLX-8bit`` +
+    ``Qwen3.6-27B-MTP-4bit``.
+    """
+    import mlx.core as _mx
+    import mlx.nn as _nn
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import (
+        _detect_base_quantization,
+        inject_mtp_support,
+        validate_mtp_support,
+    )
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    _GROUP = 32
+    _BASE_BITS = 8
+    _SIDECAR_BITS = 4
+
+    # Quantize the BASE at 8-bit so ``_detect_base_quantization`` (the
+    # pre-fix source) returns 8-bit — the WRONG width for a 4-bit sidecar.
+    _nn.quantize(base.model, group_size=_GROUP, bits=_BASE_BITS)
+    assert _detect_base_quantization(base) == {
+        "bits": _BASE_BITS,
+        "group_size": _GROUP,
+    }
+
+    # Build a 4-bit MTP sidecar — weights only, NO config.json: the
+    # quantization is inferred from the sidecar tensors themselves.
+    args = base.args
+    template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    _nn.quantize(template, group_size=_GROUP, bits=_SIDECAR_BITS)
+    _mx.eval(template.parameters())
+    flat = dict(tree_flatten(template.parameters()))
+    _mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+
+    injected = inject_mtp_support(base, mtp_sidecar=str(tmp_path))
+    assert injected is True, (
+        "inject_mtp_support returned False on an 8-bit base + 4-bit sidecar; "
+        "the module was likely quantized to the base's 8-bit and load_weights "
+        "or coverage-check rejected the 4-bit tensors."
+    )
+    assert validate_mtp_support(base) is True
+
+    # The MTP fc layer must carry the SIDECAR's 4 bits, not the base's 8.
+    assert isinstance(base.mtp.fc, _nn.QuantizedLinear)
+    assert int(base.mtp.fc.bits) == _SIDECAR_BITS, (
+        f"MTP fc quantized to {base.mtp.fc.bits}-bit; expected the sidecar's "
+        f"{_SIDECAR_BITS}-bit. Quantizing to the base model's bits reintroduces "
+        "the quantized_matmul weight/scales mismatch (empty-response bug)."
+    )
+
+    # And the draft forward must run without the quantized_matmul crash —
+    # this is the exact call that raised in the field repro.
+    hidden = _mx.zeros((1, 1, int(args.hidden_size)), dtype=_mx.float32)
+    next_ids = _mx.array([[0]], dtype=_mx.uint32)
+    logits = base.mtp_forward(hidden, next_ids, base.make_mtp_cache())
+    _mx.eval(logits)
+    assert logits.shape[-1] == int(args.vocab_size)
+
+
+def test_inject_keeps_mtp_full_precision_for_fp_sidecar(tmp_path):
+    """A quantized base paired with a full-precision sidecar must leave
+    the MTP module FP — NOT quantize it to the base's bits (which would
+    mispack the FP sidecar tensors on load). Full-precision is recognised
+    from the ABSENCE of ``fc.scales`` in the sidecar tensors, with NO
+    config.json — the metadata-less-FP-sidecar path that previously
+    worked and must keep working."""
+    import mlx.core as _mx
+    import mlx.nn as _nn
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import (
+        inject_mtp_support,
+        validate_mtp_support,
+    )
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    # Quantize the base — pre-fix, this drove the MTP module's quantization.
+    _nn.quantize(base.model, group_size=32, bits=8)
+
+    # Build a full-precision MTP sidecar (no quantize, no config.json) —
+    # the fc has no scales tensor, so it is recognised as FP.
+    args = base.args
+    template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    _mx.eval(template.parameters())
+    flat = dict(tree_flatten(template.parameters()))
+    _mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+
+    injected = inject_mtp_support(base, mtp_sidecar=str(tmp_path))
+    assert injected is True
+    assert validate_mtp_support(base) is True
+    # The fc layer must stay a plain (full-precision) Linear.
+    assert isinstance(base.mtp.fc, _nn.Linear)
+    assert not isinstance(base.mtp.fc, _nn.QuantizedLinear)
+
+    hidden = _mx.zeros((1, 1, int(args.hidden_size)), dtype=_mx.float32)
+    next_ids = _mx.array([[0]], dtype=_mx.uint32)
+    logits = base.mtp_forward(hidden, next_ids, base.make_mtp_cache())
+    _mx.eval(logits)
+    assert logits.shape[-1] == int(args.vocab_size)
+
+
+def test_inject_refuses_explicit_sidecar_with_malformed_packing(tmp_path):
+    """An EXPLICIT sidecar whose quantized fc tensors imply a packing we
+    cannot reproduce (here: shapes that invert to an unsupported 7-bit
+    width) must make ``inject_mtp_support`` REFUSE (return False) — never
+    fall back to the base model's bit-width. Guessing the base's width for
+    a differently-packed sidecar is exactly what aborted requests at the
+    first draft step (the empty-response bug); a safe non-install (plain
+    base path) is the correct degradation.
+
+    (A *well-formed* quantized sidecar with no config.json is NOT refused
+    — its bits/group_size are recovered from the tensors; see
+    ``test_inject_quantizes_mtp_to_sidecar_bits_not_base_bits``.)
+    """
+    import mlx.core as _mx
+    import mlx.nn as _nn
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import inject_mtp_support
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    # Base quantized at 8-bit — the WRONG width a naive fallback would use.
+    _nn.quantize(base.model, group_size=32, bits=8)
+
+    # Start from a real 4-bit sidecar, then corrupt ONLY the fc packing so
+    # the derived width is an unsupported 7 bits. fc is Linear(2H, H) →
+    # in = 2H; weight cols = in*7//32, scales cols = in//32 imply bits=7.
+    args = base.args
+    template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    _nn.quantize(template, group_size=32, bits=4)
+    _mx.eval(template.parameters())
+    flat = dict(tree_flatten(template.parameters()))
+    fp = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    _fc_out, _fc_in = (int(d) for d in fp.fc.weight.shape)
+    flat["fc.weight"] = _mx.zeros((_fc_out, _fc_in * 7 // 32), dtype=_mx.uint32)
+    flat["fc.scales"] = _mx.zeros((_fc_out, _fc_in // 32), dtype=_mx.float32)
+    _mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+
+    assert inject_mtp_support(base, mtp_sidecar=str(tmp_path)) is False
+    assert not hasattr(base, "mtp"), (
+        "inject refused but still attached an MTP module — the refusal must "
+        "leave the base model untouched (plain path)."
+    )
+
+
+def test_inject_refuses_corrupt_sidecar_file_without_raising(tmp_path):
+    """A truncated/unreadable safetensors sidecar makes ``mx.load`` raise —
+    codex flagged (PR #1201) that this exception was UNGUARDED and would
+    escape ``inject_mtp_support`` instead of hitting the same return-False
+    fail-safe as every other bad-sidecar path (malformed packing, shape
+    mismatch, dtype mismatch, ...). A corrupt file on disk (partial
+    download, disk error) must degrade the same way: refuse injection,
+    never abort the request mid-generation.
+    """
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import inject_mtp_support
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    sidecar_path = tmp_path / "corrupt-sidecar.safetensors"
+    sidecar_path.write_bytes(b"not a real safetensors file" * 4)
+
+    result = inject_mtp_support(base, mtp_sidecar=str(sidecar_path))
+    assert result is False, (
+        "inject_mtp_support should refuse (return False) a corrupt sidecar "
+        "file, not raise mx.load's exception mid-request."
+    )
+    assert not hasattr(base, "mtp"), (
+        "inject refused but still attached an MTP module — the refusal must "
+        "leave the base model untouched (plain path)."
+    )
+
+
+def test_inject_refuses_when_materialization_raises_without_propagating(
+    tmp_path, monkeypatch
+):
+    """``mx.load`` (Step 3) is LAZY — it only reads the safetensors header,
+    not tensor DATA. A truncated/lazily-unreadable sidecar with a VALID
+    header sails through every earlier shape/dtype check and only raises at
+    Step 4's ``mtp.load_weights(...)`` + ``mx.eval(mtp.parameters())``
+    materialization — a SECOND escape point from the same fail-safe that
+    ``test_inject_refuses_corrupt_sidecar_file_without_raising`` covers for
+    the eager ``mx.load`` header-read path (codex round-2 review on #1201).
+    Pin the materialization guard independent of a real truncated file:
+    monkeypatch ``mx.eval`` (as ``inject_mtp_support`` resolves it — it does
+    a local ``import mlx.core as mx``, the same shared module object) to
+    raise a sentinel, using an OTHERWISE-VALID sidecar so, absent the
+    try/except, this call would raise straight out of ``inject_mtp_support``.
+    """
+    import mlx.core as _mx
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import inject_mtp_support
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    # A valid full-precision sidecar that exactly matches the MTP module's
+    # parameter tree — built + saved BEFORE the patch, so this setup's own
+    # eval uses the real ``mx.eval``.
+    args = base.args
+    template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    _mx.eval(template.parameters())
+    flat = dict(tree_flatten(template.parameters()))
+    _mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+
+    class _MaterializeBoomError(RuntimeError):
+        pass
+
+    def _boom(*_a, **_k):
+        raise _MaterializeBoomError("sentinel: truncated tensor data")
+
+    # Set AFTER the setup eval above so only the in-inject materialization
+    # call hits the boom.
+    monkeypatch.setattr(_mx, "eval", _boom)
+
+    # Handler must convert the raise into a clean False, not propagate.
+    assert inject_mtp_support(base, mtp_sidecar=str(tmp_path)) is False
+    assert not hasattr(base, "mtp"), (
+        "inject refused but still attached an MTP module — the refusal must "
+        "leave the base model untouched (plain path)."
+    )
+
+
+def test_inject_refuses_sidecar_with_shape_mismatched_non_fc_tensor(tmp_path):
+    """The fc-derived quantization is applied UNIFORMLY across the module.
+    A sidecar whose fc is well-formed but another tensor's shape disagrees
+    with that uniform packing (a mixed-bit / differently-grouped /
+    corrupted non-fc layer) must be caught by the post-quantize shape
+    check and refused — loading it would recreate the quantized_matmul
+    mismatch mid-generation, not just at fc.
+    """
+    import mlx.core as _mx
+    import mlx.nn as _nn
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import inject_mtp_support
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    _nn.quantize(base.model, group_size=32, bits=8)
+
+    # A valid 4-bit sidecar; fc is left intact so inference derives 4-bit.
+    args = base.args
+    template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    _nn.quantize(template, group_size=32, bits=4)
+    _mx.eval(template.parameters())
+    flat = dict(tree_flatten(template.parameters()))
+
+    # Corrupt ONE non-fc tensor's shape (key stays present, so the coverage
+    # check passes and the SHAPE check is what must reject it).
+    victim = next(
+        k for k in sorted(flat) if not k.startswith("fc.") and k.endswith(".weight")
+    )
+    orig = flat[victim]
+    flat[victim] = _mx.zeros(
+        (int(orig.shape[0]) + 1, *(int(d) for d in orig.shape[1:])),
+        dtype=orig.dtype,
+    )
+    _mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+
+    assert inject_mtp_support(base, mtp_sidecar=str(tmp_path)) is False
+    assert not hasattr(base, "mtp")
+
+
+def test_inject_refuses_sidecar_with_dtype_mismatched_packed_weight(tmp_path):
+    """A shape-correct sidecar can still smuggle a wrong-*dtype* packed
+    weight. MLX packs quantized ``weight`` as unsigned 32-bit; a same-shape
+    ``float32``/``int32`` packed weight passes the coverage + shape checks
+    but ``load_weights(strict=False)`` installs it without casting and the
+    first ``mx.quantized_matmul`` rejects it (the same empty-response class).
+    The by-role dtype check must catch and refuse it.
+    """
+    import mlx.core as _mx
+    import mlx.nn as _nn
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import inject_mtp_support
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    _nn.quantize(base.model, group_size=32, bits=8)
+
+    # A valid 4-bit sidecar; fc is intact so inference derives 4-bit.
+    args = base.args
+    template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    _nn.quantize(template, group_size=32, bits=4)
+    _mx.eval(template.parameters())
+    flat = dict(tree_flatten(template.parameters()))
+
+    # Corrupt ONE packed weight's DTYPE (uint32 -> float32) while keeping its
+    # shape identical, so coverage + shape checks pass and only the dtype
+    # check can reject it.
+    victim = next(
+        k
+        for k in sorted(flat)
+        if k.endswith(".weight") and _mx.issubdtype(flat[k].dtype, _mx.integer)
+    )
+    flat[victim] = flat[victim].astype(_mx.float32)
+    _mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+
+    assert inject_mtp_support(base, mtp_sidecar=str(tmp_path)) is False
+    assert not hasattr(base, "mtp")
+
+
+def test_inject_refuses_mixed_bit_sidecar_fail_safe(tmp_path):
+    """The fc-derived quantization is applied UNIFORMLY (intentional scope).
+    A hypothetical mixed-bit sidecar — FP ``fc`` but a quantized decoder —
+    must NOT be silently mis-packed: ``_infer_sidecar_fc_quantization``
+    reads FP fc and leaves the module FP, then the Step 4 shape check sees
+    the packed decoder tensors disagree with the FP module and REFUSES
+    (clean non-MTP fallback), rather than crashing at the first draft step.
+    This documents the fail-safe boundary for non-uniform sidecars.
+    """
+    import mlx.core as _mx
+    import mlx.nn as _nn
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import inject_mtp_support
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    _nn.quantize(base.model, group_size=32, bits=8)
+
+    # Mixed-bit sidecar: quantize EVERYTHING EXCEPT fc, so fc ships FP while
+    # the decoder layers ship 4-bit packed tensors.
+    args = base.args
+    template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    _nn.quantize(
+        template,
+        group_size=32,
+        bits=4,
+        class_predicate=lambda path, m: (
+            hasattr(m, "to_quantized") and not path.startswith("fc")
+        ),
+    )
+    _mx.eval(template.parameters())
+    flat = dict(tree_flatten(template.parameters()))
+    # Sanity: fc stays FP (no fc.scales), decoder is packed (has scales).
+    assert not any(k.startswith("fc.scales") for k in flat)
+    assert any(k.endswith(".scales") and not k.startswith("fc.") for k in flat)
+    _mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+
+    assert inject_mtp_support(base, mtp_sidecar=str(tmp_path)) is False
+    assert not hasattr(base, "mtp")
+
+
+def test_inject_refuses_when_module_quantize_raises_fail_safe(tmp_path):
+    """A sidecar whose ``fc`` is validly packed at group_size=128 infers
+    ``group_size=128``, but the MTP module's narrower sibling leaves (only
+    ``hidden_size``-wide in this fixture) are NOT divisible by 128, so
+    ``nn.quantize(mtp, group_size=128)`` RAISES during Step 3 — before the
+    Step 4 shape/dtype refusal can run. That exception must be caught and
+    turned into a clean refusal (return False → non-MTP fallback), never
+    propagated (an uncaught raise aborts the request at the first draft
+    step: the empty-response class this fix closes).
+    """
+    import mlx.core as _mx
+    import mlx.nn as _nn
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import inject_mtp_support
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    _nn.quantize(base.model, group_size=32, bits=8)
+
+    args = base.args
+    template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    fc_out_dims, fc_in_dims = (int(d) for d in template.fc.weight.shape)
+
+    # Standalone group_size=128 fc (the fc IS wide enough for 128). The
+    # sidecar only needs the fc tensors — the crash fires in Step 3's
+    # module-wide quantize, before any other tensor is consulted.
+    fc = _nn.Linear(fc_in_dims, fc_out_dims, bias=False)
+    qfc = _nn.QuantizedLinear.from_linear(fc, 128, 4)
+    _mx.eval(qfc.parameters())
+    flat = {f"fc.{k}": v for k, v in dict(tree_flatten(qfc.parameters())).items()}
+    assert "fc.scales" in flat
+    _mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+
+    # Must not raise; must refuse cleanly.
+    assert inject_mtp_support(base, mtp_sidecar=str(tmp_path)) is False
+    assert not hasattr(base, "mtp")
+
+
+def test_inject_catches_module_quantize_exception_deterministically(
+    tmp_path, monkeypatch
+):
+    """Pin the Step 3 quantize exception handler independent of MLX's own
+    group-size validation: monkeypatch ``nn.quantize`` so the MTP-module
+    quantize RAISES a sentinel, then assert ``inject_mtp_support`` swallows
+    it and returns ``False`` (never propagates). Uses an OTHERWISE-VALID
+    4-bit sidecar so, absent the handler, the call would raise straight out
+    of ``inject_mtp_support`` — this test fails (errors) if the try/except
+    is removed, whereas the real-crash fixture could in principle be masked
+    by a later refusal or a future MLX that tolerates the packing.
+    """
+    import mlx.core as _mx
+    import mlx.nn as _nn
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import inject_mtp_support
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    # Real quantize for setup (base) + sidecar construction, BEFORE the patch.
+    _nn.quantize(base.model, group_size=32, bits=8)
+    args = base.args
+    template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    _nn.quantize(template, group_size=32, bits=4)
+    _mx.eval(template.parameters())
+    flat = dict(tree_flatten(template.parameters()))
+    _mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+
+    class _QuantizeBoomError(RuntimeError):
+        pass
+
+    def _boom(*_a, **_k):
+        raise _QuantizeBoomError("sentinel: module quantize failed")
+
+    # ``inject_mtp_support`` does ``import mlx.nn as nn`` internally, so its
+    # ``nn`` IS this same ``mlx.nn`` module object — patching the attribute
+    # here is what its ``nn.quantize(mtp, ...)`` call resolves to. Set AFTER
+    # the setup quantizes above so only the in-inject MTP call hits the boom.
+    monkeypatch.setattr(_nn, "quantize", _boom)
+
+    # Handler must convert the raise into a clean False, not propagate.
+    assert inject_mtp_support(base, mtp_sidecar=str(tmp_path)) is False
+    assert not hasattr(base, "mtp")
 
 
 # ---------------------------------------------------------------------------

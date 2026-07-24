@@ -141,6 +141,120 @@ def _detect_base_quantization(inner: Any) -> dict | None:
     return None
 
 
+# MLX affine quantization's practical value set. Every mlx-community
+# checkpoint (base + MTP sidecar alike) uses one of these — the shipped
+# Qwen3.6 pairing is 4-/8-bit at group_size 64. A sidecar whose tensors
+# imply a ``(bits, group_size)`` outside this set is anomalous (a
+# hand-corrupted or unknown packing); we refuse it rather than feed an
+# odd width into ``nn.quantize``. Kept deliberately narrow: over-inclusion
+# re-opens the exact mismatch this fix closes, while a genuinely-new width
+# simply needs one entry added here.
+_MLX_AFFINE_BITS = frozenset({2, 3, 4, 5, 6, 8})
+_MLX_AFFINE_GROUP_SIZES = frozenset({32, 64, 128})
+
+
+def _infer_sidecar_fc_quantization(
+    mtp_weights: dict, fc_out_dims: int, fc_in_dims: int
+) -> dict | None:
+    """Infer the sidecar fc layer's quantization from its LOADED tensors.
+
+    The sidecar tensors are the ground truth for how the checkpoint is
+    packed — strictly more reliable than any ``config.json`` proxy, which
+    a checkpoint may omit, mis-declare, or leave incomplete. The MTP
+    head's ``fc`` is an ``nn.Linear(2H, H)``; once MLX affine-quantizes
+    it, the packed ``fc.weight`` has shape ``(out, in * bits // 32)`` and
+    ``fc.scales`` has shape ``(out, in // group_size)``. Given the known
+    full-precision dims ``(out, in)`` read off the freshly-built module,
+    inverting those two shapes recovers ``(bits, group_size)`` exactly.
+
+    The MTP module must be quantized to match the sidecar it loads: a
+    QuantizedLinear's packed ``weight`` / ``scales`` shapes are a
+    function of ``(bits, group_size)``, so quantizing the module to a
+    DIFFERENT width than the sidecar tensors leaves a packing the layer's
+    ``bits`` attr disagrees with, and ``mx.quantized_matmul`` raises
+    "weight and scales incompatible" at the first MTP draft step —
+    surfacing to the client as an intermittent EMPTY response
+    (``prompt_tokens=0``). Reading the packing from the tensors fixes it
+    at the true source.
+
+    Returns:
+      * ``{"bits", "group_size"}`` — ``fc.scales`` is present, so the fc
+        is quantized; the affine params derived from the packed shapes
+        (validated against MLX's supported set + shape self-consistency).
+      * ``None`` — no ``fc.scales`` tensor, so the fc is full-precision;
+        the caller keeps the MTP module FP.
+
+    Raises:
+      ``ValueError`` — the sidecar's fc packing cannot be trusted: either
+      ``fc.scales`` is present but the shapes are inconsistent / the
+      derived ``(bits, group_size)`` are outside MLX affine's supported
+      set, OR ``fc.scales`` is absent yet a present ``fc.weight`` does
+      NOT carry the full-precision ``(out, in)`` shape (a truncated
+      quantized sidecar). The caller refuses injection rather than
+      mis-pack the module.
+    """
+    scales = mtp_weights.get("fc.scales")
+    if scales is None:
+        # No per-group scales → the fc is full-precision. Guard against a
+        # TRUNCATED quantized sidecar that shipped a packed ``fc.weight``
+        # but lost its ``fc.scales``: if ``fc.weight`` is present it MUST
+        # carry the exact full-precision ``(out, in)`` shape, else a
+        # packed weight would be loaded into an ``nn.Linear`` and crash
+        # at inference. A *missing* ``fc.weight`` is left to the
+        # downstream coverage check (the module stays FP and the check
+        # refuses the partial head).
+        fp_weight = mtp_weights.get("fc.weight")
+        if fp_weight is not None:
+            fp_shape = tuple(int(d) for d in fp_weight.shape)
+            if fp_shape != (fc_out_dims, fc_in_dims):
+                raise ValueError(
+                    f"fc has no scales but fc.weight shape {fp_shape} != "
+                    f"full-precision ({fc_out_dims}, {fc_in_dims}) — a "
+                    f"truncated quantized sidecar (packed weight, missing "
+                    f"scales)"
+                )
+        return None
+    weight = mtp_weights.get("fc.weight")
+    if weight is None:
+        raise ValueError("fc.scales present but fc.weight missing")
+    w_shape = tuple(int(d) for d in weight.shape)
+    s_shape = tuple(int(d) for d in scales.shape)
+    if len(w_shape) != 2 or len(s_shape) != 2:
+        raise ValueError(f"unexpected fc tensor ranks: weight{w_shape} scales{s_shape}")
+    if w_shape[0] != fc_out_dims or s_shape[0] != fc_out_dims:
+        raise ValueError(
+            f"fc out-dim mismatch: weight{w_shape} scales{s_shape} "
+            f"vs module out={fc_out_dims}"
+        )
+    packed_cols, scale_cols = w_shape[1], s_shape[1]
+    if scale_cols <= 0 or packed_cols <= 0:
+        raise ValueError(
+            f"non-positive fc packing cols: weight{w_shape} scales{s_shape}"
+        )
+    if fc_in_dims % scale_cols != 0:
+        raise ValueError(
+            f"in-dim {fc_in_dims} not divisible by scales cols {scale_cols}"
+        )
+    group_size = fc_in_dims // scale_cols
+    if (32 * packed_cols) % fc_in_dims != 0:
+        raise ValueError(
+            f"packed weight cols {packed_cols} inconsistent with in-dim {fc_in_dims}"
+        )
+    bits = (32 * packed_cols) // fc_in_dims
+    if bits not in _MLX_AFFINE_BITS or group_size not in _MLX_AFFINE_GROUP_SIZES:
+        raise ValueError(
+            f"derived bits={bits} group_size={group_size} outside MLX affine set"
+        )
+    # Cross-check: the packing must be exactly reproducible from the
+    # derived params (guards against a coincidental divisibility match).
+    if packed_cols != fc_in_dims * bits // 32 or scale_cols != fc_in_dims // group_size:
+        raise ValueError(
+            f"inconsistent packing: weight{w_shape} scales{s_shape} "
+            f"do not reproduce from bits={bits} group_size={group_size}"
+        )
+    return {"bits": bits, "group_size": group_size}
+
+
 def _resolve_sidecar_file(mtp_sidecar: str | Path) -> Path | None:
     """Resolve a sidecar reference to a concrete safetensors file path.
 
@@ -269,7 +383,7 @@ def inject_mtp_support(
     # NOTE: the global ``ArraysCache`` rollback_state class-default and
     # the ``GatedDeltaNet.__call__`` chunk-split patches are deferred
     # until AFTER every can-fail validation completes (see ``# --- Step
-    # 4`` below). Codex flagged on PR #954 that installing these
+    # 5`` below). Codex flagged on PR #954 that installing these
     # monkey-patches up-front meant a failed sidecar load left
     # process-global behavior mutated even though inject_mtp_support
     # returned False. The patches are now strictly post-validation.
@@ -321,21 +435,13 @@ def inject_mtp_support(
         getattr(args, "hidden_size", -1),
     )
 
-    # --- Step 2: Quantize MTP to match the base model's quantization ---
-    quant_info = _detect_base_quantization(inner)
-    if quant_info is not None:
-        nn.quantize(
-            mtp,
-            group_size=quant_info["group_size"],
-            bits=quant_info["bits"],
-        )
-        logger.info(
-            "[mtp.inject] Quantized MTP: %d-bit, group_size=%d",
-            quant_info["bits"],
-            quant_info["group_size"],
-        )
-
-    # --- Step 3: Load MTP weights from sidecar safetensors ---
+    # --- Step 2: Resolve the sidecar file up-front ---
+    # Resolved before quantization because the MTP module must be
+    # quantized to match the SIDECAR checkpoint it loads (see Step 3),
+    # whose packing is read off the sidecar's own tensors. Resolving here
+    # lets Step 3 load the tensors once and Step 4 reuse them without a
+    # second ``snapshot_download`` / ``mx.load``.
+    weights_file: Path | None = None
     if mtp_sidecar is not None:
         weights_file = _resolve_sidecar_file(mtp_sidecar)
         if weights_file is None:
@@ -348,26 +454,174 @@ def inject_mtp_support(
                 mtp_sidecar,
             )
             return False
-        raw = mx.load(str(weights_file))
-        # Some sidecars (Qwen3-Next ``add_mtp_weights.py`` output) prefix
-        # every key with ``mtp.``; others (mlx-community/Qwen3.5-9B-MTP-4bit)
-        # store at top-level. Strip the prefix if present so both shapes
-        # land on the MTP module's parameter tree.
-        mtp_weights = {
-            (k.removeprefix("mtp.") if k.startswith("mtp.") else k): v
-            for k, v in raw.items()
-        }
+
+    # --- Step 3: Match the MTP module's quantization to the SIDECAR ---
+    # The packed weight/scales shapes of a ``QuantizedLinear`` are a
+    # function of ``(bits, group_size)``. Loading a sidecar quantized
+    # at a DIFFERENT bit-width than the module was quantized to leaves
+    # a weight whose packing disagrees with the layer's ``bits`` attr,
+    # so ``mx.quantized_matmul`` raises "weight and scales incompatible"
+    # at the first MTP draft step. Historically we matched the BASE
+    # model's quantization, which is only safe when base bits == sidecar
+    # bits (the mlx-community 4bit+4bit pairing). A mixed pairing — an
+    # 8-bit base with the only-published 4-bit MTP head
+    # (Qwen3.6-27B-MLX-8bit + Qwen3.6-27B-MTP-4bit) — broke it.
+    #
+    # For an EXPLICIT sidecar we read the packing from the sidecar's own
+    # TENSORS (ground truth) — never the base model, and never a
+    # ``config.json`` proxy a checkpoint may omit or mis-declare. The
+    # presence of ``fc.scales`` distinguishes quantized from
+    # full-precision, and the packed ``fc.weight`` / ``fc.scales`` shapes
+    # recover ``(bits, group_size)`` exactly. The base-model fallback is
+    # legitimate ONLY on the no-sidecar path, where the MTP head is the
+    # base checkpoint's own and its bits match by construction.
+    mtp_weights: dict | None = None
+    if weights_file is not None:
+        # Load the sidecar tensors up-front so their real layout drives
+        # quantization; Step 4 reuses this dict for the coverage check.
+        # A truncated/unreadable/corrupt safetensors file makes ``mx.load``
+        # raise — that must hit the same return-False fail-safe as every
+        # other bad-sidecar path below, not escape as an uncaught exception
+        # and abort the request mid-generation.
+        try:
+            raw = mx.load(str(weights_file))
+            # Some sidecars (Qwen3-Next ``add_mtp_weights.py`` output) prefix
+            # every key with ``mtp.``; others (mlx-community/Qwen3.5-9B-MTP-4bit)
+            # store at top-level. Strip the prefix if present so both shapes
+            # land on the MTP module's parameter tree.
+            mtp_weights = {
+                (k.removeprefix("mtp.") if k.startswith("mtp.") else k): v
+                for k, v in raw.items()
+            }
+        except Exception as exc:
+            logger.error(
+                "[mtp.inject] sidecar %r could not be read/parsed (%s); "
+                "refusing MTP injection rather than raise mid-request. Omit "
+                "--speculative-config to run the plain base path.",
+                mtp_sidecar,
+                exc,
+            )
+            return False
+        # Read the fc's full-precision (out, in) dims off the freshly-built
+        # module, then invert the sidecar's packed fc shapes to recover its
+        # quantization.
+        #
+        # Scope (intentional): the recovered ``(bits, group_size)`` is applied
+        # UNIFORMLY to every quantizable leaf. Every shipped MTP sidecar
+        # (``mlx-community/Qwen3.5-9B-MTP-*``) is uniformly affine-packed, so
+        # fc is a faithful oracle for the whole head. A hypothetical mixed-bit
+        # sidecar (e.g. bf16 fc + 4-bit decoder, or 4-bit fc + 8-bit MoE gate)
+        # is NOT mis-packed here: the Step 4 shape/dtype verification below
+        # catches the resulting per-leaf disagreement and REFUSES the inject
+        # (returns False → clean non-MTP fallback), never shipping a head that
+        # aborts requests mid-generation. Per-leaf quantization inference would
+        # be a feature to *accept* such layouts, not a fix — the fail-safe
+        # refusal already holds.
+        fc_out_dims, fc_in_dims = (int(d) for d in mtp.fc.weight.shape)
+        try:
+            sidecar_quant = _infer_sidecar_fc_quantization(
+                mtp_weights, fc_out_dims, fc_in_dims
+            )
+        except ValueError as exc:
+            logger.error(
+                "[mtp.inject] sidecar %r has a quantized fc whose tensor "
+                "layout is inconsistent or an unsupported packing (%s); "
+                "refusing MTP injection rather than mis-pack the module and "
+                "abort requests at the first draft step. Provide a sidecar "
+                "packed with MLX affine quantization, or omit "
+                "--speculative-config to run the plain base path.",
+                mtp_sidecar,
+                exc,
+            )
+            return False
+        if sidecar_quant is None:
+            logger.info(
+                "[mtp.inject] Sidecar fc is full-precision; "
+                "leaving MTP module full-precision."
+            )
+        else:
+            # ``nn.quantize`` applies the fc-derived ``(bits, group_size)``
+            # to EVERY quantizable leaf and can itself RAISE — e.g. an fc
+            # wide enough for group_size=128 whose sibling projections are
+            # narrower than 128 (``last dimension needs to be divisible by
+            # group size``). That failure lands here, BEFORE Step 4's safe
+            # shape/dtype refusal can run, so it must be caught: an uncaught
+            # exception out of inject_mtp_support aborts the request at the
+            # first draft step — the very empty-response class this fix
+            # closes. Refuse (return False → clean non-MTP fallback) instead.
+            try:
+                nn.quantize(
+                    mtp,
+                    group_size=sidecar_quant["group_size"],
+                    bits=sidecar_quant["bits"],
+                )
+            except Exception as exc:
+                logger.error(
+                    "[mtp.inject] sidecar %r infers %d-bit / group_size=%d "
+                    "from its fc, but quantizing the MTP module at that "
+                    "packing failed (%s); refusing MTP injection rather than "
+                    "raise mid-request. The sidecar's fc packing is "
+                    "incompatible with its own narrower leaves — provide a "
+                    "uniformly-packed sidecar, or omit --speculative-config "
+                    "to run the plain base path.",
+                    mtp_sidecar,
+                    sidecar_quant["bits"],
+                    sidecar_quant["group_size"],
+                    exc,
+                )
+                return False
+            logger.info(
+                "[mtp.inject] Quantized MTP: %d-bit, group_size=%d "
+                "(from sidecar tensors)",
+                sidecar_quant["bits"],
+                sidecar_quant["group_size"],
+            )
+    else:
+        # No explicit sidecar: the MTP head is the base checkpoint's own,
+        # so the base model's quantization is the correct match.
+        base_quant = _detect_base_quantization(inner)
+        if base_quant is not None:
+            # Same fail-safe as the sidecar path: never let a quantize
+            # failure escape as an uncaught exception (→ empty response).
+            try:
+                nn.quantize(
+                    mtp,
+                    group_size=base_quant["group_size"],
+                    bits=base_quant["bits"],
+                )
+            except Exception as exc:
+                logger.error(
+                    "[mtp.inject] base model is %d-bit / group_size=%d but "
+                    "quantizing the MTP module at that packing failed (%s); "
+                    "refusing MTP injection rather than raise mid-request.",
+                    base_quant["bits"],
+                    base_quant["group_size"],
+                    exc,
+                )
+                return False
+            logger.info(
+                "[mtp.inject] Quantized MTP: %d-bit, group_size=%d (from base)",
+                base_quant["bits"],
+                base_quant["group_size"],
+            )
+
+    # --- Step 4: Load MTP weights from sidecar safetensors ---
+    if mtp_sidecar is not None:
+        # ``mtp_weights`` was loaded + prefix-normalised in Step 3
+        # (``mtp_sidecar is not None`` implies ``weights_file is not None``).
+        assert mtp_weights is not None
         # Pre-load coverage check: codex flagged on PR #954 that
         # ``strict=False`` lets the load silently succeed even when
         # sidecar tensors are missing or misspelled — leaving part of
         # the MTP head random-init while inject_mtp_support still
-        # returns True. Compute the expected parameter key set off
+        # returns True. Compute the expected parameter map off
         # ``mtp.parameters()`` (post-quantize, so ``weight`` /
         # ``scales`` / ``biases`` for QuantizedLinear layers) and
         # refuse the inject if any required tensor is missing.
         from mlx.utils import tree_flatten
 
-        expected_keys = {k for k, _ in tree_flatten(mtp.parameters())}
+        expected = dict(tree_flatten(mtp.parameters()))
+        expected_keys = set(expected)
         loaded_keys = set(mtp_weights.keys())
         missing = expected_keys - loaded_keys
         if missing:
@@ -383,11 +637,103 @@ def inject_mtp_support(
                 sorted(missing)[:8],
             )
             return False
+        # Shape verification: the quantization we applied above is inferred
+        # from the fc layer and applied UNIFORMLY across the module. Verify
+        # that EVERY sidecar tensor matches the corresponding post-quantize
+        # parameter shape EXACTLY — a mismatch means the sidecar's packing
+        # disagrees with the module's (a mixed-bit, differently-grouped, or
+        # corrupted non-fc layer), which is precisely what makes
+        # ``mx.quantized_matmul`` raise "weight and scales incompatible" at
+        # the first draft step (the empty-response bug). Refuse rather than
+        # ship a module that crashes mid-generation.
+        shape_mismatches = {
+            k: (
+                tuple(int(d) for d in mtp_weights[k].shape),
+                tuple(int(d) for d in v.shape),
+            )
+            for k, v in expected.items()
+            if tuple(int(d) for d in mtp_weights[k].shape)
+            != tuple(int(d) for d in v.shape)
+        }
+        if shape_mismatches:
+            sample = sorted(shape_mismatches.items())[:8]
+            logger.warning(
+                "[mtp.inject] sidecar %s has %d tensor(s) whose shape "
+                "disagrees with the module's quantization (got vs expected); "
+                "refusing rather than ship a head that aborts requests at the "
+                "first draft step. Mismatches (first 8): %s. This usually "
+                "means the sidecar is packed at a different bit-width / "
+                "group_size than its fc layer, or is corrupted.",
+                weights_file.name,
+                len(shape_mismatches),
+                sample,
+            )
+            return False
+        # Dtype verification (by ROLE, not exact match): a shape-correct
+        # sidecar can still smuggle in a wrong-*dtype* tensor that
+        # ``load_weights(strict=False)`` installs without casting, then
+        # ``mx.quantized_matmul`` / ``mx.gather_qmm`` rejects. MLX packs
+        # quantized ``weight`` as unsigned 32-bit; an ``int32``/``float32``
+        # packed weight (or an integer ``scales``/``biases``) has the right
+        # shape but blows up at the first draft step — the same empty-response
+        # class this fix closes. Enforce by role: an integer-typed expected
+        # parameter (the packed ``weight``) must match its dtype EXACTLY,
+        # while a floating-typed expected parameter (``scales`` / ``biases`` /
+        # any FP weight) need only be *some* floating dtype — a real sidecar
+        # legitimately ships bf16 scales against the freshly-quantized fp32
+        # module and ``load_weights`` casts them, so an exact float check
+        # would false-reject valid checkpoints.
+        dtype_mismatches = {}
+        for k, v in expected.items():
+            got_dt = mtp_weights[k].dtype
+            exp_dt = v.dtype
+            if mx.issubdtype(exp_dt, mx.integer):
+                ok = got_dt == exp_dt
+            else:
+                ok = mx.issubdtype(got_dt, mx.floating)
+            if not ok:
+                dtype_mismatches[k] = (str(got_dt), str(exp_dt))
+        if dtype_mismatches:
+            sample = sorted(dtype_mismatches.items())[:8]
+            logger.warning(
+                "[mtp.inject] sidecar %s has %d tensor(s) whose dtype is "
+                "incompatible with the module's quantization (got vs expected); "
+                "refusing rather than ship a head that aborts requests at the "
+                "first draft step. Mismatches (first 8): %s. A packed quantized "
+                "weight must be unsigned 32-bit and scales/biases must be "
+                "floating; a mismatch means the sidecar is corrupted or was "
+                "converted with an incompatible packer.",
+                weights_file.name,
+                len(dtype_mismatches),
+                sample,
+            )
+            return False
         # ``strict=False`` still — we deliberately tolerate EXTRA
         # keys (metadata blobs some converters bundle), but the
-        # coverage check above proves no required key is missing.
-        mtp.load_weights(list(mtp_weights.items()), strict=False)
-        mx.eval(mtp.parameters())
+        # coverage + shape + dtype checks above prove every required
+        # tensor is present and fits its target parameter exactly.
+        #
+        # ``mx.load`` above (Step 3) is LAZY — it only reads the
+        # safetensors header, not tensor DATA. A truncated/unreadable
+        # sidecar with a valid header sails through every check above
+        # and only RAISES here, at ``mx.eval(mtp.parameters())``
+        # materialization. That must hit the same return-False
+        # fail-safe as every other bad-sidecar path in this function,
+        # not escape as an uncaught exception and abort the request
+        # mid-generation.
+        try:
+            mtp.load_weights(list(mtp_weights.items()), strict=False)
+            mx.eval(mtp.parameters())
+        except Exception as exc:
+            logger.error(
+                "[mtp.inject] sidecar %r raised while materializing MTP "
+                "weights (%s); refusing MTP injection rather than abort "
+                "the request mid-generation. Omit --speculative-config "
+                "to run the plain base path.",
+                mtp_sidecar,
+                exc,
+            )
+            return False
         extra = loaded_keys - expected_keys
         logger.info(
             "[mtp.inject] Loaded %d/%d expected MTP weight tensors from %s%s",
@@ -424,7 +770,7 @@ def inject_mtp_support(
             "do not use in production."
         )
 
-    # --- Step 4: Install global ArraysCache + GatedDeltaNet patches ---
+    # --- Step 5: Install global ArraysCache + GatedDeltaNet patches ---
     # Deferred from the top of this function so a failed validation /
     # sidecar load (above) leaves the process global state untouched.
     # Both patches are idempotent + transparent at n_confirmed=0, so
@@ -438,7 +784,7 @@ def inject_mtp_support(
     patch_arrays_cache_rollback_state()
     patch_gated_delta_net_for_mtp()
 
-    # --- Step 5: Attach + monkey-patch ``TextModel`` class ---
+    # --- Step 6: Attach + monkey-patch ``TextModel`` class ---
     inner.mtp = mtp
     original_class = type(inner)
 
