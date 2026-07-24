@@ -1268,6 +1268,15 @@ class TestReasoningToolOutputIndexAlignment:
         assert "function_call" in types_seen, (
             f"function_call item missing from output[]; types={types_seen}"
         )
+        arg_deltas = [
+            payload["delta"]
+            for ev_name, payload in events
+            if ev_name == "response.function_call_arguments.delta"
+        ]
+        assert "".join(arg_deltas) == '{"city":"Pittsburgh"}', (
+            "function_call arguments must reconstruct to the expected "
+            f"Responses payload; got deltas={arg_deltas!r}"
+        )
 
         # Every ``output_item.done`` event's ``output_index`` matches
         # the array position of its ``item.id`` in the terminal

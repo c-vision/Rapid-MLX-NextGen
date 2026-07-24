@@ -858,6 +858,10 @@ _HY3_MODEL_NAME_RE = re.compile(
     r"(?:^|[/_.\-])(?:hy3|hy-v3|hunyuan[-_]?3)(?:$|[_.\-])",
     re.IGNORECASE,
 )
+_GPT_OSS_MODEL_NAME_RE = re.compile(
+    r"(?:^|[/_.\-])gpt[-_]oss(?:$|[_.\-])",
+    re.IGNORECASE,
+)
 
 
 def _looks_like_hy3(model_name: str) -> bool:
@@ -872,6 +876,63 @@ def _looks_like_hy3(model_name: str) -> bool:
     if not model_name:
         return False
     return bool(_HY3_MODEL_NAME_RE.search(model_name))
+
+
+def _looks_like_gpt_oss(model_name: str) -> bool:
+    """Return True when the model name is the GPT-OSS / Harmony family."""
+    if not model_name:
+        return False
+    return bool(_GPT_OSS_MODEL_NAME_RE.search(model_name))
+
+
+def _looks_like_gpt_oss_harmony_template(template: str) -> bool:
+    """Return True for Harmony chat templates even under a served alias."""
+    return all(
+        marker in template for marker in ("<|start|>", "<|channel|>", "<|message|>")
+    )
+
+
+def _chat_template_strings(template, *, tools: list[dict] | None = None) -> list[str]:
+    if isinstance(template, str):
+        return [template]
+    if isinstance(template, dict):
+        preferred_keys = ("tool_use", "tools", "default") if tools else ("default",)
+        for key in preferred_keys:
+            value = template.get(key)
+            if isinstance(value, str):
+                return [value]
+        string_values = [value for value in template.values() if isinstance(value, str)]
+        return string_values if len(string_values) == 1 else []
+    return []
+
+
+def _template_uses_reasoning_effort_without_enable_thinking(
+    template_applicator,
+    model_name: str = "",
+    tools: list[dict] | None = None,
+) -> bool:
+    """Return True for templates such as GPT-OSS/Harmony that expose a
+    ``reasoning_effort`` kwarg but do not consult ``enable_thinking``.
+
+    In that shape, passing ``enable_thinking=False`` is silently inert;
+    the closest template-native low-reasoning request is
+    ``reasoning_effort="low"``.
+    """
+    templates = _chat_template_strings(
+        getattr(template_applicator, "chat_template", None),
+        tools=tools,
+    )
+    if not templates:
+        return False
+    return any(
+        "reasoning_effort" in template
+        and "enable_thinking" not in template
+        and (
+            _looks_like_gpt_oss(model_name)
+            or _looks_like_gpt_oss_harmony_template(template)
+        )
+        for template in templates
+    )
 
 
 def apply_chat_template(
@@ -990,6 +1051,20 @@ def apply_chat_template(
     }
     if tools:
         template_kwargs["tools"] = tools
+
+    # GPT-OSS / Harmony-style templates do not expose an on/off
+    # ``enable_thinking`` switch; they expose ``reasoning_effort`` and default
+    # it to ``medium``. When a route already resolved ``enable_thinking=False``
+    # (tools / strict-json / casual-chat auto-disable, or explicit client
+    # opt-out), request the lowest native effort instead of letting the
+    # template silently ignore the off flag and keep ``Reasoning: medium``.
+    if (
+        enable_thinking is False
+        and _template_uses_reasoning_effort_without_enable_thinking(
+            template_applicator, model_name=model_name, tools=tools
+        )
+    ):
+        template_kwargs.setdefault("reasoning_effort", "low")
 
     # Hy3 chat_template.jinja defaults ``reasoning_effort=no_think`` which
     # empirically returns "France" instead of "Paris" on factual-recall

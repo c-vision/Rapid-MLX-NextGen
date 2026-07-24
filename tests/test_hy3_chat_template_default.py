@@ -103,6 +103,137 @@ def test_hy3_default_not_injected_when_enable_thinking_false():
     assert "reasoning_effort" not in tok.captured_kwargs
 
 
+def test_hy3_reasoning_effort_template_still_honors_enable_thinking_false():
+    """Hy3 also uses a ``reasoning_effort`` template knob, but
+    ``enable_thinking=False`` must leave its native ``no_think`` default
+    untouched instead of borrowing GPT-OSS's ``low`` workaround."""
+
+    class Hy3LikeTokenizer(_CapturingTokenizer):
+        chat_template = (
+            "{% if reasoning_effort is not defined %}"
+            "{% set reasoning_effort = 'no_think' %}{% endif %}"
+            "Reasoning: {{ reasoning_effort }}"
+        )
+
+    tok = Hy3LikeTokenizer()
+    apply_chat_template(
+        tok,
+        messages=[{"role": "user", "content": "hi"}],
+        enable_thinking=False,
+        model_name="mlx-community/Hy3-preview-4bit",
+    )
+    assert tok.captured_kwargs.get("enable_thinking") is False
+    assert "reasoning_effort" not in tok.captured_kwargs
+
+
+def test_gpt_oss_template_gets_low_effort_when_thinking_disabled():
+    """GPT-OSS/Harmony templates ignore ``enable_thinking`` but honor
+    ``reasoning_effort``. A route-level thinking-off decision should
+    render as the closest native setting: ``Reasoning: low``."""
+
+    class GptOssLikeTokenizer(_CapturingTokenizer):
+        chat_template = (
+            "{% if reasoning_effort is not defined %}"
+            "{% set reasoning_effort = 'medium' %}{% endif %}"
+            "Reasoning: {{ reasoning_effort }}"
+        )
+
+    tok = GptOssLikeTokenizer()
+    apply_chat_template(
+        tok,
+        messages=[{"role": "user", "content": "hi"}],
+        enable_thinking=False,
+        model_name="66ton99/gpt-oss-120b",
+    )
+    assert tok.captured_kwargs.get("enable_thinking") is False
+    assert tok.captured_kwargs.get("reasoning_effort") == "low"
+
+
+def test_gpt_oss_harmony_template_alias_gets_low_effort_when_thinking_disabled():
+    """Served aliases should still get the GPT-OSS/Harmony low-effort
+    mapping when the template itself exposes the Harmony shape."""
+
+    class HarmonyAliasTokenizer(_CapturingTokenizer):
+        chat_template = (
+            "<|start|>{{ role }}<|channel|>{{ channel }}<|message|>"
+            "{% if reasoning_effort is not defined %}"
+            "{% set reasoning_effort = 'medium' %}{% endif %}"
+            "Reasoning: {{ reasoning_effort }}"
+        )
+
+    tok = HarmonyAliasTokenizer()
+    apply_chat_template(
+        tok,
+        messages=[{"role": "user", "content": "hi"}],
+        enable_thinking=False,
+        model_name="prod-alias",
+    )
+    assert tok.captured_kwargs.get("enable_thinking") is False
+    assert tok.captured_kwargs.get("reasoning_effort") == "low"
+
+
+def test_gpt_oss_dict_chat_template_gets_low_effort_when_thinking_disabled():
+    """HF tokenizers may expose ``chat_template`` as a named-template dict."""
+
+    class DictTemplateTokenizer(_CapturingTokenizer):
+        chat_template = {
+            "default": (
+                "{% if reasoning_effort is not defined %}"
+                "{% set reasoning_effort = 'medium' %}{% endif %}"
+                "Reasoning: {{ reasoning_effort }}"
+            )
+        }
+
+    tok = DictTemplateTokenizer()
+    apply_chat_template(
+        tok,
+        messages=[{"role": "user", "content": "hi"}],
+        enable_thinking=False,
+        model_name="66ton99/gpt-oss-120b",
+    )
+    assert tok.captured_kwargs.get("enable_thinking") is False
+    assert tok.captured_kwargs.get("reasoning_effort") == "low"
+
+
+def test_gpt_oss_low_effort_survives_enable_thinking_retry():
+    """Some template applicators reject unknown ``enable_thinking`` kwargs.
+    The first retry drops only that kwarg and must keep
+    ``reasoning_effort='low'``."""
+
+    class EnableThinkingRejectingGptOssTokenizer:
+        chat_template = (
+            "{% if reasoning_effort is not defined %}"
+            "{% set reasoning_effort = 'medium' %}{% endif %}"
+            "Reasoning: {{ reasoning_effort }}"
+        )
+
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "enable_thinking" in kwargs:
+                raise TypeError(
+                    "apply_chat_template() got unexpected keyword "
+                    "argument 'enable_thinking'"
+                )
+            return "<gpt-oss prompt>"
+
+    tok = EnableThinkingRejectingGptOssTokenizer()
+    result = apply_chat_template(
+        tok,
+        messages=[{"role": "user", "content": "hi"}],
+        enable_thinking=False,
+        model_name="66ton99/gpt-oss-120b",
+    )
+    assert result == "<gpt-oss prompt>"
+    assert len(tok.calls) == 2
+    assert tok.calls[0].get("reasoning_effort") == "low"
+    assert tok.calls[0].get("enable_thinking") is False
+    assert tok.calls[1].get("reasoning_effort") == "low"
+    assert "enable_thinking" not in tok.calls[1]
+
+
 def test_non_hy3_model_never_sees_reasoning_effort_kwarg():
     """Every other family's chat template rejects unknown kwargs with
     ``TypeError``. The Hy3-only injection MUST NOT fire for other models
