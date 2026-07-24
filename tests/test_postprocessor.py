@@ -830,6 +830,38 @@ class TestStreamingPostProcessorMiniMaxRedirect:
         # Tool parser should have been called (reasoning was redirected to content)
         assert tool_parser.extract_tool_calls_streaming.called
 
+    def test_tool_xml_in_reasoning_not_redirected_when_line1_gated(self):
+        """LINE① (#558 codex r4 #4): with the reasoning gate engaged, an in-``<think>``
+        tool marker is NOT redirected to content — it stays in reasoning where the
+        tool parser cannot mis-extract it. line①'s gate guarantees the real forced
+        call lands AFTER ``</think>``, so the load-bearing MiniMax redirect is
+        unneeded and harmful here (it would expose a sub-token-spelled opener). This
+        is the streaming analog of the non-streaming reasoning-first reorder. Mirrors
+        ``test_tool_xml_in_reasoning_redirected`` with ``line1_gate_engaged=True``."""
+        parser = MagicMock()
+        delta_msg = MagicMock()
+        delta_msg.content = None
+        delta_msg.reasoning = "<tool_call>{}"
+        parser.extract_reasoning_streaming.return_value = delta_msg
+
+        tool_parser = MagicMock()
+        tool_parser.extract_tool_calls_streaming.return_value = {"content": ""}
+        tool_parser.has_pending_tool_call.return_value = False
+
+        cfg = _make_cfg(
+            reasoning_parser=parser,
+            enable_auto_tool_choice=True,
+            tool_parser_instance=tool_parser,
+        )
+        pp = StreamingPostProcessor(cfg, line1_gate_engaged=True)
+        pp.reset()
+
+        pp.process_chunk(_make_output("<tool_call>{}"))
+        # Redirect SKIPPED: the in-<think> marker is never handed to the tool parser…
+        assert not tool_parser.extract_tool_calls_streaming.called
+        # …and it stays on the reasoning channel.
+        assert "<tool_call>{}" in pp.accumulated_reasoning
+
 
 class TestStreamingPostProcessorToolCallChannel:
     """Tests for tool_call channel routing."""

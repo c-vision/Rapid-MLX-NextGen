@@ -2254,6 +2254,8 @@ class GrammarLogitsProcessor:
         grammar: str,
         *,
         reasoning_end_token: str | None = None,
+        reasoning_end_id: int | None = None,
+        think_excluded_ids: Any = None,
         tokenizer: Any = None,
         stop_token_ids: Any = None,
     ):
@@ -2278,7 +2280,46 @@ class GrammarLogitsProcessor:
         self._vocab = lltokenizer.vocab_size
         self._bitmask = allocate_token_bitmask(1, self._vocab)
         self._reasoning_end_token = reasoning_end_token
-        self._reasoning_ended = reasoning_end_token is None
+        # LINE① (#558): a TOKEN-ID reasoning gate — preferred over the string
+        # gate (no per-step decode, no multi-token ``</think>`` boundary
+        # ambiguity, and it opens deterministically). When EITHER gate token is
+        # supplied the mask starts OFF (reasoning not yet ended) and opens when
+        # the boundary is observed; with NEITHER, the grammar constrains from
+        # token 0 (PATH A). The id gate is only sound when a thinking budget
+        # guarantees the boundary is emitted — the chat route COUPLES one exactly
+        # there (Option B: it reads ``reasoning_gate_id`` and installs a budget
+        # for this tool request via ``_build_reasoning_budget_processor(allow_
+        # tools=True)``), mirroring SGLang's ``ReasonerGrammarObject`` (budget +
+        # gated grammar in one object) and vLLM's reasoning-gated structured
+        # output (budget applied to structured requests, temporally disjoint from
+        # the grammar). Because the mask is OFF through the ``<think>`` span, the
+        # forced ``</think>`` cannot land mid-tool-call (vLLM #44676 is the ungated
+        # path only).
+        self._reasoning_end_id = reasoning_end_id
+        self._reasoning_ended = reasoning_end_token is None and reasoning_end_id is None
+        # LINE① (#558): tokens the model must NOT emit WHILE the reasoning gate is
+        # closed — the tool-call start marker(s). Copies SGLang's
+        # ``think_excluded_token_ids`` (``reasoner_grammar_backend.py``): during the
+        # ``<think>`` span the inner tool grammar is inactive (free generation), so
+        # without this a model could open a ``<tool_call>`` INSIDE reasoning and the
+        # coupled budget's forced ``</think>`` could then land mid-envelope. Masking
+        # the single-special-token opener during the closed gate makes that
+        # structurally impossible (the model can only begin the call AFTER
+        # ``</think>``, where the grammar owns it). Only meaningful WITH the id gate
+        # (during free PATH-A/non-gated generation there is nothing to protect); the
+        # caller supplies these ONLY when ``reasoning_end_id`` is set. Filtered to
+        # in-vocab ids; the additive -inf mask is built lazily per logits width.
+        self._think_excluded_ids: tuple[int, ...] = tuple(
+            sorted(
+                {
+                    int(t)
+                    for t in (think_excluded_ids or ())
+                    if 0 <= int(t) < self._vocab
+                }
+            )
+        )
+        self._think_exclude_add: Any = None
+        self._think_exclude_width: int | None = None
         self._tokenizer = tokenizer
         # MODEL STOP/EOS tokens re-admitted at accepting states (0.10.16 dogfood
         # P1-①). llguidance's compiled grammar terminates on the tokenizer's
@@ -2337,6 +2378,56 @@ class GrammarLogitsProcessor:
         """Whether the grammar failed to compile (masks nothing; use fallback)."""
         return self._broken
 
+    @property
+    def reasoning_gate_id(self) -> int | None:
+        """LINE① (#558): the ``</think>`` TOKEN ID this processor's mask is gated
+        behind, or ``None`` when the grammar constrains from token 0 (PATH A) or
+        uses the string gate. The route reads this to COUPLE the generation-time
+        thinking budget to the gate — a non-``None`` value means the mask is held
+        OFF through the ``<think>`` span, so installing a budget that force-closes
+        ``</think>`` inside that span cannot land mid-tool-call (the constrained
+        region begins strictly AFTER the boundary). Mirrors how SGLang's
+        ``ReasonerGrammarObject`` carries both the budget and the inner grammar in
+        one object, and vLLM applies the budget to structured requests precisely
+        because the grammar is reasoning-gated (budget and grammar temporally
+        disjoint). ``None`` => no gate => the budget keeps its tool opt-out.
+        """
+        return self._reasoning_end_id
+
+    def _apply_think_exclusion(self, logits: Any) -> Any:
+        """Additively mask the tool-call opener id(s) to ``-inf`` while the
+        reasoning gate is closed, leaving every other logit untouched (free
+        thinking). Additive (not override): the model still generates freely; only
+        the tool-start marker is forbidden until ``</think>``. The mask row is
+        cached per logits width and broadcast, preserving the incoming shape (the
+        mlx-lm processor contract — same guarantee as ``_force_distribution``).
+
+        The full-width additive broadcast (vs an in-place indexed write at the tiny
+        opener set) is DELIBERATE (codex r6 NIT): it is out-of-place and shape-
+        preserving like ``_force_distribution``, so it cannot desync a caller that
+        retains ``logits``; the O(vocab) add is the same order as the sampler's own
+        softmax/argmax on the very next line and only runs during the reasoning span
+        of a line①-engaged request, so the allocation is negligible in practice."""
+        import mlx.core as mx
+
+        width = logits.shape[-1]
+        dtype = logits.dtype
+        if self._think_exclude_add is None or self._think_exclude_width != width:
+            # Additive row: 0 everywhere, -inf at each excluded id. Built with the
+            # same ``where``-over-arange pattern as ``_force_distribution`` (no
+            # scatter — the opener set is tiny, typically a single ``<tool_call>``).
+            vocab = mx.arange(width)
+            neg = mx.array(-float("inf"), dtype=mx.float32)
+            row = mx.zeros((width,), dtype=mx.float32)
+            for i in self._think_excluded_ids:
+                if 0 <= i < width:
+                    row = mx.where(vocab == i, neg, row)
+            self._think_exclude_add = row.astype(dtype)
+            self._think_exclude_width = width
+        elif self._think_exclude_add.dtype != dtype:
+            self._think_exclude_add = self._think_exclude_add.astype(dtype)
+        return logits + mx.broadcast_to(self._think_exclude_add, logits.shape)
+
     def _maybe_open_after_reasoning(self, token_ids: Any) -> None:
         if self._reasoning_ended or self._tokenizer is None:
             return
@@ -2376,6 +2467,16 @@ class GrammarLogitsProcessor:
             for t in tail:
                 self._committed += 1
                 if not self._reasoning_ended:
+                    # LINE① token-id gate: open the instant the reasoning-end
+                    # id is observed. The boundary token is the delimiter — it
+                    # is NOT consumed by the matcher (the grammar starts at the
+                    # first POST-reasoning token), and neither are the reasoning
+                    # tokens before it.
+                    if (
+                        self._reasoning_end_id is not None
+                        and int(t) == self._reasoning_end_id
+                    ):
+                        self._reasoning_ended = True
                     continue
                 tok = int(t)
                 if not self._matcher.consume_token(tok):
@@ -2413,10 +2514,26 @@ class GrammarLogitsProcessor:
         # from construction, so the ``continue`` above never fires and every
         # token is consumed). Only a defense-in-depth path-B caller that sets
         # ``reasoning_end_token`` hits the deferral.
-        if not self._reasoning_ended:
+        # The string gate (decode-based) only runs when no token-id gate is
+        # active — the id gate above already opened it inline (LINE①).
+        if not self._reasoning_ended and self._reasoning_end_id is None:
             self._maybe_open_after_reasoning(token_ids)
         if not self._reasoning_ended:
-            return logits  # free generation during reasoning
+            # Free generation during reasoning — EXCEPT the tool-call opener
+            # SPECIAL TOKEN(s), which are masked so the model cannot begin a tool
+            # call inside ``<think>`` via its natural opener (LINE① / SGLang
+            # ``think_excluded_token_ids``). This blocks the atomic opener a trained
+            # model actually emits; it is NOT a proof the trigger TEXT can't be
+            # spelled as ordinary subtokens (codex r3 #4). That residual is closed at
+            # the EXTRACTION layer, not here: the route's reasoning-first tool parse
+            # (non-streaming) + the line①-gated redirect (streaming) discard any
+            # in-``<think>`` marker before a tool parser sees it, spelling-agnostic
+            # (codex r4 #4 — see the route's ``_line1_split_reasoning_for_tool_parse``
+            # and the think_excluded comment). Everything else is unconstrained. No
+            # excluded ids ⇒ fully free (unchanged).
+            if self._think_excluded_ids:
+                return self._apply_think_exclusion(logits)
+            return logits
 
         if self._matcher.is_stopped():
             return logits

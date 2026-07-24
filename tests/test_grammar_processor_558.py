@@ -1085,8 +1085,11 @@ def test_route_offload_gated_on_eligibility_in_source():
     from vllm_mlx.routes import chat as chat_mod
 
     # The route calls the extracted helper (which owns the gate + admission).
+    # r3 #5: the call now spans lines (messages/resolved_thinking threaded in for
+    # the in-slot seed render), so match the normalized form.
     route_src = inspect.getsource(chat_mod._create_chat_completion_impl)
-    assert "_offload_tool_grammar_build(engine, cfg, request)" in route_src, (
+    _norm = " ".join(route_src.split())
+    assert "_offload_tool_grammar_build( engine, cfg, request" in _norm, (
         "the route must delegate the off-loop build to _offload_tool_grammar_build"
     )
 
@@ -1289,7 +1292,7 @@ def test_admission_slot_not_released_until_compile_finishes_on_cancel():
     # Make the REAL helper's build block: it submits _maybe_build_tool_grammar_
     # processor to the pool, so patch that to a blocking function. The done-
     # callback (attached by the helper) releases the slot when this returns.
-    def _blocking_build(engine, cfg, request):
+    def _blocking_build(engine, cfg, request, *args, **kwargs):
         started.set()
         release_gate.wait(timeout=5)
         finished.set()
@@ -1378,7 +1381,7 @@ def test_cancelled_caller_does_not_cancel_a_queued_compile():
     pool = ThreadPoolExecutor(max_workers=1)  # forces B to QUEUE behind A
     chat_mod._get_tool_grammar_build_executor = lambda: pool
 
-    def _build(engine, cfg, request):
+    def _build(engine, cfg, request, *args, **kwargs):
         # Distinguish A (first) from B (second) by a per-request marker.
         if getattr(request, "_which", None) == "A":
             a_started.set()
@@ -2426,7 +2429,11 @@ def test_forced_prefix_block_is_gated_on_grammar_absence():
 
     src = inspect.getsource(chat_mod._create_chat_completion_impl)
     glp_pos = src.find("_glp = await _offload_tool_grammar_build(")
-    prefix_gate = src.find("if _glp is None and request.tools")
+    # The forced-prefix computation is now factored into ``_compute_forced_tool_
+    # prefix`` and gated on ``_glp is None`` (grammar and prefix mutually
+    # exclusive). r4 #3 also RESTORES it via the same helper when a gate engaged
+    # but its coupled budget did not build.
+    prefix_gate = src.find("if _glp is None:\n        _forced_prefix = ")
     assert glp_pos != -1, "grammar processor build call not found in route"
     assert prefix_gate != -1, (
         "forced-prefix block must be gated on '_glp is None' — the two are "
@@ -2435,3 +2442,1268 @@ def test_forced_prefix_block_is_gated_on_grammar_absence():
     assert glp_pos < prefix_gate, (
         "the grammar processor must be built BEFORE the forced-prefix gate"
     )
+    # r4 #3: gate engaged + budget None must discard the gate and restore the
+    # forced-prefix fallback (never leave an orphaned gate with no force-close).
+    reconcile_pos = src.find("elif _line1_gate_engaged:")
+    assert reconcile_pos != -1 and reconcile_pos > glp_pos, (
+        "route must reconcile an engaged gate whose coupled budget did not build "
+        "(codex r4 #3) — discard the gate, restore forced-prefix"
+    )
+    assert "_restored_prefix = _compute_forced_tool_prefix(cfg, request)" in src, (
+        "reconcile must RESTORE the forced-prefix via the shared helper (r4 #3)"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# LINE① (#558): reasoning-GATED forced grammar — token-id gate mechanics.
+# --------------------------------------------------------------------------- #
+
+
+def _line1_fake_env():
+    """Patch every llguidance primitive the processor touches with fakes so the
+    gate tests run UNCONDITIONALLY in base CI (no ``llguidance`` extra). Returns
+    ``(restore_fn, state)`` where ``state`` exposes the accepting matcher's
+    consume count and the fill spy count. Mirrors
+    ``test_rejected_committed_token_drops_constraint_and_stops_masking``.
+    """
+    import mlx.core as mx
+
+    import vllm_mlx.api.tool_grammar as tg
+
+    state = {"consumed": [], "fills": 0}
+
+    class _AcceptingMatcher:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_error(self):
+            return None
+
+        def deep_copy(self):
+            return _AcceptingMatcher()
+
+        def consume_token(self, tok_id):
+            state["consumed"].append(tok_id)
+            return True
+
+        def is_stopped(self):
+            return False
+
+        def reset(self):
+            pass
+
+    orig = (
+        tg.LLMatcher,
+        tg.allocate_token_bitmask,
+        tg.fill_next_token_bitmask,
+        tg.apply_token_bitmask,
+    )
+
+    def _spy_fill(matcher, bitmask, row):
+        state["fills"] += 1
+
+    tg.LLMatcher = _AcceptingMatcher
+    tg.allocate_token_bitmask = lambda n, v: None
+    tg.fill_next_token_bitmask = _spy_fill
+    # A sentinel mask clearly distinct from unchanged logits, so a test can prove
+    # whether masking ran on a given step.
+    tg.apply_token_bitmask = lambda logits, bitmask: mx.full(
+        logits.shape, -1.0, dtype=logits.dtype
+    )
+
+    def _restore():
+        (
+            tg.LLMatcher,
+            tg.allocate_token_bitmask,
+            tg.fill_next_token_bitmask,
+            tg.apply_token_bitmask,
+        ) = orig
+
+    return _restore, state
+
+
+def test_line1_reasoning_end_id_sets_initial_gate_closed():
+    # With a token-id gate supplied, the mask starts OFF (reasoning not ended);
+    # with NEITHER a token nor an id, the grammar constrains from token 0 (PATH
+    # A, the non-reasoning default is unchanged).
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    restore, _ = _line1_fake_env()
+    try:
+        gated = GrammarLogitsProcessor(
+            _FakeLLTok(), "g", reasoning_end_id=99, tokenizer=None
+        )
+        assert gated._reasoning_ended is False
+        plain = GrammarLogitsProcessor(_FakeLLTok(), "g", tokenizer=None)
+        assert plain._reasoning_ended is True
+    finally:
+        restore()
+
+
+def test_line1_token_id_gate_holds_then_opens_and_excludes_boundary():
+    # The decisive LINE① mechanic. With ``reasoning_end_id`` set the processor:
+    #   1. leaves generation FREE while thinking — reasoning tokens are neither
+    #      consumed by the matcher nor masked (logits returned unchanged);
+    #   2. opens the gate the instant the reasoning-end id is decoded, WITHOUT
+    #      consuming that boundary token (the grammar begins at the first
+    #      POST-reasoning token);
+    #   3. masks + consumes every token after the boundary.
+    import mlx.core as mx
+    import numpy as np
+
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    END = 99  # stand-in </think> id
+    restore, state = _line1_fake_env()
+    try:
+        proc = GrammarLogitsProcessor(
+            _FakeLLTok(), "g", reasoning_end_id=END, tokenizer=None
+        )
+
+        # Prompt baseline (1 token) — no generation yet.
+        proc(mx.array([1]), mx.zeros((1, 8)))
+
+        # A reasoning token (id 5, != END): free generation, no mask, not consumed.
+        out_think = proc(mx.array([1, 5]), mx.zeros((1, 8)))
+        assert np.array_equal(np.array(out_think), np.zeros((1, 8))), (
+            "logits must be unchanged while thinking (gate closed)"
+        )
+        assert state["fills"] == 0, "no mask fill while thinking"
+        assert state["consumed"] == [], "reasoning tokens must NOT feed the matcher"
+
+        # The </think> boundary (id == END): opens the gate. The boundary itself
+        # is the delimiter — it is NOT consumed by the matcher, and the SAME step
+        # begins masking the NEXT token.
+        out_boundary = proc(mx.array([1, 5, END]), mx.zeros((1, 8)))
+        assert proc._reasoning_ended is True, "boundary id must open the gate"
+        assert state["consumed"] == [], "the </think> boundary must not be consumed"
+        assert state["fills"] == 1, "mask must engage on/after the boundary step"
+        assert np.array_equal(np.array(out_boundary), np.full((1, 8), -1.0)), (
+            "post-boundary logits must be masked (constraint active)"
+        )
+
+        # First post-reasoning token (id 7): consumed by the matcher, masked.
+        out_post = proc(mx.array([1, 5, END, 7]), mx.zeros((1, 8)))
+        assert state["consumed"] == [7], "post-reasoning tokens must feed the matcher"
+        assert state["fills"] == 2
+        assert np.array_equal(np.array(out_post), np.full((1, 8), -1.0))
+    finally:
+        restore()
+
+
+def test_line1_think_exclusion_masks_tool_start_during_gate_closed():
+    # codex #3 / SGLang think_excluded_token_ids: while the reasoning gate is
+    # CLOSED, the tool-call opener id(s) are masked to -inf so the model cannot
+    # begin a <tool_call> inside <think> (which the forced </think> could then
+    # split). Every OTHER logit stays free. After </think> the grammar owns the
+    # mask and the exclusion is moot.
+    import mlx.core as mx
+    import numpy as np
+
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    END = 99
+    EXCLUDED = 3  # stand-in <tool_call> opener id
+    restore, state = _line1_fake_env()
+    try:
+        proc = GrammarLogitsProcessor(
+            _FakeLLTok(),
+            "g",
+            reasoning_end_id=END,
+            think_excluded_ids=(EXCLUDED,),
+            tokenizer=None,
+        )
+        proc(mx.array([1]), mx.zeros((1, 8)))  # prompt baseline
+
+        # Thinking: gate closed → only the excluded id is -inf, the rest untouched.
+        out_think = np.array(proc(mx.array([1, 5]), mx.zeros((1, 8))))
+        assert out_think[0, EXCLUDED] == -np.inf, (
+            "tool-start id must be masked in think"
+        )
+        free = np.delete(out_think[0], EXCLUDED)
+        assert np.array_equal(free, np.zeros(7)), "all non-opener logits stay free"
+        assert state["fills"] == 0, "grammar mask must NOT run while thinking"
+
+        # After </think> the grammar mask takes over (exclusion no longer applies).
+        proc(mx.array([1, 5, END]), mx.zeros((1, 8)))
+        out_post = np.array(proc(mx.array([1, 5, END, 7]), mx.zeros((1, 8))))
+        assert np.array_equal(out_post, np.full((1, 8), -1.0)), (
+            "post-boundary masking is the grammar's, not the think-exclusion"
+        )
+    finally:
+        restore()
+
+
+def test_line1_no_exclusion_when_gate_absent():
+    # Without a gate (PATH A / non-reasoning) there is nothing to protect, so the
+    # think-exclusion never runs even if ids were passed — grammar constrains from
+    # token 0 as before.
+    import mlx.core as mx
+    import numpy as np
+
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    restore, _ = _line1_fake_env()
+    try:
+        proc = GrammarLogitsProcessor(
+            _FakeLLTok(), "g", think_excluded_ids=(3,), tokenizer=None
+        )
+        assert proc._reasoning_ended is True, "no gate ⇒ constrain from token 0"
+        proc(mx.array([1]), mx.zeros((1, 8)))
+        out = np.array(proc(mx.array([1, 4]), mx.zeros((1, 8))))
+        # First real token is grammar-masked (-1 from the fake matcher), NOT the
+        # additive think-exclusion (which is inert once the gate is open).
+        assert np.array_equal(out, np.full((1, 8), -1.0))
+    finally:
+        restore()
+
+
+def test_line1_resolve_tool_start_exclusion_ids():
+    # The trigger resolver keeps ONLY a single-special-token opener (surgical mask)
+    # and declines multi-token / missing triggers (best-effort no-op).
+    from vllm_mlx.routes.chat import _resolve_tool_start_exclusion_ids
+
+    class _SI:
+        def __init__(self, trigger):
+            self.trigger = trigger
+
+    class _Tok:
+        # <tool_call> is a single special token (id 55); a multi-token trigger is
+        # not (returns >1 id) and must be declined.
+        def encode(self, s, add_special_tokens=False):
+            return {"<tool_call>": [55], "<mt>": [10, 11]}.get(s, [1, 2, 3])
+
+    class _Parser:
+        def __init__(self, trigger):
+            self._t = trigger
+
+        def structure_info(self):
+            return lambda name: _SI(self._t)
+
+    tools = [{"name": "f", "parameters": {}}]
+    # Single special token → kept.
+    assert _resolve_tool_start_exclusion_ids(_Parser("<tool_call>"), _Tok(), tools) == (
+        55,
+    )
+    # Multi-token trigger → declined.
+    assert _resolve_tool_start_exclusion_ids(_Parser("<mt>"), _Tok(), tools) == ()
+    # No structure_info → declined.
+
+    class _NoSI:
+        structure_info = None
+
+    assert _resolve_tool_start_exclusion_ids(_NoSI(), _Tok(), tools) == ()
+    # No tools → declined.
+    assert _resolve_tool_start_exclusion_ids(_Parser("<tool_call>"), _Tok(), []) == ()
+
+    # codex r3 #3 — ALL-OR-NOTHING across a mixed forced set: if even ONE tool's
+    # opener does not resolve to a single special token, the WHOLE set is declined
+    # (returning the resolved subset would leave the unresolved tool's opener
+    # emittable inside <think>).
+    class _PerNameParser:
+        def __init__(self, mapping):
+            self._m = mapping
+
+        def structure_info(self):
+            return lambda name: _SI(self._m.get(name))
+
+    mixed = [{"name": "ok", "parameters": {}}, {"name": "bad", "parameters": {}}]
+    # ``ok`` → single special token, ``bad`` → multi-token: decline the whole set.
+    assert (
+        _resolve_tool_start_exclusion_ids(
+            _PerNameParser({"ok": "<tool_call>", "bad": "<mt>"}), _Tok(), mixed
+        )
+        == ()
+    )
+    # ``bad`` has NO trigger (None) → decline the whole set.
+    assert (
+        _resolve_tool_start_exclusion_ids(
+            _PerNameParser({"ok": "<tool_call>", "bad": None}), _Tok(), mixed
+        )
+        == ()
+    )
+    # BOTH resolve to (the same) single special token → kept.
+    assert _resolve_tool_start_exclusion_ids(
+        _PerNameParser({"ok": "<tool_call>", "bad": "<tool_call>"}), _Tok(), mixed
+    ) == (55,)
+
+
+def test_line1_completion_limit_declines_uncoverable_schema():
+    # codex r3 #2 / r7 #2-#4 — the completion-limit gate. A DISCRETE serializable
+    # value keyword (enum / const / numeric bound) is PRICED into the byte floor and
+    # stays coverable; shape/length-forcing keywords the flat pricer cannot bound
+    # (minLength / minItems / minProperties / pattern / nested-required / $ref /
+    # combinators) DECLINE a bounded request to the (non-regressive) forced-prefix
+    # fallback.
+    from vllm_mlx.routes.chat import (
+        _line1_completion_limit_ok,
+        _line1_min_call_tokens,
+        _line1_schema_has_uncoverable_constraint,
+    )
+
+    class _Req:
+        def __init__(self, params, max_tokens=4096, reasoning_max_tokens=64):
+            self.tools = [{"function": {"name": "f", "parameters": params}}]
+            self.max_tokens = max_tokens
+            self.reasoning_max_tokens = reasoning_max_tokens
+
+    # Plain schema → coverable → gate stays eligible on the numeric floor.
+    plain = {"type": "object", "properties": {"a": {"type": "string"}}}
+    assert _line1_schema_has_uncoverable_constraint(plain) is False
+    assert _line1_completion_limit_ok(_Req(plain)) is True
+
+    # codex r7 #2: a short enum is COVERABLE — its shortest member is PRICED into the
+    # floor (not blanket-declined), so the canonical enum-constrained arg keeps the
+    # grammar engaged when there is room, instead of always dropping to forced-prefix.
+    small_enum = {"type": "object", "properties": {"a": {"enum": ["celsius", "f"]}}}
+    assert _line1_schema_has_uncoverable_constraint(small_enum) is False
+    assert _line1_completion_limit_ok(_Req(small_enum)) is True
+
+    # codex r7 #2/#3 (pricing, retroactively closing r6 B1): the enum member's / the
+    # numeric bound's OWN bytes enter the floor, so a value too large for a TIGHT
+    # max_tokens declines even though the keyword itself is "coverable".
+    long_enum = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"enum": ["y" * 200]}},
+    }
+    assert _line1_schema_has_uncoverable_constraint(long_enum) is False
+    assert _line1_min_call_tokens(_Req(long_enum)) > 200  # the 200-byte member priced
+    assert _line1_completion_limit_ok(_Req(long_enum, max_tokens=4096)) is True  # room
+    assert (
+        _line1_completion_limit_ok(_Req(long_enum, max_tokens=128)) is False
+    )  # priced out
+
+    big_min = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"type": "integer", "minimum": 10**40}},
+    }
+    assert _line1_schema_has_uncoverable_constraint(big_min) is False
+    assert _line1_min_call_tokens(_Req(big_min)) > 40  # 41-digit boundary priced
+    assert _line1_completion_limit_ok(_Req(big_min, max_tokens=80)) is False
+
+    # codex r11 #3: a FLOAT bound reprs in exponent form (repr(1e100)=="1e+100", 6
+    # chars) while an integer grammar may need 101 digits, so the repr under-reserves.
+    # Plain ints repr as full decimal (safe, priced above); floats DECLINE.
+    float_min = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"type": "integer", "minimum": 1e100}},
+    }
+    assert _line1_schema_has_uncoverable_constraint(float_min) is True
+    assert _line1_completion_limit_ok(_Req(float_min)) is False
+
+    # codex r12 #2: a ROOT-level enum/const on the params OBJECT (not a property) must
+    # be priced as the whole value — the flat required-key skeleton never sees it, so
+    # a large member has to inflate the floor and decline a tight completion.
+    root_enum = {"type": "object", "enum": [{"a": "x" * 300}]}
+    assert _line1_schema_has_uncoverable_constraint(root_enum) is False
+    assert _line1_min_call_tokens(_Req(root_enum)) > 300
+    assert _line1_completion_limit_ok(_Req(root_enum, max_tokens=128)) is False
+
+    # codex r8 #2: an UPPER / negative bound forbids the 1-byte default value —
+    # ``maximum:-999`` needs at least ``"-999"`` (4 bytes), which must be priced.
+    neg_max = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"type": "integer", "maximum": -999}},
+    }
+    bare_int = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"type": "integer"}},
+    }
+    assert _line1_min_call_tokens(_Req(neg_max)) > _line1_min_call_tokens(
+        _Req(bare_int)
+    )
+
+    # codex r9 #2: an ARRAY-valued (union) ``type`` must be priced by the smallest
+    # allowed member, not the 2-byte unknown default. ``["boolean"]`` needs >=4 bytes
+    # ("true"); the common nullable ``["string","null"]`` stays a 2-byte string.
+    from vllm_mlx.routes.chat import _line1_min_value_bytes
+
+    assert _line1_min_value_bytes({"type": ["boolean"]}) >= 4
+    assert _line1_min_value_bytes({"type": ["string", "null"]}) == 2
+    assert _line1_min_value_bytes({"type": ["integer", "null"]}) == 1
+    union_bool = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"type": ["boolean"]}},
+    }
+    assert _line1_schema_has_uncoverable_constraint(union_bool) is False
+    assert _line1_min_call_tokens(_Req(union_bool)) > _line1_min_call_tokens(
+        _Req({"type": "object", "required": ["a"], "properties": {"a": {}}})
+    )
+
+    # codex r10 #3: a sibling ``type`` invalidates enum members of another type, so
+    # the shortest PRICED member must be the shortest TYPE-VALID one — not the 1-byte
+    # ``0`` that ``{"type":"string","enum":[0,"verylongstring"]}`` forbids.
+    typed_enum = {"type": "string", "enum": [0, "verylongstring"]}
+    assert _line1_min_value_bytes(typed_enum) == len('"verylongstring"')  # 16, not 1
+    assert _line1_min_value_bytes({"enum": [0, "verylongstring"]}) == len("0")  # 1
+
+    # codex r14 #2: an ``enum`` COMBINED with a numeric bound is UNCOVERABLE — the
+    # shortest member (``0``) can be excluded by a sibling ``minimum``, leaving only a
+    # much longer legal value. Declining fails closed to the non-regressive path.
+    enum_with_bound = {"type": "integer", "enum": [0, 10**100], "minimum": 10**100}
+    assert _line1_schema_has_uncoverable_constraint(enum_with_bound) is True
+    # A required prop whose sub-schema is enum+bound also declines the whole request.
+    enum_bound_prop = {
+        "type": "object",
+        "required": ["n"],
+        "properties": {"n": enum_with_bound},
+    }
+    assert _line1_completion_limit_ok(_Req(enum_bound_prop, max_tokens=4096)) is False
+    # const+bound stays priceable (const value byte length is fixed regardless of bound).
+    const_with_bound = {"type": "integer", "const": 5, "minimum": 1}
+    assert _line1_schema_has_uncoverable_constraint(const_with_bound) is False
+
+    # codex r8 #3: a key needing JSON escaping (``a"b`` -> ``a\"b``) must be priced by
+    # its full json.dumps serialization, not raw UTF-8 bytes.
+    esc_key = {"type": "object", "required": ['a"b\\c'], "properties": {}}
+    plain_key = {"type": "object", "required": ["a_b_c"], "properties": {}}
+    assert _line1_min_call_tokens(_Req(esc_key)) > _line1_min_call_tokens(
+        _Req(plain_key)
+    )
+
+    # A small const / small numeric bound is priced cheaply → stays engaged.
+    assert (
+        _line1_completion_limit_ok(
+            _Req({"type": "object", "properties": {"a": {"const": "ok"}}})
+        )
+        is True
+    )
+    assert (
+        _line1_completion_limit_ok(
+            _Req(
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "integer", "minimum": 0}},
+                }
+            )
+        )
+        is True
+    )
+
+    # codex r7 #4: a multi-byte identifier a ``len(str(...))`` char count would
+    # UNDER-reserve is bounded by UTF-8 BYTES (>=1 byte per token), so its floor
+    # exceeds the naive char count.
+    multibyte = {
+        "type": "object",
+        "required": ["日本語"],
+        "properties": {"日本語": {"type": "string"}},
+    }
+    assert _line1_min_call_tokens(_Req(multibyte)) > len("日本語") + 6
+
+    # Shape/length-forcing keywords the flat pricer cannot bound → DECLINE (bounded).
+    for params in (
+        {"type": "object", "properties": {"a": {"type": "string", "minLength": 1000}}},
+        {
+            "type": "object",
+            "properties": {"a": {"type": "string", "pattern": "^.{99}$"}},
+        },
+        {"type": "object", "properties": {"a": {"type": "array", "minItems": 3}}},
+        {"type": "object", "properties": {"a": {"type": "object", "minProperties": 4}}},
+        # combinator PRESENCE is uncoverable — the pricer can't see the minimal branch
+        {"type": "object", "properties": {"a": {"anyOf": [{"const": "x" * 500}]}}},
+        {"type": "object", "properties": {"a": {"oneOf": [{"type": "string"}]}}},
+        # nested required object whose inner skeleton the flat floor never descends
+        {
+            "type": "object",
+            "properties": {
+                "a": {
+                    "type": "object",
+                    "required": ["b"],
+                    "properties": {"b": {"type": "string"}},
+                }
+            },
+        },
+        {"$ref": "#/$defs/Foo"},
+        # codex r10 #2 — the fail-safe allowlist declines ANY unlisted keyword, so a
+        # blacklist gap can no longer under-price. A required key GOVERNED by
+        # additionalProperties (absent from ``properties``) is unpriced → decline.
+        {
+            "type": "object",
+            "required": ["a"],
+            "properties": {},
+            "additionalProperties": {"minLength": 1000},
+        },
+        {"type": "object", "properties": {"a": {"type": "integer", "multipleOf": 7}}},
+        {"type": "object", "dependentRequired": {"a": ["b"]}},
+        {
+            "type": "object",
+            "properties": {"a": {"type": "array", "minContains": 5}},
+        },
+        {"type": "object", "properties": {"a": {"type": "string", "format": "email"}}},
+    ):
+        assert _line1_schema_has_uncoverable_constraint(params) is True, params
+        assert _line1_completion_limit_ok(_Req(params)) is False, params
+
+    # codex r5 #1: an uncoverable schema is unbounded under ANY max_tokens — a
+    # max_tokens=None request with such a schema must ALSO decline (the flat context
+    # floor cannot price the schema minimum, so the gate would strand the call).
+    assert (
+        _line1_completion_limit_ok(
+            _Req(
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "string", "minLength": 1000}},
+                },
+                max_tokens=None,
+            )
+        )
+        is False
+    )
+
+    # codex r4 #2 — a NESTED ``required`` (no value keyword at all) is uncoverable
+    # because ``_line1_min_call_tokens`` prices only the ROOT required list.
+    nested_required = {
+        "type": "object",
+        "required": ["outer"],
+        "properties": {
+            "outer": {
+                "type": "object",
+                "required": ["a", "b", "c"],
+                "properties": {
+                    "a": {"type": "string"},
+                    "b": {"type": "string"},
+                    "c": {"type": "string"},
+                },
+            }
+        },
+    }
+    assert _line1_schema_has_uncoverable_constraint(nested_required) is True
+    assert _line1_completion_limit_ok(_Req(nested_required)) is False
+    # A ROOT-only required list (what the flat floor DOES price) stays coverable.
+    root_only = {
+        "type": "object",
+        "required": ["a", "b"],
+        "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+    }
+    assert _line1_schema_has_uncoverable_constraint(root_only) is False
+
+
+def test_compute_forced_tool_prefix_helper():
+    # r4 #3 — the shared forced-prefix helper the reconcile path reuses.
+    from vllm_mlx.routes.chat import _compute_forced_tool_prefix
+
+    class _Cfg:
+        tool_call_parser = "hermes"
+
+    class _Fn:
+        def __init__(self, name):
+            self._n = name
+
+        def get(self, k, default=None):
+            return {"name": self._n}.get(k, default)
+
+    class _Tool:
+        def __init__(self, name):
+            self.function = _Fn(name)
+
+    class _Req:
+        def __init__(self, tools, tool_choice):
+            self.tools = tools
+            self.tool_choice = tool_choice
+
+    # named function → hermes JSON envelope opener with the name baked in.
+    named = _Req(
+        [_Tool("set_color")], {"type": "function", "function": {"name": "set_color"}}
+    )
+    pfx = _compute_forced_tool_prefix(_Cfg(), named)
+    assert pfx is not None and '"name": "set_color"' in pfx
+    # required + single tool → same forcing semantics.
+    req_single = _Req([_Tool("only")], "required")
+    assert _compute_forced_tool_prefix(_Cfg(), req_single) is not None
+    # no tools / no choice → None.
+    assert _compute_forced_tool_prefix(_Cfg(), _Req([], "required")) is None
+    assert _compute_forced_tool_prefix(_Cfg(), _Req([_Tool("x")], None)) is None
+
+
+def test_line1_string_gate_not_run_when_id_gate_active():
+    # The decode-based string gate (``_maybe_open_after_reasoning``) is a known
+    # footgun and must be BYPASSED whenever the deterministic token-id gate is
+    # in use. Spy on the string gate and assert it is never called across a full
+    # think→boundary→answer sequence driven purely by the id gate.
+    import mlx.core as mx
+
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    restore, _ = _line1_fake_env()
+    try:
+        proc = GrammarLogitsProcessor(
+            _FakeLLTok(), "g", reasoning_end_id=99, tokenizer=None
+        )
+        calls = {"n": 0}
+        proc._maybe_open_after_reasoning = lambda *_a, **_k: calls.__setitem__(
+            "n", calls["n"] + 1
+        )
+        proc(mx.array([1]), mx.zeros((1, 8)))
+        proc(mx.array([1, 5]), mx.zeros((1, 8)))  # thinking
+        proc(mx.array([1, 5, 99]), mx.zeros((1, 8)))  # boundary
+        proc(mx.array([1, 5, 99, 7]), mx.zeros((1, 8)))  # answer
+        assert calls["n"] == 0, "string gate must not run while the id gate is active"
+    finally:
+        restore()
+
+
+class _L1Req:
+    """Minimal request stub carrying the fields the line① front-line predicate
+    reads (``_RequestStub`` above omits ``reasoning_max_tokens``)."""
+
+    def __init__(
+        self,
+        tools=("t",),
+        tool_choice="required",
+        reasoning_max_tokens=64,
+        max_tokens=None,
+        stop=None,
+    ):
+        self.tools = list(tools) if tools else tools
+        self.tool_choice = tool_choice
+        self.reasoning_max_tokens = reasoning_max_tokens
+        self.max_tokens = max_tokens
+        self.stop = stop
+
+
+def test_line1_should_probe_seed_predicate():
+    # Behavioral test for the EXTRACTED eligibility predicate (an earlier revision
+    # only searched source text, so it passed even if the code were unreachable).
+    # Exercises forced/auto/none x budget/no-budget x
+    # thinking on/off x tools/no-tools — the predicate that decides whether the
+    # (synchronous) seed-state render runs and, transitively, whether line①
+    # engages.
+    from vllm_mlx.routes.chat import _line1_should_probe_seed
+
+    # Engages: forced (required OR named) + thinking + a set budget + tools.
+    assert _line1_should_probe_seed(_L1Req(tool_choice="required"), True) is True
+    assert (
+        _line1_should_probe_seed(
+            _L1Req(tool_choice={"type": "function", "function": {"name": "f"}}), True
+        )
+        is True
+    )
+    assert _line1_should_probe_seed(_L1Req(reasoning_max_tokens=0), True) is True
+
+    # Declines: non-forced choice (auto / none / unset all keep the fallback).
+    assert _line1_should_probe_seed(_L1Req(tool_choice="auto"), True) is False
+    assert _line1_should_probe_seed(_L1Req(tool_choice="none"), True) is False
+    assert _line1_should_probe_seed(_L1Req(tool_choice=None), True) is False
+
+    # Declines: no / negative budget (no #1185 force-close ⇒ gate could hang).
+    assert _line1_should_probe_seed(_L1Req(reasoning_max_tokens=None), True) is False
+    assert _line1_should_probe_seed(_L1Req(reasoning_max_tokens=-1), True) is False
+
+    # Declines: thinking off or unresolved.
+    assert _line1_should_probe_seed(_L1Req(), False) is False
+    assert _line1_should_probe_seed(_L1Req(), None) is False
+
+    # Declines: no tools.
+    assert _line1_should_probe_seed(_L1Req(tools=None), True) is False
+    assert _line1_should_probe_seed(_L1Req(tools=[]), True) is False
+
+    # Declines: max_tokens too small for force-close + a minimal call (codex #4).
+    # tools=("t",) has no resolvable name → floor == envelope (24); budget=64 ⇒
+    # max_tokens must exceed 88.
+    assert (
+        _line1_should_probe_seed(_L1Req(reasoning_max_tokens=64, max_tokens=64), True)
+        is False
+    )
+    assert (
+        _line1_should_probe_seed(_L1Req(reasoning_max_tokens=64, max_tokens=88), True)
+        is False
+    )
+    # Engages: max_tokens comfortably above the floor.
+    assert (
+        _line1_should_probe_seed(_L1Req(reasoning_max_tokens=64, max_tokens=256), True)
+        is True
+    )
+    # Unset max_tokens never blocks (unbounded generation).
+    assert (
+        _line1_should_probe_seed(_L1Req(reasoning_max_tokens=64, max_tokens=None), True)
+        is True
+    )
+
+
+def test_line1_completion_limit_ok_predicate():
+    # codex #4 / r2 #2: the completion-limit guard in isolation. max_tokens must
+    # leave room for the force-close + a minimal constrained call past the budget,
+    # and the floor SCALES with the tool name + required schema (not a flat const).
+    from vllm_mlx.routes.chat import (
+        _LINE1_CALL_ENVELOPE_TOKENS,
+        _line1_completion_limit_ok,
+        _line1_min_call_tokens,
+    )
+
+    # Unset either bound → no constraint.
+    assert _line1_completion_limit_ok(_L1Req(reasoning_max_tokens=64, max_tokens=None))
+    assert _line1_completion_limit_ok(_L1Req(reasoning_max_tokens=None, max_tokens=32))
+    # Bare tools stub (no resolvable name) → floor == the fixed envelope.
+    bare = _L1Req(reasoning_max_tokens=64)
+    assert _line1_min_call_tokens(bare) == _LINE1_CALL_ENVELOPE_TOKENS
+    floor = 64 + _LINE1_CALL_ENVELOPE_TOKENS
+    assert not _line1_completion_limit_ok(
+        _L1Req(reasoning_max_tokens=64, max_tokens=floor)
+    )
+    assert _line1_completion_limit_ok(
+        _L1Req(reasoning_max_tokens=64, max_tokens=floor + 1)
+    )
+
+    # Floor SCALES with a long tool name + required fields (codex r2 #2): a value
+    # of max_tokens that clears the bare floor must NOT clear the fat-schema floor.
+    fat_tool = {
+        "function": {
+            "name": "an_extremely_long_and_descriptive_tool_name_for_testing",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "alpha": {"type": "string"},
+                    "beta": {"type": "string"},
+                    "gamma": {"type": "string"},
+                },
+                "required": ["alpha", "beta", "gamma"],
+            },
+        }
+    }
+    fat = _L1Req(tools=(fat_tool,), reasoning_max_tokens=64)
+    assert _line1_min_call_tokens(fat) > _LINE1_CALL_ENVELOPE_TOKENS, (
+        "floor must grow with a long name + required schema"
+    )
+    # A budget that would pass the bare floor is rejected for the fat schema.
+    fat.max_tokens = floor + 1
+    assert not _line1_completion_limit_ok(fat), (
+        "a long-name/large-schema tool must not slip under the flat envelope"
+    )
+
+
+def test_line1_context_room_ok_predicate(monkeypatch):
+    # codex r4 #1: the HARD context-window allowance check that runs at the route
+    # AFTER the prompt is counted. Proves room for the coupled budget + a minimal
+    # call ONLY on the ``max_tokens=None`` path (where the request-time context
+    # guard reserves zero completion room); conservative on every missing signal.
+    import vllm_mlx.routes.chat as chat_mod
+    from vllm_mlx.routes.chat import (
+        _LINE1_CALL_ENVELOPE_TOKENS,
+        _line1_context_room_ok,
+    )
+
+    engine = object()  # get_model_max_context is monkeypatched, so any object works
+    threshold = 64 + _LINE1_CALL_ENVELOPE_TOKENS  # rmt(64) + bare-tool floor
+
+    def _window(_n):
+        def _fn(_engine):
+            return _n
+
+        return _fn
+
+    # No constraint: rmt unset → always ok regardless of window.
+    monkeypatch.setattr(chat_mod, "get_model_max_context", _window(1))
+    assert (
+        _line1_context_room_ok(engine, 10_000, _L1Req(reasoning_max_tokens=None))
+        is True
+    )
+
+    # max_tokens set → covered by enforce_context_length + completion-limit; this
+    # check stays permissive even with an absurdly small window.
+    assert (
+        _line1_context_room_ok(
+            engine, 10_000, _L1Req(reasoning_max_tokens=64, max_tokens=32)
+        )
+        is True
+    )
+
+    # FAIL CLOSED (codex r5 #2): unknown prompt count (MLLM / skipped render) →
+    # cannot prove room → False (disengage to forced-prefix, the safer choice).
+    assert (
+        _line1_context_room_ok(engine, None, _L1Req(reasoning_max_tokens=64)) is False
+    )
+
+    # Unreadable window (probe raises) → cannot prove room → False.
+    def _boom(_engine):
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(chat_mod, "get_model_max_context", _boom)
+    assert _line1_context_room_ok(engine, 100, _L1Req(reasoning_max_tokens=64)) is False
+
+    # Non-int / non-positive window (incl. DoS sentinel) → cannot prove room → False.
+    monkeypatch.setattr(chat_mod, "get_model_max_context", _window(0))
+    assert _line1_context_room_ok(engine, 100, _L1Req(reasoning_max_tokens=64)) is False
+    monkeypatch.setattr(chat_mod, "get_model_max_context", _window(None))
+    assert _line1_context_room_ok(engine, 100, _L1Req(reasoning_max_tokens=64)) is False
+
+    # PROVABLE no-room: room == threshold is NOT > threshold → decline.
+    monkeypatch.setattr(chat_mod, "get_model_max_context", _window(1000))
+    no_room_prompt = 1000 - threshold
+    assert (
+        _line1_context_room_ok(engine, no_room_prompt, _L1Req(reasoning_max_tokens=64))
+        is False
+    )
+
+    # PROVABLE room: one token of slack past the floor → engage.
+    assert (
+        _line1_context_room_ok(
+            engine, no_room_prompt - 1, _L1Req(reasoning_max_tokens=64)
+        )
+        is True
+    )
+
+
+def test_line1_stop_conflicts_with_forced_output():
+    # codex r12 #3 / r13 #1: a client stop overlapping the FORCED wire opener would
+    # truncate the gated path's GENERATED call (forced-prefix prompt-injects that
+    # opener, immune), so the gate must decline when such an overlap exists.
+    from vllm_mlx.routes.chat import _line1_stop_conflicts_with_forced_output as _conf
+
+    forced = '<tool_call>\n{"name": "get_weather", "arguments": '
+    assert _conf(["<tool_call>"], forced) is True  # opener substring -> conflict
+    assert _conf("<tool_call>", forced) is True  # bare-string stop form
+    assert _conf(['{"name"'], forced) is True  # any forced-output substring
+    assert _conf(["\n\n"], forced) is False  # unrelated stop -> no conflict
+    # missing signals never conflict (no false decline)
+    assert _conf(["<tool_call>"], None) is False
+    assert _conf(None, forced) is False
+    assert _conf([], forced) is False
+
+    # r13 #1: name-INDEPENDENT trigger marker(s) as an iterable of openers — the
+    # required+multi-tool case where no fixed-name envelope exists.
+    assert _conf(["<tool_call>"], ("<tool_call>",)) is True
+    assert _conf(["tool_call"], ["<tool_call>"]) is True  # substring of the marker
+    assert _conf(["hi"], ["<tool_call>", "<|tool_call|>"]) is False  # unrelated
+    assert _conf(["<tool_call>"], ()) is False  # no openers -> never conflict
+    # r13 #1: boundary-spanning — a non-empty PREFIX of the stop is a SUFFIX of an
+    # opener, so the stop could complete on the very next generated byte -> decline.
+    assert _conf([">STOP"], ["<tool_call>"]) is True  # ">" tail overlaps ">STOP"
+    # a normal turn terminator that shares no boundary/substring -> no false decline
+    assert _conf(["<|im_end|>"], ["<tool_call>"]) is False
+
+
+def test_line1_forced_wire_openers():
+    # r13 #1: openers derive from structure_info triggers INDEPENDENTLY of the fixed
+    # function name (so required+multi-tool is covered), plus the named envelope.
+    from vllm_mlx.routes.chat import _line1_forced_wire_openers
+
+    class _SI:
+        def __init__(self, trigger):
+            self.trigger = trigger
+
+    class _Parser:
+        def structure_info(self):
+            return lambda name: _SI("<tool_call>")
+
+    class _Cfg:
+        tool_call_parser = "hermes"
+
+    class _Req:
+        tools = [{"name": "alpha"}, {"name": "beta"}]
+        tool_choice = "required"  # multi-tool required -> no fixed-name envelope
+
+    openers = _line1_forced_wire_openers(
+        _Parser(), [{"name": "alpha"}, {"name": "beta"}], _Cfg(), _Req()
+    )
+    assert "<tool_call>" in openers  # (a) trigger marker present, name-independent
+    # (b) codex r15 #2: per-candidate envelopes for BOTH multi-tool candidates, so a
+    # stop matching either NAME or the mandatory boundary declines the gate.
+    assert any('"name": "alpha"' in o for o in openers)
+    assert any('"name": "beta"' in o for o in openers)
+    # a stop matching a non-selected candidate name still conflicts (conservative).
+    from vllm_mlx.routes.chat import _line1_stop_conflicts_with_forced_output as _conf
+
+    assert _conf(["alpha"], openers) is True
+    assert _conf(['", "arguments": '], openers) is True  # mandatory boundary text
+
+    # A named choice scopes candidates to just the named tool.
+    class _ReqNamed:
+        tools = [{"name": "alpha"}, {"name": "beta"}]
+        tool_choice = {"type": "function", "function": {"name": "alpha"}}
+
+    named_openers = _line1_forced_wire_openers(
+        _Parser(), [{"name": "alpha"}, {"name": "beta"}], _Cfg(), _ReqNamed()
+    )
+    assert any('"name": "alpha"' in o for o in named_openers)
+    assert not any('"name": "beta"' in o for o in named_openers)  # not emittable
+
+    # A parser with no structure_info yields no triggers, but still per-candidate
+    # envelopes (best-effort, no raise).
+    class _NoInfo:
+        pass
+
+    no_info = _line1_forced_wire_openers(_NoInfo(), [{"name": "alpha"}], _Cfg(), _Req())
+    assert any('"name": "alpha"' in o for o in no_info)  # envelope still built
+
+
+def test_line1_gated_tool_call_preserves_reasoning_content():
+    # codex r13 #3 was a FALSE POSITIVE: it claimed the gated branch selects the
+    # post-</think> suffix for reasoning and loses reasoning_content when residual
+    # text remains. In fact ``_finalize_content_and_reasoning`` extracts reasoning
+    # from the FULL raw_text whenever tool_calls fire (helpers.py: ``if tool_calls:
+    # reasoning_text, _ = extract(raw_text)``) — never from the suffix — which is
+    # exactly what the "fix" recommends the code already does. Lock it so the
+    # false positive cannot be re-litigated into a real regression.
+    from vllm_mlx.reasoning.deepseek_r1_parser import DeepSeekR1ReasoningParser
+    from vllm_mlx.service.helpers import _finalize_content_and_reasoning
+
+    rp = DeepSeekR1ReasoningParser()
+    raw = "<think>pick the tool</think>\nSure, calling it:\n"
+    suffix_content = "Sure, calling it:"  # truthy residual the tool parser cleaned
+    content, reasoning = _finalize_content_and_reasoning(
+        raw_text=raw,
+        cleaned_text=suffix_content,  # gated path passes the post-</think> content
+        tool_calls=[object()],  # a forced call fired
+        reasoning_parser=rp,
+        engine_reasoning_text="",  # text-parser family: no OutputRouter reasoning
+        enable_thinking=True,
+    )
+    assert reasoning and "pick the tool" in reasoning  # recovered from raw, not lost
+    assert content == suffix_content  # residual post-think prose stays as content
+
+
+def test_line1_split_reasoning_for_tool_parse():
+    # codex r4 #4 / r5 #3: upstream-faithful reasoning-first split. Returns the
+    # post-</think> content the tool parser should see. FAILS CLOSED — NEVER returns
+    # the raw full text (that would re-expose an in-<think> marker on an engaged
+    # gate); on no-parser / parser-error it falls back to a literal </think> split.
+    from vllm_mlx.routes.chat import _line1_split_reasoning_for_tool_parse
+
+    class _RP:
+        def __init__(self, result):
+            self._result = result
+            self.seen = None
+
+        def extract_reasoning(self, text):
+            self.seen = text
+            if isinstance(self._result, Exception):
+                raise self._result
+            return self._result
+
+    # No parser → deterministic literal </think> split (NOT the raw text): the suffix
+    # after the FIRST close tag, so the <think> span never reaches the tool parser.
+    assert _line1_split_reasoning_for_tool_parse(None, "<think>x</think>call") == "call"
+    # No parser AND no </think> (still thinking) → "" (no legitimate post-think call).
+    assert _line1_split_reasoning_for_tool_parse(None, "<think>only <tool_call>") == ""
+
+    # codex r6 B3: a schema-valid tool ARGUMENT may itself contain the literal
+    # "</think>". Splitting on the LAST occurrence (the old rfind) would truncate the
+    # call; the FIRST close tag is the real reasoning boundary, so the whole call —
+    # embedded "</think>" and all — must survive.
+    arg_with_marker = '<think>reason</think>{"a":"the </think> tag means stop"}'
+    assert (
+        _line1_split_reasoning_for_tool_parse(None, arg_with_marker)
+        == '{"a":"the </think> tag means stop"}'
+    )
+
+    # (reasoning, content) → the post-</think> content only; the <think> marker is
+    # never returned, so a sub-token-spelled opener inside it cannot reach the parser.
+    rp = _RP(("some reasoning <tool_call>fake</tool_call>", '{"name":"f"}'))
+    assert (
+        _line1_split_reasoning_for_tool_parse(rp, '<think>...</think>{"name":"f"}')
+        == '{"name":"f"}'
+    )
+    assert rp.seen == '<think>...</think>{"name":"f"}'  # split ran on the full text
+
+    # (reasoning, None) — all-reasoning / no </think> split → "" (NOT the raw think
+    # text), so the tool parser sees nothing and cannot extract an in-think marker.
+    assert _line1_split_reasoning_for_tool_parse(_RP(("all think", None)), "x") == ""
+
+    # codex r6 B2: a parser that reports "no reasoning found" as (None, full_text)
+    # returns the ENTIRE raw output as content. Trusting it would re-open the leak, so
+    # reasoning is None must be IGNORED and the helper must fall through to the literal
+    # split — the in-<think> marker must NOT survive into the returned string.
+    leaky = "<think>plot <tool_call>evil</tool_call></think>call"
+    assert _line1_split_reasoning_for_tool_parse(_RP((None, leaky)), leaky) == "call"
+    # (None, None) — parser found no reasoning markers → "" (empty, safe).
+    assert _line1_split_reasoning_for_tool_parse(_RP((None, None)), "x") == ""
+
+    # Parser raises → FAIL CLOSED via the literal </think> split, NEVER the raw text
+    # (codex r5 #3). With a </think> present, the post-think suffix; without, "".
+    assert (
+        _line1_split_reasoning_for_tool_parse(_RP(RuntimeError("boom")), "a</think>b")
+        == "b"
+    )
+    assert _line1_split_reasoning_for_tool_parse(_RP(RuntimeError("boom")), "x") == ""
+
+
+def test_line1_streaming_redirect_gated_on_gate():
+    # codex r4 #4 (streaming half): the MiniMax tool-markup redirect
+    # (StreamingPostProcessor._process_with_reasoning) that promotes in-<think>
+    # reasoning bytes into content must be SKIPPED for line① requests, so a
+    # sub-token-spelled opener inside <think> stays in reasoning. And the route must
+    # DERIVE that flag from the actually-installed grammar's reasoning_gate_id (so
+    # the #1 / r4 #3 disengage paths, which pop the grammar, read False and keep the
+    # load-bearing redirect).
+    import inspect
+    from unittest.mock import MagicMock
+
+    from vllm_mlx.routes import chat as chat_mod
+    from vllm_mlx.service.postprocessor import StreamingPostProcessor
+
+    def _cfg():
+        cfg = MagicMock()
+        cfg.engine = None
+        cfg.reasoning_parser = None
+        cfg.reasoning_parser_name = None
+        cfg.enable_auto_tool_choice = False
+        cfg.tool_call_parser = None
+        cfg.tool_parser_instance = None
+        return cfg
+
+    # Constructor accepts the flag, defaults False (every existing call site / test
+    # keeps the redirect).
+    sig = inspect.signature(StreamingPostProcessor.__init__)
+    assert "line1_gate_engaged" in sig.parameters, (
+        "StreamingPostProcessor must accept line1_gate_engaged"
+    )
+    assert sig.parameters["line1_gate_engaged"].default is False, (
+        "line1_gate_engaged must default False so non-line① requests keep the redirect"
+    )
+    assert StreamingPostProcessor(_cfg())._line1_gate_engaged is False
+    assert StreamingPostProcessor(_cfg(), line1_gate_engaged=True)._line1_gate_engaged
+
+    # The redirect is gated on the flag (not silently removed / always-on).
+    pp_src = inspect.getsource(StreamingPostProcessor._process_with_reasoning)
+    assert "not self._line1_gate_engaged" in pp_src, (
+        "MiniMax redirect must be gated OFF when the reasoning gate is engaged"
+    )
+
+    # The route derives the flag from the installed grammar's reasoning_gate_id.
+    stream_src = inspect.getsource(chat_mod.stream_chat_completion)
+    assert "line1_gate_engaged=" in stream_src, (
+        "streaming route must pass line1_gate_engaged into StreamingPostProcessor"
+    )
+    assert "reasoning_gate_id" in stream_src, (
+        "streaming flag must derive from the installed grammar's reasoning_gate_id"
+    )
+
+
+def test_line1_route_threads_predicate_into_offload_build():
+    # Wiring guard (same pattern as ``test_route_offload_gated_on_eligibility_in_
+    # source``): the behavioral predicate/coupling tests below prove the units;
+    # this asserts the route actually WIRES them on the live path, not dead code.
+    import inspect
+
+    from vllm_mlx.routes import chat as chat_mod
+
+    src = inspect.getsource(chat_mod._create_chat_completion_impl)
+    # r3 #5 (DoS): the seed-state render runs INSIDE the admission-gated build
+    # (``_line1_probe_seed`` called from ``_maybe_build_tool_grammar_processor``),
+    # NOT on the shared default executor before admission. The route no longer runs
+    # a separate pre-admission probe — it passes ``messages`` / ``resolved_thinking``
+    # into the offload so the in-slot probe can render.
+    offload_pos = src.find(
+        "_offload_tool_grammar_build(\n        engine, cfg, request, messages, resolved_thinking"
+    )
+    assert offload_pos != -1, (
+        "route must thread messages/resolved_thinking into the admission-gated build "
+        "so the seed render runs in-slot (r3 #5)"
+    )
+    assert "_line1_probe_seed_offloaded(" not in src, (
+        "the pre-admission offloaded probe must be gone (r3 #5 DoS)"
+    )
+    # The in-slot probe classifies "open" and degrades gracefully on render failure.
+    probe_src = inspect.getsource(chat_mod._line1_probe_seed)
+    assert "reasoning_seed_state(" in probe_src and '== "open"' in probe_src, (
+        "probe must classify the rendered prefix and engage only on 'open'"
+    )
+    assert "line①: generation-prefix render failed" in probe_src, (
+        "probe must degrade gracefully on render failure (codex #1)"
+    )
+    # The probe is invoked from within the admission-gated builder, not the route.
+    build_src = inspect.getsource(chat_mod._maybe_build_tool_grammar_processor)
+    assert "_line1_probe_seed(" in build_src, (
+        "seed probe must run inside the admission-gated build slot (r3 #5)"
+    )
+    # Option B coupling: the route derives gate-engaged from the grammar's
+    # ``reasoning_gate_id`` and threads ``allow_tools`` + the reused prefix into
+    # the budget builder (so the budget is installed for this tool request and no
+    # second render runs).
+    gate_pos = src.find("_glp.reasoning_gate_id is not None")
+    budget_pos = src.find("allow_tools=_line1_gate_engaged")
+    assert gate_pos != -1 and offload_pos < gate_pos, (
+        "route must derive line① gate-engaged from the grammar's reasoning_gate_id"
+    )
+    assert budget_pos != -1 and gate_pos < budget_pos, (
+        "route must couple the budget to the gate via allow_tools"
+    )
+    assert "seed_prefix=(_line1_prefix" in src, (
+        "route must thread the already-rendered prefix into the budget builder"
+    )
+    # The reused prefix is read off the (gated) processor, not a separate probe.
+    assert "_line1_seed_prefix" in src, (
+        "route must reuse the build's stashed seed prefix for the budget (r3 #5)"
+    )
+    # codex #2 / #4 / r2 #1: the gate declines when the coupled budget would (stop
+    # conflict), when max_tokens strands the call, OR when the tool-start opener
+    # exclusion is not guaranteed — so the gate is never orphaned or unprotected.
+    gate_src = inspect.getsource(chat_mod._maybe_build_tool_grammar_processor)
+    assert "reasoning_stop_conflicts(" in gate_src, (
+        "gate must decline on stop-conflict so the budget's force-close is present"
+    )
+    assert "_line1_completion_limit_ok(request)" in gate_src, (
+        "gate must decline when max_tokens strands the forced call (codex #4)"
+    )
+    assert "and _line1_tool_start_ids" in gate_src, (
+        "gate must require a resolved opener exclusion (codex r2 #1)"
+    )
+    # codex r4 #1: the route captures the prompt-token count the context guard
+    # already paid for and runs the HARD window check, disengaging the gate to the
+    # forced-prefix fallback when the window cannot fit the budget + a minimal call.
+    assert "_line1_prompt_tokens = enforce_context_length_for_messages(" in src, (
+        "route must capture the prompt-token count for the hard window check"
+    )
+    room_pos = src.find("not _line1_context_room_ok(")
+    assert room_pos != -1, (
+        "route must DISENGAGE on a provable no-room verdict (codex r4 #1)"
+    )
+    assert room_pos < budget_pos, (
+        "hard window check must run BEFORE the budget build so allow_tools reflects it"
+    )
+    # codex r4 #4: reasoning-first tool extraction — the route splits reasoning off
+    # FIRST for line① requests (gated on gate-engaged AND no engine structured
+    # calls) and feeds the tool parser only the post-</think> content, so an
+    # in-<think> marker (even sub-token-spelled) can never be mis-extracted.
+    assert "_line1_split_reasoning_for_tool_parse(" in src, (
+        "route must reasoning-first split before tool-parse for line① (codex r4 #4)"
+    )
+    gate_guard_pos = src.find("if _line1_gate_engaged and engine_tool_calls is None:")
+    split_pos = src.find("_line1_split_reasoning_for_tool_parse(cfg.reasoning_parser")
+    assert gate_guard_pos != -1 and split_pos != -1 and gate_guard_pos < split_pos, (
+        "reorder must be gated on line①-engaged AND no engine structured calls "
+        "(preserve the harmony/gemma4 structured-tool bypass)"
+    )
+    assert "# No forced call recovered from the post-" in src, (
+        "reorder must blank cleaned_text on no-call so _finalize re-derives from raw"
+    )
+
+
+def test_line1_probe_seed_behavior(monkeypatch):
+    # r3 #5: the seed probe is SYNCHRONOUS (runs inside the admission-gated build
+    # slot, not on the shared default executor) and degrades gracefully.
+    from vllm_mlx.routes import chat as chat_mod
+    from vllm_mlx.routes.chat import _LINE1_SEED_UNSET, _line1_probe_seed
+
+    class _Cfg:
+        model_path = "qwen3.5-4b"
+        model_name = "qwen3.5-4b"
+        reasoning_parser_name = "qwen3"
+
+    # Non-candidate (auto choice) → short-circuits to (UNSET, False), NO render.
+    called = {"n": 0}
+
+    def _boom(*a, **k):
+        called["n"] += 1
+        raise AssertionError("render must not run for a non-candidate")
+
+    monkeypatch.setattr(chat_mod, "_template_generation_prefix", _boom)
+    req_auto = _L1Req(tool_choice="auto")
+    prefix, seed = _line1_probe_seed(object(), _Cfg(), req_auto, [], True)
+    assert prefix is _LINE1_SEED_UNSET and seed is False
+    assert called["n"] == 0
+
+    # Candidate but the render RAISES → declines to (UNSET, False), no 500.
+    def _raise(*a, **k):
+        raise RuntimeError("MLLM build_prompt rejected")
+
+    monkeypatch.setattr(chat_mod, "_template_generation_prefix", _raise)
+    req = _L1Req(tool_choice="required", max_tokens=512)
+    prefix, seed = _line1_probe_seed(object(), _Cfg(), req, [], True)
+    assert prefix is _LINE1_SEED_UNSET and seed is False
+
+    # Candidate + render returns an OPEN <think> prefix → (prefix, True).
+    monkeypatch.setattr(
+        chat_mod, "_template_generation_prefix", lambda *a, **k: "<think>"
+    )
+    prefix, seed = _line1_probe_seed(object(), _Cfg(), req, [], True)
+    assert prefix == "<think>" and seed is True
+
+
+def test_line1_reasoning_gate_id_property_exposes_gate():
+    # Option B: the route reads ``reasoning_gate_id`` to decide whether to couple
+    # the budget. A gated processor exposes its ``</think>`` id; a plain one None.
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    restore, _ = _line1_fake_env()
+    try:
+        gated = GrammarLogitsProcessor(
+            _FakeLLTok(), "g", reasoning_end_id=99, tokenizer=None
+        )
+        assert gated.reasoning_gate_id == 99
+        plain = GrammarLogitsProcessor(_FakeLLTok(), "g", tokenizer=None)
+        assert plain.reasoning_gate_id is None
+    finally:
+        restore()
+
+
+def test_line1_allow_tools_couples_budget_to_gate(monkeypatch):
+    # Option B, the load-bearing behavior: a tool request normally OPTS OUT of the
+    # generation-time thinking budget (allow_tools=False → None, protecting the
+    # ungated auto/parser path from vLLM #44676). With allow_tools=True — which the
+    # route passes EXACTLY when the reasoning-gated grammar is active — the opt-out
+    # is LIFTED, coupling the budget to the gate (SGLang / vLLM shape). We also
+    # assert the already-rendered prefix is THREADED through (codex #3: no second
+    # synchronous render).
+    import vllm_mlx.api.reasoning_budget as rb
+    from vllm_mlx.routes import chat as chat_mod
+
+    sentinel = object()
+    calls = []
+
+    def _fake_build(tok, parser, mtk, seed, *, vocab_size=None):
+        calls.append({"seed": seed, "vocab": vocab_size, "mtk": mtk})
+        return sentinel
+
+    monkeypatch.setattr(rb, "build_budget_from_render", _fake_build)
+    monkeypatch.setattr(chat_mod, "_engine_output_vocab_size", lambda _e: 4096)
+
+    class _Cfg:
+        model_path = "qwen3.5-4b"
+        model_name = "qwen3.5-4b"
+        reasoning_parser_name = "qwen3"
+
+    class _Req:
+        tools = ["t"]
+        reasoning_max_tokens = 64
+        stop = None
+
+    class _Eng:
+        tokenizer = object()
+
+    # allow_tools=False (default): tool opt-out fires — builder never reached.
+    out = chat_mod._build_reasoning_budget_processor(
+        _Eng(), _Req(), _Cfg(), [], True, seed_prefix="<think>"
+    )
+    assert out is None, "a tool request must opt out of the budget by default"
+    assert calls == [], "the tool opt-out must short-circuit before the builder"
+
+    # allow_tools=True: opt-out lifted — builder reached with the THREADED prefix.
+    out2 = chat_mod._build_reasoning_budget_processor(
+        _Eng(),
+        _Req(),
+        _Cfg(),
+        [],
+        True,
+        allow_tools=True,
+        seed_prefix="<think>",
+    )
+    assert out2 is sentinel, "allow_tools=True must couple the budget to the gate"
+    assert len(calls) == 1 and calls[0]["seed"] == "<think>", (
+        "the already-rendered prefix must be threaded (no second render)"
+    )
+    assert calls[0]["mtk"] == 64 and calls[0]["vocab"] == 4096

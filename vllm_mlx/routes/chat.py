@@ -106,6 +106,7 @@ from ..service.helpers import (
     enable_thinking_warning_header,
     enforce_context_length_for_messages,
     get_engine,
+    get_model_max_context,
     maybe_apply_reasoning_effort,
     maybe_auto_disable_thinking_for_casual_chat,
     maybe_auto_disable_thinking_for_tools,
@@ -283,6 +284,35 @@ def _forced_tool_call_prefix(parser_name: str | None, function_name: str) -> str
     # we have NOT audited: no prefix injection. The post-parse
     # synthesis path remains as a fallback (``_synthesize_forced_tool_call``).
     return None
+
+
+def _compute_forced_tool_prefix(cfg, request) -> str | None:
+    """The forced-function assistant-turn prefix for a forced/named ``tool_choice``,
+    or ``None`` when the request is not a forced single/named choice or the parser
+    has no audited wire opener.
+
+    Shared by (a) the primary forced-prefix path (used when NO grammar processor is
+    active) and (b) the line① reconcile path (codex r4 #3): when a reasoning gate
+    engaged but its coupled generation-time budget did NOT build, the installed
+    gated grammar would suppress this fallback while having no force-close to open
+    the gate — the exact call-dropping regression. The reconcile discards the gate
+    and RESTORES this fallback, so the computation must be callable from both sites.
+    """
+    if not (request.tools and getattr(request, "tool_choice", None) is not None):
+        return None
+    _forced_name: str | None = None
+    if (
+        isinstance(request.tool_choice, dict)
+        and request.tool_choice.get("type") == "function"
+    ):
+        _forced_name = (request.tool_choice.get("function") or {}).get("name")
+    elif request.tool_choice == "required" and len(request.tools) == 1:
+        # OpenAI spec: ``required`` with a single tool is unambiguous — same
+        # forcing semantics as a named choice.
+        _forced_name = request.tools[0].function.get("name")
+    if not _forced_name:
+        return None
+    return _forced_tool_call_prefix(cfg.tool_call_parser, _forced_name)
 
 
 def _normalize_tool_choice_for_grammar(tool_choice) -> dict | None:
@@ -768,7 +798,726 @@ def _enforce_tool_grammar_bounds_or_400(cfg, request) -> None:
         )
 
 
-def _maybe_build_tool_grammar_processor(engine, cfg, request):
+# Conservative token allowance for the wire envelope a forced call always needs
+# AFTER the budget force-closes </think> — the structural wrapper around the payload,
+# e.g. ``<tool_call>{"name":"","arguments":{}}</tool_call>`` or the Harmony/DeepSeek
+# section markers. The full floor ADDS the request-specific cost of the tool NAME
+# plus its REQUIRED fields (``_line1_min_call_tokens``), so a long name or a
+# many-required-field schema cannot slip under a flat constant (codex r2 #2).
+#
+# This is a fixed, tokenizer-INDEPENDENT constant (codex r8 #4 / r9 #3): the exact
+# minimal envelope depends on the active parser's wire format and the model's
+# tokenizer, and computing it precisely would need to serialize + tokenize a
+# per-parser skeleton here (out of scope for this front-line guard). ``64`` is a
+# deliberately generous allowance — several times the ~10-20 tokens any supported
+# wire wrapper's EMPTY envelope actually costs — so it over-reserves rather than
+# under-reserves. This whole ``max_tokens``-room precheck is a BEYOND-UPSTREAM
+# defensive addition: vLLM / SGLang install the reasoning-gated grammar without any
+# such room guard and simply let generation truncate, so a fixed conservative
+# allowance here is strictly ahead of the upstream contract this mirrors. When the
+# true minimal call does not fit it declines to the (non-regressive) forced-prefix
+# path, and if a pathologically tokenized envelope ever exceeded even this margin the
+# runtime desync fallback finishes the request under the free-form parser rather than
+# emitting a truncated call.
+_LINE1_CALL_ENVELOPE_TOKENS = 64
+
+
+def _line1_value_matches_type(m, t) -> bool:
+    """True iff the concrete value ``m`` satisfies a JSON-Schema ``type`` ``t``
+    (scalar name, list of names, or ``None`` = unconstrained). Used to drop enum
+    members a sibling ``type`` forbids before pricing the shortest (codex r10 #3)."""
+    if t is None:
+        return True
+    if isinstance(t, list):
+        return any(_line1_value_matches_type(m, x) for x in t)
+    if t == "string":
+        return isinstance(m, str)
+    if t == "integer":
+        return isinstance(m, int) and not isinstance(m, bool)
+    if t == "number":
+        return isinstance(m, (int, float)) and not isinstance(m, bool)
+    if t == "boolean":
+        return isinstance(m, bool)
+    if t == "null":
+        return m is None
+    if t == "array":
+        return isinstance(m, list)
+    if t == "object":
+        return isinstance(m, dict)
+    return True  # unrecognized type -> do not filter
+
+
+def _line1_min_value_bytes(schema) -> int:
+    """UTF-8 byte length of the SHORTEST JSON value a required field of ``schema``
+    can legally take (codex r7 #2/#3). Prices the discrete value keywords the
+    uncoverable check no longer declines — ``enum`` (shortest member), ``const``
+    (its exact serialization), and numeric bounds (a lower OR upper bound can force
+    the value's magnitude/sign). Length-forcing container/string/regex keywords
+    (``minLength`` / ``minItems`` / ``minProperties`` / ``pattern``) are declined
+    upstream by ``_line1_schema_has_uncoverable_constraint`` and never reach here.
+
+    Bytes, not Python chars: a decoded token spans >=1 byte, so a byte count is a
+    PROVABLE upper bound on the value's token count (codex r7 #4) — a multi-byte
+    identifier that a ``len(str(...))`` char count would UNDER-reserve is bounded
+    correctly here.
+    """
+    if not isinstance(schema, dict):
+        return 2  # unknown scalar -> '""' / '0'
+    if "const" in schema:
+        try:
+            return len(json.dumps(schema["const"]).encode("utf-8"))
+        except Exception:  # noqa: BLE001 - unserializable -> small conservative default
+            return 2
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        # codex r10 #3: a sibling ``type`` narrows the enum — ``{"type":"string",
+        # "enum":[0,"long"]}`` admits only ``"long"``, so the ``0`` (shorter) is
+        # NOT a valid value. Price the shortest member that ALSO satisfies the type;
+        # if the intersection is empty the schema is unsatisfiable (no valid call to
+        # truncate) so the unfiltered set is a harmless fallback.
+        t = schema.get("type")
+        members = [m for m in enum if _line1_value_matches_type(m, t)] or enum
+        try:
+            return min(len(json.dumps(m).encode("utf-8")) for m in members)
+        except Exception:  # noqa: BLE001
+            return 2
+    # Numeric bounds (codex r7 #3, r8 #2): a LOWER *or* UPPER bound can force the
+    # shortest valid value to a specific magnitude / sign — e.g. ``{"maximum": -999}``
+    # forbids ``0`` and needs ``"-999"`` (4 bytes), not the 1-byte default. Price the
+    # WORST (longest) present bound's serialization + 1 slack byte: the slack absorbs
+    # a minus sign a positive-bound repr omits and the +1 magnitude rollover of an
+    # exclusive bound (``exclusiveMinimum: 999`` -> shortest is ``1000``).
+    numeric_bounds = [
+        schema.get(kw)
+        for kw in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum")
+    ]
+    numeric_bounds = [
+        b
+        for b in numeric_bounds
+        if isinstance(b, (int, float)) and not isinstance(b, bool)
+    ]
+    if numeric_bounds:
+        return 1 + max(len(repr(b).encode("utf-8")) for b in numeric_bounds)
+
+    def _base_type_min_bytes(tp) -> int:
+        if tp in ("integer", "number"):
+            return 1  # "0"
+        if tp == "boolean":
+            return 5  # "false" (upper bound of true/false)
+        if tp == "null":
+            return 4  # "null"
+        return 2  # string ('""'), empty object/array ('{}' / '[]'), or unknown scalar
+
+    t = schema.get("type")
+    if isinstance(t, list):
+        # JSON Schema allows a UNION type, e.g. the very common nullable
+        # ``["string", "null"]`` or ``["boolean"]`` (codex r9 #2). The shortest valid
+        # value is the smallest across the allowed members — NOT the 2-byte unknown
+        # default that an array-valued ``type`` used to silently hit and under-reserve.
+        return min((_base_type_min_bytes(mt) for mt in t), default=2)
+    return _base_type_min_bytes(t)
+
+
+def _line1_min_call_tokens(request) -> int:
+    """A CONSERVATIVE upper bound on the tokens a minimal forced call needs after
+    ``</think>`` for THIS request's tools (codex r2 #2 / r7 #2-#4).
+
+    A flat constant (the previous ``16``) let a long tool name / large required
+    schema pass the guard yet still truncate under a tight ``max_tokens``. Derive
+    the floor from the wire envelope PLUS the request's own worst-case tool: the
+    longest candidate NAME and its REQUIRED-field skeleton (``"key":<value>,`` per
+    required key), where ``<value>`` is priced by ``_line1_min_value_bytes`` (an
+    empty string, a bool, an enum's shortest member, a const's serialization, or a
+    numeric bound's digit count — codex r7 #2/#3, so a coverable enum / numeric
+    field's own bytes are counted, not just its key).
+
+    UTF-8 BYTES, not Python chars (codex r7 #4): every decoded token spans >=1
+    byte, so a byte count is a PROVABLE upper bound on token count — a multi-byte
+    tool name or key that a ``len(str(...))`` char count would UNDER-reserve (1
+    char, several tokens) is bounded correctly. The guard therefore OVER-reserves
+    and never claims room it can't back. It remains a heuristic, not a proof of the
+    compiled grammar's exact minimum; the truly unpriceable shapes are declined
+    upstream (``_line1_schema_has_uncoverable_constraint``), so we lean conservative
+    and fall back to the forced-prefix path when unsure.
+    """
+    tools = getattr(request, "tools", None) or []
+    worst = 0
+    for t in tools:
+        fn = (
+            t.function
+            if hasattr(t, "function")
+            else (t.get("function", t) if isinstance(t, dict) else t)
+        )
+        name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+        params = (
+            fn.get("parameters")
+            if isinstance(fn, dict)
+            else getattr(fn, "parameters", None)
+        )
+        # ``json.dumps`` the name/keys (codex r8 #3): a key/name with a quote,
+        # backslash, or control char is ESCAPED on the wire (``a"b`` -> ``a\"b``),
+        # so a raw ``len(...encode())`` under-reserves. ``json.dumps`` emits the exact
+        # wire spelling INCLUDING the surrounding quotes and any escapes.
+        cost = len(json.dumps(name).encode("utf-8")) if isinstance(name, str) else 0
+        if isinstance(params, dict):
+            if "enum" in params or "const" in params:
+                # ROOT-level enum/const (codex r12 #2): the WHOLE arguments object is a
+                # single fixed value the grammar must emit in full, NOT a required-key
+                # skeleton — price it as a value (the shortest enum member / the const).
+                cost += _line1_min_value_bytes(params)
+            else:
+                required = params.get("required")
+                props = params.get("properties")
+                if isinstance(required, list):
+                    # Each required key is emitted as ``<json-key>:<value>,`` — the
+                    # json.dumps-serialized key (quotes + escapes) + 2 punctuation
+                    # bytes (colon, comma) + the shortest legal value's bytes.
+                    for k in required:
+                        sub = props.get(k) if isinstance(props, dict) else None
+                        cost += (
+                            len(json.dumps(str(k)).encode("utf-8"))
+                            + 2
+                            + _line1_min_value_bytes(sub)
+                        )
+        worst = max(worst, cost)
+    return _LINE1_CALL_ENVELOPE_TOKENS + worst
+
+
+def _line1_stop_conflicts_with_forced_output(stop, forced_openers) -> bool:
+    """True iff a client ``stop`` sequence would fire on the FORCED wire output the
+    GATED path GENERATES (codex r12 #3, generalised r13 #1).
+
+    The forced-prefix fallback places the tool opener in the PROMPT — stops never
+    scan the prompt — but line①'s gated path EMITS that opener as output. So
+    ``stop=["<tool_call>"]`` (a substring of the wire opener) would terminate
+    generation the instant the constrained opener appears, truncating the call. When
+    such an overlap exists the gate declines to the forced-prefix path (where the
+    opener is prompt-injected, immune) rather than admit a self-truncating gate — the
+    same shape as the ``</think>``-in-``stop`` decline (codex #2).
+
+    ``forced_openers`` is the set of FIXED wire prefixes the gated path will generate
+    (r13 #1): the family's ``structure_info`` trigger marker(s) — derived
+    INDEPENDENTLY of any fixed function name, so ``required`` with MULTIPLE tools
+    (where ``_compute_forced_tool_prefix`` returns ``None``) is still covered — plus
+    the named/``required``-single envelope. A ``stop`` conflicts when it is either
+    (a) a SUBSTRING of an opener (fires mid-opener: over each generated prefix of the
+    opener, the accumulated text ends with the stop at exactly the step the substring
+    completes), or (b) a boundary-spanning overlap — a non-empty PREFIX of the stop is
+    a SUFFIX of an opener, so the stop could complete on the immediately-following
+    generated bytes. (b) is deliberately conservative (it may decline a stop that
+    would not in fact fire), but declining only ever falls back to the non-regressive
+    forced-prefix path, so over-declining is safe while under-declining is not. Accepts
+    a single string or an iterable of strings."""
+    if isinstance(forced_openers, str):
+        openers = [forced_openers]
+    elif forced_openers:
+        openers = list(forced_openers)
+    else:
+        openers = []
+    openers = [o for o in openers if isinstance(o, str) and o]
+    if not openers:
+        return False
+    stops = stop if isinstance(stop, (list, tuple)) else ([stop] if stop else [])
+    for s in stops:
+        if not (isinstance(s, str) and s):
+            continue
+        for o in openers:
+            if s in o:  # (a) fires mid-opener
+                return True
+            # (b) boundary-spanning: a non-empty prefix of the stop is a suffix of
+            #     the opener, so the stop could complete on the next generated bytes.
+            for k in range(1, min(len(o), len(s)) + 1):
+                if o.endswith(s[:k]):
+                    return True
+    return False
+
+
+def _line1_forced_wire_openers(parser, flat_tools, cfg, request) -> tuple[str, ...]:
+    """The FIXED wire prefix strings the line① gated path GENERATES for a forced call
+    (codex r13 #1, extended r15 #2).
+
+    Two families of mandatory generated fragment a client ``stop`` could truncate:
+
+    (a) Each forced tool's ``structure_info`` trigger marker (the opener the model
+        emits when the gate opens — the SAME source ``_resolve_tool_start_exclusion_ids``
+        masks), resolved INDEPENDENTLY of any fixed function name.
+
+    (b) The PER-CANDIDATE forced envelope ``{"name":"<tool>","arguments": `` for every
+        tool the gated path could emit — the NAMED tool for a named choice, or ALL
+        tools for ``required`` (single OR multi). This is what closes the multi-tool
+        gap (codex r15 #2): with ``required`` over several tools the model picks one and
+        generates its name + the mandatory ``", "arguments": `` boundary, so a stop
+        matching any candidate name or that boundary text would truncate the call. The
+        old code only guarded the shared trigger marker.
+
+    Fed to ``_line1_stop_conflicts_with_forced_output`` so a client ``stop`` that would
+    truncate any mandatory generated fragment declines the gate to the (non-regressive)
+    forced-prefix / free path."""
+    openers: list[str] = []
+    tools = flat_tools or []
+    # (a) trigger markers — name-independent.
+    try:
+        info_fn = getattr(parser, "structure_info", None)
+        get_info = info_fn() if info_fn is not None else None
+        if get_info is not None and tools:
+            for tool in tools:
+                si = get_info(tool.get("name"))
+                trigger = getattr(si, "trigger", None) if si is not None else None
+                if isinstance(trigger, str) and trigger:
+                    openers.append(trigger)
+    except Exception:
+        pass  # best-effort — a missing trigger just means fewer openers to guard
+    # (b) per-candidate mandatory envelope, scoped to the tools the choice could emit.
+    choice = _normalize_tool_choice_for_grammar(getattr(request, "tool_choice", None))
+    if choice and choice.get("mode") == "named":
+        cand_names = [choice.get("name")]
+    else:  # required (single or multi) — any tool is eligible
+        cand_names = [t.get("name") for t in tools]
+    parser_name = getattr(cfg, "tool_call_parser", None)
+    for nm in cand_names:
+        if not (isinstance(nm, str) and nm):
+            continue
+        env = _forced_tool_call_prefix(parser_name, nm)
+        if isinstance(env, str) and env:
+            openers.append(env)
+    return tuple(openers)
+
+
+# FAIL-SAFE ALLOWLIST of JSON-Schema keywords whose effect on a minimal instance's
+# byte length ``_line1_min_call_tokens`` either prices EXACTLY or provably ignores.
+# A BLACKLIST of "unbounded" keywords is unbounded WORK — JSON Schema is large and
+# each codex round surfaced another gap (minLength, then minItems, then combinators,
+# then additionalProperties / dependentRequired / minContains / multipleOf ...).
+# So we invert it (codex r10): a required tool schema is priceable ONLY if every
+# node uses solely these keywords; ANY other keyword — present or future — makes the
+# floor unprovable and DECLINES the gate to the (non-regressive) forced-prefix path.
+# New keywords fail CLOSED, not open. Excluded on purpose (they force / hide length):
+# minLength/maxLength, minItems/maxItems, minProperties/maxProperties, minContains,
+# pattern, multipleOf, dependentRequired, patternProperties, propertyNames,
+# if/then/else, not, allOf/anyOf/oneOf, $ref/$defs, format. ``additionalProperties``
+# is allowed (a required key it would govern is caught by the required-in-properties
+# check below), and the DISCRETE value keywords enum/const/numeric-bounds are priced.
+_LINE1_SAFE_SCHEMA_KEYWORDS = frozenset(
+    {
+        # container structure we descend into / price explicitly
+        "type",
+        "properties",
+        "required",
+        "items",
+        "additionalProperties",
+        # discrete value keywords the byte pricer serializes exactly
+        "enum",
+        "const",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        # pure annotations — no effect on a valid instance's bytes
+        "description",
+        "title",
+        "default",
+        "examples",
+        "$comment",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "$schema",
+        "$id",
+    }
+)
+
+
+def _line1_schema_has_uncoverable_constraint(schema, _depth: int = 0) -> bool:
+    """True iff ``schema`` (a JSON-Schema dict) carries a shape the byte floor
+    ``_line1_min_call_tokens`` cannot price (codex r3 #2 / r7 / r10).
+
+    FAIL-SAFE ALLOWLIST: decline on ANY keyword outside
+    ``_LINE1_SAFE_SCHEMA_KEYWORDS`` (so minLength / pattern / minItems / multipleOf /
+    additionalProperties-governed / dependentRequired / combinators / $ref / any
+    future keyword all fall back), on a NESTED ``required`` skeleton the flat floor
+    never descends into, on a required key absent from ``properties`` (unpriced), or
+    on an over-deep schema. What survives is a flat object of scalar fields the pricer
+    bounds exactly — a discrete-value or plain-scalar shape.
+    """
+    if _depth > 6:
+        return True  # too deep to price -> conservatively uncoverable
+    if not isinstance(schema, dict):
+        return False
+    # Any keyword we do not KNOW to be length-safe -> decline (fail closed).
+    if set(schema.keys()) - _LINE1_SAFE_SCHEMA_KEYWORDS:
+        return True
+    # A FLOAT numeric bound is unpriceable (codex r11 #3): ``repr`` renders a large
+    # float in EXPONENT form (``repr(1e100) == "1e+100"``, 6 chars) while an integer
+    # grammar may require the full 101-digit decimal expansion — so pricing the repr
+    # under-reserves. A plain ``int`` bound always ``repr``s as full decimal (never
+    # exponent), so only floats are the hazard; decline them (non-regressive).
+    _numeric_bound_kws = ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum")
+    for _kw in _numeric_bound_kws:
+        _b = schema.get(_kw)
+        if isinstance(_b, float):
+            return True
+    # An ``enum`` COMBINED with a numeric bound is unpriceable (codex r14 #2):
+    # ``_line1_min_value_bytes`` picks the shortest TYPE-valid enum member, but a
+    # sibling ``minimum`` / ``maximum`` can EXCLUDE that short member and leave only a
+    # much longer legal value — e.g. ``{"type":"integer","enum":[0,10**100],
+    # "minimum":10**100}`` is priced as ``0`` (1 byte) while only the 101-digit value
+    # is legal. Intersecting a discrete set with a range is exactly the precision work
+    # the allowlist exists to avoid, so decline (const is exempt: a single fixed value
+    # is priced exactly and a bound cannot change its byte length).
+    if "enum" in schema and any(_kw in schema for _kw in _numeric_bound_kws):
+        return True
+    # A NESTED ``required`` skeleton (codex r4 #2): the flat floor prices ONLY the
+    # ROOT required list, so any required list below the root is unpriced bytes.
+    if _depth > 0 and schema.get("required"):
+        return True
+    props = schema.get("properties")
+    required = schema.get("required")
+    # Every required key must be defined in ``properties`` — the only place the flat
+    # floor reads a per-key schema. A required key governed by ``additionalProperties``
+    # or otherwise absent is unpriced, so decline (codex r10 #2).
+    if isinstance(required, list):
+        prop_keys = set(props) if isinstance(props, dict) else set()
+        if any(k not in prop_keys for k in required):
+            return True
+    if isinstance(props, dict):
+        for sub in props.values():
+            if _line1_schema_has_uncoverable_constraint(sub, _depth + 1):
+                return True
+    return False
+
+
+def _line1_request_has_uncoverable_constraint(request) -> bool:
+    """True iff ANY of THIS request's forced tools carries a schema constraint the
+    flat floor can't bound (codex r3 #2). Best-effort: any error -> assume
+    uncoverable (conservative decline)."""
+    try:
+        tools = getattr(request, "tools", None) or []
+        for t in tools:
+            fn = (
+                t.function
+                if hasattr(t, "function")
+                else (t.get("function", t) if isinstance(t, dict) else t)
+            )
+            params = (
+                fn.get("parameters")
+                if isinstance(fn, dict)
+                else getattr(fn, "parameters", None)
+            )
+            if isinstance(params, dict) and _line1_schema_has_uncoverable_constraint(
+                params
+            ):
+                return True
+        return False
+    except Exception:
+        return True
+
+
+def _line1_completion_limit_ok(request) -> bool:
+    """LINE① (#558, codex #4 / r2 #2 / r3 #2): true unless the request's completion
+    allowance is too small — or too unprovable — for the force-close + a minimal
+    constrained call for THIS request's tools.
+
+    The coupled budget force-closes ``</think>`` after ``reasoning_max_tokens``
+    thinking tokens; the gated grammar then constrains the call AFTER that
+    boundary. If ``max_tokens <= reasoning_max_tokens + _line1_min_call_tokens``
+    generation terminates before a complete call can be emitted, so line① declines
+    to the forced-prefix fallback (non-regressive) rather than install a gate that
+    strands / truncates the forced choice. The floor scales with the tool name and
+    required schema, so a long-name / large-schema tool cannot pass under a flat
+    constant.
+
+    Two conservative declines harden the floor (codex r3):
+      * **#2 — unprovable schema minimum.** ``_line1_min_call_tokens`` only prices
+        the required-key skeleton; a ``minLength`` / ``const`` / nested-required /
+        ``$ref`` schema can make a VALID call arbitrarily larger. When the schema
+        carries such a constraint the floor cannot bound, the room check is
+        unprovable, so we DECLINE — REGARDLESS of ``max_tokens`` (codex r5 #1). A
+        ``max_tokens=None`` request whose schema has a 1,000-char ``minLength`` is
+        just as unbounded as a bounded one; letting it engage because
+        ``_line1_context_room_ok`` only reserves the flat floor would strand the call
+        when the schema minimum exceeds that floor. The uncoverable-schema decline is
+        therefore checked BEFORE the ``max_tokens`` split.
+      * **#1 — unknown effective allowance.** ``max_tokens=None`` is NOT unbounded:
+        the model context window still caps generation, and a near-full prompt can
+        leave no room for ``</think>`` + the call. This request-time predicate runs
+        BEFORE the prompt is rendered, so it cannot see the prompt-token count and
+        keeps engaging on ``max_tokens=None`` (declining every no-``max_tokens``
+        request — the common case — would gut the feature). The HARD context-window
+        check now lives at the route in :func:`_line1_context_room_ok`, which runs
+        AFTER ``enforce_context_length_for_messages`` has rendered + counted the
+        prompt (reusing that already-paid count) and fails CLOSED (disengages to the
+        forced-prefix fallback) when it cannot PROVE the window fits the budget + a
+        minimal call. Here we stay permissive on the allowance only.
+    """
+    rmt = getattr(request, "reasoning_max_tokens", None)
+    mx = getattr(request, "max_tokens", None)
+    if rmt is None:
+        return True
+    # #2 (codex r5 #1): an uncoverable schema minimum is unbounded under ANY
+    # ``max_tokens`` — including ``None`` — so decline BEFORE the allowance split.
+    if _line1_request_has_uncoverable_constraint(request):
+        return False
+    if mx is None:
+        # #1: allowance unknown at this pre-render gate. Stay permissive on the
+        # allowance; the route's ``_line1_context_room_ok`` makes the hard window
+        # check (fail-closed) once the prompt has been counted.
+        return True
+    return mx > rmt + _line1_min_call_tokens(request)
+
+
+def _line1_context_room_ok(engine, prompt_tokens, request) -> bool:
+    """LINE① (#558, codex r4 #1): the HARD context-window allowance check.
+
+    Runs at the route AFTER ``enforce_context_length_for_messages`` has rendered
+    and counted the prompt, so it can PROVE — not just assume — that the model
+    context window still fits the coupled thinking budget plus a minimal
+    constrained call. Returns ``True`` ONLY when room is provable; the route
+    disengages the gate to the forced-prefix fallback on ``False``.
+
+    Only ``max_tokens=None`` requests need this. When ``max_tokens`` is set the
+    request-time guard already proved ``prompt_tokens + max_tokens <= window``
+    AND ``_line1_completion_limit_ok`` proved ``max_tokens > rmt + floor``, so the
+    room is transitively guaranteed. But with ``max_tokens=None`` that guard uses
+    ``completion=0`` (it reserves ZERO generation room) — so a prompt sitting just
+    under the ceiling passes the guard yet leaves nothing for ``</think>`` + the
+    call. This check closes exactly that window.
+
+    FAIL CLOSED on missing signal (codex r5 #2): an unknown prompt count (``None`` —
+    MLLM engine / render skipped) or an unreadable / non-positive window means we
+    CANNOT prove room, so we DISENGAGE to the forced-prefix fallback rather than
+    install a gate that might exhaust the window during reasoning and never emit the
+    forced call. Forced-prefix emits the call immediately (no reasoning budget to
+    burn through the window), so it is the strictly safer choice when room is
+    unprovable — and it is non-regressive (identical to the pre-line① path).
+    """
+    rmt = getattr(request, "reasoning_max_tokens", None)
+    if rmt is None:
+        return True
+    if getattr(request, "max_tokens", None) is not None:
+        return True  # covered by enforce_context_length + _line1_completion_limit_ok
+    if prompt_tokens is None:
+        return False  # no prompt count -> cannot prove room -> fail closed
+    try:
+        window = get_model_max_context(engine)
+    except Exception:  # noqa: BLE001 - never fail the request over a probe error
+        return False  # unreadable window -> cannot prove room -> fail closed
+    if not isinstance(window, int) or window <= 0:
+        return False  # no usable window (incl. DoS sentinel) -> fail closed
+    room = window - int(prompt_tokens)
+    return room > rmt + _line1_min_call_tokens(request)
+
+
+_LINE1_THINK_END = "</think>"
+
+
+def _line1_split_reasoning_for_tool_parse(reasoning_parser, text):
+    """LINE① (#558, codex r4 #4) — upstream-faithful reasoning-first split.
+
+    Return the post-``</think>`` content the tool parser should see. NEVER returns
+    the raw full text: the caller invokes this ONLY for an ENGAGED gate, where the
+    real call is guaranteed AFTER ``</think>``, so exposing the ``<think>`` span to
+    the tool parser (even on a parser error) would re-open the very leak this closes.
+
+    This mirrors what vLLM (``Parser.parse``: ``reasoning, content =
+    extract_reasoning(model_output)`` then ``_extract_tool_calls(content)``) and
+    SGLang (``_build_chat_response``: ``parse_non_stream`` then ``_process_tool_
+    calls`` on the cleaned text) do for EVERY reasoning model — split reasoning off
+    FIRST, then parse tool calls only on the remainder. Because the split runs on
+    the DECODED string, a tool-call opener that appears inside ``<think>`` is
+    discarded before the tool parser ever sees it. That is the structural (not
+    best-effort) close for codex r4 #4: masking the opener token id at generation
+    time cannot prove the trigger TEXT is unspellable inside the think span, but
+    reasoning-first extraction discards that span before the parser runs.
+
+    KNOWN RESIDUAL (codex r7 #1), matching upstream: the split boundary is the
+    DECODED ``</think>`` text, whereas the runtime grammar gate opens on the ATOMIC
+    ``</think>`` token id (``ReasonerGrammarObject``: ``int(t) == reasoning_end_id``).
+    The two agree for every honest model (a reasoning model emits ``</think>`` as its
+    template's atomic special token), but an ADVERSARIAL model that sub-token-SPELLS
+    both ``</think>`` and a tool opener inside its reasoning could plant a false text
+    boundary the splitter honours. We deliberately do NOT preserve a token-id
+    boundary here: (a) vLLM/SGLang — the sources this mirrors — also split on decoded
+    text and carry the same residual, so closing it would EXCEED the upstream
+    contract raullen scoped this to; (b) it is strictly NON-REGRESSIVE — the pre-line①
+    path parsed tool calls on the ENTIRE raw output including all reasoning, so
+    reasoning-first extraction only ever SHRINKS this surface; (c) the coupled budget
+    force-closes the real atomic ``</think>`` regardless, so a well-behaved call still
+    lands after the true boundary. A token-id-anchored split (thread the gen-time gate
+    position into post-processing) is the sound-but-beyond-upstream follow-up.
+
+    FAIL CLOSED (codex r5 #3, r6 B2/B3): the configured ``cfg.reasoning_parser``
+    (consistent with ``_finalize_content_and_reasoning``) is tried first, but its
+    ``content`` is trusted ONLY when the parser POSITIVELY identified a reasoning
+    span (``reasoning is not None``). A parser that reports "no reasoning found" as
+    ``(None, text)`` returns the FULL raw output as ``content``; trusting that would
+    re-open the leak (codex r6 B2), so on ``reasoning is None`` we ignore ``content``
+    and fall through to the literal split. When the parser is absent, raises, or
+    found no reasoning we deterministically locate the span after the FIRST
+    ``</think>`` literal (codex r6 B3: the FIRST close tag is the real reasoning
+    boundary — a schema-valid tool argument may itself contain the literal
+    ``</think>``, and splitting on the LAST occurrence would truncate the call). If
+    there is no close tag the model never closed thinking, so there is no legitimate
+    post-think call and we return ``""`` (the tool parser sees nothing). Either way
+    the think span never reaches the parser.
+
+    Applied ONLY when line① is engaged (the caller gates on
+    ``_line1_gate_engaged``): line①'s gate + coupled thinking budget GUARANTEE the
+    real forced call lands strictly AFTER ``</think>``, so parsing only post-think
+    content loses nothing legitimate. Families that legitimately emit a tool call
+    INSIDE ``<think>`` (minimax bare ``<invoke>``, forced-prefix hermes/qwen3) never
+    engage line① — their multi-token openers fail the single-special-token gate —
+    so a blanket reorder is unsafe but this gated one is not.
+    """
+    if reasoning_parser is not None:
+        try:
+            reasoning, content = reasoning_parser.extract_reasoning(text)
+            # Trust ``content`` ONLY when a reasoning span was positively identified
+            # (codex r6 B2). ``reasoning is None`` means the parser found no
+            # reasoning and routed EVERYTHING to ``content`` (i.e. ``content`` is the
+            # full raw output incl. any ``<think>`` span) — trusting it re-opens the
+            # leak, so fall through to the deterministic literal split instead.
+            # ``reasoning is not None`` + ``content is None`` = all-reasoning /
+            # Case-4 (no legitimate post-think call), so the tool parser sees "".
+            if reasoning is not None:
+                return content or ""
+        except Exception:  # noqa: BLE001 - parser bug must not re-open the leak
+            pass  # fall through to the deterministic literal split (fail closed)
+    # No parser, it raised, or it found no reasoning: fail closed on the ``</think>``
+    # literal. Take the suffix after the FIRST close tag (the real reasoning
+    # boundary; a later ``</think>`` inside a tool argument must NOT truncate the
+    # call — codex r6 B3); no close tag => still thinking => "" (no call).
+    idx = text.find(_LINE1_THINK_END)
+    if idx == -1:
+        return ""
+    return text[idx + len(_LINE1_THINK_END) :]
+
+
+def _line1_should_probe_seed(request, resolved_thinking) -> bool:
+    """LINE① (#558): true iff this request is a CANDIDATE for the reasoning-
+    gated forced grammar, so the synchronous seed-state render is worth doing.
+
+    Requires ALL of: a FORCED (``required`` / named) tool choice — never
+    ``auto`` / ``none`` (codex: don't run the two-render prefix probe for
+    choices the builder never gates on); a thinking model
+    (``resolved_thinking is True``); a set thinking budget
+    (``reasoning_max_tokens >= 0`` — the coupled generation-time force-close is
+    what makes the runtime token-id gate provably open); ``max_tokens`` with room
+    for the call past that budget (``_line1_completion_limit_ok`` — codex #4); and
+    tools present. The seed-state ``"open"`` classification, the ``</think>``-id
+    resolution, and the stop-conflict guard (codex #2) happen AFTER this cheap,
+    pure, front-line gate.
+    """
+    if not request.tools or resolved_thinking is not True:
+        return False
+    rmt = getattr(request, "reasoning_max_tokens", None)
+    if rmt is None or rmt < 0:
+        return False
+    if not _line1_completion_limit_ok(request):
+        return False
+    choice = _normalize_tool_choice_for_grammar(getattr(request, "tool_choice", None))
+    return choice is not None and choice["mode"] != "auto"
+
+
+def _line1_probe_seed(engine, cfg, request, messages, resolved_thinking):
+    """LINE① seed-state probe — SYNCHRONOUS, run INSIDE the admission-gated build
+    slot (codex r2 #3 + r3 #5).
+
+    The seed-state classification needs the template's isolated generation-prefix
+    delta (``_template_generation_prefix`` — a full ``apply_chat_template`` render +
+    tokenization). r3 #5 (DoS): the earlier revision submitted this render to the
+    SHARED default executor from the route BEFORE the grammar-build admission gate,
+    so a flood of concurrent / abandoned forced-tool requests could queue unbounded
+    render work and starve unrelated ``run_in_executor`` users. It now runs
+    SYNCHRONOUSLY from within ``_maybe_build_tool_grammar_processor``, which itself
+    executes only inside a SLOT of the bounded, admission-gated tool-grammar
+    executor (``_offload_tool_grammar_build`` → ``_try_admit_tool_grammar_build``).
+    So the render is bounded by the SAME compile-admission cap as the build it feeds
+    — no separate unbounded queue, and the single render is reused for both the gate
+    decision and the coupled budget (no second render).
+
+    Returns ``(prefix, seed_open)`` — or ``(_LINE1_SEED_UNSET, False)`` when line①
+    is not a candidate or the render fails (an MLLM engine may reject
+    ``build_prompt``); line① then declines to the forced-prefix fallback
+    (non-regressive).
+    """
+    if not _line1_should_probe_seed(request, resolved_thinking):
+        return _LINE1_SEED_UNSET, False
+
+    from ..api.reasoning_budget import reasoning_seed_state
+
+    try:
+        prefix = _template_generation_prefix(
+            engine, messages, request.tools, resolved_thinking
+        )
+    except Exception as exc:
+        logger.debug(
+            "line①: generation-prefix render failed for model=%s (%s: %s) — "
+            "declining the gated grammar (forced-prefix fallback)",
+            getattr(cfg, "model_path", None) or getattr(cfg, "model_name", None),
+            type(exc).__name__,
+            exc,
+        )
+        return _LINE1_SEED_UNSET, False
+    if prefix is None:
+        return _LINE1_SEED_UNSET, False
+    seed_open = (
+        reasoning_seed_state(prefix, getattr(cfg, "reasoning_parser_name", None))
+        == "open"
+    )
+    return prefix, seed_open
+
+
+def _resolve_tool_start_exclusion_ids(parser, tokenizer, flat_tools) -> tuple[int, ...]:
+    """LINE① (#558, codex #3): the tool-call opener token id(s) to MASK while the
+    reasoning gate is closed (SGLang ``think_excluded_token_ids``).
+
+    Resolve the family's wire ``trigger`` from the parser's ``structure_info`` —
+    the SAME source ``build_tool_grammar`` uses (e.g. hermes/qwen3 ``<tool_call>``,
+    gemma4 ``<|tool_call>``) — and keep it ONLY when it encodes to a SINGLE special
+    token on this tokenizer. That single-token requirement is what makes masking
+    surgical: it forbids exactly the opener marker during ``<think>`` without
+    touching ordinary reasoning bytes (a multi-token trigger would require masking
+    its first piece, e.g. ``<``, which would corrupt legitimate reasoning).
+
+    ALL-OR-NOTHING across the forced set (codex r3 #3): a ``required`` choice may
+    span SEVERAL tools, and the model is free to open ANY of them during
+    reasoning. If even one eligible tool's opener does not resolve to a single
+    special token, masking the resolved subset leaves the unresolved tool's opener
+    emittable inside ``<think>`` — a hole the caller's ``non-empty`` admission gate
+    would not catch. So we return ``()`` the moment ANY tool's trigger is
+    missing / non-string / multi-token / unresolvable, declining the whole gate to
+    the forced-prefix fallback rather than protecting only part of the set. Returns
+    ``()`` on any failure (no ``structure_info``, no tools, or any unresolvable /
+    multi-token trigger).
+    """
+    try:
+        info_fn = getattr(parser, "structure_info", None)
+        if info_fn is None or not flat_tools:
+            return ()
+        get_info = info_fn()
+        if get_info is None:
+            return ()
+        from ..api.reasoning_budget import _encode_single_special
+
+        seen: set[int] = set()
+        for tool in flat_tools:
+            si = get_info(tool.get("name"))
+            trigger = getattr(si, "trigger", None) if si is not None else None
+            if not isinstance(trigger, str) or not trigger:
+                return ()  # unresolved opener -> decline the WHOLE gate (codex r3 #3)
+            tid = _encode_single_special(tokenizer, trigger)
+            if tid is None:
+                return ()  # multi-token / non-special opener -> decline the WHOLE gate
+            seen.add(tid)
+        return tuple(sorted(seen))
+    except Exception:
+        # Best-effort hardening only — never fail the request over it.
+        return ()
+
+
+def _maybe_build_tool_grammar_processor(
+    engine, cfg, request, messages=None, resolved_thinking=None
+):
     """Build a per-request ``GrammarLogitsProcessor`` for #558, or ``None``.
 
     Non-breaking: returns ``None`` (today's free-form-then-parse fallback)
@@ -780,6 +1529,15 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
     Re-runs the cheap eligibility checks (so it stays correct when called
     directly, e.g. from tests) before the heavy path; the route gates on
     ``_tool_grammar_eligible`` first to keep the offload off the hot path.
+
+    LINE① (#558, r3 #5): the reasoning-gate seed-state probe (``_line1_probe_seed``)
+    runs HERE, inside this admission-gated executor slot, rather than on the shared
+    default executor before admission — so its template render is bounded by the
+    compile-admission cap. ``messages`` / ``resolved_thinking`` are the render
+    inputs; when absent (a direct unit-test call) the probe short-circuits to
+    non-candidate and line① stays disengaged. When the gate DOES engage, the
+    rendered prefix is stashed on the returned processor as ``_line1_seed_prefix``
+    so the route can reuse it for the coupled budget (no second render).
     """
     if not _tool_grammar_eligible(cfg, request):
         return None
@@ -787,6 +1545,14 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
     choice = _normalize_tool_choice_for_grammar(getattr(request, "tool_choice", None))
     if choice is None:  # pragma: no cover - _tool_grammar_eligible already gated
         return None  # "none" / malformed object form -> no grammar (free-form)
+
+    # LINE① (#558, r3 #5): seed-state probe runs HERE (bounded by this slot's
+    # admission), not on the shared default executor before the gate. Returns
+    # ``(_LINE1_SEED_UNSET, False)`` for a non-candidate / render failure / a
+    # direct unit-test call with no ``messages``.
+    _line1_seed_prefix, reasoning_seed_open = _line1_probe_seed(
+        engine, cfg, request, messages, resolved_thinking
+    )
 
     try:
         from ..api.tool_grammar import (
@@ -898,6 +1664,126 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
         reasoning_sentinels = resolve_reasoning_sentinels(
             getattr(cfg, "reasoning_parser_name", None), tokenizer
         )
+
+        # LINE① (#558): reasoning-GATED forced grammar. A forced/named tool call
+        # on a reasoning model normally opts OUT (``build_tool_grammar`` :2068)
+        # to the forced-prefix lever, because a bounded forced grammar would
+        # force the trigger at token 0 and leave the prompt ``<think>`` unclosed
+        # (the qwen3 parser then buries the whole call in ``reasoning_content``).
+        # That opt-out is LIFTED here: build the PLAIN (non-reasoning) bounded
+        # forced grammar but hold its mask OFF behind a runtime TOKEN-ID gate
+        # until ``</think>`` is decoded, and COUPLE a generation-time thinking
+        # budget (Option B) that force-closes ``</think>`` inside the think span —
+        # the exact shape SGLang's ``ReasonerGrammarObject`` and vLLM's
+        # reasoning-gated structured output use. The route installs that coupled
+        # budget by passing ``allow_tools`` to ``_build_reasoning_budget_processor``
+        # EXACTLY when this gate is set (``GrammarLogitsProcessor.reasoning_gate_
+        # id``), so the budget is GUARANTEED to force ``</think>`` and the gate is
+        # provably guaranteed to open (no infinite-wait regression). Because the
+        # mask is OFF through the whole ``<think>`` span, the force-closed
+        # ``</think>`` lands before any tool-call token can exist — safe despite
+        # vLLM #44676 (that footgun is the UNGATED auto/parser path we never take).
+        #
+        # The engage predicate is the seed-state "open" classification (the
+        # template PREFILLS an unclosed ``<think>``) plus a set budget — precisely
+        # when the coupled budget installs a SEEDED force-close. We additionally
+        # re-verify ``</think>`` is a single in-vocab id (the same
+        # ``resolve_think_token_ids`` + width check ``build_reasoning_budget_
+        # processor`` applies), so line① declines in the identical corner the
+        # budget declines. "emit"/"ambiguous"/no-budget requests never set
+        # ``reasoning_seed_open`` and keep the forced-prefix fallback — strictly
+        # non-regressive; the "emit" (model-emitted-``<think>``) scope is a
+        # tracked follow-up.
+        _line1_gate_id = None
+        _line1_tool_start_ids: tuple[int, ...] = ()
+        if choice["mode"] != "auto" and reasoning_seed_open:
+            from ..api.reasoning_budget import (
+                reasoning_stop_conflicts,
+                resolve_think_token_ids,
+            )
+
+            _parser_name = getattr(cfg, "reasoning_parser_name", None)
+            _t_start, _t_end = resolve_think_token_ids(tokenizer, _parser_name)
+            _vocab = _engine_output_vocab_size(engine)
+            # SGLang ``think_excluded_token_ids``: mask the tool-call opener token
+            # WHILE the gate is closed, so the model cannot begin a tool call inside
+            # ``<think>`` via its NATURAL opener and the coupled budget's forced
+            # ``</think>`` does not land inside a tool-call envelope. Resolved from
+            # the parser's ``structure_info`` trigger (the SAME source the grammar
+            # builder uses) and kept ONLY when it is a single special token on this
+            # tokenizer, and only when EVERY forced tool's opener so resolves (codex
+            # r3 #3 — all-or-nothing). A RESOLVED exclusion is a PRECONDITION for
+            # gating (codex r2 #1): a family whose opener is multi-token /
+            # unresolvable does NOT get the gate (it keeps the forced-prefix
+            # fallback), rather than getting an unprotected gate.
+            #
+            # SCOPE (codex r3 #4 / r4 #4): this masks the opener's SPECIAL TOKEN id
+            # at GENERATION time — the way a trained reasoning model actually emits a
+            # tool call. On its own it is NOT a structural proof that the trigger
+            # TEXT (e.g. ``<tool_call>``) can never appear: a model could in principle
+            # spell it out as ordinary subtokens inside ``<think>``. That residual is
+            # now closed at the EXTRACTION layer, which is what actually determines
+            # whether a marker becomes a tool call: the non-streaming path splits
+            # reasoning off FIRST and parses tool calls only on the post-``</think>``
+            # remainder (``_line1_split_reasoning_for_tool_parse``, mirroring
+            # vLLM/SGLang), and the streaming path gates the MiniMax tool-markup
+            # redirect OFF for line① (``StreamingPostProcessor._line1_gate_engaged``)
+            # so an in-``<think>`` marker stays in reasoning. Because both operate on
+            # the DECODED text, they are spelling-agnostic — a subtoken-spelled opener
+            # inside ``<think>`` is discarded before any tool parser sees it. So the
+            # opener mask removes the natural generation path (best-effort) AND the
+            # reasoning-first extraction makes the think span structurally invisible
+            # to tool parsing (guaranteed). See the design note / PR body.
+            _line1_tool_start_ids = _resolve_tool_start_exclusion_ids(
+                parser, tokenizer, flat_tools
+            )
+            # AUTHORITATIVE gate decision — mirror ALL of the coupled budget's
+            # install conditions so the gate NEVER engages when the budget would
+            # decline (which would strand the gate with no force-close), AND require
+            # the opener exclusion so the closed span is protected:
+            #   * ``</think>`` resolves to a single in-vocab id;
+            #   * ``_line1_completion_limit_ok`` — ``max_tokens`` leaves room for the
+            #     call past the force-close (codex #4);
+            #   * NOT ``reasoning_stop_conflicts`` — the budget declines (keeps the
+            #     post-hoc cap) when the client lists ``</think>`` in ``stop``, so the
+            #     gate must decline too (codex #2);
+            #   * NOT ``_line1_stop_conflicts_with_forced_output`` — a client ``stop``
+            #     overlapping the forced wire opener would truncate the GENERATED call
+            #     (the forced-prefix path prompt-injects that opener, immune) (codex
+            #     r12 #3). The openers are derived from ``structure_info`` triggers
+            #     INDEPENDENTLY of any fixed function name, so ``required`` with several
+            #     tools is covered too, and a boundary-spanning stop also declines
+            #     (codex r13 #1);
+            #   * ``_line1_tool_start_ids`` non-empty — opener exclusion guaranteed
+            #     (codex r2 #1).
+            # On decline we leave ``reasoning_sentinels`` INTACT so
+            # ``build_tool_grammar`` hits the :2068 forced+reasoning opt-out →
+            # ``None`` → the forced-prefix fallback (non-regressive).
+            if (
+                _t_end is not None
+                and _vocab is not None
+                and 0 <= _t_end < _vocab
+                and _line1_completion_limit_ok(request)
+                and _line1_tool_start_ids
+                and not reasoning_stop_conflicts(
+                    getattr(request, "stop", None), _parser_name
+                )
+                and not _line1_stop_conflicts_with_forced_output(
+                    getattr(request, "stop", None),
+                    _line1_forced_wire_openers(parser, flat_tools, cfg, request),
+                )
+            ):
+                _line1_gate_id = _t_end
+                # Empty the reasoning refs so ``build_tool_grammar`` takes the
+                # NON-reasoning constrained path (bypasses the :2068 opt-out and
+                # the free-prefix path-A grammar); the runtime id gate is the
+                # reasoning lever instead.
+                reasoning_sentinels = ()
+            else:
+                # Not gating — drop any resolved exclusion so it is never passed
+                # without an active gate (the processor ignores it then anyway).
+                _line1_tool_start_ids = ()
+
         grammar = build_tool_grammar(
             flat_tools,
             builder_choice,
@@ -930,6 +1816,8 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
             lltok,
             grammar,
             reasoning_end_token=None,
+            reasoning_end_id=_line1_gate_id,
+            think_excluded_ids=_line1_tool_start_ids,
             tokenizer=tokenizer,
             stop_token_ids=stop_ids,
         )
@@ -941,13 +1829,21 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
         if processor.is_broken():
             logger.error("tool-grammar: grammar failed to compile; free-form fallback")
             return None
+        # LINE① (#558, r3 #5): stash the seed render on the (gated) processor so the
+        # route reuses it for the coupled budget instead of rendering a second time.
+        # Only meaningful when the gate engaged (``_line1_gate_id`` set); harmless
+        # otherwise (the route reads it only when ``reasoning_gate_id is not None``).
+        if _line1_gate_id is not None and _line1_seed_prefix is not _LINE1_SEED_UNSET:
+            processor._line1_seed_prefix = _line1_seed_prefix
         return processor
     except Exception:
         logger.exception("tool-grammar: failed to build processor; free-form fallback")
         return None
 
 
-async def _offload_tool_grammar_build(engine, cfg, request):
+async def _offload_tool_grammar_build(
+    engine, cfg, request, messages=None, resolved_thinking=None
+):
     """Off-loop, admission-gated build of a ``GrammarLogitsProcessor`` (or None).
 
     Extracted from the chat route so the admission gate is directly testable
@@ -1002,7 +1898,12 @@ async def _offload_tool_grammar_build(engine, cfg, request):
         return None
     try:
         fut = _get_tool_grammar_build_executor().submit(
-            _maybe_build_tool_grammar_processor, engine, cfg, request
+            _maybe_build_tool_grammar_processor,
+            engine,
+            cfg,
+            request,
+            messages,
+            resolved_thinking,
         )
     except Exception:
         # Submission itself failed (e.g. pool shut down): the compile never ran,
@@ -2353,8 +3254,18 @@ def _engine_output_vocab_size(engine) -> int | None:
     return _actual_output_head_width(model)
 
 
+_LINE1_SEED_UNSET = object()  # sentinel: no pre-rendered seed prefix supplied
+
+
 def _build_reasoning_budget_processor(
-    engine, request, cfg, messages, resolved_thinking
+    engine,
+    request,
+    cfg,
+    messages,
+    resolved_thinking,
+    *,
+    allow_tools: bool = False,
+    seed_prefix=_LINE1_SEED_UNSET,
 ) -> "ReasoningBudgetLogitsProcessor | None":  # noqa: F821 — forward ref
     """Build the generation-time thinking-budget processor for this request, or
     ``None`` (the caller then keeps the post-hoc reasoning cap).
@@ -2379,9 +3290,20 @@ def _build_reasoning_budget_processor(
         unknown-model default (``None``) is skipped, so we never install an
         unseeded processor that can't fire yet still suppresses the post-hoc cap
         (guards vLLM #39130: never force a reasoning-end that cannot occur).
-      * TOOL requests opt out — a mid-span force-close could inject ``</think>``
-        after a tool-call opener and corrupt the call (vLLM #44676); a tracked
-        follow-up adds SGLang's ``think_excluded_tokens`` so the two can coexist.
+      * TOOL requests opt out — UNLESS ``allow_tools`` (LINE① #558): a mid-span
+        force-close could inject ``</think>`` after a tool-call opener and corrupt
+        the call ONLY when the tool grammar/parser is active DURING the think span
+        (vLLM #44676 — the UNGATED ``tool_choice="auto"`` parser path). LINE①'s
+        forced grammar is REASONING-GATED (its mask is held OFF until ``</think>``
+        via the runtime token-id gate), so the constrained region begins strictly
+        AFTER the boundary and the force-closed ``</think>`` cannot land mid-call.
+        The route passes ``allow_tools=True`` EXACTLY when that gate is active
+        (``GrammarLogitsProcessor.reasoning_gate_id is not None``), COUPLING the
+        budget to the gate — the same structural coupling SGLang enforces (its
+        ``ReasonerGrammarObject`` never installs the budget without the gate) and
+        the same reason vLLM applies the budget to structured requests without a
+        tool opt-out (budget and grammar are temporally disjoint). Every other
+        tool request keeps the opt-out (protects the ungated auto/parser path).
       * A request that lists ``</think>`` (or an overlapping substring) in
         ``stop`` opts out — forcing ``</think>`` would trip that client stop AT
         the reasoning boundary; the post-hoc cap (which appends ``</think>`` to
@@ -2406,33 +3328,41 @@ def _build_reasoning_budget_processor(
         return None
     if getattr(request, "reasoning_max_tokens", None) is None:
         return None
-    if request.tools:
+    if request.tools and not allow_tools:
         return None
     if reasoning_stop_conflicts(
         getattr(request, "stop", None), getattr(cfg, "reasoning_parser_name", None)
     ):
         return None
-    try:
-        seed_suffix = _template_generation_prefix(
-            engine, messages, request.tools, resolved_thinking
-        )
-    except Exception as exc:
-        # Rendering can fail (e.g. MLLM engines reject build_prompt). Signal that
-        # with None so build_budget_from_render installs NO processor and the
-        # post-hoc cap is retained — never a non-seeded processor that would
-        # silently suppress the cap yet never fire (codex). The budget stays
-        # enforced via the post-hoc cap, so this is a legitimate fallback for some
-        # engines — but log it (debug, with model context) so a genuine rendering
-        # regression is diagnosable instead of silently degrading to post-hoc for
-        # every request (codex R16 nit).
-        logger.debug(
-            "reasoning budget: generation-prefix render failed for model=%s "
-            "(%s: %s) — falling back to the post-hoc reasoning cap",
-            getattr(cfg, "model_path", None) or getattr(cfg, "model_name", None),
-            type(exc).__name__,
-            exc,
-        )
-        seed_suffix = None
+    # LINE① threads the ALREADY-rendered generation prefix (the route computed it
+    # to classify the seed state before building the gated grammar), so the budget
+    # reuses that single render instead of a second synchronous ``apply_chat_
+    # template`` on the event loop (codex #3). The sentinel distinguishes "not
+    # supplied" from a legitimate ``None`` (render failed → post-hoc cap).
+    if seed_prefix is not _LINE1_SEED_UNSET:
+        seed_suffix = seed_prefix
+    else:
+        try:
+            seed_suffix = _template_generation_prefix(
+                engine, messages, request.tools, resolved_thinking
+            )
+        except Exception as exc:
+            # Rendering can fail (e.g. MLLM engines reject build_prompt). Signal
+            # that with None so build_budget_from_render installs NO processor and
+            # the post-hoc cap is retained — never a non-seeded processor that
+            # would silently suppress the cap yet never fire (codex). The budget
+            # stays enforced via the post-hoc cap, so this is a legitimate fallback
+            # for some engines — but log it (debug, with model context) so a
+            # genuine rendering regression is diagnosable instead of silently
+            # degrading to post-hoc for every request (codex R16 nit).
+            logger.debug(
+                "reasoning budget: generation-prefix render failed for model=%s "
+                "(%s: %s) — falling back to the post-hoc reasoning cap",
+                getattr(cfg, "model_path", None) or getattr(cfg, "model_name", None),
+                type(exc).__name__,
+                exc,
+            )
+            seed_suffix = None
     return build_budget_from_render(
         getattr(engine, "tokenizer", None),
         getattr(cfg, "reasoning_parser_name", None),
@@ -3149,7 +4079,38 @@ async def _create_chat_completion_impl(
     # schema as ineligible and returns ``None`` (silent free-form), which under
     # default-on would drop the structural guarantee the operator asked for.
     _enforce_tool_grammar_bounds_or_400(cfg, request)
-    _glp = await _offload_tool_grammar_build(engine, cfg, request)
+    # LINE① (#558): decide reasoning-gated forced-grammar eligibility. Engage only
+    # when a thinking budget is set AND the template PREFILLS an unclosed
+    # ``<think>`` (seed state "open") — the exact condition under which the coupled
+    # budget installs a SEEDED force-close, so the runtime token-id gate is
+    # guaranteed to open. ``_line1_should_probe_seed`` is the pure front-line gate
+    # (forced choice + thinking + set budget + max_tokens room + tools); it excludes
+    # ``auto``/``none`` so the probe never runs for them. r3 #5 (DoS): the seed-state
+    # render now runs INSIDE the admission-gated build slot (``_line1_probe_seed`` is
+    # called from ``_maybe_build_tool_grammar_processor``), bounded by the same
+    # compile-admission cap — NOT on the shared default executor before admission,
+    # where a request flood could queue unbounded render work. When the gate engages
+    # the build stashes the rendered prefix on the processor (``_line1_seed_prefix``)
+    # and the coupled budget reuses it below (no second render).
+    _glp = await _offload_tool_grammar_build(
+        engine, cfg, request, messages, resolved_thinking
+    )
+    # LINE① (#558) Option B — COUPLE the generation-time thinking budget to the
+    # gated grammar. ``reasoning_gate_id is not None`` means the grammar's mask is
+    # held OFF until ``</think>`` (runtime token-id gate), so a budget that
+    # force-closes ``</think>`` inside the think span cannot corrupt a tool call
+    # (the constrained region starts strictly AFTER the boundary). This is the
+    # structural coupling SGLang enforces and the reason vLLM applies the budget to
+    # structured requests without a tool opt-out. ``_build_reasoning_budget_
+    # processor`` is passed ``allow_tools`` EXACTLY here (every other tool request
+    # keeps the opt-out, protecting the ungated auto/parser path — vLLM #44676).
+    _line1_gate_engaged = _glp is not None and _glp.reasoning_gate_id is not None
+    # Reuse the render the (gated) build already did for the coupled budget below.
+    _line1_prefix = (
+        getattr(_glp, "_line1_seed_prefix", _LINE1_SEED_UNSET)
+        if _line1_gate_engaged
+        else _LINE1_SEED_UNSET
+    )
     # DELIBERATE AVAILABILITY POLICY (codex #558-PR5 override, NOT fail-closed):
     # a ``None`` here degrades this request to the pre-#558 free-form
     # tool-parsing path. That degrade is reserved for exactly two families of
@@ -3181,21 +4142,8 @@ async def _create_chat_completion_impl(
     # taxonomy. SKIPPED when a grammar processor is active (see above) —
     # the grammar is the stronger, self-sufficient lever.
     _forced_prefix = None
-    if _glp is None and request.tools and request.tool_choice is not None:
-        _forced_name: str | None = None
-        if (
-            isinstance(request.tool_choice, dict)
-            and request.tool_choice.get("type") == "function"
-        ):
-            _forced_name = (request.tool_choice.get("function") or {}).get("name")
-        elif request.tool_choice == "required" and len(request.tools) == 1:
-            # OpenAI spec: ``required`` with a single tool is unambiguous
-            # — same forcing semantics as a named choice.
-            _forced_name = request.tools[0].function.get("name")
-        if _forced_name:
-            _forced_prefix = _forced_tool_call_prefix(
-                cfg.tool_call_parser, _forced_name
-            )
+    if _glp is None:
+        _forced_prefix = _compute_forced_tool_prefix(cfg, request)
     if _forced_prefix:
         chat_kwargs["forced_assistant_prefix"] = _forced_prefix
 
@@ -3232,13 +4180,43 @@ async def _create_chat_completion_impl(
     # DeepSeek-R1), over-estimates the prompt by the
     # ``<|im_start|>think...`` scaffolding, and can reject requests
     # that actually fit.
-    enforce_context_length_for_messages(
+    # Capture the prompt-token count the context guard already paid for
+    # (build_prompt + tokenize) so LINE①'s hard window check below reuses it
+    # rather than re-rendering (#558 codex r4 #1).
+    _line1_prompt_tokens = enforce_context_length_for_messages(
         engine,
         messages,
         tools=request.tools,
         max_tokens=chat_kwargs.get("max_tokens"),
         enable_thinking=resolved_thinking,
     )
+
+    # LINE① (#558, codex r4 #1) — HARD context-window allowance check. With
+    # ``max_tokens=None`` the guard above only proved ``prompt_tokens <= window``
+    # (it reserves ZERO completion room), so a near-ceiling prompt could leave no
+    # room for the coupled budget's ``</think>`` close + a minimal call. Now that
+    # the prompt is counted, PROVE the room; if the window cannot fit it, disengage
+    # the gate to the forced-prefix fallback (strictly non-regressive) — the same
+    # reconcile the coupled-budget-unavailable branch performs below. Done BEFORE
+    # the budget build so it sees the updated ``allow_tools`` and never installs a
+    # budget it would immediately discard.
+    if _line1_gate_engaged and not _line1_context_room_ok(
+        engine, _line1_prompt_tokens, request
+    ):
+        logger.warning(
+            "line①: a %s-token prompt + %s-token thinking budget leaves no provable "
+            "room in the context window for a minimal constrained call; discarding "
+            "the gated grammar and restoring the forced-prefix fallback",
+            _line1_prompt_tokens,
+            getattr(request, "reasoning_max_tokens", None),
+        )
+        chat_kwargs.pop("grammar_logits_processor", None)
+        _glp = None
+        _line1_gate_engaged = False
+        _line1_prefix = _LINE1_SEED_UNSET
+        _restored_prefix = _compute_forced_tool_prefix(cfg, request)
+        if _restored_prefix:
+            chat_kwargs["forced_assistant_prefix"] = _restored_prefix
 
     # Cloud routing: offload large-context requests to cloud LLM.
     #
@@ -3340,11 +4318,44 @@ async def _create_chat_completion_impl(
     # is committed to LOCAL generation (past the cloud-offload decision), so a
     # cloud-routed request neither installs the processor nor has its post-hoc
     # cap suppressed (codex). See ``_build_reasoning_budget_processor``.
+    # LINE① Option B: when the gated grammar is active, pass ``allow_tools`` so the
+    # budget is installed for this tool request (coupled to the gate) and thread
+    # the already-rendered generation prefix so no second render runs. The gate
+    # holds the tool grammar OFF through the ``<think>`` span, so the budget's
+    # force-close of ``</think>`` lands before any tool-call token — safe despite
+    # vLLM #44676 (which is the UNGATED auto/parser path this never touches).
     _rblp = _build_reasoning_budget_processor(
-        engine, request, cfg, messages, resolved_thinking
+        engine,
+        request,
+        cfg,
+        messages,
+        resolved_thinking,
+        allow_tools=_line1_gate_engaged,
+        seed_prefix=(_line1_prefix if _line1_gate_engaged else _LINE1_SEED_UNSET),
     )
     if _rblp is not None:
         chat_kwargs["reasoning_budget_logits_processor"] = _rblp
+    elif _line1_gate_engaged:
+        # LINE① ATOMICITY (codex r4 #3): the reasoning gate engaged but its coupled
+        # generation-time budget did NOT build. Left as-is that is a REGRESSION: the
+        # gated grammar (installed above) holds its mask OFF until ``</think>`` and
+        # relies on the budget to force that close — with no budget the gate can
+        # never open, AND the forced-prefix fallback was suppressed because ``_glp``
+        # is non-``None``, so a forced call that never naturally closes ``<think>``
+        # is dropped entirely. The gate's engage predicate mirrors the budget's
+        # install conditions so this divergence should not happen in practice, but
+        # it is not STRUCTURALLY guaranteed — so reconcile safely: discard the gated
+        # grammar and RESTORE the forced-prefix path (strictly non-regressive).
+        logger.warning(
+            "line①: reasoning gate engaged but coupled budget unavailable; "
+            "discarding the gated grammar and restoring the forced-prefix fallback"
+        )
+        chat_kwargs.pop("grammar_logits_processor", None)
+        _glp = None
+        _line1_gate_engaged = False
+        _restored_prefix = _compute_forced_tool_prefix(cfg, request)
+        if _restored_prefix:
+            chat_kwargs["forced_assistant_prefix"] = _restored_prefix
 
     # ``tool_choice="required"`` + ``stream=true`` is enforceable IF the
     # engine has SOME path to produce a streaming tool_call:
@@ -4356,9 +5367,34 @@ async def _create_chat_completion_impl(
     # contained literal harmony sentinel substrings (PR #515 codex
     # round-12 / round-14 BLOCKING).
     engine_tool_calls = getattr(output, "tool_calls", None)
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-        output.text, request, structured_tool_calls=engine_tool_calls
-    )
+    # LINE① (#558, codex r4 #4) — reasoning-first extraction. When the reasoning
+    # gate is engaged (and the engine did NOT already produce structured calls via
+    # the OutputRouter's channel), split reasoning off FIRST and feed the tool parser
+    # ONLY the post-``</think>`` content — matching vLLM/SGLang, which never let the
+    # tool parser see the ``<think>`` span. This structurally closes the sub-token-
+    # spelling residual (a spelled-out opener inside ``<think>`` is discarded before
+    # tool parsing) that masking the opener token id alone could not. Gated on line①
+    # because the gate GUARANTEES the real call lands after ``</think>`` — families
+    # that legitimately parse a call inside ``<think>`` (minimax / forced-prefix
+    # hermes) never engage line①. ``_line1_split_reasoning_for_tool_parse`` FAILS
+    # CLOSED (never returns the raw text), so an engaged gate never re-exposes the
+    # think span even on a reasoning-parser error (codex r5 #3).
+    if _line1_gate_engaged and engine_tool_calls is None:
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+            _line1_split_reasoning_for_tool_parse(cfg.reasoning_parser, output.text),
+            request,
+            structured_tool_calls=engine_tool_calls,
+        )
+        if not tool_calls:
+            # No forced call recovered from the post-``</think>`` remainder. Blank
+            # the tool-parser content so ``_finalize_content_and_reasoning`` re-derives
+            # BOTH content and reasoning from the raw text (its ``cleaned_text or
+            # raw_text`` fallback) — identical to today's no-tool-call outcome.
+            cleaned_text = ""
+    else:
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+            output.text, request, structured_tool_calls=engine_tool_calls
+        )
 
     # r7-A R7-H1: UI-TARS chat-lane coordinate-key parity. The parser
     # emits canonical ``point`` / ``start_point`` / ``end_point``; the
@@ -4980,6 +6016,18 @@ async def stream_chat_completion(
             # route into chat_kwargs and unpacked here) owns this request —
             # #558 single mechanism, decision shared with the non-stream path.
             reasoning_max_tokens=_effective_posthoc_reasoning_cap(kwargs, request),
+            # LINE① (#558, codex r4 #4): derive gate-engaged from the ACTUALLY
+            # installed grammar processor (``reasoning_gate_id is not None``) rather
+            # than a threaded flag — this stays self-consistent with the route's
+            # disengage paths (the #1 context-window check and the r4 #3 reconcile
+            # both ``pop`` the grammar, so a disengaged request reads False here and
+            # keeps the load-bearing MiniMax redirect).
+            line1_gate_engaged=(
+                getattr(
+                    kwargs.get("grammar_logits_processor"), "reasoning_gate_id", None
+                )
+                is not None
+            ),
         )
         processor.set_thinking_model(request.model)
         processor.reset()

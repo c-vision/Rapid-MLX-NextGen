@@ -197,10 +197,23 @@ class StreamingPostProcessor:
         json_mode: bool = False,
         request: dict | None = None,
         reasoning_max_tokens: int | None = None,
+        line1_gate_engaged: bool = False,
     ):
         self.cfg = cfg
         self.tools_requested = tools_requested
         self.json_mode = json_mode
+        # LINE① (#558, codex r4 #4): when the reasoning-gated forced tool grammar is
+        # engaged for THIS request, the real call is guaranteed to land AFTER
+        # ``</think>`` (already on the content channel). The MiniMax tool-markup
+        # redirect below — which promotes reasoning bytes containing a tool opener
+        # back into content so an in-``<think>`` forced-prefix call can surface — is
+        # then not only unneeded but HARMFUL: a sub-token-spelled opener inside
+        # ``<think>`` would be redirected and mis-parsed. We gate the redirect OFF
+        # for line① so an in-think marker stays in the reasoning channel (invisible
+        # to the tool parser) — the streaming analog of the non-streaming reasoning-
+        # first reorder. Default False keeps every other request (and all existing
+        # call sites / tests) on the load-bearing redirect.
+        self._line1_gate_engaged = line1_gate_engaged
         # Per-request reasoning cap (upstream vLLM PR #20859 backport).
         # When set and the model is still emitting on the reasoning
         # channel after this many tokens, the processor force-closes
@@ -2998,7 +3011,14 @@ class StreamingPostProcessor:
         # the reasoning parser would otherwise leave the model's
         # continuation of the prefix in the reasoning channel and the
         # tool_call would never surface.
-        if self.tool_parser and reasoning:
+        #
+        # LINE① (#558, codex r4 #4): skipped when the reasoning gate is engaged —
+        # line①'s gate guarantees the real call lands AFTER ``</think>`` (on the
+        # content channel), so redirecting in-``<think>`` markers here would only
+        # expose a sub-token-spelled opener to the tool parser. Keep such markers in
+        # reasoning where they cannot be mis-extracted (mirrors the non-streaming
+        # reasoning-first reorder).
+        if self.tool_parser and reasoning and not self._line1_gate_engaged:
             _check = self.tool_accumulated_text + reasoning
             if (
                 "<minimax:tool_call>" in _check
