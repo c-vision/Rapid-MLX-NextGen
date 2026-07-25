@@ -557,13 +557,13 @@ def install_quantized_batch_cache(
     return batch_gen
 
 
-def probe_head_dim(model: Any) -> int | None:
-    """Best-effort head dimension of a loaded mlx-lm model; ``None`` if unknown.
+def _head_dim_from_args(args: Any) -> int | None:
+    """Head dim carried directly by a single args/config object, or ``None``.
 
-    Used at install time to pick a compatible group size (or disable live
-    quantization when no supported group size divides the head dim).
+    Reads an explicit ``head_dim`` first, then falls back to
+    ``hidden_size // num_attention_heads``. Does not descend into sub-configs;
+    see :func:`_text_attention_args` for the multimodal-aware resolution.
     """
-    args = getattr(model, "args", None)
     if args is None:
         return None
     hd = getattr(args, "head_dim", None)
@@ -576,16 +576,72 @@ def probe_head_dim(model: Any) -> int | None:
     return None
 
 
+def _text_attention_args(model: Any) -> Any:
+    """The args object carrying the *language* model's attention dims.
+
+    Multimodal wrappers (VLMs such as ``Qwen3.5-4B-MLX-4bit``) keep the language
+    model's ``head_dim``/``hidden_size`` on a nested ``language_model`` submodule
+    (its own ``.args``) or an ``args.text_config`` sub-config, while the
+    top-level ``model.args`` may carry no attention dims at all — or, worse,
+    vision/composite dims. The KV cache stores *language* attention, so the
+    language-specific config is authoritative: resolve it FIRST, and fall back
+    to the top-level args only when no language config exists. Preferring the
+    top level would let a wrapper's ``hidden_size // num_attention_heads`` (a
+    vision or composite value) short-circuit to the wrong head dim and mis-size
+    the live cache — an incompatible first write that cannot fall back mid-stream
+    would then crash the request instead of failing safe.
+
+    The multimodal signal is the *presence* of a ``language_model`` submodule or
+    an ``args.text_config`` — NOT whether their dims happen to be probeable. Once
+    that signal is present we never fall back to the top-level args (which may be
+    vision/composite and would mis-size the live cache); an unprobeable language
+    config yields ``None`` so the live cache fails safe to bf16. Only genuinely
+    text-only models (neither signal present) use the top-level args, unchanged,
+    so callers can read ``v_head_dim`` from them exactly as before.
+    """
+    args = getattr(model, "args", None)
+    lm = getattr(model, "language_model", None)
+    lm_args = getattr(lm, "args", None) if lm is not None else None
+    text_cfg = getattr(args, "text_config", None) if args is not None else None
+
+    # Prefer a probeable language-specific config (multimodal wrappers).
+    if _head_dim_from_args(lm_args) is not None:
+        return lm_args
+    if _head_dim_from_args(text_cfg) is not None:
+        return text_cfg
+
+    # Multimodal wrapper detected but no language config was probeable: stay
+    # language-scoped (or None) so the probe fails safe to bf16. Never fall back
+    # to the top-level args here — on a VLM they may be vision/composite dims.
+    if lm is not None or text_cfg is not None:
+        return lm_args if lm_args is not None else text_cfg
+
+    # Genuinely text-only model: the top-level args ARE the language config.
+    return args
+
+
+def probe_head_dim(model: Any) -> int | None:
+    """Best-effort head dimension of a loaded mlx-lm model; ``None`` if unknown.
+
+    Used at install time to pick a compatible group size (or disable live
+    quantization when no supported group size divides the head dim). Descends
+    into a multimodal wrapper's language submodule so VLMs are not spuriously
+    reported as unprobeable (see :func:`_text_attention_args`).
+    """
+    return _head_dim_from_args(_text_attention_args(model))
+
+
 def probe_kv_head_dims(model: Any) -> tuple[int | None, int | None]:
     """Best-effort ``(key, value)`` head dims of a loaded mlx-lm model.
 
     ``mx.quantize`` groups along the last (head) dimension, and a model may use a
     distinct value head dim (``v_head_dim``) from its key head dim. Both must be
     divisible by the chosen group size, so probe both. A dim that cannot be
-    determined comes back as ``None``.
+    determined comes back as ``None``. ``v_head_dim`` is read from the same
+    (possibly nested) args object that supplied the key head dim.
     """
-    k = probe_head_dim(model)
-    args = getattr(model, "args", None)
+    args = _text_attention_args(model)
+    k = _head_dim_from_args(args)
     v = getattr(args, "v_head_dim", None) if args is not None else None
     if not (isinstance(v, int) and v > 0):
         v = k  # standard models: value head dim == key head dim
