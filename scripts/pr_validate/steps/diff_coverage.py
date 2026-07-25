@@ -1,0 +1,774 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Advisory step — patch (diff) coverage measurement. MEASURE-FIRST, NO GATE.
+
+This step reports what fraction of the *production lines this PR adds or
+changes* are exercised by the unit suite. It NEVER blocks a merge.
+
+Why advisory-only (dev-flow gate proposal, 2026-07): a hard threshold
+picked before we have any distribution is a number out of thin air. The
+plan is to publish patch-coverage across ~20 PRs, look at where the
+numbers actually land, and only *then* decide whether a gate is
+justified. Until then this step exists purely to make the signal
+visible in the scorecard (which is posted as a PR comment).
+
+Mechanism:
+  1. Run the same unit set ``full_unit`` runs, but under ``coverage``
+     instrumentation (``pytest --cov=vllm_mlx --cov-report=xml``). This
+     is a SEPARATE, self-contained run — we deliberately do NOT
+     piggyback on ``full_unit``. ``full_unit`` is a merge-*gating*
+     step; an advisory measurement feature must not be able to break
+     the gate. The asymmetry is the whole argument: sharing would save
+     the cost of one extra instrumented suite run (~3 min), but at the
+     risk of a false block on the gate — which costs a maintainer a
+     blocked-PR investigation. Isolation wins.
+  2. Feed the coverage XML to ``diff-cover`` scoped to the diff vs the
+     base branch → patch-coverage %.
+
+Because it's advisory, EVERY failure path here returns ``pass`` or
+``skip`` — never ``fail`` / ``error``. A crash in an advisory measurer
+must not be the reason a good PR can't merge. The base ``execute``
+wrapper would turn an *uncaught* exception into ``error`` (which the
+scorecard treats as blocking), so ``run`` catches everything and
+downgrades to ``skip``. The subprocess calls carry bounded timeouts so
+a hung test or diff-cover can't wedge the (auto-deploy) pipeline, and
+the diagnostic-log writes are best-effort (a disk-full / permission
+error while logging must not escape as a blocking ``error`` either).
+"""
+
+from __future__ import annotations
+
+import collections
+import importlib.util
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+
+from ..base import Step, StepResult
+from ..context import Context
+
+# The package we measure. Coverage is scoped to production code only —
+# test files aren't the subject of "is this PR's new code tested".
+_COV_PACKAGE = "vllm_mlx"
+
+# Bounded so a hung test or a wedged diff-cover can't block the pipeline
+# — the whole point of an advisory step is that it never blocks. On
+# expiry ``_run_group_bounded`` SIGKILLs the whole process group; we catch
+# and skip. The suite timeout is deliberately generous (the instrumented
+# full suite is ~3 min today) — a false timeout would just silently drop a
+# measurement, so err long.
+_PYTEST_TIMEOUT_S = 1800
+_DIFF_COVER_TIMEOUT_S = 180
+
+# pytest exit codes that still yield a trustworthy coverage.xml. 0 = all
+# passed; 1 = tests ran but some FAILED — coverage is a complete record of
+# the lines that executed either way (pytest-cov writes on session finish
+# regardless of outcomes). 2 = interrupted, 3 = internal error, 4 = usage
+# error, 5 = no tests collected — those leave no dependable coverage, so we
+# skip on them. Accepting exit 1 is deliberate: an ADVISORY baseline
+# collector must survive an unrelated flaky test (this repo has known
+# GPU-contention flakes, e.g. ``test_batching_improves_throughput``) rather
+# than discard the whole measurement and skip on most real PRs (codex
+# #1220). ``full_unit`` still owns gating on a red suite.
+_PYTEST_COVERAGE_VALID_EXITS = (0, 1)
+
+# Bounded reap after a group SIGKILL. SIGKILL is uncatchable so the leader
+# dies at once; this bound only guards the pathological case where a
+# descendant that inherited the pipes is wedged in an uninterruptible
+# syscall — we must never block the (auto-deploy) pipeline waiting on it.
+_REAP_TIMEOUT_S = 10
+
+# Bounded in-memory capture per stream. A plain ``communicate()`` buffers the
+# ENTIRE suite output for up to ``_PYTEST_TIMEOUT_S``, so a test that streams
+# gigabytes to stdout could OOM-kill the validator before its advisory handler
+# runs (codex #1220 r17). Instead each stream is drained by a reader thread that
+# keeps only the last ~``_CAPTURE_TAIL_BYTES`` — memory stays bounded no matter
+# the volume, while the END (diff-cover's footer, pytest's ``-q`` summary) is
+# always retained. 1 MiB is far more than any well-behaved run emits, yet a
+# hard ceiling against a runaway.
+_CAPTURE_TAIL_BYTES = 1_048_576
+_CAPTURE_BLOCK_BYTES = 65536  # pipe read granularity
+
+# Keep the diagnostic log readable — we tail (not head) subprocess output so
+# the most recent lines (pytest's failure summary) always survive truncation.
+_LOG_TAIL_CHARS = 4000
+
+
+class DiffCoverageStep(Step):
+    name = "diff_coverage"
+    description = "advisory patch (diff) coverage — measure-only, never gates"
+
+    # An advisory measurer must never stop the pipeline. (Belt-and-braces:
+    # ``run`` already catches every exception, so ``execute`` can't reach
+    # its error path — but if it somehow did, don't halt later steps.)
+    continue_on_error = True
+
+    def should_run(self, ctx: Context) -> bool:
+        # Nothing to measure on docs/example-only PRs.
+        if ctx.blast_radius == "low":
+            return False
+        # Only meaningful when the PR touches production Python under the
+        # measured package — a tests-only or config-only PR has no
+        # ``vllm_mlx`` lines for diff-cover to score.
+        return any(
+            f.startswith(f"{_COV_PACKAGE}/") and f.endswith(".py")
+            for f in ctx.files_changed
+        )
+
+    def run(self, ctx: Context) -> StepResult:
+        # Advisory contract: swallow ALL failures. Never fail/error.
+        # Resolve the artifact path INSIDE the protected block —
+        # ``artifact_path()`` does a ``mkdir`` that can itself raise on
+        # disk-full / permission errors, and even that must not escape
+        # through ``execute()`` as a blocking ``error`` (codex #1220).
+        # The fallback tolerates ``log_path`` never getting assigned.
+        log_path: Path | None = None
+        try:
+            log_path = ctx.artifact_path("diff-coverage.log")
+            # Fresh-file guarantee: unlink any pre-existing log so ``_skip``
+            # can never attach a stale ``diff-coverage.log`` (e.g. from a reused
+            # artifact dir) that THIS run did not write — an early skip
+            # (tooling missing) writes no log, so its artifact list must stay
+            # empty (codex #1220 r15). Best-effort: a failed unlink must not
+            # itself escape as a blocking error.
+            try:
+                log_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return self._measure(ctx, log_path)
+        except Exception as e:  # noqa: BLE001 — advisory must not block merge
+            # ``_safe_write`` never raises; guard the path being unset too.
+            # Attach the log ONLY if this handler actually wrote it — never a
+            # stale prior-run file (codex #1220 r19).
+            wrote = log_path is not None and _safe_write(
+                log_path, traceback.format_exc()
+            )
+            return self._skip(
+                f"advisory coverage skipped (internal error: {type(e).__name__}: {e})",
+                log_path if wrote else None,
+            )
+
+    # ------------------------------------------------------------------
+
+    def _measure(self, ctx: Context, log_path: Path) -> StepResult:
+        # 1. Tooling present? Both are declared in the ``[test]``/``[dev]``
+        #    extras, but the operator may run validate from a leaner env.
+        #    Missing tooling is a clean skip, not a failure.
+        if importlib.util.find_spec("pytest_cov") is None:
+            return self._skip(
+                "pytest-cov not installed — advisory coverage unavailable"
+            )
+        if importlib.util.find_spec("diff_cover") is None:
+            return self._skip(
+                "diff-cover not installed — advisory coverage unavailable"
+            )
+
+        xml_path = ctx.artifact_path("coverage.xml")
+        # Fresh-file guarantee: never let a stale coverage.xml from an
+        # earlier run masquerade as this run's result. If pytest fails to
+        # regenerate it below, the ``not xml_path.exists()`` path fires
+        # instead of publishing yesterday's numbers.
+        xml_path.unlink(missing_ok=True)
+
+        # coverage.py writes its data file to ``$COVERAGE_FILE`` or, unset,
+        # ``.coverage`` in the CWD — which here is the repo root. Point it at a
+        # dedicated (per-run) artifact path so an advisory run can NEVER
+        # erase/overwrite a developer's own ``.coverage`` database at the repo
+        # root (codex #1220 r12). The XML report is still emitted to
+        # ``xml_path``; only the intermediate data file moves. Unlink it first
+        # so a leftover from an aborted prior run can't be appended to.
+        cov_data = ctx.artifact_path("coverage.data")
+        cov_data.unlink(missing_ok=True)
+        cov_env = {**os.environ, "COVERAGE_FILE": str(cov_data)}
+        # Drop ``PYTEST_ADDOPTS`` from the child env: a host that exports it
+        # (``--collect-only``, ``-x``, ``--cov-append``, ``-p no:cov`` …) would
+        # otherwise silently turn the run into empty / partial / stale coverage
+        # that we would then publish as the PR's measurement. The explicit argv
+        # below is the whole spec of the run; nothing may override it (codex
+        # #1220 r14).
+        cov_env.pop("PYTEST_ADDOPTS", None)
+
+        # 2. Instrumented suite — mirrors ``full_unit``'s selection so the
+        #    coverage picture matches what we actually gate on.
+        #    ``-o addopts=`` clears any repo-level ``addopts`` from
+        #    pyproject.toml / pytest.ini: stripping the ENV var alone is not
+        #    enough — a configured ``-x`` / ``--maxfail`` would stop the suite
+        #    early and hand us partial exit-1 coverage that we would then
+        #    publish as the PR's number. With this override the argv here is the
+        #    complete, self-contained spec of the run (codex #1220 r17).
+        pytest_cmd = [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-o",
+            "addopts=",
+            "tests/",
+            "--ignore=tests/integrations",
+            "--ignore=tests/test_event_loop.py",
+            f"--cov={_COV_PACKAGE}",
+            # Suppress the terminal cov table (noise); we only need XML.
+            "--cov-report=",
+            f"--cov-report=xml:{xml_path}",
+            "-q",
+            "--no-header",
+            "-p",
+            "no:cacheprovider",
+        ]
+        ctx.run_log("diff_coverage: running instrumented suite (advisory)…")
+        try:
+            pytest_proc = _run_group_bounded(
+                pytest_cmd, str(ctx.repo_root), _PYTEST_TIMEOUT_S, env=cov_env
+            )
+        except subprocess.TimeoutExpired as exc:
+            wrote = _safe_write(
+                log_path, _timeout_dump("instrumented pytest", pytest_cmd, exc)
+            )
+            return self._skip(
+                f"advisory coverage skipped (instrumented suite exceeded "
+                f"{_PYTEST_TIMEOUT_S}s — process group killed)",
+                log_path if wrote else None,
+            )
+
+        # 3. Coverage trust model (see ``_PYTEST_COVERAGE_VALID_EXITS``). We
+        #    accept exit 0 (all passed) and exit 1 (some tests failed but the
+        #    run completed and coverage.xml is a valid record of executed
+        #    lines) and skip only on 2-5 (interrupted / internal error /
+        #    usage error / no tests) — those leave no dependable coverage. A
+        #    failing test that WAS meant to exercise the changed lines simply
+        #    leaves them uncovered, which is honest advisory signal, not
+        #    contamination; the caveat below flags that the % may under-count.
+        if pytest_proc.returncode not in _PYTEST_COVERAGE_VALID_EXITS:
+            wrote = _safe_write(log_path, _pytest_dump(pytest_cmd, pytest_proc))
+            return self._skip(
+                f"advisory coverage skipped (instrumented suite exit "
+                f"{pytest_proc.returncode} — interrupted/error, not merely "
+                f"test failures; see full_unit)",
+                log_path if wrote else None,
+            )
+        suite_had_failures = pytest_proc.returncode == 1
+
+        if not xml_path.exists():
+            wrote = _safe_write(log_path, _pytest_dump(pytest_cmd, pytest_proc))
+            return self._skip(
+                "advisory coverage skipped (no coverage.xml produced)",
+                log_path if wrote else None,
+            )
+
+        # 4. diff-cover: patch coverage of the changed lines vs the PR's
+        #    base. The compare ref is the PR's ACTUAL base — ``ctx.base_sha``
+        #    (its ``baseRefOid``, a concrete commit) — so a PR targeting a
+        #    release/maintenance branch is scored against ITS base, never a
+        #    hardcoded ``main`` (codex #1220 r5). A SHA also resolves in a
+        #    detached CI checkout, where a *bare* local branch name may not
+        #    exist. So the no-metadata fallback qualifies the target branch
+        #    with the remote — ``origin/<base_branch>`` — which exists after
+        #    fetch even detached, rather than a bare ``main`` that would fail
+        #    to resolve and skip every fallback run (codex #1220 r6). Invoke
+        #    via ``-m`` so it runs in the SAME interpreter the coverage was
+        #    produced with (matches targeted_tests' policy).
+        compare_ref = ctx.base_sha or f"origin/{ctx.base_branch}"
+        dc_cmd = [
+            sys.executable,
+            "-m",
+            "diff_cover.diff_cover_tool",
+            str(xml_path),
+            "--compare-branch",
+            compare_ref,
+        ]
+        try:
+            dc_proc = _run_group_bounded(
+                dc_cmd, str(ctx.repo_root), _DIFF_COVER_TIMEOUT_S
+            )
+        except subprocess.TimeoutExpired as exc:
+            wrote = _safe_write(log_path, _timeout_dump("diff-cover", dc_cmd, exc))
+            return self._skip(
+                f"advisory coverage skipped (diff-cover exceeded "
+                f"{_DIFF_COVER_TIMEOUT_S}s — process group killed)",
+                log_path if wrote else None,
+            )
+
+        # Record pytest's own output too (tail-truncated) — on an accepted
+        # exit-1 measurement the reader needs to see WHICH tests failed and
+        # why, not just the bare exit code (codex #1220 r5 nit). ``wrote_log``
+        # governs whether every downstream skip / the final pass advertises
+        # this file, so a stale prior-run log is never attached (codex r19).
+        wrote_log = _safe_write(
+            log_path,
+            "# diff_coverage advisory run\n\n"
+            f"## pytest cmd\n`{' '.join(pytest_cmd)}`\n\n"
+            f"## pytest exit: {pytest_proc.returncode}\n\n"
+            "## pytest stdout (tail)\n"
+            + _tail(pytest_proc.stdout)
+            + "\n## pytest stderr (tail)\n"
+            + _tail(pytest_proc.stderr)
+            + f"\n## diff-cover cmd\n`{' '.join(dc_cmd)}`\n\n"
+            f"## diff-cover exit: {dc_proc.returncode}\n\n"
+            "## diff-cover stdout\n"
+            + (dc_proc.stdout or "")
+            + "\n## diff-cover stderr\n"
+            + (dc_proc.stderr or ""),
+        )
+        log_artifact = log_path if wrote_log else None
+
+        # A nonzero diff-cover exit means it errored (bad XML, git
+        # failure, interrupted) — even if it happened to print a footer
+        # first, that number is not trustworthy. Skip BEFORE parsing so a
+        # failed run can't publish a misleading success (codex #1220).
+        # Verified exit codes: scored-lines=0, no-lines=0, bad-xml=1,
+        # bad-branch=1 — so this never false-skips the happy path.
+        if dc_proc.returncode != 0:
+            return self._skip(
+                f"advisory coverage skipped (diff-cover exit "
+                f"{dc_proc.returncode} — not scored)",
+                log_artifact,
+            )
+
+        parsed = _parse_diff_cover(dc_proc.stdout)
+        if parsed is None:
+            # diff-cover ran but found no changed lines it could score
+            # (e.g. every changed line is a comment / blank / not in the
+            # coverage source map). Nothing to report — clean skip.
+            return self._skip(
+                "advisory coverage skipped (no measurable production lines in diff)",
+                log_artifact,
+            )
+        if parsed is _PARSE_FAILED:
+            # diff-cover exited 0 but we recognized NEITHER its explicit
+            # no-lines message NOR a Total/Missing footer — most likely a
+            # diff-cover version whose output format drifted (the ``>=8.0.0``
+            # floor permits future majors). Surface this as a DISTINCT
+            # tooling-format skip rather than silently reporting "no lines",
+            # which would let the baseline quietly die (codex #1220 r8).
+            return self._skip(
+                "advisory coverage skipped (diff-cover output format "
+                "unrecognized — parser may need updating for this diff-cover "
+                "version)",
+                log_artifact,
+            )
+
+        pct, covered, total = parsed
+        # Exit-1 caveat. We deliberately don't try to CLASSIFY exit 1 into
+        # "isolated flaky failures" vs "a session-scoped fixture error that
+        # wiped out every test" (codex #1220 r18 nit) — that would mean parsing
+        # pytest's summary text, which is exactly the brittle heuristic this
+        # step avoids. Instead we tag EVERY exit-1 measurement as caveated so
+        # the human building the baseline distribution can exclude it: a
+        # widespread setup failure that drives the % near zero is the extreme
+        # end of the same "a failing test left changed lines uncovered" signal,
+        # and caveated runs are precisely the ones to drop before deciding a
+        # threshold. The raw pytest tail is in the log for that judgement.
+        caveat = (
+            " NOTE: some unit tests failed this run (see full_unit) — the % may "
+            "under-count lines a failing test would otherwise have covered; a "
+            "widespread setup/session-fixture failure can drive it near zero, so "
+            "EXCLUDE caveated runs from the baseline distribution."
+            if suite_had_failures
+            else ""
+        )
+        # One decimal (not {:.0f}) so 99.5% doesn't read as a misleading
+        # "100%" nor 0.5% as "0%" — matches the finding's precision (codex
+        # #1220 r6 nit).
+        summary = (
+            f"patch coverage {pct:.1f}% ({covered}/{total} changed lines) · "
+            "advisory — not gating"
+        )
+        finding = (
+            f"[ADVISORY] patch (diff) coverage: {pct:.1f}% — "
+            f"{covered}/{total} newly changed {_COV_PACKAGE} lines exercised "
+            "by the unit suite. Measure-only; no threshold enforced yet "
+            f"(collecting baseline across ~20 PRs before deciding a gate).{caveat}"
+        )
+        return StepResult(
+            name=self.name,
+            status="pass",  # ALWAYS pass — advisory
+            summary=summary,
+            findings=[finding],
+            # Advertise the log ONLY if THIS run wrote it (``wrote_log``), never
+            # a stale prior-run file that survived a failed unlink (codex #1220
+            # r19). ``xml_path`` still uses the never-raising existence probe —
+            # it was freshly (re)generated by this run's pytest above.
+            artifacts=[
+                str(p)
+                for p, keep in (
+                    (log_path, wrote_log),
+                    (xml_path, _path_exists(xml_path)),
+                )
+                if keep
+            ],
+        )
+
+    # ------------------------------------------------------------------
+
+    def _skip(self, summary: str, log_path: Path | None = None) -> StepResult:
+        """Uniform advisory skip. Callers pass ``log_path`` ONLY when this run's
+        ``_safe_write`` returned success (so it holds this-run content, never a
+        stale prior-run file — codex #1220 r19); ``None`` otherwise. The
+        ``_path_exists`` guard is then belt-and-braces against the file vanishing
+        between the write and here, and must itself never raise."""
+        return StepResult(
+            name=self.name,
+            status="skip",
+            summary=summary,
+            artifacts=[str(log_path)] if _path_exists(log_path) else [],
+        )
+
+
+class _TailReader:
+    """Drains one pipe on a daemon thread, retaining only the last
+    ~``_CAPTURE_TAIL_BYTES``. The MIDDLE of a runaway stream is discarded so
+    validator memory stays bounded regardless of total volume (codex #1220 r17),
+    while the END — where diff-cover's footer / pytest's ``-q`` summary live — is
+    always kept.
+
+    Draining concurrently (rather than after the process exits) is also what
+    stops a chatty child deadlocking on a full 64 KiB kernel pipe buffer. All
+    access to the retained chunks is under ``_lock`` so ``text()`` can snapshot
+    the tail race-free even if the reader thread is still running — otherwise a
+    concurrent ``append``/``popleft`` would raise ``RuntimeError: deque mutated
+    during iteration`` mid-``b"".join`` (codex #1220 r18)."""
+
+    def __init__(self, pipe) -> None:
+        self._pipe = pipe
+        self._lock = threading.Lock()
+        self._chunks: collections.deque = collections.deque()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            for block in iter(lambda: self._pipe.read(_CAPTURE_BLOCK_BYTES), b""):
+                with self._lock:
+                    self._chunks.append(block)
+                    # Drop whole oldest blocks while the tail (excluding the
+                    # newest block) still exceeds the cap. Keep >=1 block so a
+                    # stream we actually read is never emptied.
+                    retained = sum(len(c) for c in self._chunks)
+                    while (
+                        len(self._chunks) > 1
+                        and retained - len(self._chunks[0]) >= _CAPTURE_TAIL_BYTES
+                    ):
+                        retained -= len(self._chunks.popleft())
+        except (OSError, ValueError):
+            # Pipe closed under us / read on a closed fd — nothing left to drain.
+            pass
+        finally:
+            try:
+                self._pipe.close()
+            except OSError:
+                pass
+
+    def join(self, timeout: float) -> None:
+        self._thread.join(timeout)
+
+    def alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def text(self) -> str:
+        """Decode the retained byte tail under the lock. ``errors='replace'``
+        because child output isn't guaranteed valid UTF-8 and a block boundary
+        may split a multibyte sequence — a torn edge byte becomes U+FFFD."""
+        with self._lock:
+            return b"".join(self._chunks).decode("utf-8", "replace")
+
+
+def _run_group_bounded(
+    cmd: list[str], cwd: str, timeout: int, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run ``cmd`` with a hard timeout, killing its whole process group on
+    expiry, capturing a BOUNDED tail of each stream.
+
+    Like the merge-GATING ``full_unit`` step this runs the SAME pytest suite and
+    returns a ``CompletedProcess`` with text stdout/stderr. It adds the
+    properties an ADVISORY step in an auto-deploy pipeline needs and the gate
+    does not:
+
+      * **hard timeout + whole-group kill.** ``subprocess``'s own timeout
+        SIGKILLs only the direct child, so a timed-out pytest could orphan xdist
+        workers / a serve subprocess into later steps. The child leads a new
+        session (``start_new_session=True`` → its own process group) and on
+        expiry we SIGKILL the WHOLE group (``_kill_group``) BEFORE reaping the
+        leader — race-free, because the unreaped leader keeps its PGID reserved
+        (POSIX) so ``killpg`` can't hit a recycled group. The ``TimeoutExpired``
+        is re-raised (with the captured tail attached) for skip-on-timeout.
+      * **bounded capture.** Two ``_TailReader`` threads keep only the last
+        ~``_CAPTURE_TAIL_BYTES`` per stream instead of ``communicate()``
+        buffering the entire (up-to-30-min) suite output in memory, which a
+        runaway test could grow until it OOM-kills the validator before its
+        advisory handler runs (codex #1220 r17).
+      * **bounded, never-wedge drain.** After the leader exits we ``join`` the
+        readers under ``_REAP_TIMEOUT_S`` and return the (lock-guarded) tail
+        even if a reader is still blocked — a setsid-escaped descendant holding
+        the pipe can't wedge the pipeline. The stuck reader is a harmless daemon
+        thread reaped at interpreter exit.
+
+    Deliberately NOT done, after a long convergence (codex #1220 r8–r20):
+
+      * No ``RLIMIT_FSIZE`` file-size cap (inherited by the whole pytest tree,
+        it would truncate/corrupt legitimate large writes — e.g. a >256 MiB
+        model shard — codex r16), no temp-file/quota/exec-wrapper machinery.
+      * **No group sweep on the CLEAN-exit path** (codex #1220 r19). Once
+        ``proc.wait`` has reaped the leader, ``killpg(pgid)`` is NOT safe: a
+        descendant can ``setsid()`` into its OWN group while still holding the
+        pipe, so the original PGID can be empty-and-recycled even though a reader
+        is still blocked — the kill would then land on an UNRELATED group
+        (potentially an operator service). ``killpg`` therefore fires ONLY from
+        ``_kill_group`` on the timeout / exception paths, where the leader is
+        still unreaped.
+      * **No platform-enforced containment of a detached descendant that
+        survives a CLEAN leader exit** (codex #1220 r18/r20). This is the one
+        residual leak, and it is accepted deliberately, not overlooked:
+          - It is a genuine dilemma with no race-free resolution on macOS. The
+            two horns are: sweep the group (risks the r19 wrong-group SIGKILL
+            above) or don't (may leak an escaped descendant). codex has flagged
+            BOTH horns as blocking across rounds; there is no third option here
+            — cgroups / job objects don't exist on Darwin, and there is no
+            non-reaping group wait to enumerate survivors race-free.
+          - It is at PARITY with the merge-GATING ``full_unit`` step, which runs
+            the SAME suite via a bare ``subprocess.run`` with NO session, NO
+            group-kill and NO timeout — so it leaks a daemonized descendant TODAY
+            on every gating run, and would additionally HANG on a pipe-holder
+            where this step returns. An advisory measurer cannot reasonably be
+            held to a stricter containment bar than the gate it mirrors.
+          - The exposure is a misbehaving TEST that daemonizes a server; the fix
+            for that belongs in the test, and the same leak already reaches the
+            gate. We take the strictly-safer, never-wedge, never-wrong-kill
+            behavior and document the residue rather than add unsafe or
+            unavailable machinery.
+    """
+    # ``start_new_session=True`` runs the child through ``setsid()``: it leads a
+    # brand-new process group whose PGID EQUALS its PID. Capture that id NOW,
+    # not via ``os.getpgid(proc.pid)`` on timeout — by then the leader may have
+    # exited and ``getpgid`` would raise, leaving the group un-killed. Binary
+    # pipes (no ``text=``): the reader threads decode the retained tail.
+    proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        start_new_session=True,
+    )
+    pgid = proc.pid  # == PGID under start_new_session (setsid)
+    # Everything after ``Popen`` runs under a guard: if starting the reader
+    # threads fails (e.g. ``RuntimeError: can't start new thread`` under thread
+    # exhaustion), the child is already running with open pipes — tear the group
+    # down and close the pipes rather than leak it, then re-raise so ``run``
+    # downgrades to an advisory skip (codex #1220 r19).
+    try:
+        r_out = _TailReader(proc.stdout)
+        r_err = _TailReader(proc.stderr)
+        r_out.start()
+        r_err.start()
+    except BaseException:
+        _kill_group(proc, pgid)
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+        raise
+
+    def _join_readers() -> None:
+        # Bounded on purpose. On clean exit the pipes hit EOF the moment the last
+        # writer dies, so both joins return at once; the bound only bites when a
+        # setsid-escaped descendant still holds a write end — we then return the
+        # partial tail rather than block the pipeline (codex #1220 r19). We do
+        # NOT ``killpg`` here: post-reap the PGID may be recycled (see docstring).
+        #
+        # ONE shared deadline across both joins so the total drain bound is
+        # ~``_REAP_TIMEOUT_S``, not 2× it — a per-stream bound would let the two
+        # joins compound to 20 s (codex #1220 r20 nit). The second join gets only
+        # the remaining budget; ``max(0.0, …)`` keeps it a non-blocking poll once
+        # the deadline has passed.
+        deadline = time.monotonic() + _REAP_TIMEOUT_S
+        r_out.join(max(0.0, deadline - time.monotonic()))
+        r_err.join(max(0.0, deadline - time.monotonic()))
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Time budget blown: SIGKILL the whole group BEFORE reaping the leader
+        # (race-free — ``pgid`` can't be recycled while the unreaped leader is a
+        # member), drain under a bound, and re-raise with the captured tail so
+        # the caller can log WHAT hung.
+        _kill_group(proc, pgid)
+        _join_readers()
+        raise subprocess.TimeoutExpired(
+            cmd, timeout, output=r_out.text(), stderr=r_err.text()
+        ) from None
+    except BaseException:
+        # Any other escape (e.g. KeyboardInterrupt): tear the group down so
+        # nothing is orphaned, drain under a bound, then re-raise unchanged.
+        _kill_group(proc, pgid)
+        _join_readers()
+        raise
+    # Clean exit: leader already reaped by ``proc.wait``. Drain the readers under
+    # a bound and return — no group sweep here (post-reap PGID-recycle hazard;
+    # see docstring). A lingering pipe-holder leaks at gate parity, never wedges.
+    _join_readers()
+    return subprocess.CompletedProcess(cmd, proc.returncode, r_out.text(), r_err.text())
+
+
+def _kill_group(proc: subprocess.Popen, pgid: int) -> None:
+    """SIGKILL the whole process group, then reap the leader under a bounded
+    wait. SIGKILL is uncatchable so the leader dies at once; the bound only
+    guards the near-impossible wedged-leader case so we never hang the
+    auto-deploy pipeline. Called only on the timeout/exception paths, where the
+    leader is unreaped when ``killpg`` fires — so ``pgid`` can't have been
+    recycled onto an unrelated group (race-free)."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        # Group already gone / not permitted — fall back to the leader.
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=_REAP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        pass  # truly wedged leader (near-impossible post-SIGKILL) — give up
+
+
+def _path_exists(path: Path | None) -> bool:
+    """``Path.exists()`` that NEVER raises. ``pathlib.Path.exists`` re-raises
+    OSErrors other than ENOENT/ENOTDIR (e.g. EACCES permission-denied, EIO on
+    a failing mount), so a bare ``log_path.exists()`` inside ``_skip`` could
+    escape ``run``'s handler and become the blocking ``error`` this advisory
+    step promises never to produce (codex #1220 r7). Treat any error as
+    'not present' — the worst case is a missing artifact link, never a block."""
+    if path is None:
+        return False
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _safe_write(path: Path, text: str) -> bool:
+    """Best-effort diagnostic write. NEVER raises. Returns ``True`` iff THIS
+    call successfully replaced ``path`` with ``text``. An advisory step must
+    still return skip/pass even if it can't write its own log (disk full,
+    permissions) — otherwise a failing write inside an exception handler
+    would escape as a blocking ``error`` (codex review on #1220).
+
+    The boolean is what lets callers advertise the log ONLY when this run
+    actually wrote it: a mere ``path.exists()`` can be true because a prior
+    run's file survived (the run-start unlink is itself best-effort and can
+    fail), which would attach STALE diagnostics as if they were this run's
+    (codex #1220 r19). On failure we also best-effort unlink any such stale
+    file so it can't linger, but the return value is the authoritative signal.
+
+    Writes explicitly as UTF-8 with ``errors="replace"``: the default
+    locale encoding can be ASCII on some CI, and our diagnostics contain
+    non-ASCII (tracebacks, the ``…`` elision marker), which would raise
+    ``UnicodeEncodeError`` — a ``ValueError``, NOT an ``OSError`` — and slip
+    past a bare ``except OSError`` to become a blocking error (codex #1220
+    r10). We also catch ``UnicodeError`` belt-and-braces."""
+    try:
+        path.write_text(text, encoding="utf-8", errors="replace")
+        return True
+    except (OSError, UnicodeError):
+        # Couldn't write fresh content — make sure no stale prior-run file is
+        # left behind to be mistaken for this run's (best-effort).
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def _tail(text: str | None, limit: int = _LOG_TAIL_CHARS) -> str:
+    """Last ``limit`` chars of ``text`` (pytest's failure summary lives at the
+    end), with an elision marker when truncated. Never raises."""
+    s = text or ""
+    if len(s) <= limit:
+        return s
+    return f"…[{len(s) - limit} chars elided]…\n" + s[-limit:]
+
+
+def _pytest_dump(cmd: list[str], proc: subprocess.CompletedProcess[str]) -> str:
+    return (
+        f"# instrumented pytest (exit {proc.returncode})\n\n"
+        f"## cmd\n`{' '.join(cmd)}`\n\n"
+        "## stdout\n" + _tail(proc.stdout) + "\n## stderr\n" + _tail(proc.stderr)
+    )
+
+
+def _timeout_dump(label: str, cmd: list[str], exc: subprocess.TimeoutExpired) -> str:
+    """Diagnostics for a timed-out child. Preserves the captured (tail-
+    truncated) stdout/stderr carried on the ``TimeoutExpired`` so the log
+    records WHAT hung."""
+    return (
+        f"# {label} TIMED OUT\n\n"
+        f"## cmd\n`{' '.join(cmd)}`\n\n"
+        "## stdout (tail)\n"
+        + _tail(exc.stdout if isinstance(exc.stdout, str) else "")
+        + "\n## stderr (tail)\n"
+        + _tail(exc.stderr if isinstance(exc.stderr, str) else "")
+    )
+
+
+# ----------------------------------------------------------------------
+# diff-cover output parsing — we parse the stable human-readable text
+# rather than a JSON report because the JSON flag name has churned
+# across diff-cover versions (``--json-report`` vs ``--format json:``)
+# while the text footer (``Total:`` / ``Missing:`` / ``Coverage:``) has
+# been stable for years.
+# ----------------------------------------------------------------------
+
+_TOTAL_RE = re.compile(r"^Total:\s+(\d+)\s+lines?", re.MULTILINE)
+_MISSING_RE = re.compile(r"^Missing:\s+(\d+)\s+lines?", re.MULTILINE)
+_NO_LINES_RE = re.compile(r"No lines with coverage information", re.IGNORECASE)
+
+# Distinct from ``None``: diff-cover exited 0 but we recognized NEITHER its
+# explicit no-lines message NOR a Total/Missing footer. ``None`` means the
+# legitimate "nothing to score" case; this sentinel means the output format
+# was unrecognizable — most likely a diff-cover version whose text drifted
+# (the ``>=8.0.0`` floor permits future majors). The caller reports the two
+# differently so a format break can't masquerade as "no lines" and silently
+# kill baseline collection (codex #1220 r8).
+_PARSE_FAILED = object()
+
+
+def _parse_diff_cover(stdout: str) -> tuple[float, int, int] | None | object:
+    """Return ``(percent, covered_lines, total_lines)``; ``None`` when
+    diff-cover legitimately reports nothing to score; or ``_PARSE_FAILED``
+    when its output is unrecognizable (format drift — see the sentinel).
+
+    Percent is computed from the exact ``Total`` / ``Missing`` counts,
+    NOT from diff-cover's own ``Coverage:`` line. diff-cover *floors*
+    that displayed integer (e.g. 58/1934 = 2.9989 % prints as
+    ``Coverage: 2%``), which both loses resolution and can read a point
+    below the true value — bad for a baseline we intend to threshold on
+    later. So our headline % may read ~1 pt above the number in the
+    saved diff-cover log; the ``covered/total`` counts we surface
+    alongside it are the unambiguous ground truth.
+    """
+    text = stdout or ""
+    if _NO_LINES_RE.search(text):
+        return None  # legitimate: no scorable lines in the diff
+    tm = _TOTAL_RE.search(text)
+    mm = _MISSING_RE.search(text)
+    if not tm or not mm:
+        return _PARSE_FAILED  # unrecognized footer — format drift
+    total = int(tm.group(1))
+    missing = int(mm.group(1))
+    if total <= 0:
+        return None  # explicit "Total: 0 lines" — nothing to score
+    if not 0 <= missing <= total:
+        # Missing out of [0, Total] is impossible for real diff-cover output;
+        # a footer this malformed means format drift, not a coverage number.
+        # Guarding it stops a bogus negative / >100 % from being published
+        # (codex #1220 r9).
+        return _PARSE_FAILED
+    covered = total - missing
+    pct = 100.0 * covered / total
+    return pct, covered, total
