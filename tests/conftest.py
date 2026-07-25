@@ -42,6 +42,10 @@ def pytest_configure(config):
         "markers",
         "integration: mark test as integration test (requires running server)",
     )
+    config.addinivalue_line(
+        "markers",
+        "property: hermetic Hypothesis property-based test (see tests/property/)",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
