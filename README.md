@@ -98,9 +98,9 @@ print(client.chat.completions.create(
 
 | | |
 |---|---|
-| **Apple-Silicon-native** | Pure MLX kernels — no llama.cpp fallback, no Metal shim. Continuous batching, prompt cache (radix + DeltaNet RNN snapshots), and TurboQuant K8V4 KV codec run at native MLX bandwidth on M1 → M4. |
+| **Apple-Silicon-native** | Pure MLX kernels — no llama.cpp fallback, no Metal shim. Continuous batching, prompt cache (radix + DeltaNet RNN snapshots), and a quantized live KV cache (int4/int8 on the continuous-batching cache + TurboQuant K8V4 codec) run at native MLX bandwidth on M1 → M4. |
 | **Drop-in OpenAI / Anthropic API** | `/v1/chat/completions`, `/v1/responses` (Codex CLI), `/v1/messages` (Anthropic SDK / Claude Code), `/v1/embeddings`, `/v1/audio/*` — same wire as ChatGPT / Claude, no client adapter. |
-| **Tier-1 ecosystem coverage** | 8 agent CLIs and 3 Python frameworks are wire-verified against real weights every release — Codex CLI, Claude Code, OpenCode, Qwen Code, OpenHands, Hermes Agent, Aider, Kilo Code + LangChain, PydanticAI, smolagents. |
+| **Tier-1 ecosystem coverage** | 11 agent CLIs and 3 Python frameworks are wire-verified against real weights every release — Codex CLI, Claude Code, OpenCode, Qwen Code, OpenHands, Hermes Agent, Aider, Kilo Code, GitHub Copilot, Factory Droid, Moonshot Kimi Code + LangChain, PydanticAI, smolagents. |
 
 → [Full feature breakdown](https://rapidmlx.com/docs/index.html)
 
@@ -112,7 +112,7 @@ print(client.chat.completions.create(
 |---|---|---|
 | **Chat in the terminal** | `rapid-mlx chat qwen3.5-9b-4bit` | Streaming REPL, `/help` for slash commands, `--think` / `--no-think` to control CoT. |
 | **OpenAI server for your apps** | `rapid-mlx serve qwen3.5-9b-4bit` | Point Cursor, Aider, LibreChat, Open WebUI, LangChain at `http://localhost:8000/v1`. |
-| **Agent backends** | `rapid-mlx serve qwen3.6-35b-8bit &`<br>`rapid-mlx agents codex --setup && codex` | 8 Tier-1 agents auto-configure once the server is up — see [Tier-1 support](#tier-1-support). |
+| **Agent backends** | `rapid-mlx serve qwen3.6-35b-8bit &`<br>`rapid-mlx agents codex --setup && codex` | 8 agents auto-configure via `agents <name> --setup` once the server is up (11 wire-verified total) — see [Tier-1 support](#tier-1-support). |
 | **Benchmark your Mac** | `rapid-mlx bench qwen3.5-9b-4bit --submit` | Standardized B=1 bench, opens a PR to publish your row on [rapidmlx.com](https://rapidmlx.com). |
 
 → [One-shot IDE setup](https://rapidmlx.com/docs/cli.html#launch) with `rapid-mlx launch <cursor|claude-code|cline|continue-dev>`
@@ -121,16 +121,16 @@ print(client.chat.completions.create(
 
 ## Tier-1 Support
 
-Every row below has a `rapid-mlx agents <name> --setup` config template (except Claude Code, which is one env-var) *and* an integration test that drives the same wire the real client drives against a live server.
+Every agent below is wire-verified against real weights every release via its own integration-test cell. The first eight each ship a `rapid-mlx agents <name> --setup` config template (except Claude Code, which is one env-var); GitHub Copilot, Factory Droid, and Moonshot Kimi Code plug in through their own documented BYOK config (auth-gated, so the matrix cell is a wire smoke).
 
-| Agents (8) | Frameworks (3) |
+| Agents (11) | Frameworks (3) |
 |---|---|
-| [Codex CLI](https://github.com/openai/codex) · [Claude Code](https://www.anthropic.com/claude-code) · [OpenCode](https://github.com/sst/opencode) · [Qwen Code](https://github.com/QwenLM/qwen-code) · [OpenHands](https://github.com/All-Hands-AI/OpenHands) · [Hermes Agent](https://github.com/NousResearch/hermes-agent) · [Aider](https://aider.chat) · [Kilo Code](https://github.com/Kilo-Org/kilocode) | [LangChain](https://langchain.com) (+ [LangGraph](https://langchain-ai.github.io/langgraph/)) · [PydanticAI](https://ai.pydantic.dev) · [smolagents](https://github.com/huggingface/smolagents) |
+| [Codex CLI](https://github.com/openai/codex) · [Claude Code](https://www.anthropic.com/claude-code) · [OpenCode](https://github.com/sst/opencode) · [Qwen Code](https://github.com/QwenLM/qwen-code) · [OpenHands](https://github.com/All-Hands-AI/OpenHands) · [Hermes Agent](https://github.com/NousResearch/hermes-agent) · [Aider](https://aider.chat) · [Kilo Code](https://github.com/Kilo-Org/kilocode) · [GitHub Copilot](https://github.com/features/copilot) · [Factory Droid](https://factory.ai) · [Moonshot Kimi Code](https://github.com/MoonshotAI/kimi-cli) | [LangChain](https://langchain.com) (+ [LangGraph](https://langchain-ai.github.io/langgraph/)) · [PydanticAI](https://ai.pydantic.dev) · [smolagents](https://github.com/huggingface/smolagents) |
 
 Also compatible with any OpenAI-compatible client via `http://localhost:8000/v1` — Cursor, LibreChat, Open WebUI, and more plug in with a single URL change.
 
-→ [Full 8×3 agent matrix + 3×3 framework matrix (test cells + xfail reasons)](https://rapidmlx.com/docs/matrix.html)
-→ [Codex CLI](https://rapidmlx.com/docs/matrix.html#agent-codex-cli) · [Claude Code](https://rapidmlx.com/docs/matrix.html#agent-claude-code) · [OpenCode](https://rapidmlx.com/docs/matrix.html#agent-opencode) · [Qwen Code](https://rapidmlx.com/docs/matrix.html#agent-qwen-code) · [OpenHands](https://rapidmlx.com/docs/matrix.html#agent-openhands) · [Hermes](https://rapidmlx.com/docs/matrix.html#agent-hermes-agent) · [Aider](https://rapidmlx.com/docs/matrix.html#agent-aider) · [Kilo Code](https://rapidmlx.com/docs/matrix.html#agent-kilo-code)
+→ [Full 11-agent + 3-framework matrix (test cells + xfail reasons)](https://rapidmlx.com/docs/matrix.html)
+→ [Codex CLI](https://rapidmlx.com/docs/matrix.html#agent-codex-cli) · [Claude Code](https://rapidmlx.com/docs/matrix.html#agent-claude-code) · [OpenCode](https://rapidmlx.com/docs/matrix.html#agent-opencode) · [Qwen Code](https://rapidmlx.com/docs/matrix.html#agent-qwen-code) · [OpenHands](https://rapidmlx.com/docs/matrix.html#agent-openhands) · [Hermes](https://rapidmlx.com/docs/matrix.html#agent-hermes-agent) · [Aider](https://rapidmlx.com/docs/matrix.html#agent-aider) · [Kilo Code](https://rapidmlx.com/docs/matrix.html#agent-kilo-code) · [Copilot](https://rapidmlx.com/docs/matrix.html#agent-copilot) · [Droid](https://rapidmlx.com/docs/matrix.html#agent-droid) · [Kimi Code](https://rapidmlx.com/docs/matrix.html#agent-kimi-code)
 
 ---
 
@@ -146,7 +146,7 @@ The installer's RAM detector picks a sensible default. If you want to shop the f
 | **96 GB+** Mac Studio / Pro | `gpt-oss-120b-mxfp4-q8` | `rapid-mlx serve gpt-oss-120b-mxfp4-q8` |
 
 → [Full RAM tier map + serve flags per tier](https://rapidmlx.com/docs/hardware-tiers.html)
-→ [Every alias, quant, and family (128+ aliases across 30+ families)](https://rapidmlx.com/docs/aliases.html) · interactive at [models.rapidmlx.com](https://models.rapidmlx.com/)
+→ [Every alias, quant, and family (165+ text aliases + 26 audio across 30+ families)](https://rapidmlx.com/docs/aliases.html) · interactive at [models.rapidmlx.com](https://models.rapidmlx.com/)
 
 ---
 
