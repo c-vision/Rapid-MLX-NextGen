@@ -30,7 +30,19 @@ from ..patches.deepseek_v32_indexer_gate import (
     install_deepseek_v32_indexer_gate as _install_dsv32_indexer_gate,
 )
 
+# Same wiring rationale as the indexer gate above: the production load path
+# (engine/batched.py -> load_model_with_fallback -> mlx_lm.load) does NOT
+# import model_runner, so installing the Qwen3.5/3.6 norm-shift correction
+# there alone would miss it. Install here too. Idempotent + a no-op on
+# checkpoints whose norm gains are already zero-centered.
+from ..patches.qwen3_5_norm_shift import (
+    install_qwen3_5_norm_shift_fix as _install_qwen3_5_norm_shift_fix,
+)
+
+# Both installers run below the import block so no module-level import
+# follows an executable statement (E402).
 _install_dsv32_indexer_gate()
+_install_qwen3_5_norm_shift_fix()
 
 # Models that require tokenizer fallback
 FALLBACK_MODELS = [
