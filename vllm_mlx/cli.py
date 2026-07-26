@@ -4152,6 +4152,7 @@ def bench_command(args):
     from .pflash import validate_model_support as _bench_pflash_validate
     from .request import SamplingParams
     from .scheduler import SchedulerConfig
+    from .utils.model_file_guard import validate_local_model_file
 
     _check_disk_space(args.model, force=getattr(args, "force_disk_check", False))
     _check_memory_capacity(args.model)
@@ -4221,6 +4222,7 @@ def bench_command(args):
     async def run_benchmark():
         print(f"Loading model: {args.model}")
         try:
+            validate_local_model_file(args.model)
             model, tokenizer = load(args.model)
         except Exception as e:
             # Opt-in telemetry (Phase 2.2 error wiring): mirror the

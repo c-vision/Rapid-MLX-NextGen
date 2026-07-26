@@ -122,6 +122,7 @@ def _load_model(model_path: str):
     """Load an mlx_lm model, installing the MLX hardware-compat shim first."""
     # The shim must run before ``from mlx_lm import load`` (see cli.py / #404).
     from . import _mlx_compat
+    from .utils.model_file_guard import validate_local_model_file
 
     _mlx_compat.install()
 
@@ -130,6 +131,7 @@ def _load_model(model_path: str):
     # ``pull`` or from a successful mirror pass here) are picked up by
     # ``mlx_lm.load`` transparently.
     _prefetch_via_mirror(model_path)
+    validate_local_model_file(model_path)
 
     from mlx_lm import load
 

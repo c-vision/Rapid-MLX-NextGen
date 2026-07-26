@@ -123,7 +123,10 @@ class MLXModelRunner:
         try:
             from mlx_lm import load
 
+            from .utils.model_file_guard import validate_local_model_file
+
             model_name = self.model_config.model
+            validate_local_model_file(model_name)
 
             logger.info(f"Loading model with mlx-lm: {model_name}")
             start_time = time.time()

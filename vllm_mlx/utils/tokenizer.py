@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 
 from .chat_templates import DEFAULT_CHATML_TEMPLATE, NEMOTRON_CHAT_TEMPLATE
+from .model_file_guard import validate_local_model_file
 
 logger = logging.getLogger(__name__)
 
@@ -750,6 +751,11 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
     Returns:
         Tuple of (model, tokenizer)
     """
+    # ``mlx_lm.load`` may import config.json::model_file.  Validate that
+    # caller-supplied local path once at this shared boundary before any native
+    # or fallback loader runs.  Remote repository ids are intentionally a no-op
+    # here; see validate_local_model_file for the containment boundary.
+    validate_local_model_file(model_name)
     result = _load_model_with_fallback_impl(model_name, tokenizer_config)
     # Defect 4: evict UBC mirror of safetensors shards on Darwin so
     # the (mmap mirror + materialised weights) burst does not double

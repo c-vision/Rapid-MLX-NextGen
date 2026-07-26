@@ -42,7 +42,9 @@ def _build_engine(model_name: str, *, pflash_mode: str, keep_ratio: float):
     from ..engine_core import AsyncEngineCore, EngineConfig
     from ..pflash import PFlashConfig
     from ..scheduler import SchedulerConfig
+    from ..utils.model_file_guard import validate_local_model_file
 
+    validate_local_model_file(model_name)
     model, tokenizer = load(model_name)
     scheduler_config = SchedulerConfig(
         pflash_config=PFlashConfig(
