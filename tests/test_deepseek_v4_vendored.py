@@ -60,6 +60,58 @@ def test_register_vendored_archs_is_idempotent():
     assert first is second
 
 
+def test_deepseek_v4_rope_honors_explicit_yarn_attention_factor():
+    """HF's explicit YaRN attention factor scales only rotary channels."""
+    mx = pytest.importorskip("mlx.core")
+
+    from vllm_mlx.models.deepseek_v4 import DeepseekV4RoPE
+
+    scaling = {
+        "rope_type": "yarn",
+        "factor": 4.0,
+        "original_max_position_embeddings": 128,
+    }
+    x = mx.arange(24, dtype=mx.float32).reshape(1, 3, 8) / 10
+    baseline = DeepseekV4RoPE(dims=4, base=10000.0, scaling_config=scaling)
+    explicit_one = DeepseekV4RoPE(
+        dims=4,
+        base=10000.0,
+        scaling_config={**scaling, "attention_factor": 1.0},
+    )
+    explicit_null = DeepseekV4RoPE(
+        dims=4,
+        base=10000.0,
+        scaling_config={**scaling, "attention_factor": None},
+    )
+    explicit_half = DeepseekV4RoPE(
+        dims=4,
+        base=10000.0,
+        scaling_config={**scaling, "attention_factor": 0.5},
+    )
+
+    original_input = mx.array(x)
+    expected_input = mx.concatenate([x[..., :4], 0.5 * x[..., 4:]], axis=-1)
+    baseline_output = baseline(x)
+    one_output = explicit_one(x)
+    null_output = explicit_null(x)
+    half_output = explicit_half(x)
+    expected_half_output = baseline(expected_input)
+    mx.eval(
+        original_input,
+        x,
+        baseline_output,
+        one_output,
+        null_output,
+        half_output,
+        expected_half_output,
+    )
+
+    assert mx.array_equal(x, original_input).item()
+    assert mx.allclose(baseline_output, one_output, atol=1e-6).item()
+    assert mx.allclose(baseline_output, null_output, atol=1e-6).item()
+    assert mx.allclose(half_output, expected_half_output, atol=1e-6).item()
+
+
 def test_tiny_model_forward_pass():
     """Smoke test the full forward path on a CPU-sized synthetic config.
 

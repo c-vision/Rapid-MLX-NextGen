@@ -192,11 +192,18 @@ class DeepseekV4RoPE(nn.Module):
     ):
         super().__init__()
         self.dims = dims
+        # HF YaRN configs may explicitly override the attention-amplitude
+        # scale. Keep Rapid's existing no-override behavior (1.0) when the
+        # field is absent or null.
+        self.attention_factor = 1.0
 
         inv_freq = 1.0 / (base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims))
         rope_type = None
         if scaling_config is not None:
             rope_type = scaling_config.get("type") or scaling_config.get("rope_type")
+            attention_factor = scaling_config.get("attention_factor")
+            if attention_factor is not None:
+                self.attention_factor = attention_factor
 
         if rope_type in ("yarn", "deepseek_yarn"):
             factor = scaling_config["factor"]
@@ -254,6 +261,13 @@ class DeepseekV4RoPE(nn.Module):
         head_dim = x.shape[-1]
         freqs = self._get_freqs(head_dim, inverse, freq_scale)
         offset = offset // freq_scale if freq_scale != 1 else offset
+        if self.attention_factor != 1.0:
+            x = x[...]
+            # DeepSeek-V4 lays out the non-rotary (NOPE) channels first and
+            # the rotary channels last. ``_get_freqs`` mirrors that layout by
+            # prepending infinite frequencies for the NOPE pairs, so apply the
+            # YaRN amplitude override to the trailing rotary slice.
+            x[..., -self.dims :] = self.attention_factor * x[..., -self.dims :]
         return mx.fast.rope(
             x,
             head_dim,
