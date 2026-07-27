@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .types import MCPConfig, MCPServerConfig
+from .types import MCPConfig, MCPServerConfig, select_server_map
 
 logger = logging.getLogger(__name__)
 
@@ -135,10 +135,14 @@ def validate_config(data: dict[str, Any]) -> MCPConfig:
     if not isinstance(data, dict):
         raise ValueError("MCP config must be a dictionary")
 
-    # Validate servers section
-    servers_data = data.get("servers", {})
-    if not isinstance(servers_data, dict):
-        raise ValueError("'servers' must be a dictionary")
+    # Accept BOTH the ecosystem-standard "mcpServers" key (Claude Desktop,
+    # .mcp.json, VS Code — and our own docs/guides/mcp-tools.md) and the
+    # historical "servers" key. Reading only "servers" silently loaded ZERO
+    # servers for anyone who pasted a standard config or followed our own MCP
+    # guide (which uses "mcpServers") — no error, just a mysteriously
+    # tool-less agent. Key selection + misconfig warnings live in the shared
+    # select_server_map so this path and MCPConfig.from_dict can't diverge.
+    servers_data = select_server_map(data)
 
     servers = {}
     for name, server_data in servers_data.items():
@@ -178,7 +182,7 @@ def create_example_config() -> str:
         JSON string with example configuration
     """
     example = {
-        "servers": {
+        "mcpServers": {
             "filesystem": {
                 "transport": "stdio",
                 "command": "npx",
