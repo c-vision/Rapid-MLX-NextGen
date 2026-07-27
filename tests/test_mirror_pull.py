@@ -3494,9 +3494,13 @@ def test_progress_tracker_clamps_display_at_total():
     saved = _mirror._PROGRESS_HEARTBEAT_SECONDS
     _mirror._PROGRESS_HEARTBEAT_SECONDS = 0.0
     try:
-        t = _mirror._ProgressTracker(total=1000)
         buf = io.StringIO()
         with redirect_stdout(buf):
+            # Construct INSIDE the redirect: the tracker captures its output
+            # stream once at construction (codex #1259) and writes there for
+            # the life of the pull, so ``buf`` must be the active stdout when
+            # it's built — not merely when add()/flush() run.
+            t = _mirror._ProgressTracker(total=1000)
             t.add(800)  # 800/1000
             t.add(400)  # over-streamed: internal _done=1200, display 1000/1000
             t.subtract(1200)  # rollback raw 1200 → internal _done=0

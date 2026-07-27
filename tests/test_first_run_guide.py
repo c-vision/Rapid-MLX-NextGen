@@ -6,7 +6,7 @@ Covers the ``vllm_mlx/first_run.py`` helpers and their three wiring points in
 
   * P0-1 — ``chat`` / ``run`` with no model → starter auto-select in
     ``main()`` (the known-good starter alias chosen, notice printed only on a
-    TTY; the standard download gate is left untouched — the ~2.5 GB starter is
+    TTY; the standard download gate is left untouched — the ~3.1 GB starter is
     under its 10 GiB confirm threshold — and non-interactive sessions fall
     through to that gate exactly as before this feature).
   * P0-2 — bare ``rapid-mlx`` in an interactive terminal → nameplate + exit 0;
@@ -376,7 +376,7 @@ def test_autoselected_starter_uses_standard_download_gate():
     # interactive), an uncached auto-selected starter reaches confirm_or_abort
     # exactly like an explicit model does. The "small model → no prompt"
     # decision belongs to confirm_or_abort's own 10 GiB threshold (covered in
-    # test_download_gate), NOT to a bypass here — the ~2.5 GB starter is far
+    # test_download_gate), NOT to a bypass here — the ~3.1 GB starter is far
     # under that threshold, so the gate stays silent for it on its own.
     confirm, dispatched = _run_main_gate_probe(
         ["chat"], auto_select_alias="qwen3.5-4b-4bit"

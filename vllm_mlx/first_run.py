@@ -37,8 +37,12 @@ from pathlib import Path
 FIRST_RUN_MODEL = "qwen3.5-4b-4bit"
 
 # Human-facing one-time download size for FIRST_RUN_MODEL. A fixed string (not
-# a network probe) so the "no model specified" notice is instant.
-FIRST_RUN_MODEL_SIZE = "~2.5 GB"
+# a network probe) so the "no model specified" notice is instant. Anchored to
+# the actual snapshot size of ``mlx-community/Qwen3.5-4B-MLX-4bit`` — 3.061 GB
+# decimal (2.85 GiB), i.e. the ``3061132920`` bytes the download bar counts up
+# to. The old "~2.5 GB" undershot the real download by ~0.5 GB (0.11 dogfood).
+# If the starter checkpoint is re-quantized, re-probe and update this.
+FIRST_RUN_MODEL_SIZE = "~3.1 GB"
 
 # Preference order when several coding agents are detected: claude-code is the
 # ICP, so it leads. Others follow in a stable order.

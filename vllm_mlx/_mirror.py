@@ -94,27 +94,79 @@ _CHUNK_BYTES = 8 * 1024 * 1024
 # (codex R1 BLOCKING on PR #682).
 _PROGRESS_HEARTBEAT_SECONDS = 0.5
 
+# In-place TTY bar sizing. The bar shrinks to the terminal width; below the
+# minimum it's dropped for a compact percentage + bytes readout so a narrow
+# terminal never wraps a redraw onto a second row (codex #1259).
+_BAR_MAX_CELLS = 24
+_BAR_MIN_CELLS = 8
+
 
 class _ProgressTracker:
     """Aggregate bytes-done counter for one R2 pull.
 
-    Workers call ``add(delta)`` for each chunk they write; the call is
-    cheap (atomic int add under a lock) and at most one in every
-    ``_PROGRESS_HEARTBEAT_SECONDS`` window emits a ``[bytes] D/T``
-    line to stdout. Print is flushed eagerly so a non-TTY stdout
-    (desktop pipe) sees the line as soon as it's emitted.
+    Workers call ``add(delta)`` for each chunk they write; at most one call
+    per ``_PROGRESS_HEARTBEAT_SECONDS`` window renders a progress
+    observation.
+
+    Two render modes, chosen once at construction from the captured
+    ``stdout``:
+
+    * **non-TTY** (the desktop app's captured pipe, a redirected log, or
+      pytest capture) — emit the machine-readable ``[bytes] D/T`` line the
+      desktop's ``DownloadProgress`` parser and the mirror regression tests
+      depend on. Unchanged from the original heartbeat.
+    * **TTY** (a human running bare ``rapid-mlx chat``) — redraw a single
+      in-place bar with ``\\r`` so a multi-GB cold pull shows one live line
+      instead of scrolling hundreds of raw ``[bytes]`` lines (0.11 dogfood
+      papercut). Discrete status lines route through :meth:`write_line` so
+      they don't shred the bar. ``isatty()`` alone selects this mode;
+      ``NO_COLOR`` keeps the bar but drops ANSI (``\\r`` + space-pad erase)
+      rather than falling back to the machine flood.
+
+    Three robustness properties, all from codex review on PR #1259:
+
+    * **Two locks: counters (``_lock``) vs rendering (``_io_lock``).** Chunk
+      accounting stays on the fast ``_lock``; the potentially-blocking
+      terminal/pipe write happens with only ``_io_lock`` held, so a slow or
+      backpressured stdout can never stall a worker updating its byte count.
+    * **Renders read the freshest count, and can't regress.** ``_emit``
+      re-reads ``_done`` under a brief ``_lock`` nested inside ``_io_lock``,
+      so serialized renders are monotonic (each reads a ``_done`` ≥ the
+      previous render's) — no out-of-order/stale bar even when two workers
+      heartbeat close together. Lock order is always ``_io_lock`` → ``_lock``
+      (never the reverse while held), so there is no deadlock.
+    * **The output stream is captured once** (``self._out``) and used for
+      both the ``isatty()`` decision and every write, so swapping or
+      redirecting ``sys.stdout`` after construction can't send ANSI to a
+      pipe or machine heartbeats to a terminal.
     """
 
     def __init__(self, total: int = 0) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # guards the byte counters (fast)
+        self._io_lock = threading.Lock()  # serializes rendering + bar state
         self._done = 0
         self._total = max(0, int(total))
         self._last_emit = 0.0
+        # Capture the stream once so the isatty() decision and every write
+        # target the same object even if sys.stdout is later swapped.
+        self._out = sys.stdout
+        # A human terminal gets the in-place bar; anything piped keeps the
+        # machine ``[bytes] D/T`` contract. The TTY-vs-machine choice is
+        # ``isatty()`` ALONE — ``NO_COLOR`` must NOT push an interactive user
+        # back to the byte flood this change removes (codex #1259). NO_COLOR
+        # only downgrades *styling*: an escape-free ``\r`` + space-pad bar
+        # instead of the ``\x1b[2K`` erase (``\r`` is a carriage return, not
+        # color, so a colorless progress bar is still fine under NO_COLOR).
+        self._is_tty = bool(self._out) and self._out.isatty()
+        self._ansi = self._is_tty and "NO_COLOR" not in os.environ
+        # Render state — guarded by ``_io_lock`` (never ``_lock``).
+        self._bar_live = False  # a bar is currently drawn on the TTY row
+        self._last_line_len = 0  # width of the current row (no-ANSI erase)
 
     def add(self, delta: int) -> None:
         if delta <= 0:
             return
-        emit: tuple[int, int] | None = None
+        do_emit = False
         with self._lock:
             self._done += int(delta)
             if self._total <= 0:
@@ -122,18 +174,121 @@ class _ProgressTracker:
             now = time.monotonic()
             if now - self._last_emit >= _PROGRESS_HEARTBEAT_SECONDS:
                 self._last_emit = now
-                # Codex R3 BLOCKING on PR #682: clamp DISPLAY at total so
-                # an oversized/corrupt R2 stream (Content-Length lies,
-                # proxy injects extra bytes) can't emit ``[bytes] 1200/1000``
-                # before the final-size-mismatch rollback runs. Internal
-                # ``_done`` stays raw so ``subtract`` continues to balance
-                # against the actual credit (rollback of raw 1200 from
-                # raw 1200 leaves _done=0 → next ``add(1000)`` from HF
-                # lands at clean 1000/1000).
-                emit = (min(self._done, self._total), self._total)
-        if emit is not None:
-            done, total = emit
-            print(f"  [bytes] {done}/{total}", flush=True)
+                do_emit = True
+        # Render OUTSIDE the counter lock (codex #1259): a slow / backpressured
+        # stdout must not stall every worker's chunk accounting. ``_emit``
+        # re-reads the freshest byte count under a brief counter-lock nested
+        # inside ``_io_lock``, so serialized renders stay monotonic (each
+        # reads a ``_done`` ≥ the previous render's) and never regress.
+        if do_emit:
+            self._emit()
+
+    def _emit(self) -> None:
+        """Render the current progress under ``_io_lock``.
+
+        The byte snapshot is read under a brief ``_lock`` nested inside
+        ``_io_lock``; the potentially-blocking terminal/pipe write then runs
+        with only ``_io_lock`` held, so it never stalls a worker updating
+        counters. Lock order ``_io_lock`` → ``_lock`` matches :meth:`flush`.
+        """
+        with self._io_lock:
+            with self._lock:
+                if self._total <= 0:
+                    return
+                # Clamp DISPLAY at total (codex R3 on PR #682): an oversized
+                # / corrupt R2 stream (Content-Length lies, proxy injects
+                # extra bytes) must not render ``1200/1000`` before the
+                # final-size-mismatch rollback runs. ``_done`` stays raw so
+                # ``subtract`` still balances against the actual credit.
+                done = min(self._done, self._total)
+                total = self._total
+            if self._is_tty:
+                self._draw_bar(done, total)
+                self._bar_live = True
+            else:
+                print(f"  [bytes] {done}/{total}", file=self._out, flush=True)
+
+    def _inplace(self, text: str, newline: bool) -> None:
+        """Redraw ``text`` on the current terminal row (caller holds
+        ``_io_lock``). With styling allowed, uses the ANSI erase-line; under
+        ``NO_COLOR`` falls back to a carriage return + trailing-space pad so
+        a shorter line still overwrites a longer predecessor without emitting
+        any escape sequence."""
+        if self._ansi:
+            body = f"\r\x1b[2K{text}"
+        else:
+            pad = " " * max(0, self._last_line_len - len(text))
+            body = f"\r{text}{pad}"
+        self._last_line_len = 0 if newline else len(text)
+        print(body, end=("\n" if newline else ""), file=self._out, flush=True)
+
+    def _terminal_width(self) -> int:
+        """Column count of THIS output stream's terminal.
+
+        ``shutil.get_terminal_size`` measures ``sys.__stdout__`` — the
+        process's default controlling terminal — which can differ from
+        ``self._out`` when stdout is redirected to a different-width PTY; the
+        bar would then wrap despite the single-line guarantee (codex #1259).
+        So measure ``self._out`` directly.
+
+        Precedence: the stream's OWN live ``TIOCGWINSZ`` wins — it is the
+        true source of truth for wrapping, so a stale/oversized inherited
+        ``COLUMNS`` can't wrap the bar. ``COLUMNS`` is only a fallback for
+        streams with no queryable terminal (``StringIO``, a pipe); failing
+        that, 80.
+        """
+        try:
+            return os.get_terminal_size(self._out.fileno()).columns
+        except (OSError, ValueError, AttributeError):
+            pass
+        cols_env = os.environ.get("COLUMNS")
+        if cols_env and cols_env.isdigit():
+            return int(cols_env)
+        return 80
+
+    def _draw_bar(self, done: int, total: int, newline: bool = False) -> None:
+        """Redraw the single in-place progress bar (TTY only). Caller holds
+        ``self._io_lock``. ``newline=True`` finalizes the row (used by flush).
+
+        Width-adaptive: the whole line is kept within the terminal so a
+        narrow TTY doesn't wrap a redraw onto a second row and defeat the
+        single-line guarantee (codex #1259). The bar shrinks to fit; below a
+        minimum it's dropped for a compact percentage + bytes readout; and the
+        line is hard-capped at the column count as a final backstop.
+        """
+        pct = int(done * 100 / total) if total else 0
+        head = f"  ↓ {pct:3d}%  "
+        tail = f"  {done / 1e6:.0f}/{total / 1e6:.0f} MB"
+        cols = self._terminal_width()
+        # Cells left for the bar after the head, the ``[]`` brackets, and tail.
+        bar_cells = min(_BAR_MAX_CELLS, cols - len(head) - len(tail) - 2)
+        if bar_cells >= _BAR_MIN_CELLS:
+            filled = int(bar_cells * done / total) if total else 0
+            text = f"{head}[{'█' * filled}{'░' * (bar_cells - filled)}]{tail}"
+        else:
+            # Too narrow for a legible bar — percentage + bytes only.
+            text = f"  ↓ {pct:3d}%{tail}"
+        if cols > 0 and len(text) > cols:
+            text = text[:cols]  # backstop: a redraw never exceeds one row
+        self._inplace(text, newline)
+
+    def write_line(self, text: str) -> None:
+        """Print a discrete status line without corrupting the live bar.
+
+        On a TTY, erase the in-place bar first and print ``text`` on its own
+        row; the next heartbeat redraws the bar below it. On a non-TTY
+        stream this is a plain ``print`` — byte-identical to the old
+        ``_print_dim`` path the desktop parser and tests observe.
+        """
+        with self._io_lock:
+            if self._is_tty and self._bar_live:
+                # Erase the live bar and print the line on its own row (ANSI
+                # erase, or \r + pad under NO_COLOR); next heartbeat redraws.
+                self._inplace(text, newline=True)
+                self._bar_live = False
+            else:
+                print(text, file=self._out)
+                self._last_line_len = 0
 
     def subtract(self, delta: int) -> None:
         """Roll back optimistic R2-chunk credits when the file fails
@@ -149,17 +304,25 @@ class _ProgressTracker:
             self._done = max(0, self._done - int(delta))
 
     def flush(self) -> None:
-        """Emit a final heartbeat at the end of a pull regardless of
+        """Emit a final observation at the end of a pull regardless of the
         throttle window — the last 500 ms of bytes would otherwise be
-        invisible to the UI."""
-        emit: tuple[int, int] | None = None
-        with self._lock:
-            if self._total > 0:
-                # Clamp display at total — same rationale as ``add()``.
-                emit = (min(self._done, self._total), self._total)
-        if emit is not None:
-            done, total = emit
-            print(f"  [bytes] {done}/{total}", flush=True)
+        invisible. On a TTY this finalizes the in-place bar with a trailing
+        newline so the next banner starts on a clean row."""
+        with self._io_lock:
+            with self._lock:
+                if self._total <= 0:
+                    return
+                # Clamp display at total — same rationale as ``_emit``.
+                done = min(self._done, self._total)
+                total = self._total
+            if self._is_tty:
+                if self._bar_live or done > 0:
+                    # Finalize the bar with a trailing newline so the next
+                    # banner starts on a clean row.
+                    self._draw_bar(done, total, newline=True)
+                    self._bar_live = False
+            else:
+                print(f"  [bytes] {done}/{total}", file=self._out, flush=True)
 
 
 def _rollback_credits(
@@ -1547,7 +1710,12 @@ def download_with_mirror_fallback(
                     # users aren't surprised when the outer caller falls
                     # back to ``snapshot_download``.
                     tag = f"{DIM}miss (will retry via HF snapshot_download){RESET}"
-                _print_dim(
+                # Route through the tracker (not ``_print_dim``): on a TTY it
+                # erases the in-place byte bar before printing this line and
+                # lets the next heartbeat redraw it below, so the completion
+                # lines and the live bar don't clobber each other. On a
+                # non-TTY stdout this is a plain print — unchanged output.
+                progress_tracker.write_line(
                     f"  {DIM}[{completed}/{total_files_planned}]{RESET} "
                     f"{_safe_display_name(fname)} {tag}"
                 )
