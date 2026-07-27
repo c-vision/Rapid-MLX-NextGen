@@ -103,6 +103,24 @@ if ! curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
   exit 2
 fi
 
+#-------------------- G0 output coherence -------------------------
+# The most fundamental gate: does the served model produce coherent,
+# correct text at all? Qwen3.6/3.5-35B shipped garbage from the first
+# token (#1234) and passed every perf / import / unit gate because
+# nothing checked generation coherence (#1247). Run this FIRST — if it
+# fails, the stress / SDK gates below would just re-test the same broken
+# inference path. Blocking = deterministic golden answers; the garbage
+# detector is advisory-only. Reads RAPID_MLX_BASE_URL (exported above).
+#
+# This checks the ONE model the gauntlet booted. A release / model-path
+# change must ALSO sweep the representative aliases it affects (a 35B-
+# specific regression is invisible to a 4B/9B-only run) — see
+# scripts/coherence_sweep.sh and docs/development/releasing.md.
+line
+echo "  G0 — output coherence gate (blocking golden answers)"
+line
+"$PY" evals/coherence_gate.py
+
 #-------------------- G5 stress -----------------------------------
 line
 echo "  G5 — make stress (8 scenarios incl. tool storm)"
