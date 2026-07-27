@@ -69,7 +69,12 @@ if __name__ == "__main__":
             name: str
             age: int
 
-        agent = Agent(model, output_type=Person)
+        # Keep the output-tool assertion deterministic and bound any retry.
+        agent = Agent(
+            model,
+            output_type=Person,
+            model_settings={"temperature": 0.0, "max_tokens": 256},
+        )
         r = agent.run_sync("Extract: 'Alice is 30 years old'")
         assert isinstance(r.output, Person), type(r.output)
         assert r.output.name.lower() == "alice", r.output.name
