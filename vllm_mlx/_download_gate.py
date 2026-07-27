@@ -136,6 +136,16 @@ def _model_info_with_timeout(repo_id: str, timeout: float):
     """
     from huggingface_hub import HfApi
 
+    from ._hf_logging import silence_hf_unauthenticated_warning
+
+    # The Hub currently attaches its "set a HF_TOKEN" advisory to
+    # file-download responses (silenced in _mirror), not this metadata
+    # probe. But the probe is our first Hub touch on a cold pull, so
+    # installing the fail-open filter here too upholds the "filter is up
+    # before the first request" invariant whichever response the server
+    # decides to tag — it is warn-once per process.
+    silence_hf_unauthenticated_warning()
+
     result: dict = {}
 
     def _call() -> None:

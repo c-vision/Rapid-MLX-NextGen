@@ -1196,6 +1196,14 @@ def download_with_mirror_fallback(
     silently overwriting ``refs/main`` with HEAD. ``revision=None`` and
     ``revision="main"`` both mean default branch and are accepted.
     """
+    from ._hf_logging import silence_hf_unauthenticated_warning
+
+    # Whether we pull via R2 + hf_hub_download below or bail (returning
+    # False) and let the caller run plain snapshot_download, HF's
+    # unauthenticated-token advisory would fire once — drop it up front,
+    # before either path's first Hub request.
+    silence_hf_unauthenticated_warning()
+
     base = _mirror_base()
     if not base or "/" not in repo_id:
         # Mirror disabled or repo_id isn't a HF-shaped ``owner/name``.
