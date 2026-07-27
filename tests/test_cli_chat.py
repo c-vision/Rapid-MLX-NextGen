@@ -89,23 +89,33 @@ def test_chat_subcommand_registered_in_cli():
 
 
 def test_chat_no_model_defaults_to_qwen35_4b():
-    """`rapid-mlx chat` (no model) routes chat_command with qwen3.5-4b.
+    """`rapid-mlx chat` (no model) on a COLD cache routes chat_command with
+    the first-run starter (qwen3.5-4b-4bit).
 
     Goes through the real ``cli.main()`` so a parser-wiring regression
-    (e.g. dropping ``nargs='?'`` or changing the default alias) fails the
-    test. ``chat_command`` is patched to capture args before the REPL
-    runs.
+    (e.g. dropping ``nargs='?'`` or changing the sentinel default) fails the
+    test. The HF cache is forced empty so the starter reports NOT-cached
+    deterministically (the "one-time download" notice + interactive TTY path),
+    independent of this machine's real cache. ``chat_command`` is patched to
+    capture args before the REPL runs.
     """
     captured: list = []
     with (
         patch.object(sys, "argv", ["rapid-mlx", "chat"]),
+        # Interactive: exercise the intended cold-cache auto-select path,
+        # which prints the "one-time download" notice before the gate. (A
+        # non-TTY cold cache prints no notice and falls through to the same
+        # download gate silently — that path is covered by the non-TTY tests.)
+        patch.object(sys.stdin, "isatty", return_value=True),
+        # Cold cache → select_chat_default() falls back to FIRST_RUN_MODEL.
+        patch("vllm_mlx.first_run.cached_known_aliases", return_value=[]),
         patch.object(cli, "chat_command", side_effect=captured.append),
     ):
         cli.main()
     assert len(captured) == 1
     args = captured[0]
     # Either the alias name itself or the resolved HF repo path — either
-    # signals the default plumbed through. The canonical alias is the one
+    # signals the starter plumbed through. The canonical alias is the one
     # we documented as the default; confirm via the round-trip name.
     assert (
         args.model == "qwen3.5-4b-4bit"
@@ -615,6 +625,51 @@ def test_chat_command_repl_multi_turn(monkeypatch, capsys):
     assert payloads[0]["messages"] == [{"role": "user", "content": "hello"}]
     # After /reset and "again", history should NOT contain "hello".
     assert payloads[1]["messages"] == [{"role": "user", "content": "again"}]
+
+
+# ----------------------------------------------------------------------
+# First-run guide (P0-3): one-time "connect your agent" tip on chat exit
+# ----------------------------------------------------------------------
+def test_chat_exit_agent_tip_fires_once_after_response(monkeypatch, tmp_path, capsys):
+    """After a session that produced a response, the one-time agent tip prints
+    on exit — and does NOT re-appear on the next session (marker claimed)."""
+    monkeypatch.setenv("RAPID_MLX_STATE_DIR", str(tmp_path / "state"))
+    # Force the interactive path so the TTY-gated tip runs under capsys.
+    monkeypatch.setattr(
+        "vllm_mlx.chat_render.supports_rich_output", lambda *_a, **_k: True
+    )
+
+    canned = [_delta("Hi there!")]
+    with _fake_server(canned) as (port, _payloads):
+        inputs = iter(["hello", "exit"])
+        monkeypatch.setattr("builtins.input", lambda _p="": next(inputs))
+        cli.chat_command(_ns_for_chat(port))
+    # Tip text is "... → rapid-mlx launch <agent|--all>" regardless of what
+    # agent (if any) is detected on the runner.
+    assert "rapid-mlx launch" in capsys.readouterr().out
+
+    with _fake_server(canned) as (port2, _payloads2):
+        inputs2 = iter(["hey", "exit"])
+        monkeypatch.setattr("builtins.input", lambda _p="": next(inputs2))
+        cli.chat_command(_ns_for_chat(port2))
+    assert "rapid-mlx launch" not in capsys.readouterr().out
+
+
+def test_chat_exit_agent_tip_skipped_when_no_response(monkeypatch, tmp_path, capsys):
+    """Immediate exit (no response produced) → no tip, and the one-time marker
+    is NOT consumed, so a later real session can still show it."""
+    monkeypatch.setenv("RAPID_MLX_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(
+        "vllm_mlx.chat_render.supports_rich_output", lambda *_a, **_k: True
+    )
+
+    with _fake_server([_delta("unused")]) as (port, _payloads):
+        inputs = iter(["exit"])
+        monkeypatch.setattr("builtins.input", lambda _p="": next(inputs))
+        cli.chat_command(_ns_for_chat(port))
+    assert "rapid-mlx launch" not in capsys.readouterr().out
+    # Marker never created → the one-time chance is intact.
+    assert not (tmp_path / "state" / "chat_agent_tip_shown").exists()
 
 
 def test_chat_command_system_prompt_prepended(monkeypatch):
@@ -2151,126 +2206,6 @@ def test_chat_no_thinking_hidden_from_help(capsys):
     )
     # Sanity check that we actually captured the chat help (not stdlib's).
     assert "--think" in help_text or "--no-think" in help_text
-
-
-# ----------------------------------------------------------------------
-# D8 — first-launch-only banner for "agents codex" tip
-# ----------------------------------------------------------------------
-
-
-def test_seen_tips_marker_round_trip(tmp_path, monkeypatch):
-    """``_has_seen_tip`` returns False before, True after ``_mark_tip_seen``."""
-    monkeypatch.setenv("RAPID_MLX_CONFIG_HOME", str(tmp_path))
-    assert cli._has_seen_tip("chat_intro_codex") is False
-    cli._mark_tip_seen("chat_intro_codex")
-    assert cli._has_seen_tip("chat_intro_codex") is True
-    # Marker file landed in the override dir.
-    assert (tmp_path / "seen-tips.json").exists()
-
-
-def test_seen_tips_marker_survives_corrupt_file(tmp_path, monkeypatch):
-    """A corrupt marker (parse error) must be treated as 'not seen' so
-    the tip re-fires once, rather than being silently hidden forever."""
-    monkeypatch.setenv("RAPID_MLX_CONFIG_HOME", str(tmp_path))
-    (tmp_path / "seen-tips.json").write_text("not json {{")
-    assert cli._has_seen_tip("chat_intro_codex") is False
-
-
-def test_chat_banner_shown_on_first_launch_only(monkeypatch, capsys, tmp_path):
-    """First chat launch shows the agents-codex tip; subsequent launches
-    do NOT. The marker file under ``RAPID_MLX_CONFIG_HOME`` records the
-    first-seen state."""
-    monkeypatch.setenv("RAPID_MLX_CONFIG_HOME", str(tmp_path))
-
-    # Force the TTY/NO_COLOR gate to think we're interactive (otherwise
-    # the marker logic short-circuits to "skip everything").
-    class _Tty(io.StringIO):
-        def isatty(self):
-            return True
-
-    monkeypatch.delenv("NO_COLOR", raising=False)
-
-    canned = [_delta("ok")]
-    # First launch.
-    with (
-        _fake_server(canned) as (port, _payloads),
-        patch.object(sys, "stdout", _Tty()) as buf1,
-    ):
-        inputs = iter(["exit"])
-        monkeypatch.setattr("builtins.input", lambda _p="": next(inputs))
-        cli.chat_command(_ns_for_chat(port))
-        first = buf1.getvalue()
-    assert "agents codex" in first, (
-        f"first launch should show the agents-codex tip; got {first!r}"
-    )
-
-    # Second launch — marker file now exists, banner should be suppressed.
-    canned2 = [_delta("ok")]
-    with (
-        _fake_server(canned2) as (port2, _payloads),
-        patch.object(sys, "stdout", _Tty()) as buf2,
-    ):
-        inputs2 = iter(["exit"])
-        monkeypatch.setattr("builtins.input", lambda _p="": next(inputs2))
-        cli.chat_command(_ns_for_chat(port2))
-        second = buf2.getvalue()
-    assert "agents codex" not in second, (
-        f"second launch must NOT re-show the banner; got {second!r}"
-    )
-
-
-def test_chat_banner_skipped_when_no_color_set(monkeypatch, capsys, tmp_path):
-    """``NO_COLOR`` or non-TTY stdout: skip the marker logic AND the
-    banner entirely so pipe/CI runs don't pollute the user's config."""
-    monkeypatch.setenv("RAPID_MLX_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setenv("NO_COLOR", "1")
-
-    canned = [_delta("ok")]
-    with _fake_server(canned) as (port, _payloads):
-        inputs = iter(["exit"])
-        monkeypatch.setattr("builtins.input", lambda _p="": next(inputs))
-        cli.chat_command(_ns_for_chat(port))
-    out = capsys.readouterr().out
-    assert "agents codex" not in out, "NO_COLOR run should suppress the banner entirely"
-    # And no marker file was written.
-    assert not (tmp_path / "seen-tips.json").exists(), (
-        "NO_COLOR run must not pollute the user's config dir"
-    )
-
-
-def test_chat_banner_write_failure_does_not_abort(monkeypatch, tmp_path, capsys):
-    """If the marker dir is unwritable (read-only FS / permission
-    denied), the tip should still print and chat must continue — best
-    effort only."""
-    monkeypatch.setenv("RAPID_MLX_CONFIG_HOME", str(tmp_path / "no_perm"))
-
-    class _Tty(io.StringIO):
-        def isatty(self):
-            return True
-
-    monkeypatch.delenv("NO_COLOR", raising=False)
-
-    # Mock os.makedirs to raise so the write path fails.
-    real_makedirs = os.makedirs
-
-    def _failing(*a, **kw):
-        if str(tmp_path / "no_perm") in str(a[0]):
-            raise PermissionError("read only fs")
-        return real_makedirs(*a, **kw)
-
-    monkeypatch.setattr("os.makedirs", _failing)
-
-    canned = [_delta("ok")]
-    with (
-        _fake_server(canned) as (port, _payloads),
-        patch.object(sys, "stdout", _Tty()) as buf,
-    ):
-        inputs = iter(["exit"])
-        monkeypatch.setattr("builtins.input", lambda _p="": next(inputs))
-        # Must NOT raise.
-        cli.chat_command(_ns_for_chat(port))
-    # Banner still printed.
-    assert "agents codex" in buf.getvalue()
 
 
 # ----------------------------------------------------------------------

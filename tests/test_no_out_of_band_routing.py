@@ -156,6 +156,13 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # Override the per-user config dir used to remember "seen-tips"
         # banner state (chat REPL first-launch tip gating).
         "RAPID_MLX_CONFIG_HOME",
+        # Override the ``~/.rapid-mlx/`` state dir used by the first-run guide
+        # to place its one-time "connect your agent" marker
+        # (``first_run.py::_state_dir``). Tests point it at a temp dir to
+        # isolate the marker from the real home; it also serves as an escape
+        # hatch for sandboxed / read-only-home environments. Pure state-file
+        # placement knob — never selects a model, parser, or routing tier.
+        "RAPID_MLX_STATE_DIR",
         # Override where DDTree writes its patched draft-config mirror.
         # This is a cache placement/testing knob; model routing and DDTree
         # enablement still come from explicit CLI flags and alias metadata.

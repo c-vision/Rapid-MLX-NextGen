@@ -480,65 +480,6 @@ def _port_is_busy(host: str, port: int) -> bool:
     return False
 
 
-def _chat_config_dir() -> str:
-    """Directory for first-launch tip markers (and future per-user chat
-    state). Honors ``RAPID_MLX_CONFIG_HOME`` override; otherwise falls back
-    to ``~/.config/rapid-mlx``. The directory is created lazily by the
-    writer; callers don't need to ensure it exists for reads.
-    """
-    override = os.environ.get("RAPID_MLX_CONFIG_HOME")
-    if override:
-        return override
-    return os.path.join(os.path.expanduser("~"), ".config", "rapid-mlx")
-
-
-def _seen_tips_path() -> str:
-    return os.path.join(_chat_config_dir(), "seen-tips.json")
-
-
-def _has_seen_tip(key: str) -> bool:
-    """Return True iff the marker file records ``key: true``.
-
-    Any IO/parse error is treated as "not seen" — better to show the tip
-    one extra time than to hide it forever on a corrupt marker.
-    """
-    import json
-
-    try:
-        with open(_seen_tips_path(), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return False
-    return isinstance(data, dict) and bool(data.get(key))
-
-
-def _mark_tip_seen(key: str) -> None:
-    """Persist ``key: true`` to the seen-tips marker. Best-effort —
-    failures are swallowed so a read-only config dir never aborts chat.
-    """
-    import json
-
-    path = _seen_tips_path()
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-    except OSError:
-        return
-    try:
-        existing: dict = {}
-        try:
-            with open(path, encoding="utf-8") as fh:
-                loaded = json.load(fh)
-            if isinstance(loaded, dict):
-                existing = loaded
-        except (OSError, ValueError):
-            existing = {}
-        existing[key] = True
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(existing, fh)
-    except OSError:
-        return
-
-
 def _print_unknown_model_help(name: str, *, full_path_example: str) -> None:
     """Print fuzzy suggestions + a curated popular-models hint.
 
@@ -5662,6 +5603,12 @@ def chat_command(args):
     RED = "\x1b[31m" if _is_tty else ""
     RESET = "\x1b[0m" if _is_tty else ""
 
+    # P0-3 (first-run guide): did the user see real value this session — i.e.
+    # at least one completed, non-empty response? Gates the one-time agent-
+    # connect tip printed on exit, so a load-then-immediate-/exit run neither
+    # nags the user nor burns the one-time marker.
+    _generated_any = False
+
     def _teardown_proc(p) -> None:
         """Terminate a spawned chat server and free its log file.
 
@@ -5915,22 +5862,13 @@ def chat_command(args):
         f"{DIM}type {RESET}{BOLD}/help{RESET}{DIM} for commands, "
         f"Ctrl-D to exit.{RESET}"
     )
-    # First-launch-only banner for the agents/codex tip. The marker-file
-    # gate keeps the tip from re-appearing on every chat launch (persona-3
-    # finding: irritating by launch #50). Marker logic is skipped entirely
-    # when stdout is not a TTY or NO_COLOR is set — pipe/CI runs shouldn't
-    # pollute the user's config dir, and the banner is fluff there anyway.
-    _is_pipe_or_no_color = (not sys.stdout.isatty()) or ("NO_COLOR" in os.environ)
-    if not _is_pipe_or_no_color and not _has_seen_tip("chat_intro_codex"):
-        print(
-            f"  {DIM}For a Claude Code-like TUI: `rapid-mlx agents codex --setup`, "
-            f"then run `codex` in any project.{RESET}\n"
-        )
-        _mark_tip_seen("chat_intro_codex")
-    else:
-        # Maintain the existing blank-line spacing the banner used to
-        # provide — keeps the prompt layout consistent across runs.
-        print()
+    # A single blank line before the prompt keeps the layout consistent.
+    # The "connect your agent" nudge that used to live here (a start-of-chat
+    # agents/codex banner) moved to a one-time tip printed after the user's
+    # FIRST successful chat exit — see the P0-3 block at the end of this
+    # function and ``vllm_mlx/first_run.py``. Nudging once, after value has
+    # landed, beats nudging on every cold start.
+    print()
 
     served_name = getattr(args, "_original_alias", args.model)
     messages: list[dict] = []
@@ -6398,6 +6336,9 @@ def chat_command(args):
                 )
             if assistant:
                 messages.append({"role": "assistant", "content": assistant})
+                # A non-empty response reached the user → the session
+                # delivered value. Arms the one-time exit tip (P0-3).
+                _generated_any = True
             else:
                 _recover_failed_chat_turn(messages, turn_start)
     finally:
@@ -6406,6 +6347,27 @@ def chat_command(args):
         # before running atexit callbacks. Closing here avoids that shutdown
         # ordering deadlock and also tears down a spawned model server promptly.
         _cleanup()
+
+    # P0-3 (first-run guide): after the user's FIRST session that actually
+    # produced a response, print a one-line nudge to connect their coding
+    # agent — the highest-retention next step, offered only once value has
+    # landed. Fires at most once per machine (a marker under ~/.rapid-mlx/),
+    # interactive terminals only, and never on a crash (an uncaught exception
+    # propagates through ``finally`` before reaching here). Fail-silent.
+    if _generated_any and _is_tty:
+        try:
+            from vllm_mlx.first_run import chat_agent_tip_text, claim_chat_agent_tip
+
+            # Build the tip text (which runs agent detection) BEFORE claiming
+            # the marker, so a detection error can't burn the one-time chance
+            # without ever showing the tip. The atomic claim is last, so only
+            # the process that wins the exclusive-create prints — concurrent
+            # first sessions can't both show it.
+            _tip = chat_agent_tip_text()
+            if claim_chat_agent_tip():
+                print(f"\n  {DIM}{_tip}{RESET}")
+        except Exception:
+            pass
 
 
 def info_command(args):
@@ -8283,9 +8245,11 @@ Examples:
     chat_parser.add_argument(
         "model",
         nargs="?",
-        default="qwen3.5-4b-4bit",
+        default=None,
         help="Model alias (e.g. qwen3.5-4b-4bit) or HF repo (org/name). "
-        "Defaults to qwen3.5-4b-4bit when omitted.",
+        "When omitted, defaults to the qwen3.5-4b-4bit starter — a "
+        "dogfood-tested, tool-call-reliable model — downloaded once on first "
+        "use. See `vllm_mlx.first_run.select_chat_default`.",
     ).completer = alias_completer
     chat_parser.add_argument(
         "--system",
@@ -8733,6 +8697,44 @@ Examples:
         _telemetry_emit.register_session_end_hook(_emit_session_end)
         _atexit.register(_telemetry_emit.fire_session_end_hook)
 
+    # First-run auto-select: ``chat`` / ``run`` invoked with no model arg.
+    # Resolve the starter alias HERE — before the alias→path resolution below —
+    # so it flows through the normal resolve + download path (and the
+    # ``_original_alias`` banner) exactly as if the user had typed it. Always
+    # the known-good starter, never an arbitrary cached model (which could be a
+    # non-chat checkpoint); the bare-command nameplate lists cached models for
+    # explicit selection instead.
+    if (
+        getattr(args, "command", None) in ("chat", "run")
+        and getattr(args, "model", None) is None
+    ):
+        from vllm_mlx.first_run import FIRST_RUN_MODEL_SIZE, select_chat_default
+
+        _cmd = getattr(args, "command", "chat")
+        _sel_alias, _starter_cached = select_chat_default()
+        args.model = _sel_alias
+        if sys.stdin.isatty():
+            if _starter_cached:
+                print(
+                    f"  No model specified — using {_sel_alias} (already downloaded)."
+                )
+            else:
+                print(
+                    f"  No model specified — using {_sel_alias} "
+                    f"({FIRST_RUN_MODEL_SIZE}, one-time download)."
+                )
+            print(f"  Browse: rapid-mlx models · Override: rapid-mlx {_cmd} <model>")
+            print()
+        # We intentionally do NOT special-case the download gate for the
+        # auto-selected starter. The starter is a small (~2.5 GB) model, well
+        # under the gate's 10 GiB confirm threshold, so the gate never prompts
+        # for it regardless — deferring to the gate's own authoritative
+        # ``is_repo_cached`` + threshold policy is simpler and safer than a
+        # bypass flag derived from a fail-silent pre-scan. Non-interactive
+        # (CI / pipe): no notice (it is TTY-only); ``main()`` sets the starter
+        # and falls through to the same gate a bare ``rapid-mlx chat`` always
+        # used, so scripted callers are unchanged (no new exit-1 path).
+
     # Resolve model aliases before dispatch.
     #
     # The doctor subcommand is exempt for historical reasons (and as a
@@ -8940,6 +8942,27 @@ Examples:
         from vllm_mlx.launch.cli import launch_command
 
         launch_command(args)
+    elif (
+        getattr(args, "command", None) is None
+        and sys.stdout.isatty()
+        and sys.stdin.isatty()
+    ):
+        # Bare ``rapid-mlx`` in an interactive terminal = a first-run
+        # nameplate (hardware + cached-model hint + "get started" signpost),
+        # not a wall of argparse help. Non-blocking: it prints and exits 0.
+        # Non-interactive invocations (pipe, redirect, CI) fall through to the
+        # unchanged help + exit 1 so scripts parsing ``rapid-mlx`` output are
+        # unaffected. Fail-silent: any nameplate error also falls through.
+        try:
+            from vllm_mlx.first_run import build_nameplate
+
+            print(build_nameplate(_version))
+            sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception:
+            parser.print_help()
+            sys.exit(1)
     else:
         parser.print_help()
         sys.exit(1)
