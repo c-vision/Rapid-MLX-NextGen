@@ -1487,10 +1487,8 @@ def test_request_enable_thinking_false_honored(monkeypatch) -> None:
 
 
 @_skip_without_mlx_vlm
-def test_enable_thinking_default_preserved(monkeypatch) -> None:
-    """When neither --no-thinking nor request enable_thinking is set,
-    the historic default (True) must still reach the chat template so
-    existing Qwen3 callers see no behaviour change."""
+def test_enable_thinking_defaults_false_without_reasoning_parser(monkeypatch) -> None:
+    """DFlash must not leak unparsed thinking into normal response content."""
     captured = _capture_enable_thinking(
         monkeypatch,
         no_thinking=False,
@@ -1498,6 +1496,22 @@ def test_enable_thinking_default_preserved(monkeypatch) -> None:
             "model": "qwen3.5-27b-8bit",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
+        },
+    )
+    assert captured.get("enable_thinking") is False
+
+
+@_skip_without_mlx_vlm
+def test_request_enable_thinking_true_honored(monkeypatch) -> None:
+    """Callers can still explicitly opt in to the model's thinking output."""
+    captured = _capture_enable_thinking(
+        monkeypatch,
+        no_thinking=False,
+        request_body={
+            "model": "qwen3.5-27b-8bit",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "enable_thinking": True,
         },
     )
     assert captured.get("enable_thinking") is True

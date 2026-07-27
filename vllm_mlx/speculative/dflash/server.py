@@ -1095,7 +1095,7 @@ def _render_prompt(
     DFlash-eligible aliases are text-only Qwen3.5/3.6 variants today).
 
     ``enable_thinking`` resolution (caller-side; we just thread through):
-      None  → defer to mlx-vlm default (Qwen3 family = True).
+      None  → disable thinking because DFlash has no reasoning parser.
       True  → force chain-of-thought on.
       False → force chain-of-thought off (server --no-thinking or per-
               request ``enable_thinking=false`` body field).
@@ -1134,10 +1134,10 @@ def _render_prompt(
             content = "".join(text_pieces)
         messages.append({"role": m.role, "content": content})
 
-    # Preserve historic default (enable_thinking=True) when neither the
-    # server-level --no-thinking nor a per-request body override is set,
-    # to keep behaviour stable for callers that never opt out.
-    effective_thinking = True if enable_thinking is None else enable_thinking
+    # DFlash bypasses the normal reasoning parser, so thinking tokens would
+    # otherwise be exposed directly in ``content`` and commonly exhaust the
+    # response budget. Keep thinking available as an explicit request opt-in.
+    effective_thinking = False if enable_thinking is None else enable_thinking
     return apply_chat_template(
         processor,
         model.config,
