@@ -458,10 +458,14 @@ class ResponsesUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
-    # Optional details for prompt cache + reasoning tokens. Codex parses
-    # these fields and they're 1:1 with the OpenAI public spec.
-    input_tokens_details: dict[str, int] | None = None
-    output_tokens_details: dict[str, int] | None = None
+    # Current OpenAI SDKs require both details objects, including for zero
+    # cache hits and zero reasoning tokens.
+    input_tokens_details: dict[str, int] = Field(
+        default_factory=lambda: {"cached_tokens": 0, "cache_write_tokens": 0}
+    )
+    output_tokens_details: dict[str, int] = Field(
+        default_factory=lambda: {"reasoning_tokens": 0}
+    )
 
 
 class ResponsesOutputContent(BaseModel):

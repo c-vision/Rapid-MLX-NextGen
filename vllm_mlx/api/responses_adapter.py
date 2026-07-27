@@ -1186,6 +1186,9 @@ def _build_responses_usage(response: ChatCompletionResponse) -> ResponsesUsage:
         input_tokens=prompt,
         output_tokens=completion,
         total_tokens=prompt + completion,
-        input_tokens_details=({"cached_tokens": cached} if cached else None),
-        output_tokens_details=({"reasoning_tokens": reasoning} if reasoning else None),
+        input_tokens_details={
+            "cached_tokens": cached,
+            "cache_write_tokens": 0,
+        },
+        output_tokens_details={"reasoning_tokens": reasoning},
     )

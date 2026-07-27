@@ -1286,7 +1286,23 @@ class TestOpenaiToResponses:
         assert resp.usage.input_tokens == 100
         assert resp.usage.output_tokens == 50
         assert resp.usage.total_tokens == 150
-        assert resp.usage.input_tokens_details == {"cached_tokens": 30}
+        assert resp.usage.input_tokens_details == {
+            "cached_tokens": 30,
+            "cache_write_tokens": 0,
+        }
+
+    def test_usage_block_populated_without_cache(self):
+        chat_resp = _chat_response(
+            text="hi", prompt_tokens=100, completion_tokens=50, cached=0
+        )
+        resp = openai_to_responses(
+            chat_resp, model="test-model", request=_bare_request(), created_at=0
+        )
+        assert resp.usage.input_tokens_details == {
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+        }
+        assert resp.usage.output_tokens_details == {"reasoning_tokens": 0}
 
     def test_cached_tokens_clamped_to_prompt(self):
         # Defensive against an over-reported cache count — same clamp
@@ -1297,7 +1313,10 @@ class TestOpenaiToResponses:
         resp = openai_to_responses(
             chat_resp, model="test-model", request=_bare_request(), created_at=0
         )
-        assert resp.usage.input_tokens_details == {"cached_tokens": 10}
+        assert resp.usage.input_tokens_details == {
+            "cached_tokens": 10,
+            "cache_write_tokens": 0,
+        }
 
     def test_request_metadata_echoed(self):
         req = ResponsesRequest(

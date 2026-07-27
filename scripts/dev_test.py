@@ -6,8 +6,8 @@ Orchestrates all test levels from quick lint to overnight benchmarks.
 
 Usage:
     python scripts/dev_test.py lint          # ruff + import check (~10s)
-    python scripts/dev_test.py unit          # pytest unit suite (~30s)
-    python scripts/dev_test.py smoke         # lint + unit (~1 min)
+    python scripts/dev_test.py unit          # pytest unit suite (~3 min)
+    python scripts/dev_test.py smoke         # lint + unit (~3 min)
     python scripts/dev_test.py stress        # 8-test stress suite (needs server)
     python scripts/dev_test.py soak          # 10-min agent soak test (needs server)
     python scripts/dev_test.py cross-model   # multi-model stress (auto starts servers)
@@ -88,7 +88,7 @@ def run_unit():
             "tests/test_reasoning_parsers.py",
         ],
         "Unit tests (pytest)",
-        timeout=120,
+        timeout=300,
     )
 
 

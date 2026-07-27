@@ -2130,6 +2130,44 @@ class TestMLLMSchedulerErrorPropagation:
         assert outputs[0].finish_reason == "stop"
         assert outputs[0].error is None
 
+    @pytest.mark.asyncio
+    async def test_final_output_consumer_break_does_not_abort_completed_request(self):
+        """A caller may stop as soon as it receives the terminal output.
+
+        Async-generator code after ``yield`` does not run when that caller
+        closes the generator, so completion must be recorded before yielding.
+        """
+        import asyncio
+
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+        from vllm_mlx.request import RequestOutput
+
+        sched = MLLMScheduler.__new__(MLLMScheduler)
+        sched.output_queues = {}
+        sched.abort_request = MagicMock()
+
+        req_id = "req-completed-before-consumer-break"
+        queue: asyncio.Queue = asyncio.Queue()
+        sched.output_queues[req_id] = queue
+        await queue.put(
+            RequestOutput(
+                request_id=req_id,
+                output_text="done",
+                new_text="done",
+                finished=True,
+                finish_reason="stop",
+            )
+        )
+
+        stream = sched.stream_outputs(req_id)
+        async for output in stream:
+            assert output.finished is True
+            break
+        await stream.aclose()
+
+        sched.abort_request.assert_not_called()
+        assert req_id not in sched.output_queues
+
 
 # Run tests
 if __name__ == "__main__":

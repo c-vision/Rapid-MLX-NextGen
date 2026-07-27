@@ -232,6 +232,37 @@ def test_build_app_healthz_models_and_completion() -> None:
     assert call.kwargs["skip_special_tokens"] is True
 
 
+def test_render_prompt_defaults_to_no_thinking_but_honors_explicit_opt_in() -> None:
+    from vllm_mlx.api.models import ChatCompletionRequest
+    from vllm_mlx.speculative.ddtree.server import _render_prompt
+
+    runtime = _fake_runtime()
+    default_request = ChatCompletionRequest(
+        model="qwen3.5-9b-8bit",
+        messages=[{"role": "user", "content": "2+2?"}],
+    )
+    _render_prompt(runtime, default_request)
+    assert (
+        runtime.generator.target.tokenizer.apply_chat_template.call_args.kwargs[
+            "enable_thinking"
+        ]
+        is False
+    )
+
+    thinking_request = ChatCompletionRequest(
+        model="qwen3.5-9b-8bit",
+        messages=[{"role": "user", "content": "2+2?"}],
+        enable_thinking=True,
+    )
+    _render_prompt(runtime, thinking_request)
+    assert (
+        runtime.generator.target.tokenizer.apply_chat_template.call_args.kwargs[
+            "enable_thinking"
+        ]
+        is True
+    )
+
+
 def test_build_app_healthz_works_while_runtime_loads() -> None:
     from fastapi.testclient import TestClient
 

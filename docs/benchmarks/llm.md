@@ -95,7 +95,11 @@ Notes:
 - Throughput peaks at **1024–2048** tokens, then dips at 4096 — consistent with KV-cache pressure as the rolling window fills.
 - Memory delta (baseline → DFlash) tracks the draft model + verification overhead; see the source benchmark for the exact figure.
 
-`Qwen3.6-35B-A3B-8bit` supports DFlash as an experimental opt-in (install `[dflash]` extra, pass `--speculative-config '{"method":"dflash"}'`); numbers above are from a community benchmark and reflect that single run.
+These are historical community results from a single run, not a currently
+enabled model/decoder pair. Rapid-MLX now keeps DFlash behind per-alias
+correctness and speed gates; `qwen3.6-35b-8bit` is an MoE model and does not
+currently pass those gates. Run `rapid-mlx info <alias>` for the live
+eligibility result before enabling DFlash.
 
 ## Prefix Cache Results
 

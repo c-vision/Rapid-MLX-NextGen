@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import unittest
+import uuid
 
 import httpx
 
@@ -491,12 +492,21 @@ def test_hermes_chat():
 
 def test_hermes_read_file():
     """Hermes reads a file via tool call."""
-    out, err = hermes_query("Read the first line of pyproject.toml")
-    fail_or_skip(err)
-    assert "build" in out.lower() or "project" in out.lower(), (
-        f"Unexpected: {out[:100]}"
-    )
-    print(f"  Hermes read_file: {out.strip()[:80]}")
+    marker = f"rapid-mlx-hermes-{uuid.uuid4().hex}"
+    path = os.path.join(os.getcwd(), f".hermes-read-{uuid.uuid4().hex}.txt")
+    try:
+        with open(path, "w") as f:
+            f.write(f"{marker}\n")
+        out, err = hermes_query(
+            f"Use the read_file tool to read {os.path.basename(path)}, "
+            "then reply with its exact contents."
+        )
+        fail_or_skip(err)
+        assert marker in out, f"File content missing from Hermes output: {out[:100]}"
+        print(f"  Hermes read_file: {out.strip()[:80]}")
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
 
 
 def test_hermes_terminal():

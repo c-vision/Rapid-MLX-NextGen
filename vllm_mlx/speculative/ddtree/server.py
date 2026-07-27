@@ -392,7 +392,11 @@ def _render_prompt(
         messages.append({"role": m.role, "content": content})
 
     enable_thinking = False if no_thinking else _extract_thinking_from_request(request)
-    effective_thinking = True if enable_thinking is None else enable_thinking
+    # DDTree does not run the normal reasoning parser, so thinking tokens
+    # would be exposed directly in ``content`` and commonly exhaust the
+    # response budget. Default to a clean final answer while still honoring
+    # an explicit per-request ``enable_thinking=true`` opt-in.
+    effective_thinking = False if enable_thinking is None else enable_thinking
     if hasattr(tokenizer, "apply_chat_template"):
         try:
             return tokenizer.apply_chat_template(

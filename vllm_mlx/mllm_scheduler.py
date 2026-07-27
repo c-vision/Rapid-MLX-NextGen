@@ -1680,9 +1680,15 @@ class MLLMScheduler:
                     # doesn't double-abort what's already cleaned up.
                     finished_normally = True
                     raise ValueError(output.error)
-                yield output
+                # Mark terminal output before yielding it. A consumer of an
+                # async generator may stop immediately after receiving the
+                # final item, so code after ``yield`` is not guaranteed to
+                # run. Marking it here prevents a successful request from
+                # being misclassified and aborted as an orphan.
                 if output.finished:
                     finished_normally = True
+                yield output
+                if output.finished:
                     break
         finally:
             if not finished_normally:

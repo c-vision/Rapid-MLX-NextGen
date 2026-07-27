@@ -2810,6 +2810,7 @@ async def _stream_responses(
                     "cached_tokens": cached_tokens_clamped
                     if cached_tokens_clamped
                     else 0,
+                    "cache_write_tokens": 0,
                 },
                 "output_tokens_details": {"reasoning_tokens": reasoning_token_credit},
             }
