@@ -302,7 +302,7 @@ def test_per_file_fallback(
     # the calls so we can assert which files HF was asked for.
     hf_calls: list[str] = []
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         hf_calls.append(filename)
         snap = (
             Path(cache_dir)
@@ -386,7 +386,7 @@ def test_not_yet_mirrored_skips_r2_entirely(
 
     hf_calls: list[str] = []
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         hf_calls.append(filename)
         snap = (
             Path(cache_dir)
@@ -452,7 +452,7 @@ def test_catalog_500_falls_through_to_hf(
     # fast to HF rather than incur 60s timeouts per file (codex round-4
     # BLOCKING #3). Therefore: no R2 file URL is registered.
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         snap = (
             Path(cache_dir)
             / f"models--{repo_id.replace('/', '--')}"
@@ -605,7 +605,7 @@ def test_size_mismatch_deletes_r2_file_and_uses_hf(
 
     hf_calls: list[str] = []
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         hf_calls.append(filename)
         snap = (
             Path(cache_dir)
@@ -752,7 +752,7 @@ def test_resume_rejects_bad_content_range(
         _FakeResponse(206, b"x" * 200, headers={"Content-Range": "bytes 0-199/200"}),
     )
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         snap_local = (
             Path(cache_dir)
             / f"models--{repo_id.replace('/', '--')}"
@@ -1042,7 +1042,7 @@ def test_resume_rejects_short_content_range(
         _FakeResponse(206, b"x" * 50, headers={"Content-Range": "bytes 50-99/200"}),
     )
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         snap_local = (
             Path(cache_dir)
             / f"models--{repo_id.replace('/', '--')}"
@@ -1106,7 +1106,7 @@ def test_resume_rejects_wrong_total_in_content_range(
         _FakeResponse(206, b"x" * 150, headers={"Content-Range": "bytes 50-199/300"}),
     )
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         snap_local = (
             Path(cache_dir)
             / f"models--{repo_id.replace('/', '--')}"
@@ -1277,7 +1277,7 @@ def test_custom_mirror_with_5xx_catalog_skips_direct_layout(
         _FakeResponse(503, b"backend down"),
     )
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         snap = (
             Path(cache_dir)
             / f"models--{repo_id.replace('/', '--')}"
@@ -1348,7 +1348,7 @@ def test_r2_lfs_sha256_mismatch_falls_back_to_hf(
         _FakeResponse(200, payload_corrupt),
     )
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         snap = (
             Path(cache_dir)
             / f"models--{repo_id.replace('/', '--')}"
@@ -1571,7 +1571,7 @@ def test_r2_empty_response_without_expected_size_falls_back_to_hf(
     # re-fetched from HF (not silently accepted as R2 success).
     hf_calls: list[str] = []
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         hf_calls.append(filename)
         snap = (
             Path(cache_dir)
@@ -1651,7 +1651,7 @@ def test_r2_empty_response_with_expected_size_still_falls_back_via_size_check(
 
     hf_calls: list[str] = []
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         hf_calls.append(filename)
         snap = (
             Path(cache_dir)
@@ -2488,7 +2488,7 @@ def test_snap_dir_as_symlink_is_refused(
         _FakeResponse(200, b"x" * 100),
     )
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         # HF would write to its own cache layout — for this test it
         # doesn't matter, we just need the per-file loop to complete.
         snap = (
@@ -3018,7 +3018,7 @@ def test_progress_file_count_matches_downloaded_files(
         else:
             router.add(url, _FakeResponse(404, b""))
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         snap = (
             Path(cache_dir)
             / f"models--{repo_id.replace('/', '--')}"
@@ -3166,7 +3166,7 @@ def test_bytes_heartbeat_skipped_when_total_unknown(
             _FakeResponse(404, b""),
         )
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         snap = (
             Path(cache_dir)
             / f"models--{repo_id.replace('/', '--')}"
@@ -3351,7 +3351,7 @@ def test_progress_no_double_count_on_r2_short_read_then_hf(
         _FakeResponse(200, b"x" * 400, headers={"Content-Length": "1000"}),
     )
 
-    def _fake_hf(repo_id, filename, revision, cache_dir=None):
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
         snap = (
             Path(cache_dir)
             / f"models--{repo_id.replace('/', '--')}"
@@ -3651,3 +3651,367 @@ def test_progress_tracker_flush_runs_even_when_worker_raises_unwhitelisted(
         f"The post-with flush is gated by a try/finally so the desktop "
         f"progress bar lands at 100% even on the failure path."
     )
+
+
+# ---------------------------------------------------------------------------
+# First-run cold-start UX (P1/P2): resolve-phase spinner hook + HF tqdm mute.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "filename,expected_size,want_suppress",
+    [
+        # Weight shards — always keep the intra-file bar (only progress
+        # signal if a big shard falls back to HF on a transient R2 failure).
+        ("model-00001-of-00002.safetensors", 2_000_000_000, False),
+        ("model.bin", 900_000_000, False),
+        ("weights.gguf", 3_000_000, False),  # weight suffix wins over size
+        # Confirmed-small non-weight metadata — mute the noise.
+        (".gitattributes", 1500, True),
+        ("README.md", 8000, True),
+        ("config.json", 900, True),
+        ("vocab.txt", 500_000, True),
+        # Unknown size → fail toward SHOWING the bar.
+        ("tokenizer.json", None, False),
+        (".gitattributes", None, False),
+        # Boundary: exactly at the 5 MiB keep-threshold stays visible.
+        ("tokenizer.json", _mirror._HF_BAR_KEEP_MIN_BYTES, False),
+        ("tokenizer.json", _mirror._HF_BAR_KEEP_MIN_BYTES - 1, True),
+    ],
+)
+def test_should_suppress_hf_bar(filename, expected_size, want_suppress):
+    assert _mirror._should_suppress_hf_bar(filename, expected_size) is want_suppress
+
+
+def test_silent_hf_tqdm_class_renders_nothing():
+    """The suppression class must be a disabled, no-op tqdm."""
+    Silent = _mirror._silent_hf_tqdm_class()
+    buf = io.StringIO()
+    bar = Silent(total=100, file=buf)
+    bar.update(50)
+    bar.update(50)
+    bar.close()
+    assert buf.getvalue() == ""
+    assert getattr(bar, "disable", None) is True
+
+
+def test_feature_detect_matches_real_hf_signature():
+    """The ``tqdm_class`` feature-detect must reflect the REAL installed
+    ``hf_hub_download`` signature — the whole point is to avoid passing an
+    unsupported kwarg (codex: our >=0.23.0 floor lacks it and would TypeError).
+    """
+    import inspect
+
+    from huggingface_hub import hf_hub_download
+
+    real = "tqdm_class" in inspect.signature(hf_hub_download).parameters
+    assert _mirror._hf_supports_tqdm_class() is real
+
+
+def test_silent_class_mutes_hf_real_download_bar_construction():
+    """Against the REAL installed hf, prove both (a) the per-file download bar
+    this PR mutes is a genuine leak and (b) our injected class silences it.
+
+    Exercises hf's own bar-construction function — ``_create_progress_bar``,
+    which ``hf_hub_download`` reaches via ``http_get`` →
+    ``_get_progress_bar_context`` — with the call shape hf uses, differing only
+    in ``cls``:
+
+    * hf's default tqdm            → renders a real bar (``%|`` / ``B/s``),
+    * our ``_silent_hf_tqdm_class()`` → emits nothing.
+
+    Hermetic (no network) and — unlike a "capture a real download's stderr"
+    test — not defeated by a fast sub-interval transfer or by non-TTY
+    auto-disable (both of which mask the difference). This is the direct,
+    non-mocked evidence that the injected class works with the installed hf, and
+    that ``hf_hub_download`` honors ``tqdm_class`` for its per-file bar. If hf
+    relocates these internals in a future release the test skips (the mechanism
+    is also covered by the unit-level forwarding/omit tests) rather than
+    falsely failing.
+    """
+    import logging
+
+    hf_tqdm_utils = pytest.importorskip("huggingface_hub.utils.tqdm")
+    create = getattr(hf_tqdm_utils, "_create_progress_bar", None)
+    hf_tqdm = getattr(hf_tqdm_utils, "tqdm", None)
+    if create is None or hf_tqdm is None:
+        pytest.skip("hf progress-bar internals moved; mechanism covered elsewhere")
+
+    class _FakeTTY(io.StringIO):
+        def isatty(self):  # tqdm renders only when it believes it's a terminal
+            return True
+
+    def _render(cls):
+        buf = _FakeTTY()
+        bar = create(
+            cls=cls,
+            log_level=logging.WARNING,
+            name="huggingface_hub.http_get",
+            unit="B",
+            unit_scale=True,
+            total=17_000_000,
+            initial=0,
+            desc="pytorch_model.bin",
+            file=buf,
+        )
+        for _ in range(4):
+            bar.update(4_250_000)
+            bar.refresh()
+        bar.close()
+        return buf.getvalue()
+
+    default_out = _render(hf_tqdm)
+    silent_out = _render(_mirror._silent_hf_tqdm_class())
+
+    # The leak is real: hf's default renders a per-file progress bar.
+    assert "%|" in default_out or "B/s" in default_out
+    # Our injected class suppresses it entirely.
+    assert silent_out == ""
+
+
+def test_hf_fallback_one_forwards_tqdm_class_when_supported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """On a hub that supports it, a disabled ``tqdm_class`` is forwarded iff
+    ``suppress_progress`` — and never otherwise."""
+    monkeypatch.setattr(_mirror, "_hf_supports_tqdm_class", lambda: True)
+    captured: dict[str, object] = {}
+
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
+        # ``**kwargs`` so we can detect whether ``tqdm_class`` was actually
+        # forwarded (vs a defaulted None that would hide the distinction).
+        captured["kwargs"] = kwargs
+        target = Path(cache_dir) / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x")
+        return str(target)
+
+    with patch("huggingface_hub.hf_hub_download", side_effect=_fake_hf):
+        _mirror._hf_fallback_one(
+            "owner/repo", "README.md", "rev", cache_dir=tmp_path, suppress_progress=True
+        )
+    assert captured["kwargs"].get("tqdm_class") is not None  # disabled class passed
+
+    with patch("huggingface_hub.hf_hub_download", side_effect=_fake_hf):
+        _mirror._hf_fallback_one(
+            "owner/repo",
+            "model.safetensors",
+            "rev",
+            cache_dir=tmp_path,
+            suppress_progress=False,
+        )
+    assert "tqdm_class" not in captured["kwargs"]  # kwarg omitted (bar shown)
+
+
+def test_hf_fallback_one_omits_tqdm_class_on_old_hub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Regression for codex round 2: on the >=0.23.0 floor, ``hf_hub_download``
+    has NO ``tqdm_class`` param — passing it would raise ``TypeError``. The
+    fake here deliberately does NOT accept ``tqdm_class`` (mirroring the real
+    old-hub signature), so if the kwarg were forwarded this test would raise.
+    """
+    monkeypatch.setattr(_mirror, "_hf_supports_tqdm_class", lambda: False)
+
+    def _fake_hf_old(repo_id, filename, revision, cache_dir=None):
+        target = Path(cache_dir) / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x")
+        return str(target)
+
+    with patch("huggingface_hub.hf_hub_download", side_effect=_fake_hf_old):
+        ok, path = _mirror._hf_fallback_one(
+            "owner/repo", "README.md", "rev", cache_dir=tmp_path, suppress_progress=True
+        )
+    assert ok is True  # would have TypeError'd if tqdm_class were forwarded
+    assert path is not None
+
+
+def _mirrored_pull_setup(tmp_path, monkeypatch, files, r2_status_per_file):
+    """Wire a fully-mirrored pull; return (repo_id, revision, router, ctx).
+
+    ``ctx`` is a list of patch context managers the caller enters.
+    """
+    repo_id = "mlx-community/Qwen3-0.6B-4bit"
+    revision = "abcd1234" * 5
+    catalog = _catalog_payload([("qwen3-0.6b-4bit", repo_id, "mirrored")])
+    router = _UrlRouter()
+    router.add(
+        "https://models.rapidmlx.com/api/models",
+        _FakeResponse(200, json.dumps(catalog).encode()),
+    )
+    for (fname, size), status in zip(files, r2_status_per_file, strict=True):
+        url = f"https://models.rapidmlx.com/mlx-community/Qwen3-0.6B-4bit/{fname}"
+        router.add(
+            url,
+            _FakeResponse(200, b"x" * size)
+            if status == 200
+            else _FakeResponse(404, b""),
+        )
+    monkeypatch.setenv("RAPID_MLX_MODEL_MIRROR", "https://models.rapidmlx.com")
+    return repo_id, revision, router
+
+
+def test_on_pull_start_fires_once_before_first_pulling_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The resolve-phase hook must fire exactly once, and strictly BEFORE the
+    first ``Pulling`` line — otherwise the CLI spinner would collide with the
+    download output it is meant to precede.
+    """
+    files = [("config.json", 100), ("model.safetensors", 200)]
+    repo_id, revision, router = _mirrored_pull_setup(
+        tmp_path, monkeypatch, files, [200, 200]
+    )
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        _mirror, "_print_dim", lambda msg: events.append(f"print:{msg}")
+    )
+
+    with (
+        patch("urllib.request.urlopen", side_effect=router),
+        patch(
+            "huggingface_hub.model_info",
+            return_value=_mk_model_info(revision, files),
+        ),
+    ):
+        ok = _mirror.download_with_mirror_fallback(
+            repo_id,
+            cache_dir=tmp_path,
+            on_pull_start=lambda: events.append("resolve_done"),
+        )
+
+    assert ok
+    assert events.count("resolve_done") == 1, "hook must fire exactly once"
+    hook_idx = events.index("resolve_done")
+    pulling_idxs = [i for i, e in enumerate(events) if "Pulling" in e]
+    assert pulling_idxs, "expected a Pulling line"
+    assert hook_idx < pulling_idxs[0], "hook must fire before the first Pulling line"
+
+
+def test_on_pull_start_not_fired_when_mirror_skipped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """When the catalog says the alias is NOT mirrored, the mirror returns
+    False (caller falls back to ``snapshot_download``) and must NOT fire the
+    hook — the CLI keeps its spinner up for the snapshot banner instead.
+    """
+    repo_id = "mlx-community/Gemma-4-31B-4bit"
+    revision = "beef" * 10
+    files = [("config.json", 100)]
+    catalog = _catalog_payload([("gemma-4-31b-4bit", repo_id, "not yet mirrored")])
+    router = _UrlRouter()
+    router.add(
+        "https://models.rapidmlx.com/api/models",
+        _FakeResponse(200, json.dumps(catalog).encode()),
+    )
+    monkeypatch.setenv("RAPID_MLX_MODEL_MIRROR", "https://models.rapidmlx.com")
+
+    fired: list[str] = []
+    with (
+        patch("urllib.request.urlopen", side_effect=router),
+        patch(
+            "huggingface_hub.model_info",
+            return_value=_mk_model_info(revision, files),
+        ),
+    ):
+        ok = _mirror.download_with_mirror_fallback(
+            repo_id,
+            cache_dir=tmp_path,
+            on_pull_start=lambda: fired.append("x"),
+        )
+
+    assert ok is False
+    assert fired == [], "hook must not fire on the return-False fall-through"
+
+
+def test_on_pull_start_exception_does_not_abort_pull(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A misbehaving hook must never break a good pull."""
+    files = [("config.json", 100)]
+    repo_id, revision, router = _mirrored_pull_setup(
+        tmp_path, monkeypatch, files, [200]
+    )
+
+    def _boom():
+        raise RuntimeError("spinner blew up")
+
+    with (
+        patch("urllib.request.urlopen", side_effect=router),
+        patch(
+            "huggingface_hub.model_info",
+            return_value=_mk_model_info(revision, files),
+        ),
+    ):
+        ok = _mirror.download_with_mirror_fallback(
+            repo_id, cache_dir=tmp_path, on_pull_start=_boom
+        )
+    assert ok
+
+
+def test_metadata_hf_fallback_mutes_bar_but_weight_keeps_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """End-to-end: on a mixed R2-miss pull, the pipeline asks to MUTE hf's
+    per-file bar for a small metadata file and to KEEP it for a weight shard.
+
+    We spy on ``_hf_fallback_one`` and assert the ``suppress_progress`` flag it
+    receives per file — i.e. the real ``_should_suppress_hf_bar`` discrimination
+    flowing through ``download_with_mirror_fallback``. This is the behavior this
+    PR introduces, and testing it here is honest and hermetic:
+
+    * It does NOT mock ``_hf_supports_tqdm_class`` (no forced feature support).
+    * It does NOT depend on the installed hub version, nor on introspecting a
+      mocked ``hf_hub_download`` (whose ``patch`` MagicMock has a generic
+      ``(*args, **kwargs)`` signature — feature-detection can't see through it).
+    * It does NOT assert "no stderr output": hf's tqdm auto-disables on a
+      non-TTY stream, so that would be trivially green even on broken code.
+
+    Whether the muted flag actually forwards a disabled ``tqdm_class`` to hf,
+    and whether the real ``hf_hub_download`` honors it, are covered separately
+    by ``test_hf_fallback_one_forwards_tqdm_class_when_supported`` /
+    ``test_feature_detect_matches_real_hf_signature`` (and hf's own contract).
+    """
+    files = [(".gitattributes", 1500), ("model.safetensors", 4000)]
+    # Both files miss R2 (404) → both fall back to HF.
+    repo_id, revision, router = _mirrored_pull_setup(
+        tmp_path, monkeypatch, files, [404, 404]
+    )
+
+    suppress_seen: dict[str, bool] = {}
+
+    def _spy_fallback(
+        repo_id, filename, revision, cache_dir=None, suppress_progress=False
+    ):
+        suppress_seen[filename] = suppress_progress
+        snap = (
+            Path(cache_dir)
+            / f"models--{repo_id.replace('/', '--')}"
+            / "snapshots"
+            / revision
+        )
+        snap.mkdir(parents=True, exist_ok=True)
+        size = next(s for n, s in files if n == filename)
+        target = snap / filename
+        target.write_bytes(b"h" * size)
+        return True, str(target)
+
+    with (
+        patch("urllib.request.urlopen", side_effect=router),
+        patch(
+            "huggingface_hub.model_info",
+            return_value=_mk_model_info(revision, files),
+        ),
+        patch.object(_mirror, "_hf_fallback_one", side_effect=_spy_fallback),
+    ):
+        ok = _mirror.download_with_mirror_fallback(repo_id, cache_dir=tmp_path)
+
+    assert ok
+    assert suppress_seen[".gitattributes"] is True  # metadata → bar muted
+    assert suppress_seen["model.safetensors"] is False  # weight → bar kept

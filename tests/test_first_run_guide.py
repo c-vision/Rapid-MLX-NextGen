@@ -369,20 +369,39 @@ def _run_main_gate_probe(
 
 def test_autoselected_starter_uses_standard_download_gate():
     # Regression guard: the auto-selected starter must NOT special-case the
-    # download gate. (An earlier revision set an `_auto_selected_model` flag
-    # from a fail-silent pre-scan and bypassed the gate entirely — codex
-    # flagged that the unreliable pre-scan could then wave through an
-    # unconfirmed download.) With the gate armed (is_repo_cached=False,
-    # interactive), an uncached auto-selected starter reaches confirm_or_abort
-    # exactly like an explicit model does. The "small model → no prompt"
-    # decision belongs to confirm_or_abort's own 10 GiB threshold (covered in
-    # test_download_gate), NOT to a bypass here — the ~3.1 GB starter is far
-    # under that threshold, so the gate stays silent for it on its own.
+    # download gate. The starter is an unpinned Hugging Face repo whose
+    # declared size we must actually verify — never assume — before waiving
+    # confirmation, so it flows through ``estimate_repo_size_bytes`` +
+    # ``confirm_or_abort`` exactly like an explicit model. (The "small model →
+    # no prompt" decision belongs to confirm_or_abort's own 10 GiB threshold,
+    # covered in test_download_gate — the ~3.1 GB starter is under it, so the
+    # gate stays silent for it on its own, but the size is still checked.)
+    # The redundant round-trip's *latency* is what we hide — behind a
+    # "Resolving…" spinner, NOT by skipping the check.
     confirm, dispatched = _run_main_gate_probe(
         ["chat"], auto_select_alias="qwen3.5-4b-4bit"
     )
     assert confirm.called is True  # gate NOT bypassed
     assert dispatched is True  # and the run still reaches dispatch
+
+
+def test_autoselected_starter_still_runs_disk_gate_in_prefetch(monkeypatch):
+    # Belt-and-braces: the download-prep path always runs the DISK-SPACE gate
+    # before pulling. ``_ensure_model_downloaded`` calls ``_check_disk_space``
+    # (under the spinner) so a full disk still aborts cleanly regardless of the
+    # confirm gate above.
+    called = {"disk": False}
+
+    def _fake_disk(model_name, force=False):
+        called["disk"] = True
+
+    # An HF-style repo id is not a local path, so the early ``os.path.exists``
+    # return is naturally skipped — no need to patch os.
+    monkeypatch.setattr(cli, "_check_disk_space", _fake_disk)
+    monkeypatch.setattr(cli, "_try_mirror_prefetch", lambda *a, **k: True)
+    monkeypatch.setattr("vllm_mlx._download_gate.is_repo_cached", lambda *a, **k: False)
+    cli._ensure_model_downloaded("mlx-community/Qwen3.5-4B-MLX-4bit")
+    assert called["disk"] is True
 
 
 def test_explicit_uncached_model_still_confirms():
