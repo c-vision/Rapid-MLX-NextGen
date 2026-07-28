@@ -34,6 +34,23 @@ import pytest
 from vllm_mlx.request import Request, SamplingParams
 from vllm_mlx.scheduler import BackpressureError, Scheduler, SchedulerConfig
 
+# Rotating-cache capacity granularity — mirrors kv_estimation's
+# ``_ROTATING_CACHE_STEP`` / ``_ROTATING_CACHE_KEEP`` (mlx_lm's
+# ``RotatingKVCache.step = 256``; ``KEEP = 4`` is the largest keep any shipped
+# construction uses). A sliding layer's per-request slot count is
+# ``ceil((min(T, window) + keep) / step) * step`` — sublinear in the token
+# budget, capped at the full window.
+_STEP = 256
+_KEEP = 4
+
+
+def _slots(window: int, tokens: int) -> int:
+    """Reference re-implementation of ``kv_estimation.rotating_cache_slots``."""
+    if window <= 0 or tokens <= 0:
+        return 0
+    effective = min(tokens, window) + _KEEP
+    return ((effective + _STEP - 1) // _STEP) * _STEP
+
 
 def _make_request(rid: str = "req-1", tokens: int = 16) -> Request:
     """Tiny synthetic request — only ``request_id`` and
@@ -806,3 +823,431 @@ class TestMetricsRoute:
         assert "# TYPE rapid_mlx_metal_cap_violations_total counter" in body, (
             "metric type must be 'counter' for monotonic rate() to work"
         )
+
+
+class TestArchitectureAwareKVEstimate:
+    """Wire-through of the architecture-aware KV estimator into the D-METAL-CAP
+    admission path (``_resolve_kv_bytes_per_token`` /
+    ``_estimate_request_kv_bytes``). The uniform-fallback and operator-override
+    contracts must stay byte-identical (covered by the classes above); these
+    add the hybrid-reduction cases.
+
+    Uses ``SimpleNamespace`` for ``model.config`` so unset fields resolve to
+    ``None`` (a ``MagicMock`` auto-creates every attribute, which would falsely
+    look like a hybrid layer structure).
+    """
+
+    def _sched(self, config_obj, *, kv_bytes_override: int = 0):
+        config = SchedulerConfig(
+            max_num_seqs=8,
+            max_concurrent_requests=64,
+            enable_prefix_cache=False,
+            use_memory_aware_cache=False,
+            use_paged_cache=False,
+            gpu_memory_utilization=0.5,
+            metal_cap_kv_bytes_per_token=kv_bytes_override,
+        )
+        model = MagicMock()
+        model.config = config_obj
+        return Scheduler(model=model, tokenizer=MagicMock(), config=config)
+
+    def test_dense_config_stays_uniform_with_zero_baseline(self):
+        # No layer_types / sliding / sharing → byte-identical uniform, no
+        # fixed baseline.
+        cfg = SimpleNamespace(
+            num_hidden_layers=32,
+            num_key_value_heads=8,
+            head_dim=128,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        assert sched._resolve_kv_bytes_per_token() == 2 * 32 * 8 * 128 * 2
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+
+    def test_gpt_oss_hybrid_reduces_per_token_and_exposes_slot_term(self):
+        # ~50% sliding-window layers → unbounded per-token growth halved vs
+        # uniform, and the sliding layers are exposed as a request-dependent slot
+        # term (per-slot bytes + shared window), NOT a fixed baseline (codex round
+        # 11 BLOCKING #1: a flat whole-window baseline over-counts short requests).
+        n, kv, hd, window = 24, 8, 64, 128
+        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            sliding_window=window,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        uniform = 2 * n * kv * hd * 2
+        assert sched._resolve_kv_bytes_per_token() == uniform // 2
+        # Sliding footprint is request-dependent → not in the fixed baseline.
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+        assert sched._kv_sliding_slot_bytes == 2 * (n // 2) * kv * hd * 2
+        assert sched._kv_sliding_window == window
+
+    def test_gemma4_sharing_reduces_per_token(self):
+        n, n_shared, kv, hd = 35, 20, 1, 128
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=["full_attention"] * n,
+            num_kv_shared_layers=n_shared,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        assert sched._resolve_kv_bytes_per_token() == 2 * (n - n_shared) * kv * hd * 2
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+
+    def test_multimodal_nested_text_config_engages_reduction(self):
+        # A multimodal config nests the text-tower dims under ``text_config`` and
+        # the OUTER config carries a DECOY ``num_hidden_layers`` (the vision-tower
+        # count) that differs from the nested text layer count. The scheduler must
+        # resolve the base dims from the config whose OWN layer_types is valid —
+        # the nested text config, NOT the decoy outer count — so the hybrid
+        # reduction engages end-to-end and the uniform base is not read off the
+        # wrong tower (codex round 8 + round 9 BLOCKING #1).
+        n, kv, hd, window = 24, 8, 64, 128
+        vision_layers = 27  # decoy != n
+        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
+        cfg = SimpleNamespace(
+            # DECOY: the outer config exposes the vision-tower layer count with
+            # NO valid text layer_types of its own.
+            num_hidden_layers=vision_layers,
+            vision_config=SimpleNamespace(num_hidden_layers=vision_layers),
+            text_config=SimpleNamespace(
+                num_hidden_layers=n,
+                num_key_value_heads=kv,
+                head_dim=hd,
+                layer_types=layer_types,
+                sliding_window=window,
+            ),
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        uniform = 2 * n * kv * hd * 2  # text dims (n=24), NOT the decoy 27
+        # Reduction engaged off the nested text dims: growth halved, sliding
+        # exposed as the request-dependent slot term.
+        assert sched._resolve_kv_bytes_per_token() == uniform // 2
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+        assert sched._kv_sliding_slot_bytes == 2 * (n // 2) * kv * hd * 2
+        assert sched._kv_sliding_window == window
+
+    def test_nested_config_without_layer_types_stays_byte_identical(self):
+        # BYTE-IDENTICAL guard: a multimodal config whose text_config carries NO
+        # valid layer_types (a non-hybrid nested model) must NOT adopt the nested
+        # dims — the outer config has no num_hidden_layers, so admission
+        # accounting stays exactly as before (0, no phantom estimate). Only a
+        # genuine nested hybrid (valid layer_types) flips to the nested dims.
+        cfg = SimpleNamespace(
+            vision_config=SimpleNamespace(num_hidden_layers=27),
+            text_config=SimpleNamespace(
+                num_hidden_layers=32,
+                num_key_value_heads=8,
+                head_dim=128,
+                # no layer_types → not a recognized nested hybrid
+            ),
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        assert sched._resolve_kv_bytes_per_token() == 0
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+
+    def test_operator_override_wins_and_zeroes_baseline(self):
+        # Explicit knob short-circuits the estimator; no baseline is charged.
+        cfg = SimpleNamespace(
+            num_hidden_layers=24,
+            num_key_value_heads=8,
+            head_dim=64,
+            layer_types=["sliding_attention", "full_attention"] * 12,
+            sliding_window=128,
+        )
+        sched = self._sched(cfg, kv_bytes_override=42)
+        assert sched._resolve_kv_bytes_per_token() == 42
+        # The override short-circuits ALL architecture-aware refinement — no
+        # baseline and no sliding term.
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+        assert sched._kv_sliding_slot_bytes == 0
+        assert sched._kv_sliding_window == 0
+
+    def test_estimator_failure_preserves_uniform_estimate(self):
+        # If the architecture-aware estimator raises, the scheduler must keep
+        # the already-computed uniform per-token value (zero baseline), NOT
+        # reset admission accounting to 0 (codex round 3 BLOCKING #3).
+        cfg = SimpleNamespace(
+            num_hidden_layers=32,
+            num_key_value_heads=8,
+            head_dim=128,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        with patch(
+            "vllm_mlx.scheduler.estimate_kv_footprint",
+            side_effect=RuntimeError("boom"),
+        ):
+            per_tok = sched._resolve_kv_bytes_per_token()
+        assert per_tok == 2 * 32 * 8 * 128 * 2  # uniform, not 0
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+
+    def test_magicmock_config_yields_zero_and_no_baseline(self):
+        # Bare MagicMock model — int(MagicMock()) path must still yield 0 with
+        # no phantom baseline (back-compat for the stub-model unit tests).
+        config = SchedulerConfig(
+            max_num_seqs=8,
+            max_concurrent_requests=64,
+            enable_prefix_cache=False,
+            use_memory_aware_cache=False,
+            use_paged_cache=False,
+            gpu_memory_utilization=0.5,
+            metal_cap_kv_bytes_per_token=0,
+        )
+        sched = Scheduler(model=MagicMock(), tokenizer=MagicMock(), config=config)
+        assert sched._resolve_kv_bytes_per_token() == 0
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+
+    def test_estimate_request_charges_recurrent_baseline_plus_growth(self):
+        # A GatedDeltaNet hybrid: the recurrent state is a real per-sequence
+        # fixed baseline (token-independent), charged once on top of the
+        # full-attention layers' per-token growth.
+        n, kv, hd = 16, 8, 64
+        layer_types = ["linear_attention"] * (n - 4) + ["full_attention"] * 4
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            linear_num_value_heads=32,
+            linear_num_key_heads=16,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        req = _make_request(tokens=100)
+        req.sampling_params = SamplingParams(max_tokens=50)
+        growth = sched._resolve_kv_bytes_per_token()
+        baseline = sched._resolve_kv_fixed_baseline_bytes()
+        assert baseline > 0  # recurrent state reserved
+        assert sched._estimate_request_kv_bytes(req) == baseline + growth * (100 + 50)
+
+    def test_estimate_request_charges_per_request_sliding_term(self):
+        # A GPT-OSS-style hybrid: the request projection is
+        # ``growth * T + slot_bytes * rotating_cache_slots(window, T)`` — the
+        # sliding term GROWS with the token budget up to the full window (codex
+        # round 11 BLOCKING #1), not a flat whole-window baseline. It is charged
+        # identically regardless of prompt/decode split for the same token total.
+        n, kv, hd, window = 24, 8, 64, 128
+        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            sliding_window=window,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        growth = sched._resolve_kv_bytes_per_token()
+        slot_bytes = sched._kv_sliding_slot_bytes
+        assert slot_bytes == 2 * (n // 2) * kv * hd * 2
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+        per_layer = 2 * kv * hd * 2
+        n_full = n // 2
+        n_sliding = n // 2
+
+        for prompt, budget in ((40, 20), (16, 8_000), (8_000, 50)):
+            req = _make_request(tokens=prompt)
+            req.sampling_params = SamplingParams(max_tokens=budget)
+            tokens = prompt + budget
+            projected = sched._estimate_request_kv_bytes(req)
+            assert projected == growth * tokens + slot_bytes * _slots(window, tokens)
+            # Never under-counts the true footprint of the counted layers: full
+            # layers grow exactly per token; the sliding slot count is >= the
+            # sliding layers' min(tokens, window) peak.
+            true_footprint = (
+                n_full * tokens * per_layer
+                + n_sliding * min(tokens, window) * per_layer
+            )
+            assert projected >= true_footprint
+
+    def test_short_request_not_over_charged_full_window(self):
+        # The codex round 11 win end-to-end: a SHORT request (T=1) against a big
+        # window is charged only ONE step block for the sliding layers, far below
+        # a whole-window baseline — so the D-METAL-CAP gate stops spuriously
+        # rejecting short requests a flat baseline would have rejected.
+        n, kv, hd, window = 8, 4, 64, 4096
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=["sliding_attention"] * n,
+            sliding_window=window,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        assert sched._resolve_kv_bytes_per_token() == 0  # all sliding, no growth
+        slot_bytes = sched._kv_sliding_slot_bytes
+        req = _make_request(tokens=1)
+        req.sampling_params = SamplingParams(max_tokens=0)
+        short = sched._estimate_request_kv_bytes(req)
+        assert short == slot_bytes * 256  # one step block, NOT the whole window
+        assert short < slot_bytes * _slots(window, window)  # << full-window charge
+
+    def test_dict_config_behaves_identically_to_attribute_config(self):
+        # Finding 3 (codex round 11 NIT): ``estimate_kv_footprint`` supports dict
+        # configs, so the scheduler wiring (struct selection, base-dim reads, AND
+        # dtype inference) must resolve dict-backed configs IDENTICALLY to
+        # attribute configs — bare ``getattr`` on a dict returns ``None`` for
+        # every field and would collapse the estimate to 0 (or fall to the fp32
+        # dtype default).
+        n, kv, hd, window = 24, 8, 64, 128
+        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
+        fields = dict(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            sliding_window=window,
+            dtype="bfloat16",
+        )
+        attr_sched = self._sched(SimpleNamespace(**fields))
+        dict_sched = self._sched(dict(fields))
+        assert (
+            dict_sched._resolve_kv_bytes_per_token()
+            == attr_sched._resolve_kv_bytes_per_token()
+        )
+        assert dict_sched._kv_sliding_slot_bytes == attr_sched._kv_sliding_slot_bytes
+        assert dict_sched._kv_sliding_window == attr_sched._kv_sliding_window
+        assert (
+            dict_sched._resolve_kv_fixed_baseline_bytes()
+            == attr_sched._resolve_kv_fixed_baseline_bytes()
+        )
+        # Identical per-request projection too (dtype resolved to bf16, not fp32).
+        req = _make_request(tokens=100)
+        req.sampling_params = SamplingParams(max_tokens=200)
+        assert dict_sched._estimate_request_kv_bytes(
+            req
+        ) == attr_sched._estimate_request_kv_bytes(req)
+
+    def test_orphan_borrower_charged_not_zeroed_end_to_end(self):
+        # Finding 2 (codex round 11 BLOCKING #2) through the scheduler: a config
+        # whose LAST-N borrowers include one whose attention type has no producer
+        # below the split — the exact per-index map (mirrored from
+        # ``models/gemma4_vendored/language.py``) zeroes the mappable borrower and
+        # charges the orphan its own footprint. Producers [full, full]; borrowers
+        # [full (maps → zeroed), sliding (orphan → charged as a slot term)].
+        n, kv, hd, window = 4, 8, 64, 128
+        layer_types = [
+            "full_attention",
+            "full_attention",
+            "full_attention",  # borrower idx2 → maps to a full producer → zeroed
+            "sliding_attention",  # borrower idx3 → orphan → charged
+        ]
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            num_kv_shared_layers=2,
+            sliding_window=window,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        # idx0, idx1 full grow per token; idx2 zeroed; idx3 orphan sliding charged.
+        assert sched._resolve_kv_bytes_per_token() == 2 * 2 * kv * hd * 2
+        assert sched._kv_sliding_slot_bytes == 2 * 1 * kv * hd * 2
+        assert sched._kv_sliding_window == window
+
+    def test_hybrid_admitted_where_uniform_would_reject(self):
+        # The headline win: a GPT-OSS-style hybrid whose uniform per-token
+        # over-count would trip the projection gate is ADMITTED once the
+        # sliding layers are excluded from per-token growth (their whole window
+        # is a bounded per-sequence baseline, dwarfed by the halved growth over a
+        # long generation).
+        #
+        # This test carries its OWN negative control (uniform scheduler, SAME cap,
+        # SAME request → REJECTED) so it proves the admission gate genuinely
+        # consumes the projected KV bytes — not merely that the hybrid helper
+        # returns a smaller number. Without the negative control the positive
+        # "does not raise" assertion would still pass even if
+        # ``_enforce_metal_cap_at_admission`` stopped applying the projection
+        # entirely (codex round 10 test-strength BLOCKING).
+        n, kv, hd, window = 24, 8, 64, 128
+        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            sliding_window=window,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        req = _make_request(tokens=16)
+        req.sampling_params = SamplingParams(max_tokens=8_000)
+        tokens = 16 + 8_000
+        uniform_per_tok = 2 * n * kv * hd * 2
+        arch_projected = sched._estimate_request_kv_bytes(req)
+        uniform_projected = uniform_per_tok * tokens
+        # Arch-aware projection is strictly smaller than the uniform one for a
+        # large token budget: the full layers grow at half the uniform rate and
+        # the sliding layers contribute a bounded per-request slot term (capped at
+        # the full window) instead of unbounded per-token growth.
+        assert arch_projected < uniform_projected
+        # Pick a cap that sits STRICTLY BETWEEN the two projections, so the SAME
+        # cap admits the hybrid and rejects the uniform over-count. Concrete
+        # numbers for this config (dtype=bf16, n=24, kv=8, hd=64, window=128,
+        # 16+8000 tokens): uniform_per_tok = 49_152 B; arch per_tok = 24_576 B
+        # (half) + a 6_291_456 B sliding baseline. So arch_projected ≈ 203.3 MB,
+        # uniform_projected ≈ 394.0 MB, and the cap delta above ``active`` is
+        # their midpoint ≈ 298.6 MB — comfortably above arch, comfortably below
+        # uniform.
+        active = 1_000_000_000
+        cap = active + (arch_projected + uniform_projected) // 2
+        assert active + arch_projected < cap  # hybrid fits under the cap
+        assert active + uniform_projected > cap  # uniform over-count exceeds it
+
+        # POSITIVE: the architecture-aware hybrid scheduler ADMITS the request at
+        # this cap (does not raise), because its reduced projection fits.
+        with (
+            patch.object(sched, "_resolve_metal_cap_bytes", return_value=cap),
+            patch.object(sched, "_current_metal_active_bytes", return_value=active),
+        ):
+            sched._enforce_metal_cap_at_admission(req)  # must NOT raise
+        assert sched.num_metal_cap_violations == 0
+
+        # NEGATIVE CONTROL: a scheduler on the SAME base dims (same num layers /
+        # kv heads / head_dim) but a DENSE config (no ``layer_types`` / no
+        # ``sliding_window``) forces the UNIFORM estimate — no hybrid reduction,
+        # zero baseline — so its projection for the SAME request is exactly
+        # ``uniform_projected``. At the SAME cap that admitted the hybrid, this
+        # uniform scheduler MUST raise ``BackpressureError``. The pair
+        # (uniform → rejected, hybrid → admitted, same cap, same request) is the
+        # real proof that the reduced estimate is what flips admission and that
+        # the gate is actually applying the projected KV bytes.
+        dense_cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            dtype="bfloat16",  # NO layer_types / sliding_window → uniform, base 0
+        )
+        dense_sched = self._sched(dense_cfg)
+        dense_req = _make_request(tokens=16)
+        dense_req.sampling_params = SamplingParams(max_tokens=8_000)
+        # The dense scheduler really is on the uniform estimate with no baseline,
+        # so its projection is precisely the uniform over-count that exceeds cap.
+        assert dense_sched._resolve_kv_bytes_per_token() == uniform_per_tok
+        assert dense_sched._resolve_kv_fixed_baseline_bytes() == 0
+        assert dense_sched._estimate_request_kv_bytes(dense_req) == uniform_projected
+        with (
+            patch.object(dense_sched, "_resolve_metal_cap_bytes", return_value=cap),
+            patch.object(
+                dense_sched, "_current_metal_active_bytes", return_value=active
+            ),
+            pytest.raises(BackpressureError, match="D-METAL-CAP"),
+        ):
+            dense_sched._enforce_metal_cap_at_admission(dense_req)
+        assert dense_sched.num_metal_cap_violations == 1
