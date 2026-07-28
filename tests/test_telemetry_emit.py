@@ -237,8 +237,13 @@ def test_runtime_payload_carries_every_schema_v1_field(opted_in, stub_queue):
     assert not missing, f"session_end dropped v1 keys: {missing}"
 
 
-def test_session_start_envelope_when_enabled(opted_in, stub_queue):
+def test_session_start_envelope_when_enabled(opted_in, stub_queue, monkeypatch):
     from vllm_mlx.telemetry import emit
+
+    # A random top-level UUID once contained "8000" and false-failed the
+    # flag-value leak check. Pin that case so reverting the scoped check
+    # below to the whole payload fails deterministically.
+    monkeypatch.setattr(emit, "session_id", lambda: "dead-beef-8000-cafe")
 
     # Round 19 codex catch: callers now pre-extract flag names BEFORE
     # crossing into telemetry, so the helper never sees raw argv (with
@@ -264,7 +269,15 @@ def test_session_start_envelope_when_enabled(opted_in, stub_queue):
     # And the helper signature literally CANNOT carry a value -- the
     # type checker would warn on ``flag_names=["0.0.0.0"]``, but pin
     # the runtime shape: only names.
-    blob = repr(payload)
+    #
+    # Check the SESSION sub-dict, not the whole payload: a leaked flag
+    # value could only reach the envelope through ``session`` (that's the
+    # only part built from the call args). The top-level ``session_id`` is
+    # a random ``uuid4()`` whose hex can coincidentally contain a port-like
+    # substring (e.g. ``...-8000a44317a1``), so scanning ``repr(payload)``
+    # was flaky (~1/2000 runs false-failed on "8000").
+    assert "8000" in repr(payload)
+    blob = repr(payload["session"])
     assert "0.0.0.0" not in blob
     assert "8000" not in blob
 
