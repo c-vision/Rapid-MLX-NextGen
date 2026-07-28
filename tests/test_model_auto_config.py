@@ -913,10 +913,27 @@ class TestVisibility:
         assert "throttle ON" in line
         assert "spec decode OFF" in line
 
+    def test_summary_shows_explicit_runtime_spec_decode(self):
+        cfg = detect_model_config("mlx-community/Qwen3.5-35B-A3B-4bit")
+        line = format_profile_summary(
+            "mlx-community/Qwen3.5-35B-A3B-4bit",
+            cfg,
+            runtime_spec_decode="mtp",
+        )
+        assert "spec decode MTP (explicit)" in line
+        assert "spec decode OFF" not in line
+
     def test_summary_for_unknown(self):
         line = format_profile_summary("brand-new-model", None)
         assert "unknown family" in line
         assert "brand-new-model" in line
+
+    def test_unknown_summary_shows_explicit_runtime_spec_decode(self):
+        line = format_profile_summary(
+            "brand-new-model", None, runtime_spec_decode="mtp"
+        )
+        assert "unknown family" in line
+        assert "spec decode MTP (explicit)" in line
 
     # --- Level 2 / Level 3: ASCII table ---
 
