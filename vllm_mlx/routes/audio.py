@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Audio endpoints (STT/TTS)."""
 
+import base64
+import binascii
 import logging
 import os
 import re
@@ -1330,6 +1332,29 @@ _TTS_CONTENT_TYPES: dict[str, str] = {
     "pcm": "audio/pcm",
 }
 
+_MAX_TTS_REF_AUDIO_BYTES = 10 * 1024 * 1024
+
+
+def _decode_tts_ref_audio(value: str) -> bytes:
+    """Decode a base64 F5 reference clip with a bounded payload size."""
+    encoded = value
+    if value.startswith("data:"):
+        try:
+            header, encoded = value.split(",", 1)
+        except ValueError as exc:
+            raise ValueError("ref_audio data URL is malformed") from exc
+        if ";base64" not in header:
+            raise ValueError("ref_audio data URL must use base64 encoding")
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("ref_audio must be valid base64-encoded audio") from exc
+    if not decoded:
+        raise ValueError("ref_audio must not be empty")
+    if len(decoded) > _MAX_TTS_REF_AUDIO_BYTES:
+        raise ValueError("ref_audio exceeds the 10 MB decoded size limit")
+    return decoded
+
 
 def _resolve_tts_model(model: str | None) -> str:
     """Map a TTS request-time alias to its HF repo id.
@@ -1472,6 +1497,12 @@ def _allowed_voices_for(model_name: str) -> list[str]:
         # registry ``default_voice`` (``Serena``) is a member of this
         # list so the cold-start / voice-omitted path validates.
         return list(QWEN3_TTS_VOICES)
+    if "f5-tts" in name_lower or "f5_tts" in name_lower:
+        # F5 conditions on a reference waveform rather than a named
+        # safetensors voice. ``clone`` is the registry's UI/API sentinel;
+        # when no custom reference is supplied the engine uses its packaged
+        # reference voice.
+        return ["clone"]
     if "vibevoice" in name_lower:
         # Cold-start fallback for VibeVoice — the canonical English
         # default is ``en-Grace_woman`` (per the upstream repo's
@@ -1548,6 +1579,8 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
     speed = request.speed
     response_format = request.response_format
     instructions = request.instructions
+    ref_audio = request.ref_audio
+    ref_text = request.ref_text
 
     try:
         from ..audio.tts import TTSEngine, UnsupportedAudioFormatError
@@ -1558,6 +1591,20 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
         # the future land in :data:`TTS_MODEL_ALIASES` once, not in the
         # handler body.
         model_name = _resolve_tts_model(model)
+        if ref_audio is not None and not (
+            "f5-tts" in model_name.lower() or "f5_tts" in model_name.lower()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": "ref_audio/ref_text voice cloning requires F5-TTS.",
+                        "type": "invalid_request_error",
+                        "code": "unsupported_voice_cloning",
+                        "param": "model",
+                    }
+                },
+            )
 
         # Qwen3-TTS ships two shapes: CustomVoice (predefined speakers,
         # reference-free — what we alias and support) and Base (voice-
@@ -1682,7 +1729,31 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
         gen_kwargs = {"voice": voice, "speed": speed}
         if instructions:
             gen_kwargs["instruct"] = instructions
-        audio = _tts_engine.generate(input_text, **gen_kwargs)
+        if ref_audio is not None:
+            try:
+                ref_bytes = _decode_tts_ref_audio(ref_audio)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": str(exc),
+                            "type": "invalid_request_error",
+                            "code": "invalid_ref_audio",
+                            "param": "ref_audio",
+                        }
+                    },
+                ) from exc
+            from .._tempfile_safe import managed_tempfile_path
+
+            with managed_tempfile_path(prefix="f5-ref-", suffix=".wav") as ref_path:
+                with open(ref_path, "wb") as ref_file:
+                    ref_file.write(ref_bytes)
+                gen_kwargs["ref_audio"] = ref_path.path
+                gen_kwargs["ref_text"] = ref_text
+                audio = _tts_engine.generate(input_text, **gen_kwargs)
+        else:
+            audio = _tts_engine.generate(input_text, **gen_kwargs)
         try:
             audio_bytes = _tts_engine.to_bytes(audio, format=response_format)
         except UnsupportedAudioFormatError as e:

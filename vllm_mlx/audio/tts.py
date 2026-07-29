@@ -255,12 +255,26 @@ class TTSEngine:
             return "cosyvoice"
         elif "qwen3-tts" in name_lower or "qwen3_tts" in name_lower:
             return "qwen3_tts"
+        elif "f5-tts" in name_lower or "f5_tts" in name_lower:
+            return "f5"
         else:
             return "kokoro"  # Default
 
     def load(self) -> None:
         """Load the TTS model."""
         if self._loaded:
+            return
+
+        # F5-TTS is a standalone pure-MLX package (not mlx_audio's load_model
+        # path): EN+ZH multilingual, zero-shot voice cloning, no torch. It fills
+        # the Chinese expressive/cloneable gap Qwen3-TTS (flat) and Chatterbox
+        # (English-only) leave open.
+        if self._model_family == "f5":
+            from f5_tts_mlx.cfm import F5TTS
+
+            self.model = F5TTS.from_pretrained(self.model_name)
+            self._loaded = True
+            logger.info(f"TTS model loaded (f5): {self.model_name}")
             return
 
         try:
@@ -284,6 +298,8 @@ class TTSEngine:
         speed: float = 1.0,
         lang_code: str = "a",
         instruct: str | None = None,
+        ref_audio: str | None = None,
+        ref_text: str | None = None,
     ) -> AudioOutput:
         """
         Generate speech from text.
@@ -301,12 +317,20 @@ class TTSEngine:
                 the emotional delivery of the predefined speaker. Other
                 families ignore it (they have no emotion-control surface),
                 so passing it is a no-op there rather than an error.
+            ref_audio: Optional path to a reference audio clip for zero-shot
+                voice cloning. Used by the F5-TTS ``f5`` family to clone the
+                clip's timbre; ignored by families without a cloning surface.
+            ref_text: Optional transcript of ``ref_audio`` (its exact spoken
+                text). Paired with ``ref_audio`` for F5-TTS cloning.
 
         Returns:
             AudioOutput with audio data and metadata
         """
         if not self._loaded:
             self.load()
+
+        if self._model_family == "f5":
+            return self._generate_f5(text, ref_audio, ref_text, speed)
 
         try:
             import mlx.core as mx
@@ -360,6 +384,94 @@ class TTSEngine:
         except Exception as e:
             logger.error(f"TTS generation failed: {e}")
             raise
+
+    def _generate_f5(
+        self,
+        text: str,
+        ref_audio: str | None,
+        ref_text: str | None,
+        speed: float,
+    ) -> AudioOutput:
+        """F5-TTS inference (pure MLX). Clones the reference clip's timbre and
+        speaks ``text`` in it; with no ``ref_audio`` it uses the packaged default
+        reference. Mirrors ``f5_tts_mlx.generate.generate`` but reuses the
+        already-loaded model (no per-call reload)."""
+        if (ref_audio is None) != (ref_text is None):
+            raise ValueError("F5 voice cloning requires both ref_audio and ref_text.")
+
+        import pkgutil
+
+        import mlx.core as mx
+        import soundfile as sf
+        from f5_tts_mlx.generate import (
+            FRAMES_PER_SEC,
+            SAMPLE_RATE,
+            TARGET_RMS,
+            convert_char_to_pinyin,
+            estimated_duration,
+        )
+
+        def read_reference(source):
+            info = sf.info(source)
+            if info.samplerate != SAMPLE_RATE:
+                raise ValueError(
+                    f"F5 ref_audio must be {SAMPLE_RATE} Hz "
+                    f"(got {info.samplerate}); resample it."
+                )
+            if info.channels != 1:
+                raise ValueError("F5 ref_audio must be mono.")
+            if info.frames <= 0 or info.frames > SAMPLE_RATE * 30:
+                raise ValueError("F5 ref_audio must be between 0 and 30 seconds.")
+            if hasattr(source, "seek"):
+                source.seek(0)
+            audio, _ = sf.read(source)
+            return audio
+
+        if ref_audio is not None:
+            assert ref_text is not None  # paired-input validation above
+            aud = read_reference(ref_audio)
+            rtext = ref_text
+        else:
+            # packaged short reference (its timbre; content comes from `text`)
+            data = pkgutil.get_data("f5_tts_mlx", "tests/test_en_1_ref_short.wav")
+            if data is None:
+                raise RuntimeError("F5-TTS packaged reference audio is missing.")
+            aud = read_reference(io.BytesIO(data))
+            rtext = "Some call me nature, others call me mother nature."
+
+        aud = mx.array(aud)
+        rms = mx.sqrt(mx.mean(mx.square(aud)))
+        mx.eval(rms)
+        rms_value = float(rms)
+        if not np.isfinite(rms_value) or rms_value <= 0:
+            raise ValueError("F5 ref_audio must contain finite, non-silent audio.")
+        if rms_value < TARGET_RMS:
+            aud = aud * TARGET_RMS / rms
+        # explicit duration estimate — F5's auto heuristic can collapse to ~0s
+        dur = int(estimated_duration(aud, rtext, text, speed) * FRAMES_PER_SEC)
+        ptext = convert_char_to_pinyin([rtext + " " + text])
+        # F5TTS.from_pretrained injects Vocos.decode as ``_vocoder``.
+        # sample() therefore returns the decoded 1-D waveform (Vocos'
+        # ISTFTHead squeezes the single batch axis), not mel frames.
+        wave, _ = self.model.sample(
+            mx.expand_dims(aud, axis=0),
+            text=ptext,
+            duration=dur,
+            steps=8,
+            speed=speed,
+            cfg_strength=2.0,
+            sway_sampling_coef=-1.0,
+        )
+        if wave.ndim != 1:
+            raise RuntimeError(
+                f"F5-TTS returned an unexpected waveform shape: {wave.shape}"
+            )
+        wave = wave[aud.shape[0] :]  # trim the decoded reference prefix
+        mx.eval(wave)
+        out = np.array(wave, dtype=np.float32)
+        return AudioOutput(
+            audio=out, sample_rate=SAMPLE_RATE, duration=len(out) / SAMPLE_RATE
+        )
 
     def stream_generate(
         self,

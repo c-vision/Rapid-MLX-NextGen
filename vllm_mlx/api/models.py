@@ -2623,6 +2623,11 @@ class AudioSpeechRequest(BaseModel):
     # rejected up front with the standard envelope rather than ballooning
     # the generation.
     instructions: str | None = Field(default=None, max_length=4096)
+    # Rapid-MLX extension for F5-TTS zero-shot cloning. Audio is base64
+    # rather than a server-local path so remote clients cannot make the
+    # service read arbitrary files. 14 MB base64 ~= 10 MB decoded audio.
+    ref_audio: str | None = Field(default=None, max_length=14_000_000)
+    ref_text: str | None = Field(default=None, max_length=4096)
 
     @model_validator(mode="before")
     @classmethod
@@ -2684,6 +2689,14 @@ class AudioSpeechRequest(BaseModel):
             # ``{"response_format": 123}`` would get.
             data["response_format"] = legacy
         return data
+
+    @model_validator(mode="after")
+    def _validate_f5_reference_pair(self):
+        if (self.ref_audio is None) != (self.ref_text is None):
+            raise ValueError("ref_audio and ref_text must be provided together")
+        if self.ref_text is not None and not self.ref_text.strip():
+            raise ValueError("ref_text must not be blank")
+        return self
 
     @field_validator("input")
     @classmethod
