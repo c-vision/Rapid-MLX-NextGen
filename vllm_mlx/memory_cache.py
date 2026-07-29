@@ -1152,12 +1152,15 @@ def _needs_kv_trim(layer: Any) -> bool:
 # known recurrent-state cache classes. A denylist (not an allowlist of KV
 # classes) is deliberate: it keeps the dict path consistent with the
 # conservative object-path default — an UNKNOWN or new trimmable KV class
-# (``RotatingKVCache`` / ``ChunkedKVCache`` / ``ConcatenateKVCache`` / a future
-# addition) stays cacheable (status quo) instead of being wrongly dropped and
-# regressing prefix reuse for dense / sliding-window models. Only classes that
-# are affirmatively recurrent-state (``ArraysCache`` and Mamba-style aliases)
-# are dropped. Names are matched leniently (substring) so vendor-suffixed
-# variants (``MambaCache`` etc.) are also caught.
+# (``RotatingKVCache`` or a future addition) stays cacheable (status quo)
+# instead of being wrongly dropped and regressing prefix reuse for dense /
+# sliding-window models. Only classes that are affirmatively recurrent-state
+# (``ArraysCache`` and Mamba-style aliases) are dropped here; the two known
+# trim-unsafe "trimmable liar" classes (``ChunkedKVCache`` /
+# ``ConcatenateKVCache``) are handled separately by the
+# ``_TRIM_UNSAFE_CACHE_CLASSES`` gate below. Names are matched leniently
+# (substring) so vendor-suffixed variants (``MambaCache`` etc.) are also
+# caught.
 _RECURRENT_STATE_CACHE_CLASSES = frozenset({"ArraysCache", "MambaCache"})
 
 
@@ -1168,6 +1171,96 @@ def _class_name_is_recurrent(class_name: str) -> bool:
     # Lenient substring match for vendor/variant names (e.g. "MambaCache2",
     # "GatedDeltaNetArraysCache"). "KVCache" etc. never contain these tokens.
     return any(marker in class_name for marker in _RECURRENT_STATE_CACHE_CLASSES)
+
+
+# ---------------------------------------------------------------------------
+# Trim-unsafe "trimmable liar" layer gate — sliding-window prefix-reuse lock
+# ---------------------------------------------------------------------------
+# A stored cache is safe to reuse on a TRIM-REQUIRING match path
+# (supersequence-with-excess / LCP) only if trimming it back to a shorter
+# prefix and then continuing reconstructs byte-identical KV to a cold prefill
+# of that prefix. The reuse gates read that off ``is_trimmable()``:
+# ``RotatingKVCache.is_trimmable()`` is rotation-aware (returns False once the
+# ring has rotated and the front has been overwritten), so the gate already
+# refuses it correctly (see ``test_sliding_window_prefix_reuse``).
+#
+# Two mlx-lm cache classes LIE — ``is_trimmable()`` returns True
+# unconditionally, yet a trim-then-continue does NOT reconstruct correct KV:
+#   * ``ChunkedKVCache`` (a ``KVCache`` subclass) DROPS front history via
+#     ``maybe_trim_front()`` (keeps only the last ``chunk_size`` slots and
+#     advances ``start_position``). Trimming a front-dropped instance back to
+#     a prefix shorter than ``start_position`` slices past discarded tokens →
+#     wrong KV; ``_trim_cache_offset`` even rebuilds it as a plain ``KVCache``
+#     whose offset no longer aligns with the retained window.
+#   * ``ConcatenateKVCache`` ``trim(n)`` only decrements ``offset`` WITHOUT
+#     slicing ``keys``/``values``; the next ``update_and_fetch`` concatenates
+#     onto the un-trimmed buffer, so the "trimmed" tokens resurface in the
+#     continuation → wrong KV.
+# Neither is reachable by a currently-supported family: ``ChunkedKVCache`` is
+# used only by ``mlx_lm/models/llama4.py`` (not in ``aliases.json``) and
+# ``ConcatenateKVCache`` only as a transient KV-reuse scratch inside
+# ``afm7.py`` (whose ``make_cache`` persists only ``KVCache``; also not in
+# ``aliases.json``). This denylist is therefore DEFENSE-IN-DEPTH for a latent
+# gap, not a live-bug fix, and over-classifying (treat as non-trimmable) is
+# always safe: it only ever SKIPS reuse (falling back to a correct full
+# prefill), it never corrupts. Supported KV classes (``KVCache`` /
+# ``RotatingKVCache`` / ``QuantizedKVCache`` / ``ArraysCache``) are NOT listed,
+# so their behavior is byte-for-byte unchanged. Names are matched leniently
+# (substring) like the recurrent denylist so vendor-suffixed variants are also
+# caught; both tokens are strictly longer than the safe ``KVCache`` name, so a
+# plain ``KVCache`` / ``RotatingKVCache`` can never match.
+_TRIM_UNSAFE_CACHE_CLASSES = frozenset({"ChunkedKVCache", "ConcatenateKVCache"})
+
+
+def _class_name_lies_about_trim(class_name: str) -> bool:
+    """True if ``class_name`` names a trim-unsafe "trimmable liar" cache — one
+    whose ``is_trimmable()`` returns True but which cannot be safely trimmed
+    back to a prefix (see ``_TRIM_UNSAFE_CACHE_CLASSES``)."""
+    if class_name in _TRIM_UNSAFE_CACHE_CLASSES:
+        return True
+    return any(marker in class_name for marker in _TRIM_UNSAFE_CACHE_CLASSES)
+
+
+def _layer_is_trim_liar(layer: Any) -> bool:
+    """True if ``layer`` is a trim-unsafe "trimmable liar" cache class.
+
+    Handles both live mlx-lm cache objects (matched on ``type(layer).__name__``)
+    and the dict-form extracted states used on the block-aware path (matched on
+    ``layer["class_name"]``). Classification is by class NAME only — a
+    ``ChunkedKVCache`` is unsafe to trim-reuse whether or not it has
+    front-dropped yet, so there is never a need to inspect ``start_position``
+    (over-classify = safe, it only ever skips reuse). Shared by the store-side
+    ``_layer_is_non_trimmable`` and the fetch-side ``_layer_forbids_trim`` so
+    every reuse gate agrees on these classes.
+    """
+    if layer is None:
+        return False
+    if isinstance(layer, dict):
+        class_name = layer.get("class_name")
+        if not class_name:
+            return False
+        return _class_name_lies_about_trim(class_name)
+    return _class_name_lies_about_trim(type(layer).__name__)
+
+
+def _layer_forbids_trim(layer: Any) -> bool:
+    """Fetch-side predicate: True if ``layer`` must NOT be trimmed on a
+    trim-requiring reuse path (supersequence-with-excess / LCP).
+
+    Combines the shared trim-liar denylist (``_layer_is_trim_liar``) with the
+    EXACT pre-existing inline classification used at the two fetch sites: a
+    layer exposing an ``is_trimmable`` method is non-trimmable iff it returns
+    False; a layer WITHOUT one is non-trimmable iff it also lacks a ``trim``
+    method. That ``hasattr(layer, "trim")`` fallback is preserved verbatim — it
+    differs from the store-side ``_layer_is_non_trimmable`` False fallback by
+    design (fetch-path test doubles such as ``MockKVCache`` depend on it), so
+    the two are intentionally NOT unified.
+    """
+    if _layer_is_trim_liar(layer):
+        return True
+    if hasattr(layer, "is_trimmable"):
+        return not layer.is_trimmable()
+    return not hasattr(layer, "trim")
 
 
 def _layer_is_non_trimmable(layer: Any) -> bool:
@@ -1191,9 +1284,21 @@ def _layer_is_non_trimmable(layer: Any) -> bool:
       * dict-form extracted states (block-aware path) — matched on
         ``class_name`` against the recurrent-state DENYLIST (unknown/new KV
         classes stay cacheable).
+
+    Independently of the above, a trim-unsafe "trimmable liar" class
+    (``ChunkedKVCache`` / ``ConcatenateKVCache`` — see
+    ``_TRIM_UNSAFE_CACHE_CLASSES``) is ALSO reported non-trimmable in both
+    forms, so a stored entry containing one is dropped at store time (default)
+    and never lands on a reuse path that would later trim it into corruption.
     """
     if layer is None:
         return False
+    # Trim-unsafe liar classes report is_trimmable()==True but corrupt on a
+    # trim-then-continue; classify them non-trimmable here (covers both the
+    # live-object and dict forms) so store never retains them for a trimming
+    # reuse path. Checked first so it wins over the inherited is_trimmable().
+    if _layer_is_trim_liar(layer):
+        return True
     if isinstance(layer, dict):
         class_name = layer.get("class_name")
         if not class_name:
@@ -1632,14 +1737,7 @@ class MemoryAwarePrefixCache:
             n_requested = len(tokens)
             excess = n_cached - n_requested
 
-            has_non_trimmable = any(
-                not (
-                    lc.is_trimmable()
-                    if hasattr(lc, "is_trimmable")
-                    else hasattr(lc, "trim")
-                )
-                for lc in best_super.cache
-            )
+            has_non_trimmable = any(_layer_forbids_trim(lc) for lc in best_super.cache)
 
             if excess > 0 and has_non_trimmable:
                 logger.debug(
@@ -1712,12 +1810,7 @@ class MemoryAwarePrefixCache:
             excess = len(best_lcp_entry.tokens) - best_lcp_length
 
             has_non_trimmable = any(
-                not (
-                    lc.is_trimmable()
-                    if hasattr(lc, "is_trimmable")
-                    else hasattr(lc, "trim")
-                )
-                for lc in best_lcp_entry.cache
+                _layer_forbids_trim(lc) for lc in best_lcp_entry.cache
             )
             logger.debug(
                 f"[cache_fetch] LCP candidate: lcp={best_lcp_length} "

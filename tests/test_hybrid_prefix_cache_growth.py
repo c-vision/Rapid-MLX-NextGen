@@ -232,15 +232,18 @@ def test_dict_form_all_kvcache_stored(cache):
 
 @pytest.mark.parametrize(
     "kv_class",
-    ["RotatingKVCache", "ChunkedKVCache", "ConcatenateKVCache", "QuantizedKVCache"],
+    ["RotatingKVCache", "QuantizedKVCache"],
 )
 def test_dict_form_trimmable_kv_variants_still_stored(cache, kv_class):
-    """Dict-form sliding-window / other trimmable KV classes must NOT be dropped.
+    """Dict-form sliding-window / other genuinely-trimmable KV classes must NOT
+    be dropped.
 
     Regression for codex #1075 finding: an allowlist of only KVCache would
     wrongly classify RotatingKVCache & friends as non-trimmable and drop the
     entry, regressing prefix reuse for dense / sliding-window models. The
-    denylist keeps them cacheable.
+    denylist keeps them cacheable. (``ChunkedKVCache`` / ``ConcatenateKVCache``
+    are the exception — they LIE about trimmability and are dropped; see
+    ``test_dict_form_trim_unsafe_liar_variants_dropped``.)
     """
     prompt = list(range(1000, 1100))
     dict_cache = [
@@ -252,6 +255,30 @@ def test_dict_form_trimmable_kv_variants_still_stored(cache, kv_class):
         f"{kv_class} is trimmable and must remain cacheable"
     )
     assert tuple(prompt) in cache._entries
+
+
+@pytest.mark.parametrize("kv_class", ["ChunkedKVCache", "ConcatenateKVCache"])
+def test_dict_form_trim_unsafe_liar_variants_dropped(cache, kv_class):
+    """Dict-form trim-unsafe "trimmable liar" classes MUST be dropped.
+
+    ``ChunkedKVCache`` (drops front history via ``maybe_trim_front``) and
+    ``ConcatenateKVCache`` (``trim`` never slices its buffers) both report
+    ``is_trimmable()==True`` yet corrupt on a trim-then-continue, so trimming
+    them back to a prefix produces wrong KV. The store gate must refuse them —
+    see ``_TRIM_UNSAFE_CACHE_CLASSES`` in ``memory_cache``. Neither is reachable
+    by a currently-supported family (llama4 / afm7, not in ``aliases.json``);
+    this is defense-in-depth for the latent gap.
+    """
+    prompt = list(range(1000, 1100))
+    dict_cache = [
+        {"class_name": kv_class, "state": (1, 2), "meta_state": ("0",)},
+        {"class_name": kv_class, "state": (3, 4), "meta_state": ("0",)},
+    ]
+
+    assert cache.store(prompt, dict_cache) is False, (
+        f"{kv_class} lies about trimmability and must be dropped"
+    )
+    assert tuple(prompt) not in cache._entries
 
 
 def test_dict_form_mamba_variant_dropped(cache):

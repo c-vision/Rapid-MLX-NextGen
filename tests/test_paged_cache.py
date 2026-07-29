@@ -795,6 +795,54 @@ class TestBlockAwarePrefixCache:
         }
         assert cache._extract_block_tensor_slice([non_kv_layer], 0, 4) is None
 
+    def test_seq_axis_allowlist_anchored_to_real_mlx_lm_classes(self):
+        """Anchor ``_SEQ_AXIS_KV_CLASSES`` to GROUND TRUTH — the real mlx-lm
+        class *objects*, not synthetic string literals.
+
+        The block-aware path hosts a stored layer only when its ``class_name``
+        is in this fail-closed allowlist. The sibling tests assert against
+        hardcoded strings ("KVCache", "RotatingKVCache", ...), so they can't
+        notice if the allowlist drifts out of sync with the actual mlx-lm
+        classes. This test protects two concrete regressions by keying off the
+        real ``__name__``s:
+          * allowlist drift — anyone adding ``RotatingKVCache`` /
+            ``ChunkedKVCache`` / ``QuantizedKVCache`` / ``ArraysCache`` to the
+            set (all trim-unsafe or non-seq-indexed) turns this red;
+          * an mlx-lm rename of the one hostable class — if ``KVCache`` is
+            renamed, ``KVCache.__name__`` no longer equals the allowlisted
+            string and this turns red.
+        It does NOT (and cannot) detect a hypothetical *future distinct* cache
+        class that also happens to be named ``KVCache`` — a same-name collision
+        is out of reach of a name-based allowlist; guarding that would need
+        per-family ``make_cache`` construction coverage (weights/network), which
+        is intentionally out of scope here.
+        """
+        from mlx_lm.models.cache import (
+            ArraysCache,
+            ChunkedKVCache,
+            KVCache,
+            QuantizedKVCache,
+            RotatingKVCache,
+        )
+
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        allow = BlockAwarePrefixCache._SEQ_AXIS_KV_CLASSES
+
+        # The one and only block-hostable class, keyed by its REAL __name__.
+        assert KVCache.__name__ in allow
+
+        # Every trim-unsafe / non-seq-indexed real class stays OUT.
+        for cls in (
+            RotatingKVCache,
+            ChunkedKVCache,
+            QuantizedKVCache,
+            ArraysCache,
+        ):
+            assert cls.__name__ not in allow, (
+                f"{cls.__name__} must not be block-hostable"
+            )
+
     def test_reconstruct_refuses_non_kvcache_class_name(self):
         """``reconstruct_cache`` must refuse to host anything other than a
         vanilla ``KVCache`` even if ``block.cache_data`` somehow contains

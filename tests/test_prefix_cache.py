@@ -131,6 +131,54 @@ class TestPrefixCacheManager:
         assert cache_manager.stats.hits == 1
         assert cache_manager.stats.tokens_saved == len(short_tokens)
 
+    def test_can_trim_cache_rejects_chunked_trim_liar(self, cache_manager):
+        """``_can_trim_cache`` must reject a front-dropped ChunkedKVCache even
+        though its inherited ``is_trimmable()`` lies True — trimming it via
+        ``_trim_cache`` would slice past discarded front tokens. Plain KVCache
+        stays trimmable; rotated RotatingKVCache is honestly non-trimmable.
+        Without the trim-liar guard the first assertion is False (mutation-kill).
+        """
+        mx = pytest.importorskip("mlx.core")
+        from mlx_lm.models.cache import ChunkedKVCache, KVCache, RotatingKVCache
+
+        ck = ChunkedKVCache(chunk_size=128)
+        k = mx.random.normal((1, 2, 200, 8))
+        ck.update_and_fetch(k, k)
+        ck.maybe_trim_front()
+        mx.eval(ck.keys)
+        assert ck.start_position > 0 and ck.is_trimmable() is True  # the lie
+
+        assert cache_manager._can_trim_cache([KVCache(), ck]) is False
+
+        kv = KVCache()
+        kv.update_and_fetch(k, k)
+        assert cache_manager._can_trim_cache([kv]) is True
+
+        rot = RotatingKVCache(max_size=16, keep=0)
+        rk = mx.random.normal((1, 2, 24, 8))
+        rot.update_and_fetch(rk, rk)
+        assert rot.is_trimmable() is False
+        assert cache_manager._can_trim_cache([rot]) is False
+
+    def test_fetch_longer_prefix_skips_chunked_trim_liar(self, cache_manager):
+        """A stored longer entry containing a front-dropped ChunkedKVCache must
+        NOT be trim-reused on a shorter-query fetch — it falls through to a miss
+        instead of returning a corrupt trimmed cache."""
+        mx = pytest.importorskip("mlx.core")
+        from mlx_lm.models.cache import ChunkedKVCache, KVCache
+
+        ck = ChunkedKVCache(chunk_size=128)
+        k = mx.random.normal((1, 2, 200, 8))
+        ck.update_and_fetch(k, k)
+        ck.maybe_trim_front()
+        mx.eval(ck.keys)
+
+        cache_manager.store_cache([1, 2, 3, 4, 5, 6], [KVCache(), ck])
+        cache, remaining = cache_manager.fetch_cache([1, 2, 3])
+
+        assert cache is None
+        assert remaining == [1, 2, 3]
+
     def test_lru_eviction(self, mock_model):
         """Test LRU eviction when cache is full."""
         manager = PrefixCacheManager(mock_model, max_entries=3)

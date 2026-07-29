@@ -29,6 +29,17 @@ from .paged_cache import BlockTable, PagedCacheManager
 logger = logging.getLogger(__name__)
 
 
+# Cache classes whose ``is_trimmable()`` returns True unconditionally but which
+# corrupt on a trim-then-continue (``ChunkedKVCache`` drops front history via
+# ``maybe_trim_front`` + ``start_position``; ``ConcatenateKVCache.trim`` never
+# slices its buffers). The canonical denylist + rationale live in
+# ``memory_cache._TRIM_UNSAFE_CACHE_CLASSES``; this legacy trie cache keeps a
+# self-contained mirror so ``_can_trim_cache`` refuses them too (over-classify
+# = safe, only ever skips reuse). Neither is reachable by a supported family
+# (llama4 / afm7, not in ``aliases.json``) — defense-in-depth for a latent gap.
+_TRIM_UNSAFE_CACHE_CLASSES = frozenset({"ChunkedKVCache", "ConcatenateKVCache"})
+
+
 @dataclass
 class CacheEntry:
     """Entry in the prefix cache."""
@@ -324,13 +335,25 @@ class PrefixCacheManager:
                 del parent[tok]
 
     def _can_trim_cache(self, prompt_cache: list[Any]) -> bool:
-        """Check if all cache layers can be trimmed."""
+        """Check if all cache layers can be trimmed.
+
+        A trim-unsafe "trimmable liar" layer (``ChunkedKVCache`` /
+        ``ConcatenateKVCache``) reports ``is_trimmable()==True`` but would
+        corrupt on ``_trim_cache`` -> ``cache.trim()``, so it is treated as
+        NOT trimmable here (falls through to a full prefill).
+        """
         if not prompt_cache:
             return False
-        return all(
-            c.is_trimmable() if hasattr(c, "is_trimmable") else hasattr(c, "trim")
-            for c in prompt_cache
-        )
+        for c in prompt_cache:
+            name = type(c).__name__
+            if any(marker in name for marker in _TRIM_UNSAFE_CACHE_CLASSES):
+                return False
+            trimmable = (
+                c.is_trimmable() if hasattr(c, "is_trimmable") else hasattr(c, "trim")
+            )
+            if not trimmable:
+                return False
+        return True
 
     def _trim_cache(self, prompt_cache: list[Any], num_tokens: int) -> list[Any]:
         """Trim cache by removing num_tokens from the end."""

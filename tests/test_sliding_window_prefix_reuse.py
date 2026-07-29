@@ -25,6 +25,7 @@ import copy
 import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import (
+    ChunkedKVCache,
     KVCache,
     RotatingKVCache,
     can_trim_prompt_cache,
@@ -34,6 +35,8 @@ from vllm_mlx.memory_cache import (
     MemoryAwarePrefixCache,
     MemoryCacheConfig,
     _cache_has_non_trimmable,
+    _layer_forbids_trim,
+    _layer_is_trim_liar,
 )
 
 B, H, D = 1, 2, 8
@@ -251,3 +254,111 @@ def test_scheduler_exact_hit_trim_exception_falls_back_to_cold_prefill(monkeypat
     assert req.cached_tokens == 0
     assert req.remaining_tokens == [1, 2, 3, 4, 5, 6]
     assert tokens == [1, 2, 3, 4, 5, 6]
+
+
+# ---------------------------------------------------------------------------
+# ChunkedKVCache trim-liar correctness lock (defense-in-depth; llama4-only,
+# not in aliases.json — see ``_TRIM_UNSAFE_CACHE_CLASSES`` in memory_cache).
+# ``ChunkedKVCache.is_trimmable()`` (inherited from KVCache) returns True
+# UNCONDITIONALLY, but ``maybe_trim_front()`` drops front history and advances
+# ``start_position``, so a trim-back-to-prefix slices past discarded tokens →
+# wrong KV. These tests pin the gate that must REFUSE such reuse.
+# ---------------------------------------------------------------------------
+
+
+def _front_dropped_chunked(
+    n_tokens: int = 200, chunk_size: int = 128
+) -> ChunkedKVCache:
+    """A REAL front-dropped ``ChunkedKVCache`` (``start_position > 0``).
+
+    Fills the cache past ``chunk_size`` then calls ``maybe_trim_front()``
+    exactly as ``llama4.py`` does, so the front is discarded and
+    ``start_position`` advances — the state that makes a trim-back unsafe.
+    """
+    ck = ChunkedKVCache(chunk_size=chunk_size)
+    k = mx.random.normal((B, H, n_tokens, D))
+    v = mx.random.normal((B, H, n_tokens, D))
+    ck.update_and_fetch(k, v)
+    ck.maybe_trim_front()
+    mx.eval(ck.keys, ck.values)
+    assert ck.start_position > 0  # precondition: front actually dropped
+    assert ck.is_trimmable() is True  # the LIE this fix defends against
+    return ck
+
+
+def test_front_dropped_chunked_kvcache_classified_non_trimmable():
+    """A front-dropped ChunkedKVCache is classified non-trimmable by every gate
+    even though its inherited ``is_trimmable()`` lies True. Without the fix
+    ``_cache_has_non_trimmable`` returns False here (mutation-kill)."""
+    ck = _front_dropped_chunked()
+
+    assert _layer_is_trim_liar(ck) is True
+    assert _layer_forbids_trim(ck) is True
+    # mixed dense + chunked entry, mirroring llama4's per-group layout
+    assert _cache_has_non_trimmable([KVCache(), ck]) is True
+
+
+def test_fetch_supersequence_skips_front_dropped_chunked_entry():
+    """A stored entry containing a front-dropped ChunkedKVCache must NOT be
+    reused via the supersequence-with-excess trim path — it falls through to a
+    miss (full prefill). Without the fix this returns a (corrupt) supersequence
+    hit."""
+    # hybrid_reuse_max_entries > 0 so store RETAINS the non-trimmable entry
+    # (default 0 would drop it at store time); the fetch gate is what we test.
+    cache = MemoryAwarePrefixCache(None, MemoryCacheConfig(hybrid_reuse_max_entries=8))
+    long_tokens = list(range(60))
+    kv = KVCache()
+    fk = mx.random.normal((B, H, len(long_tokens), D))
+    kv.update_and_fetch(fk, fk)
+    mx.eval(kv.keys, kv.values)
+    assert cache.store(long_tokens, [kv, _front_dropped_chunked()]) is True
+
+    result, remaining = cache.fetch(list(range(20)))  # supersequence of stored
+    assert result is None
+    assert remaining == list(range(20))
+    assert cache._last_match_type == "miss"
+
+
+def test_fetch_lcp_skips_front_dropped_chunked_entry():
+    """A stored entry containing a front-dropped ChunkedKVCache must NOT be
+    reused via the LCP (divergent-suffix) trim path — it falls through to a
+    miss. Without the fix this returns a (corrupt) LCP hit."""
+    cache = MemoryAwarePrefixCache(None, MemoryCacheConfig(hybrid_reuse_max_entries=8))
+    stored = list(range(20)) + [900, 901, 902, 903, 904]
+    kv = KVCache()
+    fk = mx.random.normal((B, H, len(stored), D))
+    kv.update_and_fetch(fk, fk)
+    mx.eval(kv.keys, kv.values)
+    assert cache.store(stored, [kv, _front_dropped_chunked()]) is True
+
+    # shares prefix [0..19] then diverges -> only the LCP path could match
+    requested = list(range(20)) + [800, 801]
+    result, remaining = cache.fetch(requested)
+    assert result is None
+    assert remaining == requested
+    assert cache._last_match_type == "miss"
+
+
+def test_fix_preserves_kvcache_reuse_and_rotated_skip():
+    """Regression guard: the trim-liar gate changes ONLY the two liar classes.
+    An all-KVCache supersequence entry is still trim-reused, and a rotated
+    RotatingKVCache entry is still skipped — exactly as before the fix."""
+    # (a) all-KVCache supersequence entry -> trimmable reuse retained
+    kv_cache = MemoryAwarePrefixCache(None, MemoryCacheConfig())
+    kv = KVCache()
+    fk = mx.random.normal((B, H, 40, D))
+    kv.update_and_fetch(fk, fk)
+    mx.eval(kv.keys, kv.values)
+    assert kv_cache.store(list(range(40)), [kv]) is True
+    result, remaining = kv_cache.fetch(list(range(15)))
+    assert result is not None
+    assert remaining == []
+    assert kv_cache._last_match_type == "supersequence"
+
+    # (b) rotated RotatingKVCache -> still classified non-trimmable / skipped
+    rot = RotatingKVCache(max_size=W, keep=0)
+    rk = mx.random.normal((B, H, W + 8, D))
+    rot.update_and_fetch(rk, rk)
+    assert rot.is_trimmable() is False
+    assert _layer_forbids_trim(rot) is True
+    assert _cache_has_non_trimmable([KVCache(), rot]) is True
