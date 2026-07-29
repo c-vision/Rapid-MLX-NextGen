@@ -86,7 +86,7 @@
     "hf_id": "mlx-community/VoxCPM1.5",
     "family": "voxcpm",
     "default_voice": "default",
-    "notes": "Chinese/English high-quality TTS (CPM-based)."
+    "notes": "English (experimental) TTS (CPM-based). WARNING: Chinese is currently BROKEN in this MLX port — Chinese input produces Thai-script gibberish plus long runaway generation, so do NOT use voxcpm for Chinese. For Chinese TTS use `f5-tts-zh` (EN+ZH, cloneable) or `qwen3-tts` (named Chinese speakers) instead. English-only is usable but best-effort; report upstream if synth fails."
   },
 
   "dia": {
