@@ -2612,6 +2612,17 @@ class AudioSpeechRequest(BaseModel):
     # matches the documented contract.
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
     response_format: str = "wav"
+    # OpenAI ``gpt-4o-mini-tts`` accepts an ``instructions`` field that
+    # steers the emotional delivery / speaking style ("Speak in a cheerful
+    # and positive tone."). We honour the same field name for spec
+    # compatibility and route it to engines that expose an emotion/style
+    # control — currently Qwen3-TTS CustomVoice (its ``instruct`` arg).
+    # Families with no such control ignore it, matching OpenAI's behaviour
+    # for voices that don't support styling. ``None`` = omitted. Bounded to
+    # OpenAI's documented 4096-char ceiling so an oversized style prompt is
+    # rejected up front with the standard envelope rather than ballooning
+    # the generation.
+    instructions: str | None = Field(default=None, max_length=4096)
 
     @model_validator(mode="before")
     @classmethod

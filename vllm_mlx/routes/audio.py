@@ -1447,6 +1447,7 @@ def _allowed_voices_for(model_name: str) -> list[str]:
     from ..audio.tts import (
         CHATTERBOX_VOICES,
         KOKORO_VOICES,
+        QWEN3_TTS_VOICES,
         _list_snapshot_voices,
     )
 
@@ -1464,6 +1465,13 @@ def _allowed_voices_for(model_name: str) -> list[str]:
         return list(KOKORO_VOICES)
     if "chatterbox" in name_lower:
         return list(CHATTERBOX_VOICES)
+    if "qwen3-tts" in name_lower or "qwen3_tts" in name_lower:
+        # Qwen3-TTS CustomVoice ships baked-in named speakers and no
+        # ``voices/`` snapshot dir, so the enumeration above always
+        # returns ``[]`` and we serve the documented speaker set. The
+        # registry ``default_voice`` (``Serena``) is a member of this
+        # list so the cold-start / voice-omitted path validates.
+        return list(QWEN3_TTS_VOICES)
     if "vibevoice" in name_lower:
         # Cold-start fallback for VibeVoice — the canonical English
         # default is ``en-Grace_woman`` (per the upstream repo's
@@ -1539,6 +1547,7 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
     voice = request.voice
     speed = request.speed
     response_format = request.response_format
+    instructions = request.instructions
 
     try:
         from ..audio.tts import TTSEngine, UnsupportedAudioFormatError
@@ -1549,6 +1558,42 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
         # the future land in :data:`TTS_MODEL_ALIASES` once, not in the
         # handler body.
         model_name = _resolve_tts_model(model)
+
+        # Qwen3-TTS ships two shapes: CustomVoice (predefined speakers,
+        # reference-free — what we alias and support) and Base (voice-
+        # cloning ONLY, requires a reference clip). A caller passing a raw
+        # ``...-Base-...`` repo id would otherwise reach the CustomVoice
+        # speaker-validation + generate path and fail deep in the engine
+        # ("Must provide one of ref_audio or ref_mel") as an opaque 500.
+        # Reject it up front with an actionable 400 pointing at CustomVoice.
+        # Classify on the REPO NAME (last path component), split into
+        # ``-``/``_``-delimited tokens, not a whole-id substring: an org like
+        # ``customvoice-org/...`` or an unrelated ``base`` elsewhere in the
+        # path must not flip the decision, and a ``base`` token must be
+        # caught wherever it sits (start/middle/end, hyphen or underscore
+        # delimited) — ``...-0.6B-Base``, ``..._base_bf16``, etc.
+        _repo = model_name.rsplit("/", 1)[-1].lower()
+        _tokens = set(re.split(r"[-_]", _repo))
+        _is_qwen3 = "qwen3-tts" in _repo or "qwen3_tts" in _repo
+        if _is_qwen3 and "base" in _tokens and "customvoice" not in _tokens:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": (
+                            f"model {model_name!r} is a Qwen3-TTS Base "
+                            "(voice-cloning-only) repo and needs a reference "
+                            "audio clip, which /v1/audio/speech does not "
+                            "provide. Use a CustomVoice repo (e.g. the "
+                            "`qwen3-tts` alias) for reference-free synthesis "
+                            "with a predefined speaker."
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "unsupported_model_variant",
+                        "param": "model",
+                    }
+                },
+            )
 
         # R11-B-F3 (Bo 0.8.12 dogfood, PR #863): translate the literal
         # ``voice="default"`` to the registry's ``default_voice`` BEFORE
@@ -1587,6 +1632,15 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
         # the ``kokoro`` short alias — both go through the same model
         # family check.
         valid_voices = _allowed_voices_for(model_name)
+        # Qwen3-TTS matches speaker names case-INsensitively (its engine
+        # lowercases before the ``spk_id`` lookup) and the upstream docs mix
+        # case ("serena" vs "Serena"). Normalize a case-insensitive hit to
+        # the canonical spelling so ``serena`` / ``ono_anna`` aren't
+        # rejected as ``invalid_voice``; the engine then receives the
+        # canonical form. Other families keep exact-match validation.
+        if "qwen3-tts" in model_name.lower() or "qwen3_tts" in model_name.lower():
+            _canonical = {v.lower(): v for v in valid_voices}
+            voice = _canonical.get(voice.lower(), voice)
         if voice not in valid_voices:
             preview = ", ".join(valid_voices[:8])
             if len(valid_voices) > 8:
@@ -1620,7 +1674,15 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
             _tts_engine = TTSEngine(model_name)
             _tts_engine.load()
 
-        audio = _tts_engine.generate(input_text, voice=voice, speed=speed)
+        # Only forward ``instruct`` when the caller actually sent an
+        # ``instructions`` field. Passing ``instruct=None`` is a no-op for
+        # the real engine, but omitting the kwarg entirely keeps the call
+        # shape backward-compatible with any generate() that predates the
+        # emotion parameter (only Qwen3-TTS consumes it).
+        gen_kwargs = {"voice": voice, "speed": speed}
+        if instructions:
+            gen_kwargs["instruct"] = instructions
+        audio = _tts_engine.generate(input_text, **gen_kwargs)
         try:
             audio_bytes = _tts_engine.to_bytes(audio, format=response_format)
         except UnsupportedAudioFormatError as e:
