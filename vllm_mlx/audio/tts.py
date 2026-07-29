@@ -313,6 +313,7 @@ class TTSEngine:
         instruct: str | None = None,
         ref_audio: str | None = None,
         ref_text: str | None = None,
+        exaggeration: float | None = None,
     ) -> AudioOutput:
         """
         Generate speech from text.
@@ -332,15 +333,21 @@ class TTSEngine:
                 so passing it is a no-op there rather than an error.
             ref_audio: Optional path to a reference audio clip for zero-shot
                 voice cloning. Used by the F5-TTS ``f5`` family to clone the
-                clip's timbre, and by Qwen3-TTS **Base** (optional — clones the
-                ref timbre; the Base variant ignores ``voice`` when ``ref_audio``
-                is set, while CustomVoice ignores ``ref_audio`` and keeps its
-                named speaker). Use a clean 5-10s clip at the model's native
-                sample rate. Ignored by families without a cloning surface.
+                clip's timbre; by the Chatterbox family (optional — clones the
+                ref timbre on top of its default voice); and by Qwen3-TTS
+                **Base** (optional — the Base variant ignores ``voice`` when
+                ``ref_audio`` is set, while CustomVoice ignores ``ref_audio``
+                and keeps its named speaker). Use a clean 5-10s clip at the
+                model's native sample rate. Ignored by families without a
+                cloning surface.
             ref_text: Optional transcript of ``ref_audio`` (its exact spoken
                 text). Paired with ``ref_audio`` for F5-TTS cloning and to
                 anchor Qwen3-TTS Base cloning. Ignored by families that clone
                 reference-free.
+            exaggeration: Chatterbox emotion/intensity knob (0.0 neutral →
+                ~1.0 very expressive). Only the Chatterbox family honours it;
+                it drives that engine's ``exaggeration`` argument and is the
+                lever that de-flattens the delivery. Other families ignore it.
 
         Returns:
             AudioOutput with audio data and metadata
@@ -363,22 +370,41 @@ class TTSEngine:
             # forwarding Kokoro's single-letter ``lang_code="a"`` to it
             # would mis-hint the language. Every other family keeps the
             # pre-existing call shape unchanged.
-            gen_kwargs: dict = {"text": text, "voice": voice, "speed": speed}
-            if self._model_family == "qwen3_tts":
-                gen_kwargs["lang_code"] = "auto"
-                if instruct:
-                    gen_kwargs["instruct"] = instruct
-                # Qwen3-TTS Base = zero-shot voice cloning: forward the
-                # reference clip (+ its transcript) when given. Base ignores
-                # ``voice`` while a ref is set; CustomVoice ignores
-                # ``ref_audio`` and keeps its named speaker — so forwarding
-                # only-when-set lets one family serve both variants.
+            if self._model_family == "chatterbox":
+                # Chatterbox's ``generate`` steers expressiveness through
+                # ``exaggeration`` and zero-shot cloning through
+                # ``ref_audio``. It DOES also accept ``voice``/``speed``/
+                # ``lang_code`` kwargs, but their Kokoro-oriented values on
+                # this path (``voice="af_heart"``, ``lang_code="a"``) are
+                # meaningless to it, so we deliberately do NOT forward them
+                # and let the model's own defaults hold. ``exaggeration`` is
+                # a real named parameter on both the non-turbo and turbo
+                # repos (they load the same ``chatterbox.Model``), backed by
+                # ``**kwargs`` on ``Model.generate`` and ``generate_audio``,
+                # so forwarding it never raises TypeError on either variant.
+                # Forward exactly those two knobs, each only when set.
+                gen_kwargs: dict = {"text": text}
+                if exaggeration is not None:
+                    gen_kwargs["exaggeration"] = exaggeration
                 if ref_audio:
                     gen_kwargs["ref_audio"] = ref_audio
-                    if ref_text:
-                        gen_kwargs["ref_text"] = ref_text
             else:
-                gen_kwargs["lang_code"] = lang_code
+                gen_kwargs = {"text": text, "voice": voice, "speed": speed}
+                if self._model_family == "qwen3_tts":
+                    gen_kwargs["lang_code"] = "auto"
+                    if instruct:
+                        gen_kwargs["instruct"] = instruct
+                    # Qwen3-TTS Base = zero-shot voice cloning: forward the
+                    # reference clip (+ its transcript) when given. Base ignores
+                    # ``voice`` while a ref is set; CustomVoice ignores
+                    # ``ref_audio`` and keeps its named speaker — so forwarding
+                    # only-when-set lets one family serve both variants.
+                    if ref_audio:
+                        gen_kwargs["ref_audio"] = ref_audio
+                        if ref_text:
+                            gen_kwargs["ref_text"] = ref_text
+                else:
+                    gen_kwargs["lang_code"] = lang_code
 
             for result in self.model.generate(**gen_kwargs):
                 audio_data = result.audio

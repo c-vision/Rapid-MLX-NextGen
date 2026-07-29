@@ -1622,10 +1622,12 @@ def _allowed_voices_for(model_name: str) -> list[str]:
 def _is_clone_capable_model(model_name: str) -> bool:
     """Whether ``model_name`` can clone a voice from an inline reference.
 
-    Two TTS families condition synthesis on a ``ref_audio`` reference
+    Three TTS families condition synthesis on a ``ref_audio`` reference
     clip sent on ``/v1/audio/speech``:
 
     * **F5-TTS** — always conditions on a reference waveform.
+    * **Chatterbox** — optionally clones the reference timbre on top of
+      its default voice (its engine branch forwards ``ref_audio``).
     * **Qwen3-TTS Base** — the ``...-Base-...`` repo clones a voice
       zero-shot from the reference. Its CustomVoice sibling does NOT
       clone: it keeps a predefined named speaker and ignores
@@ -1636,9 +1638,10 @@ def _is_clone_capable_model(model_name: str) -> bool:
     gate deems clone-capable while the engine classifies into a
     non-cloning family would skip voice validation here yet drop
     ``ref_audio`` in the engine — a silent 200 with the wrong (default)
-    voice. So the F5 check uses the SAME whole-id substring the engine
-    uses (``f5-tts``/``f5_tts``), NOT a broad ``f5`` token that would
-    catch an unrelated ``org/f5-foo`` the engine treats as Kokoro.
+    voice. So the F5 and Chatterbox checks use the SAME whole-id
+    substrings the engine uses (``f5-tts``/``f5_tts`` and ``chatterbox``),
+    NOT a broad ``f5`` token that would catch an unrelated ``org/f5-foo``
+    the engine treats as Kokoro.
 
     Qwen3-TTS Base is classified on the repo NAME (last path component)
     split into ``-``/``_`` tokens — mirroring the Base-reject guard so
@@ -1650,6 +1653,8 @@ def _is_clone_capable_model(model_name: str) -> bool:
     """
     name_lower = model_name.lower()
     if "f5-tts" in name_lower or "f5_tts" in name_lower:
+        return True
+    if "chatterbox" in name_lower:
         return True
     repo = model_name.rsplit("/", 1)[-1].lower()
     tokens = set(re.split(r"[-_]", repo))
@@ -1712,6 +1717,7 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
     instructions = request.instructions
     ref_audio = request.ref_audio
     ref_text = request.ref_text
+    exaggeration = request.exaggeration
 
     try:
         from ..audio.tts import TTSEngine, UnsupportedAudioFormatError
@@ -1724,10 +1730,14 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
         model_name = _resolve_tts_model(model)
 
         # Zero-shot cloning from an inline ``ref_audio`` reference clip is
-        # only wired for the clone-capable families (F5-TTS + Qwen3-TTS
-        # Base). A reference clip aimed at any other model is rejected up
-        # front so the caller gets an actionable 400 rather than the engine
-        # ignoring the clip and silently synthesizing a default voice.
+        # only wired for the clone-capable families (F5-TTS, Chatterbox, and
+        # Qwen3-TTS Base — see ``_is_clone_capable_model``). A reference clip
+        # aimed at any other model is rejected up front so the caller gets an
+        # actionable 400 rather than the engine ignoring the clip and silently
+        # synthesizing a default voice. (The shared ``AudioSpeechRequest``
+        # validator still requires ``ref_audio``/``ref_text`` as a pair — the
+        # F5 invariant — so a Chatterbox clone request supplies both even
+        # though the Chatterbox engine branch consumes only the audio.)
         clone_capable = _is_clone_capable_model(model_name)
         inline_clone = ref_audio is not None and clone_capable
         if ref_audio is not None and not clone_capable:
@@ -1737,7 +1747,8 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
                     "error": {
                         "message": (
                             "ref_audio/ref_text voice cloning requires a "
-                            "clone-capable model (F5-TTS or Qwen3-TTS Base)."
+                            "clone-capable model (F5-TTS, Chatterbox, or "
+                            "Qwen3-TTS Base)."
                         ),
                         "type": "invalid_request_error",
                         "code": "unsupported_voice_cloning",
@@ -1897,6 +1908,14 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
         )
         if instructions:
             gen_kwargs["instruct"] = instructions
+        # Only forward ``exaggeration`` when the caller actually sent it, so
+        # the engine's own default holds otherwise. Like ``instruct`` it is
+        # a no-op keyword for every non-Chatterbox family (``generate``
+        # accepts it but only the Chatterbox branch forwards it to the
+        # model), so a caller may send it against any model without a 400 —
+        # matching OpenAI's ignore-unsupported-styling behaviour.
+        if exaggeration is not None:
+            gen_kwargs["exaggeration"] = exaggeration
         if ref_audio is not None:
             try:
                 ref_bytes = _decode_tts_ref_audio(ref_audio)
