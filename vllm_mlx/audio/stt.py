@@ -5,6 +5,8 @@ Speech-to-Text (STT) engine using mlx-audio.
 Supports:
 - Whisper (multilingual, 99+ languages)
 - Parakeet (English-focused, fast)
+- SenseVoice (FunAudioLLM; Chinese/Cantonese/Japanese/Korean/English, very
+  fast non-autoregressive CTC — a dedicated Asian-language ASR option)
 """
 
 import logging
@@ -19,6 +21,13 @@ logger = logging.getLogger(__name__)
 # Default models
 DEFAULT_WHISPER_MODEL = "mlx-community/whisper-large-v3-mlx"
 DEFAULT_PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v2"
+DEFAULT_SENSEVOICE_MODEL = "mlx-community/SenseVoiceSmall"
+
+# SenseVoice accepts a keyword-only language hint restricted to this set;
+# anything else maps to "auto" so callers passing a Whisper-style code
+# (e.g. "es") degrade gracefully to language detection.
+# See mlx_audio/stt/models/sensevoice/README.md.
+_SENSEVOICE_LANGUAGES = frozenset({"auto", "zh", "en", "ja", "ko", "yue", "nospeech"})
 
 # ---------------------------------------------------------------------------
 # F-K-WHISPER-961: VAD pre-trim guard (see #961)
@@ -451,7 +460,7 @@ def _shift_segment_time(seg: Any, offset: float) -> None:
 
 class STTEngine:
     """
-    Speech-to-Text engine supporting Whisper and Parakeet models.
+    Speech-to-Text engine supporting Whisper, Parakeet, and SenseVoice models.
 
     Usage:
         engine = STTEngine("mlx-community/whisper-large-v3-mlx")
@@ -476,6 +485,7 @@ class STTEngine:
                 - mlx-community/whisper-small-mlx
                 - mlx-community/parakeet-tdt-0.6b-v2 (English, fastest)
                 - mlx-community/parakeet-tdt-0.6b-v3
+                - mlx-community/SenseVoiceSmall (zh/yue/ja/ko/en, fast CTC)
             enable_vad_pretrim: If ``True`` (default) and the engine
                 is Whisper-shaped, run Silero VAD before Whisper. Pure-
                 silence clips return ``text=""`` (guards #961), and
@@ -504,6 +514,15 @@ class STTEngine:
         # a dedicated ``align()`` method — ``transcribe()`` is not valid on
         # them (there is no text to discover).
         self._is_aligner = "aligner" in model_name.lower()
+        # SenseVoice (FunAudioLLM) is a non-autoregressive CTC ASR model
+        # with a different generate() contract than Whisper: keyword-only
+        # ``language`` (from ``_SENSEVOICE_LANGUAGES``, default "auto"),
+        # no translation ``task``, and it emits rich per-segment metadata
+        # (emotion / audio-event). Detected by name so ``transcribe``
+        # forwards the right kwargs. The mlx-community/SenseVoiceSmall
+        # repo carries model_type=sensevoice, which mlx_audio's
+        # ``load_model`` dispatches through MODEL_REMAPPING["sensevoice"].
+        self._is_sensevoice = "sensevoice" in model_name.lower()
         # F-K-WHISPER-961: VAD pre-trim guard. See top-of-file block
         # for the full rationale. Only applied to Whisper engines —
         # Parakeet/Canary/etc. have their own silence semantics and
@@ -519,6 +538,12 @@ class STTEngine:
             from mlx_audio.stt.utils import load_model
 
             self.model = load_model(self.model_name)
+            # Prefer the backend metadata after loading so renamed/private
+            # SenseVoice repos still receive the native generate() contract.
+            # The constructor's name check remains a useful pre-load fallback.
+            model_type = getattr(getattr(self.model, "config", None), "model_type", "")
+            if isinstance(model_type, str) and model_type:
+                self._is_sensevoice = model_type.lower() == "sensevoice"
             # F-K-WHISPER-500: patch up the missing WhisperProcessor
             # mlx-community Whisper repos don't ship. Runs AFTER
             # mlx_audio's own post_load_hook, so if that succeeded
@@ -656,6 +681,12 @@ class STTEngine:
 
         audio_path = str(audio_path)
 
+        if self._is_sensevoice and task != "transcribe":
+            raise ValueError(
+                "SenseVoice supports transcription only; use a Whisper model "
+                "for task='translate'."
+            )
+
         # F-K-WHISPER-961: VAD pre-trim guard. Runs only for Whisper
         # engines with the guard enabled — see class docstring + the
         # module-level rationale block. On any failure the helper
@@ -680,10 +711,21 @@ class STTEngine:
         try:
             # Use the model's generate method directly
             kwargs = {"verbose": False}
-            if language and not self._is_parakeet:
-                kwargs["language"] = language
-            if task and not self._is_parakeet:
-                kwargs["task"] = task
+            if self._is_sensevoice:
+                # SenseVoice: keyword-only ``language`` (default auto-detect),
+                # no translation ``task``. A caller-supplied code outside
+                # ``_SENSEVOICE_LANGUAGES`` maps to auto-detection. Normalize
+                # here as part of our adapter contract rather than depending
+                # on mlx_audio's current unknown-key fallback.
+                language_hint = (language or "auto").lower()
+                kwargs["language"] = (
+                    language_hint if language_hint in _SENSEVOICE_LANGUAGES else "auto"
+                )
+            elif not self._is_parakeet:
+                if language:
+                    kwargs["language"] = language
+                if task:
+                    kwargs["task"] = task
 
             # Choose the input Whisper actually sees: either the
             # VAD-trimmed waveform (mono 16 kHz) or the original file
