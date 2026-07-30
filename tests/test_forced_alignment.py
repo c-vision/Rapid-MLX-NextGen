@@ -372,6 +372,47 @@ class TestAlignmentRoute:
         assert first["end"] == 0.5
         assert first["text"] == "你"
 
+    def test_segment_granularity_keeps_forced_alignment_path(self, _stub_route_engine):
+        """Rebased word-timestamp plumbing must not reroute aligner requests."""
+        client, restore = _mount_audio_app()
+        try:
+            r = _post(
+                client,
+                {
+                    "model": "qwen3-aligner",
+                    "text": "你好世界",
+                    "response_format": "verbose_json",
+                    "timestamp_granularities[]": "segment",
+                },
+            )
+        finally:
+            restore()
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["text"] == "你好世界"
+        assert len(body["segments"]) == 4
+        assert "words" not in body
+        assert _ALIGN_CALLS[-1]["text"] == "你好世界"
+
+    def test_word_granularity_rejects_forced_aligner(self, _stub_route_engine):
+        client, restore = _mount_audio_app()
+        try:
+            r = _post(
+                client,
+                {
+                    "model": "qwen3-aligner",
+                    "text": "你好世界",
+                    "response_format": "verbose_json",
+                    "timestamp_granularities[]": "word",
+                },
+            )
+        finally:
+            restore()
+        assert r.status_code == 400, r.text
+        error = r.json()["detail"]["error"]
+        assert error["code"] == "invalid_model_for_word_timestamps"
+        assert error["param"] == "timestamp_granularities"
+
     def test_srt_renders_character_cues(self, _stub_route_engine):
         client, restore = _mount_audio_app()
         try:

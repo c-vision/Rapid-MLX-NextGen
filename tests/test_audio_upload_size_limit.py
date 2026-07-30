@@ -215,9 +215,20 @@ def test_streaming_cap_rejects_chunked_upload_before_engine_load(monkeypatch):
                 model_form="whisper-small",
                 language_form=None,
                 response_format_form=None,
+                # STT-word-timestamps: the route gained
+                # ``timestamp_granularities[]`` form/query sources. This
+                # test calls the handler directly (bypassing FastAPI's
+                # dependency resolution), so — like the model/language/
+                # response_format params above — the new sources must be
+                # passed explicitly as ``None`` rather than left at their
+                # ``Form``/``Query`` sentinel defaults.
+                timestamp_granularities_bracket_form=None,
+                timestamp_granularities_plain_form=None,
                 model_query=None,
                 language_query=None,
                 response_format_query=None,
+                timestamp_granularities_bracket_query=None,
+                timestamp_granularities_plain_query=None,
             )
         )
 

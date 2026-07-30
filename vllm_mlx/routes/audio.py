@@ -4,6 +4,7 @@
 import base64
 import binascii
 import logging
+import math
 import os
 import re
 import tempfile
@@ -401,6 +402,57 @@ def _reject_non_whisper_for_translation(model: str) -> None:
     )
 
 
+def _reject_word_timestamps_for_non_whisper(
+    model: str, timestamp_granularities: list[str] | None
+) -> None:
+    """Reject ``timestamp_granularities[]=word`` on non-Whisper engines.
+
+    Only the Whisper family produces per-word timings: mlx-audio's whisper
+    ``generate`` accepts ``word_timestamps=True`` and attaches a per-word
+    list to each segment. Parakeet / other STT engines don't expose the
+    flag, so honoring a ``word`` request against them would return an empty
+    ``words`` array that FALSELY signals the granularity was fulfilled.
+    Reject up front with a 400 (mirroring the Whisper-only routing the
+    translations lane already uses) so callers get an actionable error
+    instead of a misleading 200. ``segment`` granularity is unaffected —
+    every STT engine reports segments.
+
+    Classification mirrors ``_reject_non_whisper_for_translation``: alias
+    is resolved to its upstream id first; unknown bare aliases fall through
+    so ``_resolve_stt_model`` still emits the 404 ``model_not_found``
+    envelope (keeping the error surface consistent with transcriptions).
+    """
+    if not timestamp_granularities or "word" not in timestamp_granularities:
+        return
+    if not isinstance(model, str) or not model:
+        return
+    resolved = STT_MODEL_ALIASES.get(model, model)
+    if "whisper" in resolved.lower():
+        return
+    # Unknown bare alias → let ``_resolve_stt_model`` 404 it so the
+    # envelope matches the unknown-model path rather than this 400.
+    if "/" not in model and model not in STT_MODEL_ALIASES:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error": {
+                "message": (
+                    f"The model `{model}` cannot produce word-level "
+                    "timestamps. `timestamp_granularities[]=word` requires a "
+                    "Whisper engine (e.g. `whisper-large-v3` or "
+                    "`whisper-large-v3-turbo`). Drop `word` (segment-level "
+                    "timestamps work on every STT engine) or switch to a "
+                    "Whisper model."
+                ),
+                "type": "invalid_request_error",
+                "code": "invalid_model_for_word_timestamps",
+                "param": "timestamp_granularities",
+            }
+        },
+    )
+
+
 class AudioBodyLimitMiddleware:
     """ASGI middleware that bounds the request body of audio-upload
     routes BEFORE Starlette's multipart parser can spool it.
@@ -648,6 +700,50 @@ def _validate_response_format(response_format: str | None) -> str:
     return response_format
 
 
+#: OpenAI's documented ``timestamp_granularities[]`` values. ``word``
+#: yields per-word timings; ``segment`` yields per-segment cues.
+_STT_TIMESTAMP_GRANULARITIES: frozenset[str] = frozenset(("word", "segment"))
+
+
+def _normalise_timestamp_granularities(
+    values: list[str] | None,
+) -> list[str] | None:
+    """Validate + de-duplicate OpenAI ``timestamp_granularities[]`` values.
+
+    Returns ``None`` when nothing usable was requested (field omitted or
+    empty list) so downstream code can treat "no granularities" as the
+    pre-feature default. Each value is lower-cased and checked against
+    OpenAI's two-value set; an unknown value raises a 400 with the same
+    ``invalid_request_error`` envelope the rest of the route uses, so a
+    typo (``"words"``) fails cheaply BEFORE the upload drains — mirroring
+    ``_validate_response_format``.
+    """
+    if not values:
+        return None
+    normalised: list[str] = []
+    for raw in values:
+        value = (raw or "").strip().lower()
+        if value not in _STT_TIMESTAMP_GRANULARITIES:
+            available = ", ".join(sorted(_STT_TIMESTAMP_GRANULARITIES))
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": (
+                            "`timestamp_granularities[]` values must each be "
+                            f"one of: {available}; got {raw!r}."
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "invalid_request",
+                        "param": "timestamp_granularities",
+                    }
+                },
+            )
+        if value not in normalised:
+            normalised.append(value)
+    return normalised or None
+
+
 def _format_srt_timestamp(seconds: float) -> str:
     """Format a float second offset as the SRT timestamp ``HH:MM:SS,mmm``.
 
@@ -742,21 +838,129 @@ def _build_vtt_body(result) -> str:
     return "\n".join(lines)
 
 
-def _build_verbose_json_body(result) -> dict:
+def _finite_or_none(value) -> float | None:
+    """Parse ``value`` as a finite float for a word-timestamp field.
+
+    Returns the finite float when ``value`` parses cleanly, or ``None`` for
+    anything the caller must drop: a missing (``None``) timing, a
+    non-numeric value, or a NaN / infinity. Nothing is defaulted or
+    fabricated — a word without a genuine, finite start AND end is omitted
+    rather than pinned to a plausible-but-wrong ``0.0`` (which would
+    mislead caption consumers) or serialised as non-JSON-safe
+    ``NaN``/``Infinity``.
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return f
+
+
+def _iter_words_for_verbose(result) -> list[dict]:
+    """Flatten the engine's per-segment ``words`` lists into OpenAI's
+    top-level ``words`` array shape.
+
+    OpenAI's ``verbose_json`` word object has EXACTLY three keys —
+    ``word`` (str), ``start`` (float seconds), ``end`` (float seconds).
+    Whisper (mlx-audio) attaches a ``words`` list of
+    ``{word, start, end, probability}`` to each segment when
+    ``word_timestamps=True``; we drop ``probability`` (not part of the
+    OpenAI contract) and walk both dict- and object-shaped words so a
+    future non-dict backend still renders. Segments without a ``words``
+    list (e.g. a non-Whisper backend that can't emit per-word timings)
+    contribute nothing — the caller then returns an empty ``words: []``
+    array rather than raising, matching the "degrade, don't 500"
+    contract for models that lack word timestamps.
+    """
+    segments = getattr(result, "segments", None) or []
+    words_out: list[dict] = []
+    for seg in segments:
+        if isinstance(seg, dict):
+            seg_words = seg.get("words")
+        else:
+            seg_words = getattr(seg, "words", None)
+        if not isinstance(seg_words, list):
+            continue
+        for w in seg_words:
+            if isinstance(w, dict):
+                word = w.get("word")
+                start = w.get("start")
+                end = w.get("end")
+            else:
+                word = getattr(w, "word", None)
+                start = getattr(w, "start", None)
+                end = getattr(w, "end", None)
+            if word is None:
+                continue
+            # mlx-audio's whisper carries the raw leading-space token
+            # (`" Welcome"`, `" to"`); OpenAI's ``words`` array reports the
+            # bare word with surrounding whitespace stripped. Match OpenAI
+            # so caption/subtitle consumers don't have to re-trim. A token
+            # that is pure whitespace after stripping contributes nothing.
+            word_str = str(word).strip()
+            if not word_str:
+                continue
+            # A word must carry a genuine finite start AND end to be placed
+            # on a timeline. Drop any word with a missing / non-numeric /
+            # NaN / inf timing instead of fabricating one, raising a 500, or
+            # emitting JSON that standard parsers reject (NaN/inf are not
+            # valid JSON). Whisper always supplies both, so the happy path
+            # is unaffected.
+            start_f = _finite_or_none(start)
+            end_f = _finite_or_none(end)
+            if start_f is None or end_f is None:
+                continue
+            words_out.append(
+                {
+                    "word": word_str,
+                    "start": start_f,
+                    "end": end_f,
+                }
+            )
+    return words_out
+
+
+def _build_verbose_json_body(result, timestamp_granularities=None) -> dict:
     """Render the ``verbose_json`` body — text + language + duration + segments.
 
     Mirrors OpenAI's documented field set. ``segments`` is normalised
     to a list of dicts with the canonical key names; the engine's
     raw shape is whatever ``stt`` chose to expose (whisper-mlx ships
     dicts; future backends might ship objects).
+
+    ``timestamp_granularities`` maps OpenAI's ``timestamp_granularities[]``
+    request field to the response shape:
+
+    * ``None`` (field omitted) — the pre-feature default: emit
+      ``segments`` only. Unchanged so existing clients see no drift.
+    * contains ``"segment"`` — emit ``segments``.
+    * contains ``"word"`` — additionally emit a top-level ``words``
+      array of ``{word, start, end}``.
+
+    Both keys can be present when both granularities are requested; a
+    ``["word"]``-only request emits ``words`` without ``segments``,
+    matching OpenAI's Whisper API.
     """
-    cues = _iter_segments_for_subtitles(result)
-    return {
+    include_segments = (
+        timestamp_granularities is None or "segment" in timestamp_granularities
+    )
+    include_words = (
+        timestamp_granularities is not None and "word" in timestamp_granularities
+    )
+
+    body: dict = {
         "task": "transcribe",
         "text": getattr(result, "text", ""),
         "language": getattr(result, "language", None),
         "duration": getattr(result, "duration", None),
-        "segments": [
+    }
+    if include_segments:
+        cues = _iter_segments_for_subtitles(result)
+        body["segments"] = [
             {
                 "id": idx,
                 "start": start,
@@ -764,16 +968,24 @@ def _build_verbose_json_body(result) -> dict:
                 "text": text,
             }
             for idx, (start, end, text) in enumerate(cues)
-        ],
-    }
+        ]
+    if include_words:
+        body["words"] = _iter_words_for_verbose(result)
+    return body
 
 
-def _format_stt_response(result, response_format: str, task: str):
+def _format_stt_response(
+    result, response_format: str, task: str, timestamp_granularities=None
+):
     """Branch on the validated ``response_format`` and produce a body.
 
     Centralised so the transcription and translation routes pick the
     same shape for the same value — a future change to one path
     automatically lands on the other.
+
+    ``timestamp_granularities`` only affects the ``verbose_json`` branch
+    (OpenAI's word/segment timestamp switch); every other format ignores
+    it, exactly as OpenAI's API does.
     """
     if response_format == "text":
         return PlainTextResponse(getattr(result, "text", "") or "")
@@ -782,7 +994,9 @@ def _format_stt_response(result, response_format: str, task: str):
     if response_format == "vtt":
         return PlainTextResponse(_build_vtt_body(result), media_type="text/vtt")
     if response_format == "verbose_json":
-        body = _build_verbose_json_body(result)
+        body = _build_verbose_json_body(
+            result, timestamp_granularities=timestamp_granularities
+        )
         # The verbose envelope carries an explicit ``task`` field —
         # translations should advertise themselves correctly even
         # when ``transcribe`` is the engine default.
@@ -1000,6 +1214,7 @@ async def _run_stt_request(
     response_format: str,
     task: str,
     text: str | None = None,
+    timestamp_granularities: list[str] | None = None,
 ):
     """Shared STT pipeline used by both ``/v1/audio/transcriptions`` and
     ``/v1/audio/translations``.
@@ -1117,13 +1332,24 @@ async def _run_stt_request(
                 tmp_path, text=text, language=language or "Chinese"
             )
         else:
-            result = _stt_engine.transcribe(tmp_path, language=language, task=task)
+            # Forward ``timestamp_granularities`` only when requested.
+            # Keeping the default call shape unchanged preserves compatibility
+            # with older STTEngine-shaped stubs and third-party engines.
+            transcribe_kwargs: dict = {"language": language, "task": task}
+            if timestamp_granularities:
+                transcribe_kwargs["timestamp_granularities"] = timestamp_granularities
+            result = _stt_engine.transcribe(tmp_path, **transcribe_kwargs)
 
         # R6-H2: branch on the validated ``response_format`` so callers
         # that requested ``srt`` / ``vtt`` / ``verbose_json`` actually
         # get those shapes. Pre-fix only ``text`` had a non-JSON path;
         # everything else fell through to the JSON envelope.
-        return _format_stt_response(result, response_format, task=task)
+        return _format_stt_response(
+            result,
+            response_format,
+            task=task,
+            timestamp_granularities=timestamp_granularities,
+        )
 
     except ImportError:
         raise HTTPException(
@@ -1229,10 +1455,28 @@ async def create_transcription(
     # segment shape verbose_json/srt/vtt already render. Accepted on
     # both form and query for parity with the other STT fields.
     text_form: str | None = Form(None, alias="text"),
+    # STT-word-timestamps: OpenAI serialises the array field as
+    # ``timestamp_granularities[]`` (bracketed) in the multipart body.
+    # We also accept the un-bracketed ``timestamp_granularities`` name
+    # (some SDK/curl variants send it that way) and both spellings on the
+    # query string, mirroring the form-over-query precedence the rest of
+    # this route already uses for ``model``/``language``/``response_format``.
+    timestamp_granularities_bracket_form: list[str] | None = Form(
+        None, alias="timestamp_granularities[]"
+    ),
+    timestamp_granularities_plain_form: list[str] | None = Form(
+        None, alias="timestamp_granularities"
+    ),
     model_query: str | None = Query(None, alias="model"),
     language_query: str | None = Query(None, alias="language"),
     response_format_query: str | None = Query(None, alias="response_format"),
     text_query: str | None = Query(None, alias="text"),
+    timestamp_granularities_bracket_query: list[str] | None = Query(
+        None, alias="timestamp_granularities[]"
+    ),
+    timestamp_granularities_plain_query: list[str] | None = Query(
+        None, alias="timestamp_granularities"
+    ),
 ):
     """Transcribe audio to text (OpenAI Whisper API compatible).
 
@@ -1281,6 +1525,45 @@ async def create_transcription(
     # response_format".
     response_format = _validate_response_format(response_format)
 
+    # STT-word-timestamps: resolve the requested granularities from
+    # whichever source carried them (bracketed form wins → plain form →
+    # bracketed query → plain query), then validate the values up front so
+    # a bad value (``"words"``) fails cheaply with a 400 before the upload
+    # drains — same lifecycle as ``response_format`` above.
+    timestamp_granularities = _normalise_timestamp_granularities(
+        timestamp_granularities_bracket_form
+        or timestamp_granularities_plain_form
+        or timestamp_granularities_bracket_query
+        or timestamp_granularities_plain_query
+    )
+
+    # OpenAI contract: ``timestamp_granularities[]`` is only meaningful
+    # with ``response_format=verbose_json`` (the only shape that carries a
+    # ``words``/``segments`` array). Reject the mismatch with a 400 instead
+    # of silently ignoring the field, so a caller that forgot to set
+    # ``verbose_json`` learns why their timestamps never arrived.
+    if timestamp_granularities is not None and response_format != "verbose_json":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": (
+                        "`timestamp_granularities[]` requires "
+                        "`response_format=verbose_json`; got "
+                        f"response_format={response_format!r}."
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "invalid_request",
+                    "param": "timestamp_granularities",
+                }
+            },
+        )
+
+    # Word-level timings are a Whisper-only capability — reject the
+    # ``word`` granularity on non-Whisper engines with a 400 rather than
+    # returning an empty ``words`` array that falsely claims fulfillment.
+    _reject_word_timestamps_for_non_whisper(model, timestamp_granularities)
+
     # F-D05: STT-lane audio dep probe — same envelope as the TTS
     # lane shares. Fires BEFORE we spool any upload bytes so a broken
     # ``mlx_audio.stt`` install rejects cheaply (no temp file, no
@@ -1298,6 +1581,7 @@ async def create_transcription(
         response_format=response_format,
         task="transcribe",
         text=text,
+        timestamp_granularities=timestamp_granularities,
     )
 
 

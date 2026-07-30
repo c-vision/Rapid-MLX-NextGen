@@ -2510,14 +2510,58 @@ class MCPExecuteResponse(BaseModel):
 # =============================================================================
 
 
+#: OpenAI's documented ``timestamp_granularities[]`` enum values. The
+#: multipart route (``routes/audio.py``) is the runtime gate; this mirror
+#: keeps the public request schema self-validating so generated clients
+#: reject bad values too.
+_TIMESTAMP_GRANULARITY_VALUES: frozenset[str] = frozenset(("word", "segment"))
+
+
 class AudioTranscriptionRequest(BaseModel):
-    """Request for audio transcription (STT)."""
+    """Request for audio transcription (STT).
+
+    ``timestamp_granularities`` maps OpenAI's ``timestamp_granularities[]``
+    field: a subset of ``{"word", "segment"}`` requesting per-word and/or
+    per-segment timestamps in the ``verbose_json`` response. The route
+    validates the wire value (it arrives as a multipart form array, not
+    JSON); the validator below keeps this Pydantic surface honest for any
+    caller that constructs the model directly.
+    """
 
     model: str = "whisper-large-v3"
     language: str | None = None
     response_format: str = "json"
     temperature: float = 0.0
-    timestamp_granularities: list[str] | None = None
+    # ``Literal`` (not bare ``list[str]``) so the generated JSON Schema /
+    # OpenAPI advertises the enum and downstream clients reject bad values;
+    # the ``mode="before"`` validator still normalises case/whitespace and
+    # de-dups before this enum check runs.
+    timestamp_granularities: list[Literal["word", "segment"]] | None = None
+
+    @field_validator("timestamp_granularities", mode="before")
+    @classmethod
+    def _validate_timestamp_granularities(cls, value):
+        """Normalise + validate ``timestamp_granularities`` against the
+        OpenAI enum. ``None``/empty → ``None``; unknown values raise so
+        the schema advertises the same contract the route enforces."""
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("timestamp_granularities must be a list of strings")
+        normalised: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("timestamp_granularities entries must be strings")
+            g = item.strip().lower()
+            if g not in _TIMESTAMP_GRANULARITY_VALUES:
+                allowed = ", ".join(sorted(_TIMESTAMP_GRANULARITY_VALUES))
+                raise ValueError(
+                    f"timestamp_granularities values must each be one of: "
+                    f"{allowed}; got {item!r}"
+                )
+            if g not in normalised:
+                normalised.append(g)
+        return normalised or None
 
 
 class AudioTranscriptionResponse(BaseModel):

@@ -651,6 +651,18 @@ class STTEngine:
         # pre-bundle; the comment is here so the call sites are
         # discoverable from the function definition.
         task: str = "transcribe",
+        # STT-word-timestamps: OpenAI's ``timestamp_granularities[]`` maps
+        # here. When the list contains ``"word"`` and the backend is a
+        # Whisper family model, we ask mlx-audio's whisper ``generate`` for
+        # per-word timings (``word_timestamps=True``) so each returned
+        # segment carries a ``words`` list of ``{word, start, end,
+        # probability}``. Non-Whisper backends (Parakeet, etc.) do not
+        # expose the flag; we omit it for them so they never raise, and the
+        # route simply reports whatever word data (if any) the segments
+        # already carry. ``None``/empty preserves the pre-feature behavior
+        # exactly (no extra decoding cost, no signature change for callers
+        # that never request granularities).
+        timestamp_granularities: list[str] | None = None,
     ) -> TranscriptionResult:
         """
         Transcribe audio file to text.
@@ -661,6 +673,10 @@ class STTEngine:
             task: "transcribe" or "translate" (translate to English).
                 Forwarded to ``model.generate`` for Whisper engines;
                 ignored by Parakeet (which is English-only).
+            timestamp_granularities: OpenAI ``timestamp_granularities[]``
+                values (subset of ``{"word", "segment"}``). ``"word"``
+                requests per-word timings on Whisper engines; ignored by
+                non-Whisper backends.
 
         Returns:
             TranscriptionResult with text and metadata
@@ -726,6 +742,20 @@ class STTEngine:
                     kwargs["language"] = language
                 if task:
                     kwargs["task"] = task
+
+            # STT-word-timestamps: only Whisper's ``generate`` accepts
+            # ``word_timestamps``. Guard on ``self._is_whisper`` so a
+            # ``timestamp_granularities=["word"]`` request against a
+            # Parakeet / non-Whisper backend degrades to segment-level
+            # output instead of raising a TypeError (which the route would
+            # otherwise surface as a 500). Whisper attaches a per-segment
+            # ``words`` list of ``{word, start, end, probability}`` when the
+            # flag is set.
+            want_word_timestamps = (
+                bool(timestamp_granularities) and "word" in timestamp_granularities
+            )
+            if want_word_timestamps and self._is_whisper and not self._is_parakeet:
+                kwargs["word_timestamps"] = True
 
             # Choose the input Whisper actually sees: either the
             # VAD-trimmed waveform (mono 16 kHz) or the original file
