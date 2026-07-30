@@ -16,6 +16,7 @@ import warnings
 import weakref
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -385,16 +386,18 @@ async def _run_job(
     engine,
     width: int,
     height: int,
-    seconds: int,
+    num_frames: int,
+    fps: int,
     seed: int,
     image_path: Path | None,
+    negative_prompt: str | None,
+    guidance_scale: float | None,
+    conditioning_strength: float | None,
 ) -> None:
     started = False
     output = _jobs_root / job.id / "output.mp4"
     generation_gate = _generation_gate_for_current_loop()
     is_cogvideox = getattr(engine, "video_family", "") == "cogvideox-fun"
-    is_wan = getattr(engine, "video_family", "") == "wan"
-    native_fps = 5 if is_cogvideox else getattr(engine, "native_fps", 24)
     generation_width = width if is_cogvideox else ((width + 63) // 64) * 64
     generation_height = height if is_cogvideox else ((height + 63) // 64) * 64
 
@@ -415,14 +418,13 @@ async def _run_job(
                 output_path=output,
                 width=generation_width,
                 height=generation_height,
-                num_frames=(
-                    5
-                    if is_cogvideox
-                    else _frame_count(seconds, native_fps if is_wan else 24)
-                ),
-                fps=native_fps,
+                num_frames=num_frames,
+                fps=fps,
                 seed=seed,
                 image=image_path,
+                negative_prompt=negative_prompt,
+                guidance_scale=guidance_scale,
+                conditioning_strength=conditioning_strength,
                 output_width=width,
                 output_height=height,
             )
@@ -486,6 +488,11 @@ async def create_video(
     seconds: str = Form("4"),
     size: str = Form("768x512"),
     seed: int = Form(42),
+    fps: Annotated[int | None, Form()] = None,
+    frames: Annotated[int | None, Form()] = None,
+    guidance_scale: Annotated[float | None, Form()] = None,
+    conditioning_strength: Annotated[float | None, Form()] = None,
+    negative_prompt: Annotated[str | None, Form(max_length=4096)] = None,
     input_reference: UploadFile | None = File(None),
 ):
     engine = _video_engine()
@@ -508,19 +515,26 @@ async def create_video(
             status_code=400,
             detail=f"model must match the served video model ({engine.model_name})",
         )
-    try:
-        seconds_int = int(seconds)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400, detail="seconds must be an integer"
-        ) from exc
-    if is_cogvideox and seconds_int != 1:
-        raise HTTPException(
-            status_code=400,
-            detail="CogVideoX-Fun MVP currently supports seconds=1 only",
-        )
-    if not 1 <= seconds_int <= 20:
-        raise HTTPException(status_code=400, detail="seconds must be between 1 and 20")
+    if frames is None:
+        try:
+            seconds_int = int(seconds)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="seconds must be an integer"
+            ) from exc
+        if is_cogvideox and seconds_int != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="CogVideoX-Fun MVP currently supports seconds=1 only",
+            )
+        if not 1 <= seconds_int <= 20:
+            raise HTTPException(
+                status_code=400, detail="seconds must be between 1 and 20"
+            )
+    else:
+        # An explicit frame count is the temporal source of truth. Derive the
+        # public duration after request FPS validation below.
+        seconds_int = 1
     if is_cogvideox:
         if size != "672x384":
             raise HTTPException(
@@ -530,16 +544,81 @@ async def create_video(
         width, height = 672, 384
     else:
         width, height = _parse_size(size)
+    native_fps = 5 if is_cogvideox else getattr(engine, "native_fps", 24)
+    request_fps = native_fps if fps is None else fps
+    if not 1 <= request_fps <= 60:
+        raise HTTPException(status_code=400, detail="fps must be between 1 and 60")
+    if is_wan and request_fps != native_fps:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Wan output fps is fixed by this checkpoint at {native_fps}",
+        )
+    if frames is not None and not 1 <= frames <= 1201:
+        raise HTTPException(status_code=400, detail="frames must be between 1 and 1201")
+    if frames is not None:
+        seconds_int = max(1, (frames + request_fps - 1) // request_fps)
+    if guidance_scale is not None and not 1.0 <= guidance_scale <= 30.0:
+        raise HTTPException(
+            status_code=400,
+            detail="guidance_scale must be between 1 and 30",
+        )
+    if conditioning_strength is not None:
+        if not 0.0 <= conditioning_strength <= 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail="conditioning_strength must be between 0 and 1",
+            )
+        if is_cogvideox or is_wan:
+            raise HTTPException(
+                status_code=400,
+                detail="conditioning_strength is currently supported by LTX only",
+            )
+        if input_reference is None:
+            raise HTTPException(
+                status_code=400,
+                detail="conditioning_strength requires input_reference",
+            )
+    if negative_prompt is not None:
+        negative_prompt = negative_prompt.strip()
     generation_width = ((width + 63) // 64) * 64
     generation_height = ((height + 63) // 64) * 64
-    request_frames = _frame_count(
-        seconds_int, getattr(engine, "native_fps", 24) if is_wan else 24
-    )
-    if (
-        not is_cogvideox
-        and generation_width * generation_height * request_frames > _MAX_PIXEL_FRAMES
-    ):
-        family = "Wan" if is_wan else "LTX-2.3 Q4"
+    if frames is not None:
+        request_frames = frames
+    elif is_cogvideox:
+        request_frames = 5
+    else:
+        # Normalize seconds × fps to the temporal shape the diffusion
+        # backends require. Only an explicitly supplied frame count should
+        # ever reach the validation below unnormalized.
+        request_frames = _frame_count(
+            seconds_int, native_fps if is_wan else request_fps
+        )
+    if is_cogvideox and request_frames < 5:
+        raise HTTPException(
+            status_code=400, detail="CogVideoX-Fun frames must be at least 5"
+        )
+    if is_cogvideox and request_frames % 4 != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="CogVideoX-Fun frames must be 4n+1 (for example 5, 9, 13)",
+        )
+    if is_wan and (request_frames < 5 or request_frames % 4 != 1):
+        raise HTTPException(
+            status_code=400,
+            detail="Wan frames must be 4n+1 and at least 5 (for example 5, 9, 13)",
+        )
+    if not (is_cogvideox or is_wan):
+        if request_frames < 9 or request_frames % 8 != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="LTX frames must be 8n+1 and at least 9 (for example 9, 17, 25)",
+            )
+    workload_width = width if is_cogvideox else generation_width
+    workload_height = height if is_cogvideox else generation_height
+    if workload_width * workload_height * request_frames > _MAX_PIXEL_FRAMES:
+        family = (
+            "CogVideoX-Fun" if is_cogvideox else ("Wan" if is_wan else "LTX-2.3 Q4")
+        )
         raise HTTPException(
             status_code=400,
             detail=(
@@ -577,7 +656,7 @@ async def create_video(
                 await asyncio.to_thread(target.close)
             await asyncio.to_thread(_validate_reference_image, image_path)
 
-        num_frames = 5 if is_cogvideox else request_frames
+        num_frames = request_frames
         if is_wan:
             from ..runtime.video_lane import validate_video_request
 
@@ -630,9 +709,13 @@ async def create_video(
                     engine=engine,
                     width=width,
                     height=height,
-                    seconds=seconds_int,
+                    num_frames=num_frames,
+                    fps=request_fps,
                     seed=seed,
                     image_path=image_path,
+                    negative_prompt=negative_prompt,
+                    guidance_scale=guidance_scale,
+                    conditioning_strength=conditioning_strength,
                 )
             )
             _tasks[job.id] = task

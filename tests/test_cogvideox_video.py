@@ -201,6 +201,55 @@ async def test_cogvideox_job_maps_validated_mvp_shape(monkeypatch, tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_cogvideox_frame_budget_uses_actual_generation_size(
+    monkeypatch, tmp_path
+) -> None:
+    captured = {}
+
+    class FakeEngine:
+        model_name = "dgrauet/CogVideoX-Fun-V1.5-5b-InP-mlx-q4"
+        video_family = "cogvideox-fun"
+
+        def generate(self, *, output_path: Path, **kwargs):
+            captured.update(kwargs)
+            output_path.write_bytes(b"mp4")
+
+    monkeypatch.setattr(video, "_video_engine", lambda: FakeEngine())
+    created = await video.create_video(
+        prompt="long camera move",
+        model="cogvideox-fun-5b-q4",
+        seconds="1",
+        size="672x384",
+        seed=2,
+        frames=145,
+        input_reference=None,
+    )
+    for _ in range(100):
+        current = await video.retrieve_video(created["id"])
+        if current["status"] == "completed":
+            break
+        await asyncio.sleep(0.01)
+
+    assert current["status"] == "completed"
+    assert captured["width"] == 672
+    assert captured["height"] == 384
+    assert captured["num_frames"] == 145
+    await video.delete_video(created["id"])
+
+    with pytest.raises(HTTPException, match="safe CogVideoX-Fun workload") as exc:
+        await video.create_video(
+            prompt="too many frames",
+            model="cogvideox-fun-5b-q4",
+            seconds="1",
+            size="672x384",
+            seed=2,
+            frames=149,
+            input_reference=None,
+        )
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_cogvideox_mvp_rejects_unsupported_shape(monkeypatch) -> None:
     engine = SimpleNamespace(
         model_name="dgrauet/CogVideoX-Fun-V1.5-5b-InP-mlx-q4",

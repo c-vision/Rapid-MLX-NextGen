@@ -138,6 +138,9 @@ class VideoEngine:
         fps: int,
         seed: int,
         image: Path | None,
+        negative_prompt: str | None = None,
+        guidance_scale: float | None = None,
+        conditioning_strength: float | None = None,
         output_width: int | None = None,
         output_height: int | None = None,
     ) -> None:
@@ -154,6 +157,8 @@ class VideoEngine:
                         num_frames=num_frames,
                         seed=seed,
                         image=image,
+                        negative_prompt=negative_prompt,
+                        guidance_scale=guidance_scale,
                     )
             except WanBackendError as exc:
                 raise VideoRuntimeError(str(exc)) from exc
@@ -180,6 +185,8 @@ class VideoEngine:
                     frames=num_frames,
                     fps=fps,
                     seed=seed,
+                    negative_prompt=negative_prompt or "",
+                    guidance_scale=(6.0 if guidance_scale is None else guidance_scale),
                 )
             return
         if shutil.which("ffmpeg") is None:
@@ -198,20 +205,27 @@ class VideoEngine:
         # The 22B pipeline is not re-entrant and a second concurrent graph can
         # exhaust unified memory. Serialize jobs per served model.
         with self._generation_lock:
-            generate_video_with_audio(
-                model_repo=self.model_name,
-                text_encoder_repo=None,
-                prompt=prompt,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                seed=seed,
-                fps=fps,
-                output_path=str(output_path),
-                image=str(image) if image is not None else None,
-                verbose=False,
-                enhance_prompt=False,
-            )
+            generation_kwargs = {
+                "model_repo": self.model_name,
+                "text_encoder_repo": None,
+                "prompt": prompt,
+                "height": height,
+                "width": width,
+                "num_frames": num_frames,
+                "seed": seed,
+                "fps": fps,
+                "output_path": str(output_path),
+                "image": str(image) if image is not None else None,
+                "verbose": False,
+                "enhance_prompt": False,
+            }
+            if negative_prompt is not None:
+                generation_kwargs["negative_prompt"] = negative_prompt
+            if guidance_scale is not None:
+                generation_kwargs["cfg_scale"] = guidance_scale
+            if conditioning_strength is not None:
+                generation_kwargs["image_strength"] = conditioning_strength
+            generate_video_with_audio(**generation_kwargs)
         if not output_path.is_file() or output_path.stat().st_size == 0:
             raise VideoRuntimeError(
                 "LTX-2.3 generation completed without an MP4 output."

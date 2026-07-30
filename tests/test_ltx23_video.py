@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import subprocess
 import sys
 import threading
@@ -321,6 +322,9 @@ def test_video_engine_calls_mlx_native_pipeline(
         image,
         verbose,
         enhance_prompt,
+        negative_prompt=None,
+        cfg_scale=3.0,
+        image_strength=1.0,
     ) -> None:
         captured.update(locals())
         Path(output_path).write_bytes(b"mp4")
@@ -342,12 +346,18 @@ def test_video_engine_calls_mlx_native_pipeline(
         fps=24,
         seed=7,
         image=reference,
+        negative_prompt="static",
+        guidance_scale=4.5,
+        conditioning_strength=0.25,
     )
 
     assert output.read_bytes() == b"mp4"
     assert captured["model_repo"] == "notapalindrome/ltx23-mlx-av-q4"
     assert captured["num_frames"] == 97
     assert captured["image"] == str(reference)
+    assert captured["negative_prompt"] == "static"
+    assert captured["cfg_scale"] == 4.5
+    assert captured["image_strength"] == 0.25
 
 
 def test_video_engines_share_process_generation_lock() -> None:
@@ -393,6 +403,7 @@ def test_video_parameter_validation() -> None:
     assert video._parse_size("1280x720") == (1280, 720)
     assert video._parse_size("720x1280") == (720, 1280)
     assert video._frame_count(4) == 97
+    assert video._frame_count(1, 26) == 25
     with pytest.raises(HTTPException, match="divisible by 64") as exc:
         video._parse_size("700x512")
     assert exc.value.status_code == 400
@@ -456,6 +467,89 @@ async def test_openai_720p_size_is_aligned_then_cropped(
     assert captured["output_width"] == 1280
     assert captured["output_height"] == 720
     await video.delete_video(created["id"])
+
+
+@pytest.mark.asyncio
+async def test_video_route_threads_motion_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    image_bytes = io.BytesIO()
+    Image.new("RGB", (64, 64), "blue").save(image_bytes, format="PNG")
+
+    class ReferenceUpload:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+
+        async def read(self, size: int) -> bytes:
+            payload, self._payload = self._payload[:size], self._payload[size:]
+            return payload
+
+    class FakeEngine:
+        model_name = "notapalindrome/ltx23-mlx-av-q4"
+
+        def generate(self, *, output_path: Path, **kwargs) -> None:
+            captured.update(kwargs)
+            output_path.write_bytes(b"mp4")
+
+    monkeypatch.setattr(video, "_video_engine", lambda: FakeEngine())
+    created = await video.create_video(
+        prompt="a fast camera move",
+        model="ltx-2.3-mlx-q4",
+        seconds="ignored when frames is explicit",
+        size="512x512",
+        seed=3,
+        fps=12,
+        frames=17,
+        guidance_scale=4.25,
+        conditioning_strength=0.35,
+        negative_prompt="static camera",
+        input_reference=ReferenceUpload(image_bytes.getvalue()),
+    )
+    for _ in range(100):
+        current = await video.retrieve_video(created["id"])
+        if current["status"] == "completed":
+            break
+        await asyncio.sleep(0.01)
+
+    assert current["status"] == "completed"
+    assert current["seconds"] == "2"
+    assert captured["fps"] == 12
+    assert captured["num_frames"] == 17
+    assert captured["guidance_scale"] == 4.25
+    assert captured["negative_prompt"] == "static camera"
+    assert captured["conditioning_strength"] == 0.35
+    assert captured["image"].is_file()
+    await video.delete_video(created["id"])
+
+
+@pytest.mark.asyncio
+async def test_video_route_validates_motion_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeEngine:
+        model_name = "notapalindrome/ltx23-mlx-av-q4"
+
+    monkeypatch.setattr(video, "_video_engine", lambda: FakeEngine())
+    base = {
+        "prompt": "test",
+        "model": "ltx-2.3-mlx-q4",
+        "seconds": "1",
+        "size": "512x512",
+        "seed": 1,
+        "input_reference": None,
+    }
+    with pytest.raises(HTTPException, match="fps must be between"):
+        await video.create_video(**base, fps=0)
+    with pytest.raises(HTTPException, match="LTX frames must be 8n"):
+        await video.create_video(**base, frames=16)
+    with pytest.raises(HTTPException, match="at least 9"):
+        await video.create_video(**base, frames=1)
+    with pytest.raises(HTTPException, match="guidance_scale must be between"):
+        await video.create_video(**base, guidance_scale=0.5)
+    with pytest.raises(HTTPException, match="requires input_reference"):
+        await video.create_video(**base, conditioning_strength=0.5)
 
 
 @pytest.mark.asyncio

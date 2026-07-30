@@ -236,6 +236,8 @@ class WanVideoEngine:
         num_frames: int,
         seed: int,
         image: Path | None,
+        negative_prompt: str | None = None,
+        guidance_scale: float | None = None,
     ) -> None:
         self.validate_request(
             width=width, height=height, num_frames=num_frames, image=image
@@ -248,21 +250,26 @@ class WanVideoEngine:
                 "install the rapid-mlx video extra"
             ) from exc
 
-        generate_video(
-            model_dir=str(self.model_path),
-            prompt=prompt,
-            image=str(image) if image is not None else None,
-            width=width,
-            height=height,
-            num_frames=num_frames,
-            steps=self.steps,
-            seed=seed,
-            output_path=str(output_path),
-            scheduler=self.scheduler,
-            tiling=self.tiling,
-            loras=self.loras,
-            loras_high=self.loras_high,
-            loras_low=self.loras_low,
-        )
+        generation_kwargs = {
+            "model_dir": str(self.model_path),
+            "prompt": prompt,
+            "image": str(image) if image is not None else None,
+            "width": width,
+            "height": height,
+            "num_frames": num_frames,
+            "steps": self.steps,
+            "seed": seed,
+            "output_path": str(output_path),
+            "scheduler": self.scheduler,
+            "tiling": self.tiling,
+            "loras": self.loras,
+            "loras_high": self.loras_high,
+            "loras_low": self.loras_low,
+        }
+        if negative_prompt is not None:
+            generation_kwargs["negative_prompt"] = negative_prompt
+        if guidance_scale is not None:
+            generation_kwargs["guide_scale"] = guidance_scale
+        generate_video(**generation_kwargs)
         if not output_path.is_file() or output_path.stat().st_size == 0:
             raise WanBackendError("Wan generation completed without an MP4 output")

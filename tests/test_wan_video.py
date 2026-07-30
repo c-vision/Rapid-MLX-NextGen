@@ -273,6 +273,9 @@ async def test_wan_job_uses_native_fps_and_async_video_contract(
         seconds="1",
         size="832x512",
         seed=9,
+        frames=33,
+        guidance_scale=5.5,
+        negative_prompt="rain",
         input_reference=None,
     )
     for _ in range(100):
@@ -284,9 +287,57 @@ async def test_wan_job_uses_native_fps_and_async_video_contract(
     assert current["status"] == "completed"
     assert current["model"] == "wan2.2-ti2v-5b-q8"
     assert captured["fps"] == 24
-    assert captured["num_frames"] == 25
-    assert captured["validated"]["num_frames"] == 25
+    assert captured["num_frames"] == 33
+    assert captured["guidance_scale"] == 5.5
+    assert captured["negative_prompt"] == "rain"
+    assert captured["validated"]["num_frames"] == 33
     await video.delete_video(created["id"])
+
+
+@pytest.mark.asyncio
+async def test_wan_route_rejects_non_native_fps(monkeypatch) -> None:
+    class FakeWanEngine:
+        model_name = "Anes1032/Wan2.2-TI2V-5B-mlx-q8"
+        video_family = "wan"
+        native_fps = 24
+        _wan_engine = None
+
+    engine = FakeWanEngine()
+    engine._wan_engine = engine
+    monkeypatch.setattr(video, "_video_engine", lambda: engine)
+    with pytest.raises(HTTPException, match="output fps is fixed"):
+        await video.create_video(
+            prompt="test",
+            model="wan2.2-ti2v-5b-q8",
+            seconds="1",
+            size="832x512",
+            seed=1,
+            fps=12,
+            input_reference=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_wan_route_rejects_invalid_explicit_frame_shape(monkeypatch) -> None:
+    class FakeWanEngine:
+        model_name = "Anes1032/Wan2.2-TI2V-5B-mlx-q8"
+        video_family = "wan"
+        native_fps = 24
+        _wan_engine = None
+
+    engine = FakeWanEngine()
+    engine._wan_engine = engine
+    monkeypatch.setattr(video, "_video_engine", lambda: engine)
+    with pytest.raises(HTTPException, match=r"Wan frames must be 4n\+1"):
+        await video.create_video(
+            prompt="test",
+            model="wan2.2-ti2v-5b-q8",
+            seconds="ignored",
+            size="832x512",
+            seed=1,
+            frames=6,
+            input_reference=None,
+        )
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,36 @@ Video generation requires Python 3.11 or newer because the upstream
 `mlx-video-with-audio` runtime does not support Python 3.10. Rapid-MLX's core
 text and audio features continue to support Python 3.10.
 
+## Motion and conditioning controls
+
+`POST /v1/videos` accepts optional controls in addition to `seconds`:
+
+- `fps` selects the output frame rate for LTX and CogVideoX-Fun. Wan uses the
+  checkpoint's native frame rate and rejects a different value.
+- `frames` overrides the frame count derived from `seconds`. LTX requires
+  `8n+1` with a minimum of 9; Wan and CogVideoX-Fun require `4n+1` with a
+  minimum of 5.
+- `guidance_scale` (1–30) and `negative_prompt` are passed to the served
+  backend's classifier-free guidance implementation.
+- `conditioning_strength` (0–1) controls how closely LTX image-to-video follows
+  `input_reference`; it is rejected without a reference image and is not
+  currently supported by Wan or CogVideoX-Fun.
+
+For example, request a shorter, lower-frame-rate LTX image-to-video result with
+weaker reference conditioning:
+
+```bash
+curl http://127.0.0.1:8000/v1/videos \
+  -F model=ltx-2.3-mlx-q4 \
+  -F 'prompt=the camera sweeps around the subject' \
+  -F input_reference=@start.png \
+  -F fps=12 \
+  -F frames=17 \
+  -F guidance_scale=4.5 \
+  -F conditioning_strength=0.35 \
+  -F 'negative_prompt=static camera, frozen subject'
+```
+
 ## Wan 2.1 / 2.2
 
 Wan uses the `mlx-video-with-audio` runtime included in the video extra. Four
