@@ -1,19 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Audio endpoints (STT/TTS)."""
 
+import asyncio
 import base64
 import binascii
+import io
 import logging
 import math
 import os
 import re
 import tempfile
+import wave
 
 from fastapi import APIRouter, Body, Depends, Form, HTTPException, Query, UploadFile
 from starlette.responses import PlainTextResponse, Response
 
-from ..api.models import AudioSpeechRequest
+from ..api.models import AudioMusicRequest, AudioSpeechRequest
 from ..middleware.auth import verify_api_key
+from ._async_utils import run_to_completion
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +153,7 @@ _AUDIO_READ_CHUNK_SIZE = 1024 * 1024  # 1 MB chunks
 # Audio engines (lazy loaded, module-level to persist across requests)
 _stt_engine = None
 _tts_engine = None
+_music_engine = None
 
 # OpenAI-style STT model alias → MLX repo. Promoted to module scope so
 # the route can validate the model BEFORE streaming the upload (F-165):
@@ -2322,6 +2327,235 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
                 }
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# Third audio lane: text→music / text→SFX (``/v1/audio/music``).
+#
+# Wired to ``vllm_mlx.audio.music.MusicEngine`` (MLX-native Stable Audio
+# 3). OpenAI-flavored: JSON body in, WAV bytes out — the same
+# request-in / audio-bytes-out shape as ``/v1/audio/speech``. The
+# ``model`` field selects a DiT/decoder pairing via the alias table
+# below; unknown values fall back to the engine defaults.
+# ---------------------------------------------------------------------------
+
+#: ``model`` alias → ``(dit, decoder)`` pairing for SA3. ``medium`` is
+#: higher quality (~3.9 GB peak); ``sm-music`` / ``sm-sfx`` are the fast
+#: small variants (~1.7 GB, ~4x realtime). Kept local to the route (not
+#: in the audio registry, whose closed schema is stt/tts-typed) so adding
+#: a music variant is a one-line edit here. ``default`` maps to the
+#: engine's own defaults.
+MUSIC_MODEL_ALIASES: dict[str, tuple[str, str]] = {
+    "medium": ("medium", "same-l"),
+    "same-l": ("medium", "same-l"),
+    "sm-music": ("sm-music", "same-s"),
+    "sm-sfx": ("sm-sfx", "same-s"),
+    "same-s": ("sm-music", "same-s"),
+    "default": ("medium", "same-l"),
+}
+
+#: Fallback when ``model`` isn't a known music alias — the SA3 defaults.
+DEFAULT_MUSIC_DIT_DECODER: tuple[str, str] = ("medium", "same-l")
+
+#: Serialises music generation. ``MusicEngine.generate`` shells out to the
+#: vendored SA3 CLI, which peaks at ~3.9 GB (``medium``) — two concurrent
+#: requests would run two such subprocesses and can exhaust unified memory
+#: on a base-config Mac. Also guards the ``_music_engine`` global, mutated
+#: from a worker thread.
+#:
+#: An ``asyncio.Lock`` acquired ON THE EVENT LOOP, deliberately not a
+#: ``threading.Lock`` held inside the worker. ``asyncio.to_thread`` uses
+#: the shared default executor (min(32, cpu+4) threads), so queued
+#: requests blocking on a thread-level lock would each pin an executor
+#: thread just to wait — starving every other ``to_thread`` user in the
+#: process (prefix-cache save, tool-grammar warmup, the diffusion lane).
+#: With a 900 s render ceiling that is a long time to hold threads other
+#: subsystems need. Waiting on the loop instead costs a coroutine, and
+#: only the request that actually runs ever occupies an executor slot.
+#:
+#: Lazily created because the module imports before any event loop exists
+#: and an ``asyncio.Lock`` must be bound to the running loop.
+_music_lock: asyncio.Lock | None = None
+
+
+def _get_music_lock() -> asyncio.Lock:
+    """Return the process-wide music lock, creating it on first use."""
+    global _music_lock
+    if _music_lock is None:
+        _music_lock = asyncio.Lock()
+    return _music_lock
+
+
+def _generate_music_blocking(
+    dit: str,
+    decoder: str,
+    out_path: str,
+    request: AudioMusicRequest,
+) -> None:
+    """Blocking half of ``/v1/audio/music`` — runs on a worker thread.
+
+    ``MusicEngine.generate`` spawns the vendored Stable Audio 3 CLI and
+    waits on it (default timeout 900 s). Calling that inline from the
+    ``async def`` handler would stall the event loop for the entire
+    render — every concurrent chat completion, ``/healthz`` probe and SSE
+    heartbeat with it — so the handler hands it to
+    :func:`asyncio.to_thread`.
+
+    The caller holds :data:`_music_lock` for the whole call, so this body
+    is already serialised — no thread-level locking here (see the lock's
+    own comment for why it lives on the event loop).
+    """
+    global _music_engine
+
+    from ..audio.music import MusicEngine
+
+    if (
+        _music_engine is None
+        or _music_engine.dit != dit
+        or _music_engine.decoder != decoder
+    ):
+        _music_engine = MusicEngine(dit=dit, decoder=decoder)
+
+    _music_engine.generate(
+        request.input,
+        out_path,
+        seconds=request.seconds,
+        steps=request.steps,
+        negative_prompt=request.negative_prompt,
+        seed=request.seed,
+    )
+
+
+def _wav_has_audio_frames(payload: bytes) -> bool:
+    """True if ``payload`` is a parseable WAV with at least one sample frame.
+
+    Rejects both empty-output failure modes: SA3 exiting 0 having written
+    only a RIFF header (~44 bytes, which passes a non-empty-bytes check
+    but contains no audio), and output that isn't a readable WAV at all.
+
+    Fail-CLOSED on a parse error, because the producer and this check use
+    the same parser: SA3's ``save_wav`` writes 16-bit PCM via
+    ``wave.open`` (see ``audio/sa3/scripts/sa3_mlx.py``). So anything
+    ``wave`` can't read is not SA3 output, and handing it back under
+    ``Content-Type: audio/wav`` would be mislabelling bytes rather than
+    tolerating an exotic container.
+    """
+    try:
+        with wave.open(io.BytesIO(payload), "rb") as w:
+            return w.getnframes() > 0
+    except (wave.Error, EOFError, OSError):
+        return False
+
+
+def _resolve_music_model(model: str | None) -> tuple[str, str]:
+    """Map a ``/v1/audio/music`` ``model`` alias to a ``(dit, decoder)`` pair.
+
+    Recognises the :data:`MUSIC_MODEL_ALIASES` short names
+    (case-insensitively). ``None`` / ``""`` / ``"default"`` and any
+    unknown value fall back to :data:`DEFAULT_MUSIC_DIT_DECODER` (SA3's
+    own defaults) so an unfamiliar ``model`` still produces audio rather
+    than 404-ing — matching the TTS route's tolerant passthrough.
+    """
+    if not model:
+        return DEFAULT_MUSIC_DIT_DECODER
+    return MUSIC_MODEL_ALIASES.get(model.lower(), DEFAULT_MUSIC_DIT_DECODER)
+
+
+@router.post("/v1/audio/music", dependencies=[Depends(verify_api_key)])
+async def create_music(request: AudioMusicRequest = Body(...)):
+    """Generate music / SFX from a text prompt.
+
+    OpenAI-flavored: a JSON body (:class:`AudioMusicRequest`) in, WAV
+    bytes out — the same request-in / audio-bytes-out contract as
+    ``/v1/audio/speech``. Wired to
+    :class:`vllm_mlx.audio.music.MusicEngine` (MLX-native Stable Audio
+    3), which renders ``seconds`` of audio for ``input`` to a temp file
+    that we stream back as ``audio/wav``.
+
+    ``model`` selects the DiT/decoder pairing (see
+    :data:`MUSIC_MODEL_ALIASES`); ``input`` (non-blank), ``seconds``
+    (≤47s), ``steps``, ``negative_prompt`` and ``seed`` are validated by
+    the request model. Backend failures surface a 500 with the OpenAI
+    ``api_error`` envelope (``code="music_generation_failed"``), matching
+    the speech route.
+    """
+    dit, decoder = _resolve_music_model(request.model)
+
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp_path = tmp.name
+
+        # Engine load + render are blocking (a subprocess, up to 900 s) —
+        # off the event loop. Serialised on the loop before offloading so
+        # queued renders don't each pin a shared executor thread.
+        # See _generate_music_blocking and _music_lock.
+        async with _get_music_lock():
+            await run_to_completion(
+                _generate_music_blocking, dit, decoder, tmp_path, request
+            )
+
+        audio_bytes = b""
+        if os.path.exists(tmp_path):
+            with open(tmp_path, "rb") as fh:
+                audio_bytes = fh.read()
+
+        # The SA3 CLI can exit 0 having written nothing, a 0-byte
+        # placeholder, or a valid RIFF header with zero sample frames —
+        # a sampler that bailed right after opening the file. All three
+        # must fail loudly: handing back an HTTP 200 with an empty or
+        # frameless ``audio/wav`` body reads to the caller as a
+        # successfully generated silent clip, which is the failure mode
+        # hardest to notice. A byte-count check alone misses the
+        # header-only case (a bare WAV header is ~44 bytes), so count
+        # actual frames.
+        if not audio_bytes or not _wav_has_audio_frames(audio_bytes):
+            raise RuntimeError(
+                f"music engine produced no audio at {tmp_path} "
+                f"(dit={dit!r}, decoder={decoder!r}, "
+                f"{len(audio_bytes)} bytes)"
+            )
+
+        # SA3 emits WAV; ``response_format`` is validated to ``wav`` by
+        # the request model, so the Content-Type is always ``audio/wav``.
+        return Response(content=audio_bytes, media_type="audio/wav")
+
+    except HTTPException:
+        raise
+    except ImportError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"music engine dependencies unavailable at runtime: {e}. "
+                "Install with: pip install 'rapid-mlx[audio]'"
+            ),
+        )
+    except Exception as e:
+        # Mirror the speech route: full traceback to the operator log,
+        # generic OpenAI-shape envelope to the client so we don't leak
+        # subprocess/filesystem internals.
+        logger.exception("Music generation failed: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": {
+                    "message": "Audio music generation failed",
+                    "type": "api_error",
+                    "code": "music_generation_failed",
+                    "param": None,
+                }
+            },
+        )
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_err:
+                logger.warning(
+                    "Failed to unlink temp music file %s: %s", tmp_path, cleanup_err
+                )
 
 
 @router.get("/v1/audio/voices", dependencies=[Depends(verify_api_key)])

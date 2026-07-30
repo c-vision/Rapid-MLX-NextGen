@@ -2802,6 +2802,86 @@ class AudioSpeechRequest(BaseModel):
         return lower
 
 
+# ``response_format`` values the ``/v1/audio/music`` route can produce.
+# Stable Audio 3 renders WAV natively; only ``wav`` is offered for now
+# (mirrors the SA3 CLI's output). Centralised so the validator and the
+# route agree.
+_MUSIC_ALLOWED_RESPONSE_FORMATS: tuple[str, ...] = ("wav",)
+
+#: SA3 supports clips up to ~47s; reject longer requests up front so a
+#: caller doesn't wait on a generation the backend will refuse. Mirrors
+#: ``vllm_mlx.audio.music._MAX_SECONDS`` — the engine enforces the same
+#: ceiling, so a drift here only ever costs a 500 instead of a 422.
+_MUSIC_MAX_SECONDS: float = 47.0
+
+
+class AudioMusicRequest(BaseModel):
+    """Request for text→music / text→SFX (``/v1/audio/music``).
+
+    OpenAI-flavored shape mirroring :class:`AudioSpeechRequest` so the
+    music lane reads the same as the speech lane to a colleague
+    integrating over the API. Wired to
+    :class:`vllm_mlx.audio.music.MusicEngine` (MLX-native Stable Audio 3).
+
+    * ``input`` is the natural-language prompt (SA3's positive branch);
+      rejected empty / whitespace-only like the speech route's ``input``.
+    * ``model`` selects a DiT/decoder pairing via the route's
+      ``MUSIC_MODEL_ALIASES`` table (``medium`` = higher quality,
+      ``sm-music`` / ``sm-sfx`` = fast small). Unknown values fall back
+      to the engine defaults.
+    * ``seconds`` is bounded to SA3's ~47s ceiling; NaN/inf rejected via
+      the finite validator (Pydantic ``le=`` alone lets NaN through).
+    * ``input`` is length-capped: ``MusicEngine.generate`` passes it as an
+      argv element to the vendored SA3 CLI, so an unbounded prompt hits
+      the OS ``ARG_MAX`` limit and surfaces as an opaque 500 ``E2BIG``
+      instead of a 422 the caller can act on. The cap matches
+      ``negative_prompt`` (both land on the same command line).
+    """
+
+    model: str = "medium"
+    input: str = Field(..., min_length=1, max_length=4096)
+    seconds: float = Field(default=30.0, gt=0.0, le=_MUSIC_MAX_SECONDS)
+    steps: int = Field(default=8, ge=1, le=200)
+    negative_prompt: str | None = Field(default=None, max_length=4096)
+    seed: int | None = None
+    response_format: str = "wav"
+
+    @field_validator("input")
+    @classmethod
+    def _input_must_be_non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("input must be a non-empty, non-blank string")
+        return v
+
+    @field_validator("seconds")
+    @classmethod
+    def _seconds_must_be_finite(cls, v: float) -> float:
+        # Belt-and-braces against NaN/inf reaching the engine. Range
+        # checks are the classic place NaN slips through, because every
+        # comparison involving NaN is False — exactly the bug the
+        # sampling-param validators at the top of this module exist to
+        # fix. pydantic-core's ``gt=/le=`` constraints happen to reject
+        # non-finite floats today, but that is an implementation detail of
+        # the version we resolve to and it evaporates the moment someone
+        # widens the bounds or hand-rolls the check. Stating the invariant
+        # explicitly keeps it true regardless, and mirrors the identical
+        # guard in ``MusicEngine.generate``.
+        if not math.isfinite(v):
+            raise ValueError("seconds must be a finite number")
+        return v
+
+    @field_validator("response_format")
+    @classmethod
+    def _response_format_must_be_known(cls, v: str) -> str:
+        if v is None:
+            return "wav"
+        lower = v.lower()
+        if lower not in _MUSIC_ALLOWED_RESPONSE_FORMATS:
+            supported = ", ".join(_MUSIC_ALLOWED_RESPONSE_FORMATS)
+            raise ValueError(f"response_format must be one of: {supported}; got {v!r}")
+        return lower
+
+
 class AudioSeparationRequest(BaseModel):
     """Request for audio source separation."""
 

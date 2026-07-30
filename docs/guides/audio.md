@@ -309,6 +309,65 @@ curl http://localhost:8000/v1/audio/speech \
   --output speech.wav
 ```
 
+### POST /v1/audio/music
+
+Generate music or sound effects from a text prompt, via the MLX-native
+[Stable Audio 3](https://huggingface.co/stabilityai/stable-audio-3-optimized)
+engine vendored under `vllm_mlx/audio/sa3/`. Request-in / audio-bytes-out —
+the same shape as `/v1/audio/speech`.
+
+**Parameters (JSON body):**
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `model` | string | `"medium"` | DiT/decoder pairing: `medium` (higher quality, ~3.9 GB peak) or `sm-music` / `sm-sfx` (fast small, ~1.7 GB). Unknown values fall back to the engine defaults. |
+| `input` | string | — (required) | Natural-language prompt. Non-blank, max 4096 chars (it becomes an argv element for the SA3 CLI). |
+| `seconds` | number | `30.0` | Clip length. `0 < seconds <= 47` (the SA3 ceiling). NaN/inf rejected. |
+| `steps` | integer | `8` | Pingpong sampling steps, `1..200`. |
+| `negative_prompt` | string \| null | `null` | CFG negative branch (e.g. `"vocals, singing"`). Max 4096 chars. |
+| `seed` | integer \| null | `null` | Fixed seed for reproducibility. |
+| `response_format` | string | `"wav"` | Only `wav` is supported (SA3 renders WAV natively). |
+
+**Response:** `200 OK`, `Content-Type: audio/wav` — the raw WAV bytes.
+
+Errors: `400` for schema violations (blank or over-4096-char `input`,
+`seconds > 47`, unsupported `response_format`); `500`
+(`code="music_generation_failed"`) if the engine fails **or produces no
+audio** — an SA3 run that exits cleanly without writing sample frames is
+reported as a failure rather than returned as a silent clip; `503` if the
+engine's runtime deps are unavailable.
+
+> **On the status code:** a schema rejection is a FastAPI
+> `RequestValidationError`, which the rapid-mlx server's global handler
+> normalizes to **400** with a sanitized envelope (see
+> `install_exception_handlers`). Stock FastAPI would emit 422 — you'll see
+> 422 only if you mount the router on a bare app without those handlers,
+> as the unit tests do.
+
+Renders are serialized server-side: one SA3 subprocess at a time, so
+concurrent callers queue instead of racing for unified memory. The render
+runs off the event loop, so other requests (chat completions, health
+probes) are unaffected while it works.
+
+**Example:**
+```bash
+curl http://localhost:8000/v1/audio/music \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "medium",
+        "input": "epic cinematic war drums, tense build-up",
+        "seconds": 20,
+        "steps": 8,
+        "negative_prompt": "vocals, singing",
+        "seed": 42
+      }' \
+  --output bgm.wav
+```
+
+Weights are fetched from HuggingFace on first use into the standard HF
+cache (Stability Community License — free commercial use under $1M
+revenue).
+
 ### GET /v1/audio/voices
 
 List available voices for a model.
