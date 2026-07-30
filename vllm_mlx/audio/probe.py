@@ -39,6 +39,7 @@ import require_mlx_audio_tts`` without crashing.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 
 
@@ -75,12 +76,13 @@ def _reset_probe_cache() -> None:
     ``mlx_audio`` call this helper in their fixture to force re-probe.
 
     Also clears the per-lane deep-probe status recorded by
-    :func:`deep_probe_audio_lane` so tests don't leak ``degraded``
-    state across cases.
+    :func:`deep_probe_audio_lane` and the cached Kokoro espeak
+    readiness verdict so tests don't leak state across cases.
     """
     _cached_verdict.clear()
     _LANE_STATUS.clear()
     _LANE_REASON.clear()
+    _reset_espeak_state()
 
 
 # Sub-modules each route actually needs to load. Split per lane so a
@@ -116,6 +118,82 @@ _KOKORO_EXTRA_HINT = (
     "to pull every audio dep, or `pip install misaki` for a "
     "minimal Kokoro-only install."
 )
+
+# F-K-KOKORO-ESPEAK: ``misaki`` being importable is necessary but not
+# sufficient for Kokoro — its English G2P falls back to espeak-ng (via
+# ``phonemizer`` + ``espeakng-loader``) for any out-of-dictionary word.
+# On a fresh ``pip install 'rapid-mlx[audio]'`` the espeak-ng dylib
+# shipped by ``espeakng-loader`` can fail to locate its ``espeak-ng-data``
+# (the compiled data path points at the wheel's CI build dir), and the
+# resulting failure is a C-level ``exit()``/``abort()`` INSIDE
+# ``espeak_Initialize`` — it takes down the whole uvicorn worker and
+# every in-flight request, and Python ``try/except`` cannot catch it.
+#
+# Two-part mitigation, both proven necessary by dogfooding a fresh
+# ``[audio]`` venv:
+#   1. CONTAINMENT — validate espeak in a throwaway SUBPROCESS before we
+#      let the real synthesis touch it. A broken dylib kills the child,
+#      not the server; we read the child's exit code.
+#   2. REPAIR — if the bundled dylib is broken but a system espeak-ng is
+#      installed (e.g. ``brew install espeak-ng``), point ``phonemizer``
+#      at the system library + data so Kokoro actually works. Only when
+#      neither the bundled nor a system espeak-ng can initialize do we
+#      surface a clean 503 (the worker stays up either way).
+#
+# The check is Kokoro-specific and cached per-process: the first Kokoro
+# request pays a one-time ~1-2 s subprocess cost; every later request
+# hits the cached verdict. Chatterbox / VibeVoice / VoxCPM / F5 don't use
+# espeak and never reach this path.
+_ESPEAK_BROKEN_HINT = (
+    "Kokoro TTS could not initialize its espeak-ng phonemizer backend. "
+    "The espeak-ng data bundled by `espeakng-loader` failed to load on "
+    "this machine and no working system espeak-ng was found. Install one "
+    "with `brew install espeak-ng` and restart the server, or use a "
+    "non-espeak TTS model such as `chatterbox` or `f5-tts-zh`."
+)
+
+# Child-process espeak self-test. Constructs a ``phonemizer`` espeak
+# backend (this is where ``espeak_Initialize`` runs and where a broken
+# dylib aborts) and phonemizes a short string. ``RAPID_MLX_ESPEAK_LIB`` /
+# ``RAPID_MLX_ESPEAK_DATA`` (when set) redirect it at a system install;
+# absent, it exercises whatever ``misaki`` wired up at import (bundled).
+# Exit 0 == espeak works; any non-zero (including a C-level abort that
+# never returns to Python) == broken.
+_ESPEAK_SELFTEST_SRC = (
+    "import os, sys\n"
+    "try:\n"
+    "    import misaki.espeak  # noqa: F401 (import wires bundled espeak)\n"
+    "    from phonemizer.backend.espeak.wrapper import EspeakWrapper\n"
+    "    _lib = os.environ.get('RAPID_MLX_ESPEAK_LIB')\n"
+    "    _data = os.environ.get('RAPID_MLX_ESPEAK_DATA')\n"
+    "    if _lib:\n"
+    "        EspeakWrapper.set_library(_lib)\n"
+    "    if _data:\n"
+    "        EspeakWrapper.set_data_path(_data)\n"
+    "    import phonemizer\n"
+    "    _be = phonemizer.backend.EspeakBackend(\n"
+    "        language='en-us', preserve_punctuation=True,\n"
+    "        with_stress=True, tie='^')\n"
+    "    _out = _be.phonemize(['phonemizer selftest'])\n"
+    "except Exception:\n"
+    "    sys.exit(6)\n"
+    # ``sys.exit`` raises ``SystemExit`` (a BaseException, not Exception),
+    # so the success/empty exit lives OUTSIDE the ``except Exception`` above
+    # — otherwise a clean ``sys.exit(0)`` would be swallowed and reported as
+    # a failure. A broken dylib aborts at the C level and never reaches
+    # Python, so ``except Exception`` is the right (and only catchable) net.
+    "sys.exit(0 if _out and _out[0].strip() else 5)\n"
+)
+
+# Per-process espeak readiness cache: None = not yet probed, True = ready
+# (bundled works or repaired to system), False = unfixable (clean 503).
+# The lock coalesces concurrent first-request probes (two Kokoro requests
+# racing on a cold worker must not both spawn the subprocess sweep). The
+# candidate cap bounds the worst-case sweep on a badly-broken host.
+_ESPEAK_READY: bool | None = None
+_ESPEAK_REASON: str | None = None
+_ESPEAK_LOCK = threading.Lock()
+_MAX_ESPEAK_CANDIDATES = 8
 
 
 # F-K-CAPABILITIES-OMIT-AUDIO: D-CAPABILITIES-DETECTION's existing
@@ -297,6 +375,226 @@ def _reset_lane_status() -> None:
     _LANE_REASON.clear()
 
 
+def _espeak_selftest_subprocess(
+    lib: str | None = None, data: str | None = None, timeout: float = 30.0
+) -> bool:
+    """Run the espeak self-test in a throwaway child; True == espeak works.
+
+    F-K-KOKORO-ESPEAK containment: a broken ``espeakng-loader`` dylib
+    aborts the process at the C level inside ``espeak_Initialize`` —
+    uncatchable from Python. Running the probe in a subprocess means
+    that abort kills the CHILD; we recover the verdict from its exit
+    code (0 == espeak initialized and phonemized; anything else — a
+    non-zero return, a signal, or a timeout — == broken).
+
+    ``lib`` / ``data`` (when given) redirect the child at a system
+    espeak-ng install via the ``RAPID_MLX_ESPEAK_*`` env vars the
+    self-test source reads; omit both to exercise the bundled dylib.
+    """
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    if lib:
+        env["RAPID_MLX_ESPEAK_LIB"] = lib
+    else:
+        env.pop("RAPID_MLX_ESPEAK_LIB", None)
+    if data:
+        env["RAPID_MLX_ESPEAK_DATA"] = data
+    else:
+        env.pop("RAPID_MLX_ESPEAK_DATA", None)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _ESPEAK_SELFTEST_SRC],
+            env=env,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return result.returncode == 0
+
+
+def _resolve_lib_path(name_or_path: str) -> str | None:
+    """Resolve a library name or bare soname to an absolute existing path.
+
+    ``ctypes.util.find_library`` returns an absolute path on macOS but often
+    just a bare soname (``libespeak-ng.so.1``) on Linux. ``EspeakWrapper``
+    needs a real filesystem path, so resolve the basename against the
+    standard library directories — including the Debian/Ubuntu multiarch
+    dir (``/usr/lib/<triplet>``) that ``find_library`` reports only by
+    name. Returns None when nothing resolves.
+    """
+    import os
+    import sysconfig
+
+    if os.path.isabs(name_or_path):
+        return name_or_path if os.path.exists(name_or_path) else None
+
+    base = os.path.basename(name_or_path)
+    search_dirs = [
+        "/opt/homebrew/lib",
+        "/usr/local/lib",
+        "/usr/lib",
+        "/lib",
+        "/usr/lib64",  # Fedora / RHEL / SUSE
+        "/lib64",
+    ]
+    libdir = sysconfig.get_config_var("LIBDIR")
+    if libdir:
+        search_dirs.append(libdir)
+    multiarch = sysconfig.get_config_var("MULTIARCH")
+    if multiarch:
+        search_dirs += [f"/usr/lib/{multiarch}", f"/lib/{multiarch}"]
+    for directory in search_dirs:
+        cand = os.path.join(directory, base)
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _discover_system_espeak() -> list[tuple[str, str]]:
+    """Return candidate ``(library_path, data_parent_dir)`` pairs for a
+    system espeak-ng, best-first (may be empty).
+
+    Covers the layouts that show up in practice: the install prefix derived
+    from the ``espeak-ng`` executable on ``PATH`` (Homebrew's
+    ``/opt/homebrew/bin/espeak-ng`` → ``/opt/homebrew/{lib,share}``), a few
+    well-known prefixes, and ``ctypes.util.find_library`` for the library
+    (which resolves Linux multiarch dirs such as
+    ``/usr/lib/x86_64-linux-gnu`` that a bare ``<prefix>/lib`` guess would
+    miss — codex MAJOR).
+
+    Only pairs whose library file exists and whose data dir actually
+    contains ``espeak-ng-data/phontab`` are returned (espeak appends
+    ``/espeak-ng-data`` to the data parent itself). The caller still
+    self-tests each pair in a subprocess before trusting it, so a wrong
+    pairing degrades to the next candidate or a clean 503 — never a crash.
+    """
+    import ctypes.util
+    import os
+    import shutil
+
+    lib_names = (
+        "libespeak-ng.1.dylib",
+        "libespeak-ng.dylib",
+        "libespeak-ng.so.1",
+        "libespeak-ng.so",
+    )
+
+    prefixes: list[str] = []
+    exe = shutil.which("espeak-ng") or shutil.which("espeak")
+    if exe:
+        prefixes.append(os.path.dirname(os.path.dirname(os.path.realpath(exe))))
+    prefixes += ["/opt/homebrew", "/usr/local", "/usr"]
+
+    libs: list[str] = []
+    data_parents: list[str] = []
+    for prefix in prefixes:
+        for name in lib_names:
+            cand = os.path.join(prefix, "lib", name)
+            if os.path.exists(cand):
+                libs.append(cand)
+        share = os.path.join(prefix, "share")
+        if os.path.exists(os.path.join(share, "espeak-ng-data", "phontab")):
+            data_parents.append(share)
+
+    # Loader-resolved library — handles multiarch dirs the prefix guess
+    # misses. ``find_library`` returns an absolute path on macOS but often a
+    # bare soname (``libespeak-ng.so.1``) on Linux, which ``set_library``
+    # can't load — resolve it to an absolute path first (codex MAJOR r2).
+    found = ctypes.util.find_library("espeak-ng")
+    if found:
+        resolved = _resolve_lib_path(found)
+        if resolved:
+            libs.append(resolved)
+
+    def _dedup(items: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+
+    libs = _dedup(libs)
+    data_parents = _dedup(data_parents)
+    return [(lib, data) for lib in libs for data in data_parents]
+
+
+def _apply_system_espeak(lib: str, data: str) -> None:
+    """Point ``phonemizer`` at a system espeak-ng in THIS worker process.
+
+    ``misaki`` sets the bundled library/data on the ``EspeakWrapper``
+    class at import; overriding those class attributes AFTER the import
+    (but before Kokoro's pipeline constructs its espeak backend on the
+    first ``generate``) makes the real synthesis use the working system
+    install. ``set_data_path`` receives the parent dir because espeak
+    appends ``/espeak-ng-data`` itself.
+    """
+    import misaki.espeak  # noqa: F401 (ensure the import-time wiring ran)
+    from phonemizer.backend.espeak.wrapper import EspeakWrapper
+
+    EspeakWrapper.set_library(lib)
+    EspeakWrapper.set_data_path(data)
+
+
+def _probe_espeak_readiness() -> tuple[bool, str | None]:
+    """Run the (blocking) espeak readiness sweep. Returns ``(ready, reason)``.
+
+    Bundled espeak first — preserves existing behaviour on platforms where
+    the shipped dylib loads correctly (no override, no repair). If bundled
+    is broken, self-tests each discovered system espeak-ng candidate in a
+    subprocess (capped at :data:`_MAX_ESPEAK_CANDIDATES` so a badly-broken
+    host can't spin through an unbounded sweep) and repairs this worker to
+    the first that initializes. No candidate works → not ready.
+    """
+    if _espeak_selftest_subprocess():
+        return True, None
+
+    for lib, data in _discover_system_espeak()[:_MAX_ESPEAK_CANDIDATES]:
+        if _espeak_selftest_subprocess(lib=lib, data=data):
+            _apply_system_espeak(lib, data)
+            return True, None
+
+    return False, _ESPEAK_BROKEN_HINT
+
+
+def _ensure_kokoro_g2p_ready() -> None:
+    """Ensure Kokoro's espeak G2P can initialize; repair or 503 if not.
+
+    Cached per-process and coalesced under a lock so concurrent first
+    requests on a cold worker probe only once. The sweep spawns
+    subprocesses and can block, so callers on the event loop MUST offload
+    this to a worker thread (the ``/v1/audio/speech`` route does). If
+    neither the bundled nor any system espeak-ng can initialize, raises a
+    clean 503 — the worker survives; the raw C abort never reaches the
+    request path.
+    """
+    global _ESPEAK_READY, _ESPEAK_REASON
+
+    from fastapi import HTTPException
+
+    if _ESPEAK_READY is None:
+        with _ESPEAK_LOCK:
+            # Another request may have resolved the verdict while we waited.
+            if _ESPEAK_READY is None:
+                _ESPEAK_READY, _ESPEAK_REASON = _probe_espeak_readiness()
+
+    if _ESPEAK_READY:
+        return
+    raise HTTPException(status_code=503, detail=_ESPEAK_REASON)
+
+
+def _reset_espeak_state() -> None:
+    """Test hook: forget the cached espeak readiness verdict."""
+    global _ESPEAK_READY, _ESPEAK_REASON
+    _ESPEAK_READY = None
+    _ESPEAK_REASON = None
+
+
 def require_kokoro_runtime() -> None:
     """Raise an HTTP 503 when the Kokoro TTS runtime is incomplete.
 
@@ -310,6 +608,13 @@ def require_kokoro_runtime() -> None:
     ``Kokoro requires the optional 'misaki' package`` error inside
     mlx_audio.
 
+    F-K-KOKORO-ESPEAK: beyond the missing-extra check, this also
+    validates that misaki's espeak-ng G2P backend can actually
+    initialize (in a subprocess, so a broken bundled dylib can't abort
+    the worker) and repairs it to a system espeak-ng when possible —
+    otherwise a Kokoro request with any out-of-dictionary word would
+    hard-crash the whole server.
+
     The check is intentionally narrow — Chatterbox / VibeVoice /
     VoxCPM don't depend on misaki, so this helper isn't called for
     those families. The TTS lane probe still gates them all the same.
@@ -318,12 +623,12 @@ def require_kokoro_runtime() -> None:
 
     from fastapi import HTTPException
 
-    if importlib.util.find_spec(_KOKORO_EXTRA_DEP) is not None:
-        return
-    raise HTTPException(
-        status_code=503,
-        detail=f"{_KOKORO_EXTRA_HINT}",
-    )
+    if importlib.util.find_spec(_KOKORO_EXTRA_DEP) is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"{_KOKORO_EXTRA_HINT}",
+        )
+    _ensure_kokoro_g2p_ready()
 
 
 def _probe_lane(lane: str) -> _Verdict:

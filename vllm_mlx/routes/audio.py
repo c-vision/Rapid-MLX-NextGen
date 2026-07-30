@@ -1900,7 +1900,13 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
         # BEFORE any weight load (mlx-community/Kokoro-82M-bf16 is
         # ~300 MB) or pipeline construction kicks off.
         if "kokoro" in model_name.lower():
-            require_kokoro_runtime()
+            # F-K-KOKORO-ESPEAK: the espeak readiness probe spawns
+            # subprocesses and can block for seconds on a cold worker —
+            # offload it so the async event loop stays responsive to other
+            # in-flight requests (codex MAJOR).
+            from fastapi.concurrency import run_in_threadpool
+
+            await run_in_threadpool(require_kokoro_runtime)
 
         if _tts_engine is None or _tts_engine.model_name != model_name:
             _tts_engine = TTSEngine(model_name)
