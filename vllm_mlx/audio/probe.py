@@ -39,8 +39,11 @@ import require_mlx_audio_tts`` without crashing.
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -188,11 +191,17 @@ _ESPEAK_SELFTEST_SRC = (
 # Per-process espeak readiness cache: None = not yet probed, True = ready
 # (bundled works or repaired to system), False = unfixable (clean 503).
 # The lock coalesces concurrent first-request probes (two Kokoro requests
-# racing on a cold worker must not both spawn the subprocess sweep). The
-# candidate cap bounds the worst-case sweep on a badly-broken host.
+# racing on a cold worker must not both spawn the subprocess sweep).
 _ESPEAK_READY: bool | None = None
 _ESPEAK_REASON: str | None = None
 _ESPEAK_LOCK = threading.Lock()
+
+# Hard bound on the readiness sweep: at most this many system (library,
+# data-dir) self-tests, so a badly-broken host can't spin through an unbounded
+# number of subprocesses. This is a TOTAL pair budget (not a per-axis cap):
+# discovery schedules candidates fairly (anti-diagonal over the library x data
+# grid) so the budget still samples multiple libraries AND multiple data dirs
+# before exhausting either axis, then truncates the tail.
 _MAX_ESPEAK_CANDIDATES = 8
 
 
@@ -521,7 +530,21 @@ def _discover_system_espeak() -> list[tuple[str, str]]:
 
     libs = _dedup(libs)
     data_parents = _dedup(data_parents)
-    return [(lib, data) for lib in libs for data in data_parents]
+    # Fair (anti-diagonal) schedule over the library x data-dir grid: order
+    # pairs by ``library_rank + data_rank`` so the total budget samples several
+    # libraries AND several data dirs before exhausting either axis. A
+    # library-major or data-major flatten would spend the whole budget on one
+    # axis and hide a valid pairing on the other — e.g. every probe against a
+    # single wrong data dir, or against a single broken library (codex, both
+    # directions). Best-first within each diagonal (lower ranks first); the
+    # caller truncates the tail to :data:`_MAX_ESPEAK_CANDIDATES`.
+    pairs: list[tuple[str, str]] = []
+    for diag in range(len(libs) + len(data_parents)):
+        for i, lib in enumerate(libs):
+            j = diag - i
+            if 0 <= j < len(data_parents):
+                pairs.append((lib, data_parents[j]))
+    return pairs[:_MAX_ESPEAK_CANDIDATES]
 
 
 def _apply_system_espeak(lib: str, data: str) -> None:
@@ -545,19 +568,42 @@ def _probe_espeak_readiness() -> tuple[bool, str | None]:
     """Run the (blocking) espeak readiness sweep. Returns ``(ready, reason)``.
 
     Bundled espeak first — preserves existing behaviour on platforms where
-    the shipped dylib loads correctly (no override, no repair). If bundled
-    is broken, self-tests each discovered system espeak-ng candidate in a
-    subprocess (capped at :data:`_MAX_ESPEAK_CANDIDATES` so a badly-broken
-    host can't spin through an unbounded sweep) and repairs this worker to
-    the first that initializes. No candidate works → not ready.
-    """
-    if _espeak_selftest_subprocess():
-        return True, None
+    the shipped dylib loads correctly (no override, no repair). If bundled is
+    broken, self-tests each discovered system espeak-ng candidate in a
+    subprocess and repairs this worker to the first that initializes. No
+    candidate works → not ready. Discovery bounds the sweep to at most
+    :data:`_MAX_ESPEAK_CANDIDATES` self-tests, so a badly-broken host can't
+    spin through an unbounded number of installs.
 
-    for lib, data in _discover_system_espeak()[:_MAX_ESPEAK_CANDIDATES]:
-        if _espeak_selftest_subprocess(lib=lib, data=data):
-            _apply_system_espeak(lib, data)
+    Errors are contained so the caller always returns a clean 503 (never a
+    500) and the verdict is cached — an escaping exception would leave
+    ``_ESPEAK_READY`` unresolved, re-probing (and re-spawning subprocesses) on
+    every request (codex). Containment is per-candidate: one malformed
+    candidate (e.g. ``_apply_system_espeak`` raising) is skipped, never
+    aborting the sweep while a later candidate could still work (codex).
+    """
+    try:
+        if _espeak_selftest_subprocess():
             return True, None
+    except Exception:
+        logger.warning("bundled espeak self-test failed unexpectedly", exc_info=True)
+
+    try:
+        candidates = _discover_system_espeak()
+    except Exception:
+        logger.warning("espeak discovery failed unexpectedly", exc_info=True)
+        return False, _ESPEAK_BROKEN_HINT
+
+    for lib, data in candidates:
+        try:
+            if _espeak_selftest_subprocess(lib=lib, data=data):
+                _apply_system_espeak(lib, data)
+                return True, None
+        except Exception:
+            logger.warning(
+                "espeak candidate %s / %s failed unexpectedly", lib, data, exc_info=True
+            )
+            continue
 
     return False, _ESPEAK_BROKEN_HINT
 
