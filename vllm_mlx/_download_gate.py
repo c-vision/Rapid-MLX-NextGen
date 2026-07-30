@@ -438,6 +438,111 @@ def is_repo_cached(repo_id: str) -> bool:
     return False
 
 
+def _snapshot_is_complete_split_model(repo_id: str) -> bool:
+    """True if the resolved snapshot is a mlx-video component-split model whose
+    EVERY declared component weight is cached — the non-text analogue of
+    :func:`is_repo_cached` (which only knows mlx-lm's text
+    ``model*.safetensors`` layout).
+
+    Video-gen repos don't lay their weights out the way the text loader
+    expects: they ship one ``<component>.safetensors`` per component at the
+    snapshot root (CogVideoX-Fun → ``transformer`` / ``text_encoder`` / ``vae``;
+    LTX-2.3 → ``transformer`` / ``connector`` / ``vae_decoder`` / ``vocoder`` /
+    …), never a ``model*.safetensors``. ``is_repo_cached`` therefore reads a
+    fully-cached video model as *weightless*, which would make
+    :func:`is_weightless_stub` cry wolf ("config cached, weights missing —
+    will download ~N GB") on every serve of an already-downloaded video model.
+
+    Completeness, not mere presence (codex BLOCKING): we DON'T infer "non-text,
+    weighted" from the presence of any stray ``.safetensors`` — that would
+    misread (a) an interrupted multimodal *text* download whose vision tower
+    landed before its shards, or (b) an interrupted *video* pull that has only
+    one of its components. Instead we anchor on ``split_model.json`` — the
+    mlx-video manifest that positively identifies the layout AND enumerates the
+    exact component list — and require EVERY ``<component>.safetensors`` to be
+    present and non-empty, exactly as :func:`_snapshot_is_complete` walks the
+    text ``weight_map``. A text LLM never ships ``split_model.json``, so an
+    incomplete text cache always falls through to :func:`is_repo_cached`; a
+    partial video cache fails a component check and also falls through.
+
+    ``model_index.json`` (bare diffusers pipeline manifest) is intentionally
+    NOT accepted on its own: it names components but not their on-disk weight
+    filenames (flat file vs ``component/`` subdir vs sharded — packaging
+    dependent), so it can't be completeness-checked reliably here. Both rapid-
+    mlx video families (CogVideoX-Fun, LTX-2.3) ship ``split_model.json``; a
+    hypothetical manifest-less / index-only repo simply falls back to the
+    (cosmetic) false alarm rather than risking a wrong suppression.
+
+    Mirrors :func:`is_repo_cached`'s snapshot resolution (``refs/main`` →
+    pinned sha) so both read the same on-disk snapshot. Returns ``False`` on
+    any internal error so the caller defaults to the existing text-glob path.
+    """
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        repo_root = os.path.join(
+            HF_HUB_CACHE,
+            f"models--{repo_id.replace('/', '--')}",
+        )
+        resolved_sha = _resolved_snapshot_sha(repo_root)
+        if resolved_sha is None:
+            return False
+        snap_dir = os.path.join(repo_root, "snapshots", resolved_sha)
+        if not os.path.isdir(snap_dir):
+            return False
+
+        manifest_path = os.path.join(snap_dir, "split_model.json")
+        if not os.path.isfile(manifest_path):
+            return False
+        import json
+
+        try:
+            with open(manifest_path) as fh:
+                manifest = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return False
+        components = manifest.get("components") if isinstance(manifest, dict) else None
+        # A manifest that names no components tells us nothing is complete.
+        if not isinstance(components, list) or not components:
+            return False
+
+        repo_root_real = os.path.realpath(repo_root)
+        for component in components:
+            # Component names become ``<component>.safetensors`` at the
+            # snapshot root; reject anything that could escape it.
+            if not isinstance(component, str) or not component:
+                return False
+            if (
+                os.path.isabs(component)
+                or os.sep in component
+                or "/" in component
+                or ".." in component.split("/")
+            ):
+                return False
+            fpath = os.path.join(snap_dir, f"{component}.safetensors")
+            # Must be a real regular file (following the blob symlink), not a
+            # directory named ``<component>.safetensors`` nor a dangling /
+            # directory symlink — ``os.path.getsize`` alone reports a positive
+            # size for a directory, so an empty ``vae.safetensors/`` dir would
+            # otherwise pass. ``isfile`` follows symlinks and is False for
+            # symlink→dir and dangling symlinks (codex round-5 MAJOR).
+            if not os.path.isfile(fpath):
+                return False
+            # The file (via its blob symlink) must resolve inside this repo's
+            # own cache dir — a symlink escaping elsewhere doesn't count.
+            real = os.path.realpath(fpath)
+            if real != repo_root_real and not real.startswith(repo_root_real + os.sep):
+                return False
+            try:
+                if os.path.getsize(fpath) <= 0:
+                    return False
+            except OSError:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def is_weightless_stub(repo_id: str) -> bool:
     """True if ``repo_id``'s config is cached but its weight shards are NOT.
 
@@ -456,6 +561,15 @@ def is_weightless_stub(repo_id: str) -> bool:
     instead of a generic notice. Local paths and never-touched repos
     return ``False``.
 
+    Non-text scope (video-gen false-alarm fix): the underlying weight
+    probe is mlx-lm's text glob ``model*.safetensors``, which video-gen /
+    diffusers repos never satisfy (their weights are component files like
+    ``transformer.safetensors`` / ``vae.safetensors``). A fully-cached
+    video model would therefore look weightless and mis-fire this notice on
+    every serve. :func:`_snapshot_is_complete_split_model` validates the
+    mlx-video ``split_model.json`` component manifest so the stub notice
+    stays scoped to genuinely-incomplete caches.
+
     Returns ``False`` on any internal error — a best-effort diagnostic
     must never break an otherwise-fine serve.
     """
@@ -470,6 +584,13 @@ def is_weightless_stub(repo_id: str) -> bool:
         # a real cached path (str) counts as "config present".
         cached_config = try_to_load_from_cache(repo_id, "config.json")
         if not isinstance(cached_config, str):
+            return False
+        # A component-split non-text model (video-gen) stores its weights as
+        # per-component files the text glob can't see. If its split_model.json
+        # manifest lists components and EVERY one is cached, the weights are
+        # present — not a stub. Check this BEFORE the text-glob probe so a
+        # fully-cached video model doesn't mis-fire the notice.
+        if _snapshot_is_complete_split_model(repo_id):
             return False
         # Config is on disk; the stub is exactly "config present but the
         # loader's weight glob (model*.safetensors) is not satisfied".
