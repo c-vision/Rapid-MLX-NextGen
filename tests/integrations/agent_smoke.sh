@@ -150,16 +150,17 @@ TASK='Run python3 test_calc.py, it fails. Fix the bug in calc.py so all assertio
 # The agents (codex especially) are non-deterministic, so give each up to 2
 # attempts (hermes 3) — a single miss must not flap the release gate.
 #
-# Run all four CONCURRENTLY against the one warm batching server. An agent
-# spends most of its wall-clock running local tools (git, python, file edits)
-# with the GPU idle between generations, so overlapping the four fills those
-# gaps and collapses the gate's wall-clock from ~sum(agents) to ~max(agent) on
-# the 55-minute self-hosted job. Safe to overlap: the server batches concurrent
-# requests on the one GPU; each agent works in its own seed_repo dir; and the
-# two agents that need a config file write DIFFERENT paths (codex→~/.codex,
-# hermes→~/.hermes) while claude/aider use only env vars — no shared mutable
-# state. Each agent writes PASS/FAIL to its own result file (background
-# subshells can't export vars); we collect after the barrier.
+# Run the four SERIALLY, one at a time, against the warm server. An earlier
+# revision overlapped all four to collapse wall-clock from ~sum to ~max, on the
+# theory that an agent leaves the GPU idle between generations so the four fill
+# each other's gaps. In practice their turns overlap heavily, and batching 5-6
+# in-flight requests — each a 25-38k-token agent prompt — onto the ONE GPU
+# starves every stream (measured on the Studio: 12 output tokens in 65s at
+# running=6). Multi-turn agents then blow their per-agent budgets and the gate
+# flakes/fails (it flapped the 0.11.4 release twice this way). Serial hands each
+# agent the whole GPU, so it runs at solo speed (claude ~75s, aider ~5s) and
+# finishes far inside its budget: deterministic, ~sum(agents) wall-clock, still
+# minutes under the 55-minute job. Each writes PASS/FAIL to its own result file.
 mkdir -p "$WORK"
 
 # ---- Claude Code (env var, /v1/messages) ---------------------------------
@@ -224,15 +225,16 @@ save_cfg "$HERMES_CFG"
 "$RMLX" agents hermes --setup --base-url "$B/v1" >/dev/null 2>&1
 patch_port "$HERMES_CFG"
 
-echo "running 4 Tier-1 agents concurrently (budget ${AGENT_TO}s, hermes ${HERMES_TO}s)…"
-run_claude & _p_claude=$!
-run_codex &  _p_codex=$!
-run_hermes & _p_hermes=$!
-run_aider &  _p_aider=$!
-# Wait ONLY on the four agent jobs. A bare `wait` would also block on the
-# still-running background serve (SERVE_PID, launched with `&` above) and hang
-# the gate forever — the agents all finish but the script never returns.
-wait "$_p_claude" "$_p_codex" "$_p_hermes" "$_p_aider"
+echo "running 4 Tier-1 agents serially (budget ${AGENT_TO}s, hermes ${HERMES_TO}s)…"
+# Serial, NOT backgrounded: overlapping them oversubscribes the single GPU and
+# flakes the gate (see the rationale above run_claude). Each runs to completion
+# — with its own retries + per-agent timeout — before the next starts, so it
+# gets the whole GPU and finishes at solo speed. Never a bare `wait` here: the
+# serve is still backgrounded (SERVE_PID), so a bare wait would hang the gate.
+run_claude
+run_codex
+run_hermes
+run_aider
 
 # Restore the config files only after every agent has finished using them.
 restore_cfg "$CODEX_CFG"
