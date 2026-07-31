@@ -98,7 +98,14 @@ echo "== model: $ALIAS  port: $PORT =="
 if curl -s -m 3 "$B/v1/models" >/dev/null 2>&1; then
   fail "port $PORT already serving — free it (a stray server is not ours to kill)"
 fi
-nohup "$RMLX" serve "$ALIAS" --port "$PORT" > "$LOG" 2>&1 &
+# --disable-prefix-cache: this gate drives coding agents through varied,
+# non-repeating prompts, so a persisted prefix cache buys nothing here — but it
+# LOADS SYNCHRONOUSLY at startup before /v1/models flips ready (server.py), and
+# on the self-hosted Studio it accretes across gate runs (the shutdown save
+# re-persists it every time), so readiness crept from ~15s to minutes run over
+# run. Disabling it keeps serve readiness fast and deterministic for the gate
+# without changing what the agents exercise.
+nohup "$RMLX" serve "$ALIAS" --port "$PORT" --disable-prefix-cache > "$LOG" 2>&1 &
 SERVE_PID=$!
 # Serve-ready budget: 120 * 5s = 600s. The default gate model is a 35B hybrid
 # (Qwen3.6-35B-A3B, GatedDeltaNet/linear-attention). Its FIRST cold serve on the
@@ -141,59 +148,100 @@ verify() { cd "$WORK/$1" 2>/dev/null && python3 test_calc.py >/dev/null 2>&1 && 
 TASK='Run python3 test_calc.py, it fails. Fix the bug in calc.py so all assertions pass, then re-run to confirm. Only edit calc.py.'
 
 # The agents (codex especially) are non-deterministic, so give each up to 2
-# attempts — a single miss must not flap the release gate.
+# attempts (hermes 3) — a single miss must not flap the release gate.
+#
+# Run all four CONCURRENTLY against the one warm batching server. An agent
+# spends most of its wall-clock running local tools (git, python, file edits)
+# with the GPU idle between generations, so overlapping the four fills those
+# gaps and collapses the gate's wall-clock from ~sum(agents) to ~max(agent) on
+# the 55-minute self-hosted job. Safe to overlap: the server batches concurrent
+# requests on the one GPU; each agent works in its own seed_repo dir; and the
+# two agents that need a config file write DIFFERENT paths (codex→~/.codex,
+# hermes→~/.hermes) while claude/aider use only env vars — no shared mutable
+# state. Each agent writes PASS/FAIL to its own result file (background
+# subshells can't export vars); we collect after the barrier.
+mkdir -p "$WORK"
 
 # ---- Claude Code (env var, /v1/messages) ---------------------------------
-R_CLAUDE=FAIL
-for _try in 1 2; do
-  seed_repo claude
-  TO "$AGENT_TO" env ANTHROPIC_BASE_URL="$B" ANTHROPIC_API_KEY=not-needed \
-    claude -p "$TASK" --model "$ALIAS" --dangerously-skip-permissions >/dev/null 2>&1
-  [ "$(verify claude)" = PASS ] && { R_CLAUDE=PASS; break; }
-done
+run_claude() {
+  local r=FAIL
+  for _try in 1 2; do
+    seed_repo claude
+    TO "$AGENT_TO" env ANTHROPIC_BASE_URL="$B" ANTHROPIC_API_KEY=not-needed \
+      claude -p "$TASK" --model "$ALIAS" --dangerously-skip-permissions >/dev/null 2>&1
+    [ "$(verify claude)" = PASS ] && { r=PASS; break; }
+  done
+  echo "$r" > "$WORK/claude.result"
+}
 
-# ---- Codex (agents codex --setup writes ~/.codex/config.toml) ------------
-# Pass --base-url so setup points at OUR serve port (not the default :8000) —
-# otherwise the written base_url is wrong and detection can't reach the model.
+# ---- Codex (uses ~/.codex/config.toml rendered below) --------------------
+run_codex() {
+  local r=FAIL
+  for _try in 1 2; do
+    seed_repo codex
+    TO "$AGENT_TO" codex exec "$TASK" --model "$ALIAS" \
+      --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check >/dev/null 2>&1
+    [ "$(verify codex)" = PASS ] && { r=PASS; break; }
+  done
+  echo "$r" > "$WORK/codex.result"
+}
+
+# ---- Hermes (uses ~/.hermes/config.yaml rendered below) ------------------
+run_hermes() {
+  local r=FAIL
+  for _try in 1 2 3; do
+    seed_repo hermes
+    TO "$HERMES_TO" hermes chat -q "$TASK" -Q -m "$ALIAS" >/dev/null 2>&1
+    [ "$(verify hermes)" = PASS ] && { r=PASS; break; }
+  done
+  echo "$r" > "$WORK/hermes.result"
+}
+
+# ---- Aider (env vars, LiteLLM openai/ prefix) ----------------------------
+run_aider() {
+  local r=FAIL
+  for _try in 1 2; do
+    seed_repo aider
+    TO "$AGENT_TO" env OPENAI_API_BASE="$B/v1" OPENAI_API_KEY=not-needed \
+      aider --model "openai/$ALIAS" --message "$TASK" \
+      --yes-always --no-auto-commits --no-show-model-warnings calc.py >/dev/null 2>&1
+    [ "$(verify aider)" = PASS ] && { r=PASS; break; }
+  done
+  echo "$r" > "$WORK/aider.result"
+}
+
+# Render the two agent config files up front (distinct paths → no collision),
+# THEN launch. --base-url points setup at OUR serve port (not the default
+# :8000). For hermes it is REQUIRED: Hermes rejects any model whose
+# context_length is below 64K, and setup only writes the model's real context
+# (qwen3.6-35b-8bit → 262144) when it can reach the running server to detect it;
+# without --base-url it falls back to the 32768 default and Hermes refuses to
+# start every time.
 save_cfg "$CODEX_CFG"
 "$RMLX" agents codex --setup --base-url "$B/v1" >/dev/null 2>&1
 patch_port "$CODEX_CFG"
-R_CODEX=FAIL
-for _try in 1 2; do
-  seed_repo codex
-  TO "$AGENT_TO" codex exec "$TASK" --model "$ALIAS" \
-    --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check >/dev/null 2>&1
-  [ "$(verify codex)" = PASS ] && { R_CODEX=PASS; break; }
-done
-restore_cfg "$CODEX_CFG"
-
-# ---- Hermes (agents hermes --setup writes ~/.hermes/config.yaml) ----------
-# --base-url is REQUIRED here: Hermes rejects any model whose context_length is
-# below 64K, and setup only writes the model's real context (e.g. 262144) when
-# it can reach the running server to detect it. Without --base-url, setup queries
-# the default :8000 (empty in this run), falls back to the 32768 default, and
-# Hermes refuses to start every time. Give hermes a third attempt — the gate
-# model occasionally hallucinates a "tests already pass" no-op (~1 in 3).
 save_cfg "$HERMES_CFG"
 "$RMLX" agents hermes --setup --base-url "$B/v1" >/dev/null 2>&1
 patch_port "$HERMES_CFG"
-R_HERMES=FAIL
-for _try in 1 2 3; do
-  seed_repo hermes
-  TO "$HERMES_TO" hermes chat -q "$TASK" -Q -m "$ALIAS" >/dev/null 2>&1
-  [ "$(verify hermes)" = PASS ] && { R_HERMES=PASS; break; }
-done
+
+echo "running 4 Tier-1 agents concurrently (budget ${AGENT_TO}s, hermes ${HERMES_TO}s)…"
+run_claude & _p_claude=$!
+run_codex &  _p_codex=$!
+run_hermes & _p_hermes=$!
+run_aider &  _p_aider=$!
+# Wait ONLY on the four agent jobs. A bare `wait` would also block on the
+# still-running background serve (SERVE_PID, launched with `&` above) and hang
+# the gate forever — the agents all finish but the script never returns.
+wait "$_p_claude" "$_p_codex" "$_p_hermes" "$_p_aider"
+
+# Restore the config files only after every agent has finished using them.
+restore_cfg "$CODEX_CFG"
 restore_cfg "$HERMES_CFG"
 
-# ---- Aider (env vars, LiteLLM openai/ prefix) ----------------------------
-R_AIDER=FAIL
-for _try in 1 2; do
-  seed_repo aider
-  TO "$AGENT_TO" env OPENAI_API_BASE="$B/v1" OPENAI_API_KEY=not-needed \
-    aider --model "openai/$ALIAS" --message "$TASK" \
-    --yes-always --no-auto-commits --no-show-model-warnings calc.py >/dev/null 2>&1
-  [ "$(verify aider)" = PASS ] && { R_AIDER=PASS; break; }
-done
+R_CLAUDE=$(cat "$WORK/claude.result" 2>/dev/null || echo FAIL)
+R_CODEX=$(cat "$WORK/codex.result" 2>/dev/null || echo FAIL)
+R_HERMES=$(cat "$WORK/hermes.result" 2>/dev/null || echo FAIL)
+R_AIDER=$(cat "$WORK/aider.result" 2>/dev/null || echo FAIL)
 
 # ---- report --------------------------------------------------------------
 echo
