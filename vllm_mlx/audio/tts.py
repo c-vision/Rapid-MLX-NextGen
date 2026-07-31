@@ -10,16 +10,55 @@ Supports:
 - VoxCPM (Chinese/English, high quality)
 """
 
+import importlib
 import io
 import json
 import logging
+import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_QWEN_SAMPLER_PATCH_LOCK = threading.RLock()
+
+
+@contextmanager
+def _qwen_seeded_sampling(model, seed: int | None):
+    """Give one Qwen generation a request-local RNG without global seeding."""
+    if seed is None:
+        yield
+        return
+
+    import mlx.core as mx
+
+    module = importlib.import_module(type(model).__module__)
+    original = module.categorical_sampling
+    owner_thread = threading.get_ident()
+    key = mx.random.key(seed)
+
+    def dispatch(logits, temperature):
+        nonlocal key
+        if threading.get_ident() != owner_thread:
+            return original(logits, temperature)
+        keys = mx.random.split(key, 2)
+        key, sample_key = keys[0], keys[1]
+        return mx.random.categorical(logits * (1 / temperature), key=sample_key)
+
+    # The public route already serializes TTS, while this lock also protects
+    # callers embedding TTSEngine directly. Other inference threads may enter
+    # the dispatcher concurrently; they fall through to the untouched sampler.
+    with _QWEN_SAMPLER_PATCH_LOCK:
+        module.categorical_sampling = dispatch
+        try:
+            yield
+        finally:
+            module.categorical_sampling = original
+
 
 # Default models
 DEFAULT_TTS_MODEL = "mlx-community/Kokoro-82M-bf16"
@@ -521,6 +560,7 @@ class TTSEngine:
         ref_audio: str | None = None,
         ref_text: str | None = None,
         exaggeration: float | None = None,
+        voice_seed: int | None = None,
     ) -> AudioOutput:
         """
         Generate speech from text.
@@ -544,6 +584,10 @@ class TTSEngine:
                 arg is never missing. Other families ignore it (they have no
                 emotion-control surface), so passing it is a no-op there
                 rather than an error.
+            voice_seed: Optional deterministic seed for Qwen3-TTS VoiceDesign.
+                Reusing the same ``instruct`` and seed reproduces the same
+                designed voice across calls. Rejected for other families by
+                the API route.
             ref_audio: Optional path to a reference audio clip for zero-shot
                 voice cloning. Used by the F5-TTS ``f5`` family to clone the
                 clip's timbre; by the Chatterbox family (optional — clones the
@@ -649,18 +693,25 @@ class TTSEngine:
                 else:
                     gen_kwargs["lang_code"] = lang_code
 
-            for result in self.model.generate(**gen_kwargs):
-                audio_data = result.audio
-                if hasattr(result, "sample_rate"):
-                    sample_rate = result.sample_rate
+            if voice_seed is not None:
+                if not self._is_qwen3_voicedesign():
+                    raise ValueError(
+                        "voice_seed is supported only by Qwen3-TTS VoiceDesign"
+                    )
+            with _qwen_seeded_sampling(self.model, voice_seed):
+                for result in self.model.generate(**gen_kwargs):
+                    audio_data = result.audio
+                    if hasattr(result, "sample_rate"):
+                        sample_rate = result.sample_rate
 
-                # Convert mlx array to numpy
-                if isinstance(audio_data, mx.array) or hasattr(audio_data, "tolist"):
-                    audio_np = np.array(audio_data.tolist(), dtype=np.float32)
-                else:
-                    audio_np = np.array(audio_data, dtype=np.float32)
-
-                audio_chunks.append(audio_np)
+                    # Convert mlx array to numpy
+                    if isinstance(audio_data, mx.array) or hasattr(
+                        audio_data, "tolist"
+                    ):
+                        audio_np = np.array(audio_data.tolist(), dtype=np.float32)
+                    else:
+                        audio_np = np.array(audio_data, dtype=np.float32)
+                    audio_chunks.append(audio_np)
 
             if not audio_chunks:
                 raise RuntimeError("No audio generated")
