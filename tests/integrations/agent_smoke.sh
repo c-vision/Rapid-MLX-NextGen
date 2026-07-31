@@ -140,10 +140,37 @@ done
 # compiles the hybrid GatedDeltaNet / attention Metal kernels (cold ~8 tok/s vs
 # warm ~23). Paying that here, untimed, keeps a cold shader cache from pushing
 # the first agent past its per-agent budget. Best-effort — never fatal.
-echo "warming kernels…"
-curl -s -m 180 "$B/v1/chat/completions" -H 'Content-Type: application/json' \
+#
+# Two-stage, because these kernels are effectively SHAPE-SPECIALIZED: a short
+# prompt only compiles the small-sequence kernel. The real agents (claude first)
+# open with a ~25-38k-token system+tools prompt, which hits a DIFFERENT cold
+# path — the large-context / chunked-prefill GatedDeltaNet kernel. On a cold
+# shader cache that first compile can exceed the server's 300s in-flight abort,
+# so the first agent request gets force-aborted at 0 tokens and the agent flaps —
+# exactly how the 0.11.4 gate hung (short warmup finished in 0.3s, then the first
+# 25k agent request stalled 300s with 0 tokens). Warming a large-context prompt
+# here pays that compile untimed, so the first agent request lands on warm kernels.
+echo "warming kernels (small + large context, untimed)…"
+curl -s -m 60 "$B/v1/chat/completions" -H 'Content-Type: application/json' \
   -d "{\"model\":\"$ALIAS\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word OK.\"}],\"max_tokens\":16,\"temperature\":0}" \
   >/dev/null 2>&1 || true
+python3 - "$B" "$ALIAS" <<'PY' 2>&1 || true
+import json, sys, urllib.request
+B, alias = sys.argv[1], sys.argv[2]
+# ~25k-token prompt (~11 tok/line * 2600) so the large-context Metal kernels the
+# agents actually hit are compiled here, not inside a timed per-agent budget.
+prompt = "The quick brown fox jumps over the lazy dog. " * 2600
+body = json.dumps({"model": alias,
+                   "messages": [{"role": "user", "content": prompt + "\nReply with the single word OK."}],
+                   "max_tokens": 16, "temperature": 0}).encode()
+req = urllib.request.Request(B + "/v1/chat/completions", data=body,
+                            headers={"Content-Type": "application/json"})
+try:
+    urllib.request.urlopen(req, timeout=290).read()
+    print("large-context kernels warmed")
+except Exception as e:  # best-effort — a cold compile that overruns still lets agents (with retries) proceed
+    print("large-context warmup note (non-fatal):", e)
+PY
 
 # ---- the task: a buggy factorial + a failing test the agent must fix -----
 seed_repo() {
