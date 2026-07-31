@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import stat
 import subprocess
 import sys
 import threading
@@ -306,6 +307,7 @@ def test_video_engine_calls_mlx_native_pipeline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured = {}
+    ffmpeg_calls = []
     fake = ModuleType("mlx_video")
 
     def generate_video_with_audio(
@@ -327,11 +329,19 @@ def test_video_engine_calls_mlx_native_pipeline(
         image_strength=1.0,
     ) -> None:
         captured.update(locals())
-        Path(output_path).write_bytes(b"mp4")
+        generated = Path(output_path)
+        generated.write_bytes(b"mp4")
+        generated.chmod(0o640)
 
     fake.generate_video_with_audio = generate_video_with_audio
     monkeypatch.setitem(sys.modules, "mlx_video", fake)
     monkeypatch.setattr("shutil.which", lambda _: "/opt/homebrew/bin/ffmpeg")
+
+    def remux_video_only(command, **kwargs) -> None:
+        ffmpeg_calls.append(command)
+        Path(command[-1]).write_bytes(b"video-only-mp4")
+
+    monkeypatch.setattr("subprocess.run", remux_video_only)
 
     output = tmp_path / "result.mp4"
     reference = tmp_path / "reference.png"
@@ -351,13 +361,65 @@ def test_video_engine_calls_mlx_native_pipeline(
         conditioning_strength=0.25,
     )
 
-    assert output.read_bytes() == b"mp4"
+    assert output.read_bytes() == b"video-only-mp4"
+    assert stat.S_IMODE(output.stat().st_mode) == 0o640
     assert captured["model_repo"] == "notapalindrome/ltx23-mlx-av-q4"
     assert captured["num_frames"] == 97
     assert captured["image"] == str(reference)
     assert captured["negative_prompt"] == "static"
     assert captured["cfg_scale"] == 4.5
     assert captured["image_strength"] == 0.25
+    assert len(ffmpeg_calls) == 1
+    assert ffmpeg_calls[0][ffmpeg_calls[0].index("-map") + 1] == "0:v:0"
+    assert "-an" in ffmpeg_calls[0]
+    assert ffmpeg_calls[0][ffmpeg_calls[0].index("-c:v") + 1] == "copy"
+
+
+def test_video_only_remux_failure_is_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "result.mp4"
+    output.write_bytes(b"mp4-with-silent-audio")
+    sibling = tmp_path / "result.video-only.mp4"
+    sibling.write_bytes(b"unrelated-artifact")
+
+    def fail(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, "ffmpeg")
+
+    monkeypatch.setattr("subprocess.run", fail)
+
+    with pytest.raises(VideoRuntimeError, match="silent audio track"):
+        VideoEngine._remove_audio_track(output)
+
+    assert output.read_bytes() == b"mp4-with-silent-audio"
+    assert sibling.read_bytes() == b"unrelated-artifact"
+    assert not list(tmp_path.glob(".result.*.video-only.mp4"))
+
+
+def test_video_only_cleanup_failure_does_not_mask_remux_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "result.mp4"
+    output.write_bytes(b"mp4-with-silent-audio")
+    original_unlink = Path.unlink
+    temporary_paths = []
+
+    def fail_remux(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, "ffmpeg")
+
+    def fail_cleanup(path: Path, *args, **kwargs) -> None:
+        temporary_paths.append(path)
+        raise PermissionError("cleanup denied")
+
+    monkeypatch.setattr("subprocess.run", fail_remux)
+    monkeypatch.setattr(Path, "unlink", fail_cleanup)
+
+    with pytest.raises(VideoRuntimeError, match="silent audio track") as exc:
+        VideoEngine._remove_audio_track(output)
+
+    assert isinstance(exc.value.__cause__, subprocess.CalledProcessError)
+    assert len(temporary_paths) == 1
+    original_unlink(temporary_paths[0], missing_ok=True)
 
 
 def test_video_engines_share_process_generation_lock() -> None:
