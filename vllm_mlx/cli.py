@@ -6961,7 +6961,10 @@ def telemetry_command(args) -> None:
         record_consent,
         reset_state,
     )
-    from vllm_mlx.telemetry.schema import sample_preview_payload
+    from vllm_mlx.telemetry.schema import (
+        sample_preview_payload,
+        sample_request_preview_payload,
+    )
     from vllm_mlx.telemetry.state import client_id_path, consent_path
 
     action = getattr(args, "telemetry_action", None) or "status"
@@ -7010,13 +7013,23 @@ def telemetry_command(args) -> None:
 
     if action == "preview":
         cid = get_or_create_client_id()
-        payload = sample_preview_payload(
+        session_sample = sample_preview_payload(
+            client_id=cid, rapid_mlx_version=rapid_mlx_version
+        )
+        request_sample = sample_request_preview_payload(
             client_id=cid, rapid_mlx_version=rapid_mlx_version
         )
         print()
-        print("  Sample payload (this is exactly the shape we send):")
+        print("  Sample payloads (this is exactly the shape we send):")
         print()
-        print(json.dumps(payload.to_dict(), indent=2))
+        print("  session event:")
+        print(json.dumps(session_sample.to_dict(), indent=2))
+        print()
+        print("  request event (per completion, sampled) — only bucketed")
+        print("  numbers + booleans; never prompt or response text. The")
+        print("  output_degenerate flag is computed locally and sent as a")
+        print("  bare true/false (#1250):")
+        print(json.dumps(request_sample.to_dict(), indent=2))
         print()
         if not is_enabled(cli_no_telemetry=cli_no):
             print("  Telemetry is currently disabled — nothing is actually sent.")

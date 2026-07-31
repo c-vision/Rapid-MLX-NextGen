@@ -119,6 +119,24 @@ _SAFE_DEEPSEEK_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 router = APIRouter()
 
 
+def _degenerate_signal(
+    visible_text: str | None, telemetry_enabled: bool
+) -> bool | None:
+    """#1250 degeneracy canary for the emit sites below.
+
+    Returns ``None`` when telemetry is disabled — the default path skips the
+    heuristic entirely and no work is done. When enabled, runs the LOCAL
+    ``vllm_mlx.coherence.is_degenerate_completion`` on the visible completion
+    and returns only the bool; the text never leaves the host and is not
+    recoverable from the bool.
+    """
+    if not telemetry_enabled:
+        return None
+    from vllm_mlx.coherence import is_degenerate_completion
+
+    return is_degenerate_completion(visible_text)
+
+
 def _tool_call_name(tc) -> str | None:
     """Extract the function name from a tool_call entry regardless of
     shape. Three real shapes seen in production:
@@ -5715,6 +5733,15 @@ async def _create_chat_completion_impl(
     # delivered in one shot); the streaming path reports true TTFT.
     from vllm_mlx.telemetry import emit as _telemetry_emit
 
+    # Client-side degeneracy check (#1250): only when telemetry is enabled,
+    # run the local ``looks_like_garbage`` heuristic on the VISIBLE content
+    # and send ONLY the resulting bool — never the text. Empty content stays
+    # ``False`` (already captured by the zero completion-token bucket), so
+    # this is a clean "non-empty output looks like garbage" post-release
+    # canary for the #1234 class. Gated on ``is_enabled()`` so the default
+    # (telemetry off) path does no extra work.
+    _output_degenerate = _degenerate_signal(final_content, _telemetry_emit.is_enabled())
+
     _telemetry_emit.request(
         endpoint="/v1/chat/completions",
         model_alias=request.model,
@@ -5728,6 +5755,7 @@ async def _create_chat_completion_impl(
         caller_agent=(
             raw_request.headers.get("user-agent") if raw_request is not None else None
         ),
+        output_degenerate=_output_degenerate,
     )
 
     return Response(
@@ -6705,6 +6733,14 @@ async def stream_chat_completion(
         )
         from vllm_mlx.telemetry import emit as _telemetry_emit
 
+        # #1250 canary on the visible streamed content — the accumulated
+        # assistant text (reasoning is separate). Runs locally, only the
+        # bool is emitted; see ``_degenerate_signal``.
+        _output_degenerate = _degenerate_signal(
+            getattr(processor, "accumulated_text", "") or "",
+            _telemetry_emit.is_enabled(),
+        )
+
         _telemetry_emit.request(
             endpoint="/v1/chat/completions",
             model_alias=request.model,
@@ -6716,6 +6752,7 @@ async def stream_chat_completion(
             tps=_decode_tps,
             status=200,
             caller_agent=caller_agent,
+            output_degenerate=_output_degenerate,
         )
     finally:
         if cfg.gc_control and gc_was_enabled:

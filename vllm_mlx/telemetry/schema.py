@@ -20,6 +20,10 @@ from typing import Any
 
 from vllm_mlx.telemetry.redact import (
     bucket_memory_gb,
+    bucket_tokens,
+    bucket_tps,
+    bucket_ttft_ms,
+    normalize_caller_agent,
     platform_info,
 )
 
@@ -82,6 +86,19 @@ class RequestPayload:
     # RequestPayload positionally don't shift/break. request events ship
     # dark until the call sites land, so this widens no live wire contract.
     caller_agent: str = "unknown"
+    # v2.2 addition (#1250). A single derived boolean: did the completion
+    # look degenerate (repetition / single-token collapse) per the
+    # CLIENT-SIDE ``vllm_mlx.coherence.looks_like_garbage`` heuristic? The
+    # detector runs on the caller's machine and ONLY this bool leaves it —
+    # never the prompt or the completion text, and the bool is not
+    # reversible into either. It is the post-release canary for the #1234
+    # class (normal-length but garbage output), which the token-count
+    # buckets and the error events cannot see. Appended last + optional so
+    # positional ``RequestPayload`` construction stays stable; empty
+    # completions are reported ``False`` here (they already show up as the
+    # zero completion-token bucket) so this stays a clean "non-empty content
+    # looks like garbage" signal.
+    output_degenerate: bool = False
 
 
 @dataclass(frozen=True)
@@ -163,6 +180,51 @@ def sample_preview_payload(
     )
 
 
+def sample_request_preview_payload(
+    *,
+    client_id: str,
+    rapid_mlx_version: str,
+) -> TelemetryPayload:
+    """A representative ``request`` event for ``rapid-mlx telemetry preview``.
+
+    Request events are the highest-volume stream, so previewing one lets users
+    see the bucketed, content-free shape real traffic sends — every number is a
+    coarse bucket, and the #1250 ``output_degenerate`` flag is a bare boolean.
+    Neither the prompt nor the completion text is ever present. Bucket labels
+    are produced by the real ``redact`` helpers so the preview matches the wire.
+    """
+    info = platform_info()
+    return TelemetryPayload(
+        schema_version=SCHEMA_VERSION,
+        client_id=client_id,
+        session_id="preview-0000000000000000",
+        rapid_mlx_version=rapid_mlx_version,
+        platform=PlatformInfo(
+            os=info["os"],
+            os_version=info["os_version"],
+            arch=info["arch"],
+            chip=info["chip"],
+            memory_gb=info["memory_gb"],
+            python_version=info["python_version"],
+        ),
+        event="request",
+        timestamp=_utc_now_iso(),
+        request=RequestPayload(
+            endpoint="/v1/chat/completions",
+            model_alias="mlx-community/Qwen3.5-9B-4bit",
+            stream=True,
+            tool_call_used=True,
+            prompt_tokens_bucket=bucket_tokens(420),
+            completion_tokens_bucket=bucket_tokens(180),
+            ttft_ms_bucket=bucket_ttft_ms(310.0),
+            tps_bucket=bucket_tps(58.0),
+            status=200,
+            caller_agent=normalize_caller_agent("claude-code/1.0"),
+            output_degenerate=False,
+        ),
+    )
+
+
 __all__ = [
     "ErrorPayload",
     "PlatformInfo",
@@ -172,4 +234,5 @@ __all__ = [
     "TelemetryPayload",
     "bucket_memory_gb",
     "sample_preview_payload",
+    "sample_request_preview_payload",
 ]

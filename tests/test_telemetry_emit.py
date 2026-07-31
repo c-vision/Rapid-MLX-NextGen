@@ -387,6 +387,77 @@ def test_request_buckets_not_raw_numbers(opted_in, stub_queue):
         assert raw not in request_blob, f"{raw!r} survived into request payload: {r}"
 
 
+def test_request_payload_carries_every_schema_v1_field(opted_in, stub_queue):
+    """Request events now have live call sites (#1250), so a v1 consumer must
+    find EVERY ``RequestPayload`` key present — including ``output_degenerate``,
+    even when the caller doesn't pass it (defaults must still be emitted)."""
+    from dataclasses import fields as _fields
+
+    from vllm_mlx.telemetry import emit
+    from vllm_mlx.telemetry.schema import RequestPayload
+
+    expected_keys = {f.name for f in _fields(RequestPayload)}
+    emit.request(
+        endpoint="/v1/chat/completions",
+        model_alias="qwen3.5-9b-4bit",
+        stream=True,
+        tool_call_used=False,
+        prompt_tokens=10,
+        completion_tokens=20,
+        ttft_ms=100.0,
+        tps=50.0,
+        status=200,
+    )
+    r = stub_queue[-1]["request"]
+    missing = expected_keys - set(r)
+    assert not missing, f"request dropped v1 keys: {missing}"
+
+
+def test_output_degenerate_defaults_false_and_is_bool(opted_in, stub_queue):
+    """Omitting ``output_degenerate`` still emits a plain ``False`` bool — never
+    ``None`` / missing — so aggregation can count it without a null branch."""
+    from vllm_mlx.telemetry import emit
+
+    emit.request(
+        endpoint="/v1/chat/completions",
+        model_alias="qwen3.5-9b-4bit",
+        stream=False,
+        tool_call_used=False,
+        prompt_tokens=10,
+        completion_tokens=20,
+        ttft_ms=100.0,
+        tps=50.0,
+        status=200,
+    )
+    value = stub_queue[-1]["request"]["output_degenerate"]
+    assert value is False
+    assert isinstance(value, bool)
+
+
+def test_output_degenerate_true_when_caller_flags_it(opted_in, stub_queue):
+    """The caller computes the bool locally (from ``looks_like_garbage``) and
+    passes only the finished value — a truthy result lands as ``True``. This
+    field is the ONLY thing derived from completion text, and it is a bool, so
+    no text ever crosses into the payload."""
+    from vllm_mlx.telemetry import emit
+
+    emit.request(
+        endpoint="/v1/chat/completions",
+        model_alias="qwen3.5-9b-4bit",
+        stream=True,
+        tool_call_used=False,
+        prompt_tokens=10,
+        completion_tokens=20,
+        ttft_ms=100.0,
+        tps=50.0,
+        status=200,
+        output_degenerate=True,
+    )
+    r = stub_queue[-1]["request"]
+    assert r["output_degenerate"] is True
+    assert isinstance(r["output_degenerate"], bool)
+
+
 def test_error_category_and_phase_normalised_to_allowlist(opted_in, stub_queue):
     """Round 3 codex review: ``category`` + ``phase`` were stored
     verbatim. Same escape hatch as ``endpoint`` — a future caller

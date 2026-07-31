@@ -35,7 +35,13 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 
-__all__ = ["GoldenCase", "GOLDEN", "looks_like_garbage", "evaluate_case"]
+__all__ = [
+    "GoldenCase",
+    "GOLDEN",
+    "looks_like_garbage",
+    "is_degenerate_completion",
+    "evaluate_case",
+]
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
@@ -130,6 +136,23 @@ def looks_like_garbage(text: str, *, min_words: int = 10) -> tuple[bool, str]:
                 return True, f"top bigram is {bn}/{len(bigrams)} of the output"
 
     return False, "ok"
+
+
+def is_degenerate_completion(text: str | None) -> bool:
+    """Boolean form of :func:`looks_like_garbage` for the #1250 telemetry
+    canary: is a **non-empty** completion degenerate (repetition / single-token
+    collapse)?
+
+    Empty / whitespace-only input returns ``False`` — absence of output is a
+    *separate* signal (the zero completion-token bucket), not degeneracy — so
+    this stays a clean "non-empty content looks like garbage" indicator for the
+    #1234 class (normal-length but garbage output). Pure and text-only: callers
+    run it locally and emit only the returned bool, never the text.
+    """
+    s = text or ""
+    if not s.strip():
+        return False
+    return looks_like_garbage(s)[0]
 
 
 @dataclass(frozen=True)

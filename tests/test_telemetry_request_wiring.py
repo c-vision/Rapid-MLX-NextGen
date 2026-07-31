@@ -113,6 +113,75 @@ async def test_nonstreaming_completion_emits_request_event(monkeypatch):
     assert kw["tool_call_used"] is False
     assert isinstance(kw["ttft_ms"], (int, float))
     assert isinstance(kw["tps"], (int, float))
+    # #1250: the call site always threads the degeneracy signal through. With
+    # telemetry off (the default here) it is None — the local heuristic is
+    # skipped entirely — but the keyword must still be passed.
+    assert "output_degenerate" in kw
+    assert kw["output_degenerate"] is None
+
+
+class _GarbageChatEngine(_FakeChatEngine):
+    async def chat(self, messages, **kwargs):
+        from vllm_mlx.engine.base import GenerationOutput
+
+        return GenerationOutput(
+            text="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",  # doubled-norm collapse (#1234)
+            finish_reason="stop",
+            prompt_tokens=12,
+            completion_tokens=8,
+        )
+
+
+@pytest.mark.asyncio
+async def test_nonstreaming_flags_degenerate_output_when_enabled(monkeypatch):
+    """When telemetry is ENABLED, the call site runs the LOCAL degeneracy
+    heuristic on the visible completion and emits the bool. A #1234-class
+    garbage completion is flagged ``True`` — the post-release canary. Only the
+    bool is passed; the garbage text never reaches ``emit.request``."""
+    from vllm_mlx.routes import chat
+    from vllm_mlx.telemetry import emit
+
+    calls: list[dict] = []
+    engine = _GarbageChatEngine()
+    _patch_route(monkeypatch, engine, calls)
+    # Force the consent gate open so the call site actually computes the
+    # signal (default is OFF, which short-circuits to None).
+    monkeypatch.setattr(emit, "is_enabled", lambda *a, **k: True)
+
+    await chat._create_chat_completion_impl(
+        _request(),
+        _RawRequest(user_agent="claude-cli/1.4.2"),
+        engine,
+        _commit_state=[False],
+        _admission_acquired=[False],
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["output_degenerate"] is True
+
+
+@pytest.mark.asyncio
+async def test_nonstreaming_coherent_output_not_flagged_when_enabled(monkeypatch):
+    """The enabled path does not blanket-flag: a coherent completion is
+    ``False``, so the signal discriminates rather than always firing."""
+    from vllm_mlx.routes import chat
+    from vllm_mlx.telemetry import emit
+
+    calls: list[dict] = []
+    engine = _FakeChatEngine()  # returns "hello there"
+    _patch_route(monkeypatch, engine, calls)
+    monkeypatch.setattr(emit, "is_enabled", lambda *a, **k: True)
+
+    await chat._create_chat_completion_impl(
+        _request(),
+        _RawRequest(user_agent="claude-cli/1.4.2"),
+        engine,
+        _commit_state=[False],
+        _admission_acquired=[False],
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["output_degenerate"] is False
 
 
 @pytest.mark.asyncio

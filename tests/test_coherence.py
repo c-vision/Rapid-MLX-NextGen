@@ -19,7 +19,13 @@ import httpx
 import pytest
 
 from evals import coherence_gate
-from vllm_mlx.coherence import GOLDEN, GoldenCase, evaluate_case, looks_like_garbage
+from vllm_mlx.coherence import (
+    GOLDEN,
+    GoldenCase,
+    evaluate_case,
+    is_degenerate_completion,
+    looks_like_garbage,
+)
 
 # ── real, coherent outputs that must NOT be flagged as garbage ──────────────
 COHERENT = [
@@ -70,6 +76,27 @@ def test_coherent_text_not_flagged(text: str) -> None:
 def test_garbage_text_flagged(text: str) -> None:
     is_garbage, _ = looks_like_garbage(text)
     assert is_garbage, f"missed garbage: {text[:50]!r}"
+
+
+# ── is_degenerate_completion: the boolean #1250 telemetry canary ────────────
+@pytest.mark.parametrize("text", COHERENT)
+def test_is_degenerate_false_on_coherent(text: str) -> None:
+    assert is_degenerate_completion(text) is False
+
+
+@pytest.mark.parametrize("text", [g for g in GARBAGE if g.strip()])
+def test_is_degenerate_true_on_nonempty_garbage(text: str) -> None:
+    assert is_degenerate_completion(text) is True
+
+
+def test_is_degenerate_false_on_empty_is_absence_not_garbage() -> None:
+    """Empty / whitespace / None is absence of output — a SEPARATE signal (the
+    zero completion-token bucket), not degeneracy. Keep this bool a clean
+    "non-empty content looks like garbage" indicator so it never double-counts
+    empties with the token-bucket signal."""
+    assert is_degenerate_completion("") is False
+    assert is_degenerate_completion("   ") is False
+    assert is_degenerate_completion(None) is False
 
 
 def test_evaluate_case_accepts_correct_answer() -> None:

@@ -116,6 +116,20 @@ def test_preview_emits_valid_json_payload(fake_home):
     assert payload["event"] == "session_start"
 
 
+def test_preview_shows_request_event_with_degenerate_flag(fake_home):
+    """Preview must also show the highest-volume ``request`` event so users can
+    audit it — including the #1250 ``output_degenerate`` bool, the only field
+    derived from completion text, which ships as a bare boolean. No prompt or
+    response text may appear in the sample."""
+    r = _run_cli("telemetry", "preview", home=fake_home)
+    assert r.returncode == 0, r.stderr
+    assert '"event": "request"' in r.stdout
+    assert '"output_degenerate": false' in r.stdout
+    # Only bucketed numbers + booleans — no raw-text field ever surfaces.
+    for forbidden in ('"prompt"', '"prompt_text"', '"completion"', '"messages"'):
+        assert forbidden not in r.stdout, f"{forbidden} leaked into preview"
+
+
 def test_reset_removes_consent(fake_home):
     _run_cli("telemetry", "enable", home=fake_home)
     r = _run_cli("telemetry", "reset", home=fake_home)

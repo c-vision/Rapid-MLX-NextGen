@@ -490,14 +490,20 @@ def request(
     tps: float,
     status: int,
     caller_agent: str | None = None,
+    output_degenerate: bool | None = None,
 ) -> None:
-    """Emit a ``request`` payload (call sites land in a follow-up PR).
+    """Emit a ``request`` payload.
 
     ``caller_agent`` is the inbound HTTP ``User-Agent``; it is bucketed to a
     fixed allowlist here (never stored raw). Sampled by
     ``RAPID_MLX_TELEMETRY_REQUEST_SAMPLE`` because request volume dwarfs the
     session events. Consent is still checked first — sampling never turns a
     disabled client on.
+
+    ``output_degenerate`` is a derived boolean the CALLER computes with
+    ``vllm_mlx.coherence.looks_like_garbage`` (#1250). This helper never sees
+    the completion text — only the finished bool — preserving the invariant
+    that no raw prompt/completion ever passes through the telemetry module.
     """
     if not is_enabled():
         return
@@ -515,6 +521,7 @@ def request(
         "tps_bucket": bucket_tps(tps),
         "status": int(status),
         "caller_agent": normalize_caller_agent(caller_agent),
+        "output_degenerate": bool(output_degenerate),
     }
     get_queue().enqueue(payload)
 
