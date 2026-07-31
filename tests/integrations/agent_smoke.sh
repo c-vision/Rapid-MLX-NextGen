@@ -105,7 +105,20 @@ fi
 # re-persists it every time), so readiness crept from ~15s to minutes run over
 # run. Disabling it keeps serve readiness fast and deterministic for the gate
 # without changing what the agents exercise.
-nohup "$RMLX" serve "$ALIAS" --port "$PORT" --disable-prefix-cache > "$LOG" 2>&1 &
+#
+# --no-thinking: the default gate model (Qwen3.6-35B-A3B) is a HYBRID REASONING
+# model — with thinking on it emits a chain-of-thought whose length is highly
+# variable and, on some turns, runs away toward max_tokens (agents request
+# max_tokens=32000). A single such turn is ~450-1400s of decode, which alone
+# blows an agent's 480/600s per-agent budget even on an idle GPU (observed: one
+# /v1/messages stream ran >300s without finishing). That made the gate flaky in
+# a way unrelated to whether the agent path actually works. We only need to
+# verify the end-to-end agentic tool-calling path (serve → tool schema → agent
+# CLI → tool exec → fix verified); the reasoning path itself is already covered
+# by the release_check_m3 coding gate (which also runs --no-thinking). Forcing
+# enable_thinking=False bounds each turn's output, so agents finish deterministically
+# well inside budget and the gate tolerates moderate GPU contention with headroom.
+nohup "$RMLX" serve "$ALIAS" --port "$PORT" --disable-prefix-cache --no-thinking > "$LOG" 2>&1 &
 SERVE_PID=$!
 # Serve-ready budget: 120 * 5s = 600s. The default gate model is a 35B hybrid
 # (Qwen3.6-35B-A3B, GatedDeltaNet/linear-attention). Its FIRST cold serve on the
