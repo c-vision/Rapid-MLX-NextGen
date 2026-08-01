@@ -56,6 +56,15 @@ def test_parse_dflash_speculative_config_accepts_drafter_model() -> None:
     assert cfg.tree_budget is None
 
 
+def test_parse_dspark_speculative_config_accepts_native_depth() -> None:
+    cfg = parse_speculative_config('{"method":"dspark","num_speculative_tokens":5}')
+
+    assert cfg is not None
+    assert cfg.method == "dspark"
+    assert cfg.model is None
+    assert cfg.num_speculative_tokens == 5
+
+
 def test_parse_speculative_config_normalizes_registered_alias() -> None:
     cfg = parse_speculative_config('{"method":"ngram"}')
 
@@ -130,6 +139,13 @@ def test_require_migrated_speculative_config_accepts_ddtree() -> None:
 
 def test_require_migrated_speculative_config_accepts_dflash() -> None:
     cfg = parse_speculative_config('{"method":"dflash"}')
+    assert cfg is not None
+
+    require_migrated_speculative_config(cfg)
+
+
+def test_require_migrated_speculative_config_accepts_dspark() -> None:
+    cfg = parse_speculative_config('{"method":"dspark"}')
     assert cfg is not None
 
     require_migrated_speculative_config(cfg)

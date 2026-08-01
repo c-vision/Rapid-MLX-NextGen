@@ -44,6 +44,7 @@ _COMMON_KEYS = frozenset(
 _METHOD_KEYS = {
     "ddtree": frozenset({"model", "num_speculative_tokens", "tree_budget"}),
     "dflash": frozenset({"model"}),
+    "dspark": frozenset({"num_speculative_tokens"}),
     "mtp": frozenset({"model", "num_speculative_tokens", "disable_auto_k"}),
     "suffix": frozenset(
         {

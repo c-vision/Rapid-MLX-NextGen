@@ -112,6 +112,10 @@ rapid-mlx serve qwen3.5-27b-8bit --speculative-config '{"method":"dflash"}' --po
 # DDTree speculative decoding (experimental, single-user)
 rapid-mlx serve qwen3.5-9b-8bit --speculative-config '{"method":"ddtree"}' --port 8000
 
+# DeepSeek V4 Flash checkpoint-native DSpark (block size is checkpoint-defined)
+rapid-mlx serve /path/to/DeepSeek-V4-Flash-0731-MLX \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5}' --port 8000
+
 # MTP fixed-K parity bench mode
 rapid-mlx serve <mtp-eligible-qwen-checkpoint> \
   --speculative-config '{"method":"mtp","num_speculative_tokens":1,"disable_auto_k":true}'

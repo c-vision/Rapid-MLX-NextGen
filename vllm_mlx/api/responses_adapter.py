@@ -427,7 +427,9 @@ def _resolve_reasoning_effort(request: ResponsesRequest) -> str | None:
     return None
 
 
-def responses_to_openai(request: ResponsesRequest) -> ChatCompletionRequest:
+def responses_to_openai(
+    request: ResponsesRequest, *, preserve_developer_role: bool = False
+) -> ChatCompletionRequest:
     """
     Convert a Responses-API request to an OpenAI Chat Completions request.
 
@@ -453,7 +455,9 @@ def responses_to_openai(request: ResponsesRequest) -> ChatCompletionRequest:
         messages.append(Message(role="user", content=request.input))
     else:
         for item in request.input:
-            converted = _convert_input_item(item)
+            converted = _convert_input_item(
+                item, preserve_developer_role=preserve_developer_role
+            )
             messages.extend(converted)
 
     # Codex 0.136.0 sends BOTH `instructions` (the big system prompt)
@@ -471,7 +475,8 @@ def responses_to_openai(request: ResponsesRequest) -> ChatCompletionRequest:
     # instructions sit *after* `instructions` (where Codex puts them
     # semantically — the per-turn directive refines the base system
     # prompt).
-    messages = _merge_system_messages(messages)
+    if not preserve_developer_role:
+        messages = _merge_system_messages(messages)
 
     tools = _convert_tools(request.tools)
     tool_choice = _convert_tool_choice(request.tool_choice)
@@ -880,10 +885,14 @@ def _parse_computer_action(arguments: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _convert_input_item(item: ResponsesInputItem) -> list[Message]:
+def _convert_input_item(
+    item: ResponsesInputItem, *, preserve_developer_role: bool = False
+) -> list[Message]:
     """Translate one Responses-API input item to 0+ Chat messages."""
     if item.type == "message":
-        return [_message_item_to_chat(item)]
+        return [
+            _message_item_to_chat(item, preserve_developer_role=preserve_developer_role)
+        ]
     if item.type == "function_call":
         return [_function_call_to_chat(item)]
     if item.type == "function_call_output":
@@ -914,9 +923,15 @@ _RESPONSES_TO_CHAT_ROLE = {
 }
 
 
-def _message_item_to_chat(item: ResponsesInputItem) -> Message:
+def _message_item_to_chat(
+    item: ResponsesInputItem, *, preserve_developer_role: bool = False
+) -> Message:
     raw_role = item.role or "user"
-    role = _RESPONSES_TO_CHAT_ROLE.get(raw_role, raw_role)
+    role = (
+        "developer"
+        if preserve_developer_role and raw_role == "developer"
+        else _RESPONSES_TO_CHAT_ROLE.get(raw_role, raw_role)
+    )
     content = item.content
 
     if isinstance(content, str):

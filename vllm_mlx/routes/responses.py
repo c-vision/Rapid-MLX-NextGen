@@ -397,7 +397,13 @@ async def create_response(request: Request):
         # it through the sanitized 400 envelope — no more ``str(e)``
         # echo that leaked the model class name and pydantic version.
         try:
-            openai_request = responses_to_openai(responses_request)
+            cfg_for_adapter = get_config()
+            openai_request = responses_to_openai(
+                responses_request,
+                preserve_developer_role=(
+                    cfg_for_adapter.tool_call_parser == "deepseek_v4_0731"
+                ),
+            )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 

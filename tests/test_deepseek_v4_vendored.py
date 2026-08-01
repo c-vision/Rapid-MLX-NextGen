@@ -407,3 +407,53 @@ def test_tiny_model_decodes_merged_caches_with_different_offsets():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_deepseek_v4_dspark_drafts_checkpoint_block():
+    import mlx.core as mx
+
+    from vllm_mlx.models.deepseek_v4 import Model, ModelArgs
+
+    args = ModelArgs(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        n_routed_experts=8,
+        q_lora_rank=16,
+        qk_rope_head_dim=4,
+        num_experts_per_tok=2,
+        head_dim=8,
+        compress_ratios=[0, 0, 0],
+        hc_mult=4,
+        num_hash_layers=0,
+        sliding_window=16,
+        o_groups=2,
+        o_lora_rank=8,
+        dspark_num_layers=3,
+        dspark_block_size=5,
+        dspark_noise_token_id=127,
+        dspark_target_layer_ids=[0, 1, 2],
+        dspark_markov_rank=8,
+    )
+    model = Model(args)
+    target_cache = model.make_cache()
+    draft_cache = model.make_dspark_cache()
+    model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=target_cache)
+    assert (
+        model.dspark_forward(
+            mx.array([[3]], dtype=mx.int32), model._last_dspark_hidden, draft_cache
+        )
+        is None
+    )
+    model(mx.array([[4]], dtype=mx.int32), cache=target_cache)
+    proposal = model.dspark_forward(
+        mx.array([[4]], dtype=mx.int32), model._last_dspark_hidden, draft_cache
+    )
+    assert proposal is not None
+    output_ids, logits = proposal
+    mx.eval(output_ids, logits)
+    assert output_ids.shape == (1, 6)
+    assert logits.shape == (1, 5, 128)

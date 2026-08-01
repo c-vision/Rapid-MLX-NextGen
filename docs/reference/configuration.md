@@ -69,6 +69,7 @@ into the same config path.
 |--------|-------------|
 | `{"method":"dflash"}` | Enable the DFlash single-user bridge on validated aliases. |
 | `{"method":"ddtree"}` | Enable experimental DDTree verification on validated aliases. |
+| `{"method":"dspark","num_speculative_tokens":5}` | Enable checkpoint-native DSpark for a local DeepSeek V4 Flash checkpoint. The token count must match the checkpoint's complete DSpark block. Greedy single-request decoding is accelerated; unsupported request shapes safely use baseline decoding. |
 | `{"method":"mtp"}` | Enable MTP speculative decoding for checkpoints accepted by the existing MTP eligibility gate. |
 | `{"method":"mtp","model":"<sidecar-head-repo>"}` | Attach a standalone MTP **sidecar head** (e.g. `mlx-community/Qwen3.6-27B-MTP-4bit`) to a full base checkpoint. The base must be MTP-eligible; the head repo goes in the `model` field — **not** in the `serve` positional. See [MTP sidecar heads are not standalone models](#mtp-sidecar-heads-are-not-standalone-models) below. Gemma 4 sidecar MTP remains disabled after its greedy-lossless A/B failed. |
 | `{"method":"mtp","num_speculative_tokens":3}` | Set the MTP max-K controller ceiling. |

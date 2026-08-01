@@ -474,6 +474,28 @@ class TestResponsesToOpenai:
         assert chat.messages[0].role == "system"
         assert chat.messages[0].content == "Always reply in JSON."
 
+    def test_developer_role_can_be_preserved_for_native_encoder(self):
+        req = ResponsesRequest(
+            model="deepseek-v4-flash-0731",
+            instructions="Stable base instructions.",
+            input=[
+                ResponsesInputItem(type="message", role="user", content="First"),
+                ResponsesInputItem(
+                    type="message",
+                    role="developer",
+                    content="Per-turn plugin instructions.",
+                ),
+            ],
+        )
+        chat = responses_to_openai(req, preserve_developer_role=True)
+        assert [message.role for message in chat.messages] == [
+            "system",
+            "user",
+            "developer",
+        ]
+        assert chat.messages[0].content == "Stable base instructions."
+        assert chat.messages[2].content[0].text == "Per-turn plugin instructions."
+
     def test_developer_role_with_structured_content_does_not_raise(self):
         # Defensive: today every system message reaches the merge step
         # with a string content (`_message_item_to_chat` joins parts).

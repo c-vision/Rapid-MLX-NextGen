@@ -757,7 +757,12 @@ def _post_load_ubc_evict(model_name: str) -> None:
         logger.debug(f"Defect 4 post-load UBC evict skipped (non-fatal): {e}")
 
 
-def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
+def load_model_with_fallback(
+    model_name: str,
+    tokenizer_config: dict = None,
+    *,
+    enable_dspark: bool = False,
+):
     """
     Load model and tokenizer with fallback for non-standard tokenizers.
 
@@ -773,7 +778,14 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
     # or fallback loader runs.  Remote repository ids are intentionally a no-op
     # here; see validate_local_model_file for the containment boundary.
     validate_local_model_file(model_name)
-    result = _load_model_with_fallback_impl(model_name, tokenizer_config)
+    if enable_dspark:
+        result = _load_model_with_fallback_impl(
+            model_name, tokenizer_config, enable_dspark=True
+        )
+    else:
+        # Preserve the historical two-argument call shape for downstream
+        # wrappers and tests that instrument this internal dispatch boundary.
+        result = _load_model_with_fallback_impl(model_name, tokenizer_config)
     # Defect 4: evict UBC mirror of safetensors shards on Darwin so
     # the (mmap mirror + materialised weights) burst does not double
     # the load-window memory footprint. Runs ONLY after a successful
@@ -787,7 +799,12 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
     return result
 
 
-def _load_model_with_fallback_impl(model_name: str, tokenizer_config: dict = None):
+def _load_model_with_fallback_impl(
+    model_name: str,
+    tokenizer_config: dict = None,
+    *,
+    enable_dspark: bool = False,
+):
     """Inner load implementation — kept separate so the public wrapper can
     install a try/finally for the Defect 4 UBC eviction without rewriting
     every return branch in the loader."""
@@ -801,7 +818,7 @@ def _load_model_with_fallback_impl(model_name: str, tokenizer_config: dict = Non
         logger.info(
             f"Model {model_name} requires tokenizer fallback, loading directly..."
         )
-        return _load_with_tokenizer_fallback(model_name)
+        return _load_with_tokenizer_fallback(model_name, enable_dspark=enable_dspark)
 
     # Vendored architectures (e.g. deepseek_v4) — transformers' AutoConfig
     # doesn't know about them, so mlx-lm's high-level load() blows up
@@ -812,7 +829,7 @@ def _load_model_with_fallback_impl(model_name: str, tokenizer_config: dict = Non
             f"Model {model_name} uses a vendored architecture, "
             "skipping AutoConfig path and loading directly..."
         )
-        return _load_with_tokenizer_fallback(model_name)
+        return _load_with_tokenizer_fallback(model_name, enable_dspark=enable_dspark)
 
     # Gemma 4: mlx-lm 0.31+ supports it natively. Only use our wrapper
     # for older mlx-lm versions that lack gemma4 model support. Several
@@ -892,7 +909,9 @@ def _load_model_with_fallback_impl(model_name: str, tokenizer_config: dict = Non
             or "does not recognize this architecture" in str(e)
         ):
             logger.warning(f"Standard tokenizer loading failed, using fallback: {e}")
-            return _load_with_tokenizer_fallback(model_name)
+            return _load_with_tokenizer_fallback(
+                model_name, enable_dspark=enable_dspark
+            )
         # Fallback for models with extra/missing weights (e.g., vision tower, MTP layers).
         # Retry with strict=False to discard extra weights.
         elif "parameters not in model" in str(e) or (
@@ -1007,7 +1026,7 @@ def _load_non_strict(model_name: str, tokenizer_config: dict = None):
     return model, tokenizer
 
 
-def _load_with_tokenizer_fallback(model_name: str):
+def _load_with_tokenizer_fallback(model_name: str, *, enable_dspark: bool = False):
     """Load model with fallback tokenizer for non-standard models like Nemotron."""
     from mlx_lm.utils import load_model
 
@@ -1027,7 +1046,9 @@ def _load_with_tokenizer_fallback(model_name: str):
     # nests the transformer under ``model`` and renames shared-expert
     # projections, so mlx-lm would otherwise apply the global MXFP4 default to
     # MXFP8 attention tensors and reject their packed shapes.
-    model_config = _deepseek_v4_quantization_override(model_path)
+    model_config = _deepseek_v4_quantization_override(
+        model_path, enable_dspark=enable_dspark
+    )
 
     # Load model
     model, _ = load_model(model_path, model_config=model_config)
@@ -1091,7 +1112,9 @@ def _load_with_tokenizer_fallback(model_name: str):
     return model, tokenizer
 
 
-def _deepseek_v4_quantization_override(model_path: Path) -> dict | None:
+def _deepseek_v4_quantization_override(
+    model_path: Path, *, enable_dspark: bool = False
+) -> dict | None:
     """Translate standalone DeepSeek-V4 quantization paths for mlx-lm.
 
     Returns a ``model_config`` overlay only for ``model_type=deepseek_v4``.
@@ -1127,4 +1150,21 @@ def _deepseek_v4_quantization_override(model_path: Path) -> dict | None:
                 f".ffn.shared_experts.{old}", f".ffn.shared_experts.{new}"
             )
         translated[new_path] = value
-    return {"quantization": translated}
+    overlay = {"quantization": translated}
+    try:
+        from ..spec_decode.dspark import detect_dspark_metadata
+
+        dspark = detect_dspark_metadata(model_path) if enable_dspark else None
+    except Exception:  # pragma: no cover - optional checkpoint metadata
+        dspark = None
+    if dspark is not None:
+        overlay.update(
+            {
+                "dspark_num_layers": dspark.num_layers,
+                "dspark_block_size": dspark.block_size,
+                "dspark_noise_token_id": dspark.noise_token_id,
+                "dspark_target_layer_ids": list(dspark.target_layer_ids),
+                "dspark_markov_rank": dspark.markov_rank,
+            }
+        )
+    return overlay

@@ -1834,6 +1834,15 @@ class MemoryAwarePrefixCache:
                 trimmed_cache = self._decompress_cache(trimmed_cache)
                 return trimmed_cache, remaining
 
+            logger.info(
+                "[cache_fetch] LCP unavailable: shared=%d entry_len=%d "
+                "requested_len=%d non_trimmable=%s",
+                best_lcp_length,
+                len(best_lcp_entry.tokens),
+                len(tokens),
+                has_non_trimmable,
+            )
+
         self._stats.misses += 1
         self._last_match_type = "miss"
 

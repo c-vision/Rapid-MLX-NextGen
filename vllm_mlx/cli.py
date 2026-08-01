@@ -2009,6 +2009,9 @@ def _normalize_speculative_config_or_exit(args):
         args.enable_dflash = True
         if config.model:
             args.dflash_drafter_path = config.model
+    elif config.method == "dspark":
+        args.spec_decode = "dspark"
+        args.dspark_num_speculative_tokens = config.num_speculative_tokens or 5
     elif config.method == "mtp":
         args.spec_decode = "mtp"
         if legacy_enable_mtp_requested:
@@ -3336,6 +3339,7 @@ def serve_command(args):
         mtp_num_draft_tokens=getattr(args, "mtp_num_draft_tokens", 1),
         mtp_optimistic=getattr(args, "mtp_optimistic", False),
         spec_decode=getattr(args, "spec_decode", "none"),
+        dspark_num_speculative_tokens=getattr(args, "dspark_num_speculative_tokens", 5),
         dflash_drafter_path=getattr(args, "dflash_drafter_path", "") or "",
         # Optional external MTP sidecar path. ``None`` is the "no
         # sidecar; native-MTP path only" sentinel.
@@ -3397,6 +3401,31 @@ def serve_command(args):
         print(
             "MTP: enabled via --speculative-config, "
             f"max_k={getattr(args, 'mtp_max_k', 1)}"
+        )
+    if getattr(args, "spec_decode", "none") == "dspark":
+        from vllm_mlx.spec_decode.dspark import detect_dspark_metadata
+
+        metadata = detect_dspark_metadata(args.model)
+        if metadata is None:
+            print(
+                "error: DSpark requires a complete DeepSeek V4 DSpark "
+                "checkpoint (3 mtp stages plus Markov heads).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        requested_k = getattr(args, "dspark_num_speculative_tokens", 5)
+        if requested_k != metadata.block_size:
+            print(
+                "error: requested DSpark num_speculative_tokens="
+                f"{requested_k} does not match checkpoint block_size="
+                f"{metadata.block_size}. Rapid-MLX currently requires the "
+                "checkpoint's complete DSpark block.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        print(
+            "DSpark: enabled via --speculative-config, "
+            f"max_k={requested_k}, checkpoint_k={metadata.block_size}"
         )
     # Native Qwen3.5/3.6 MTP via vendored mlx-lm PR #990. The
     # config-only entrypoint is ``--speculative-config '{"method":"mtp"}'``.

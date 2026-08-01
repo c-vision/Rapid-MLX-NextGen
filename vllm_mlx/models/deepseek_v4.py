@@ -73,6 +73,11 @@ class ModelArgs(BaseModelArgs):
     index_head_dim: int = 128
     index_topk: int = 512
     num_nextn_predict_layers: int = 1
+    dspark_num_layers: int = 0
+    dspark_block_size: int = 0
+    dspark_noise_token_id: int = 0
+    dspark_target_layer_ids: List[int] = field(default_factory=list)
+    dspark_markov_rank: int = 256
     tie_word_embeddings: bool = False
     topk_method: str = "noaux_tc"
 
@@ -1059,7 +1064,13 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_head = HyperHead(config)
 
-    def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+        *,
+        return_dspark_hidden: bool = False,
+    ) -> mx.array | tuple[mx.array, mx.array]:
         h = self.embed_tokens(inputs)
         h = mx.broadcast_to(
             h[:, :, None, :],
@@ -1087,8 +1098,12 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
+        dspark_hiddens = []
         for layer, layer_cache in zip(self.pipeline_layers, cache):
             h = layer(h, mask, layer_cache, inputs)
+            global_idx = layer.attn.layer_idx
+            if return_dspark_hidden and global_idx in self.args.dspark_target_layer_ids:
+                dspark_hiddens.append(h.mean(axis=2))
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
@@ -1101,7 +1116,130 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
-        return self.norm(self.hc_head(h))
+        output = self.norm(self.hc_head(h))
+        if return_dspark_hidden:
+            if len(dspark_hiddens) != len(self.args.dspark_target_layer_ids):
+                raise RuntimeError(
+                    "DSpark hidden-state capture is not available with the "
+                    "current pipeline partition"
+                )
+            return output, mx.concatenate(dspark_hiddens, axis=-1)
+        return output
+
+
+class DSparkAttention(LocalAttention):
+    """DSpark local attention: each draft slot sees target KV plus itself."""
+
+    def update_main(self, main_x: mx.array, cache: RotatingKVCache) -> mx.array:
+        offset = cache.offset
+        kv = self.kv_norm(self.wkv(main_x)).reshape(
+            main_x.shape[0], 1, main_x.shape[1], self.head_dim
+        )
+        kv = self.rope(kv, offset)
+        return cache.update_and_fetch(
+            kv, mx.zeros((*kv.shape[:-1], 0), dtype=kv.dtype)
+        )[0]
+
+    def __call__(
+        self,
+        x: mx.array,
+        main_x: mx.array,
+        cache: RotatingKVCache,
+        *,
+        update_main: bool = True,
+    ) -> mx.array:
+        B, K, _ = x.shape
+        main_kv = self.update_main(main_x, cache) if update_main else cache.keys
+        if main_kv is None:
+            raise RuntimeError("DSpark target KV cache is empty")
+        draft_offset = cache.offset
+
+        q = self.wq_b(self.q_norm(self.wq_a(x)))
+        q = q.reshape(B, K, self.n_heads, self.head_dim)
+        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
+        q = q.transpose(0, 2, 1, 3)
+        q = self.rope(q, draft_offset)
+
+        draft_kv = self.kv_norm(self.wkv(x)).reshape(B, 1, K, self.head_dim)
+        draft_kv = self.rope(draft_kv, draft_offset)
+
+        # Flatten draft slots into the batch dimension. This gives every
+        # semi-autoregressive slot the same target window plus only its own KV.
+        main_len = main_kv.shape[2]
+        expanded_main = mx.broadcast_to(
+            main_kv[:, None], (B, K, 1, main_len, self.head_dim)
+        ).reshape(B * K, 1, main_len, self.head_dim)
+        own_kv = draft_kv.transpose(0, 2, 1, 3).reshape(B * K, 1, 1, self.head_dim)
+        verify_kv = mx.concatenate([expanded_main, own_kv], axis=2)
+        flat_q = q.transpose(0, 2, 1, 3).reshape(B * K, self.n_heads, 1, self.head_dim)
+        out = scaled_dot_product_attention(
+            flat_q,
+            verify_kv,
+            verify_kv,
+            cache=None,
+            scale=self.scale,
+            mask=None,
+            sinks=self.attn_sink.astype(flat_q.dtype),
+        )
+        out = out.reshape(B, K, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        out = self.rope(out, draft_offset, inverse=True)
+        out = out.reshape(B, self.o_groups, -1, K, self.head_dim)
+        out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
+        out = self.wo_a(out)
+        out = out.transpose(0, 2, 1, 3).flatten(-2)
+        return self.wo_b(out)
+
+
+class DSparkMarkovHead(nn.Module):
+    def __init__(self, config: ModelArgs):
+        self.markov_w1 = nn.Embedding(config.vocab_size, config.dspark_markov_rank)
+        self.markov_w2 = nn.Linear(
+            config.dspark_markov_rank, config.vocab_size, bias=False
+        )
+
+    def __call__(self, token_ids: mx.array) -> tuple[mx.array, mx.array]:
+        embedding = self.markov_w1(token_ids)
+        return self.markov_w2(embedding), embedding
+
+
+class DSparkBlock(nn.Module):
+    def __init__(self, config: ModelArgs, stage_idx: int):
+        self.stage_idx = stage_idx
+        self.attn = DSparkAttention(config, config.num_hidden_layers + stage_idx)
+        self.ffn = DeepseekV4MoE(config, config.num_hidden_layers + stage_idx)
+        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attn_hc = HyperConnection(config)
+        self.ffn_hc = HyperConnection(config)
+        if stage_idx == 0:
+            self.main_proj = nn.Linear(
+                config.hidden_size * len(config.dspark_target_layer_ids),
+                config.hidden_size,
+                bias=False,
+            )
+            self.main_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if stage_idx == config.dspark_num_layers - 1:
+            self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.markov_head = DSparkMarkovHead(config)
+            self.hc_head = HyperHead(config)
+
+    def __call__(
+        self,
+        h: mx.array,
+        main_x: mx.array,
+        cache: RotatingKVCache,
+        input_ids: mx.array,
+        *,
+        update_main: bool = True,
+    ) -> mx.array:
+        residual = h
+        x, post, comb = self.attn_hc(h)
+        x = self.attn(self.attn_norm(x), main_x, cache, update_main=update_main)
+        h = hc_expand(x, residual, post, comb)
+        residual = h
+        x, post, comb = self.ffn_hc(h)
+        x = self.ffn(self.ffn_norm(x), input_ids)
+        return hc_expand(x, residual, post, comb)
 
 
 class Model(nn.Module):
@@ -1111,9 +1249,79 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.model = DeepseekV4Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.mtp = [DSparkBlock(config, idx) for idx in range(config.dspark_num_layers)]
+        self._last_dspark_hidden: mx.array | None = None
 
-    def __call__(self, inputs: mx.array, cache: Optional[Any] = None):
-        return self.lm_head(self.model(inputs, cache))
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+        *,
+        return_dspark_hidden: bool = False,
+    ):
+        capture_dspark = return_dspark_hidden or bool(self.mtp)
+        output = self.model(inputs, cache, return_dspark_hidden=capture_dspark)
+        if capture_dspark:
+            hidden, dspark_hidden = output
+            self._last_dspark_hidden = dspark_hidden
+            logits = self.lm_head(hidden)
+            if return_dspark_hidden:
+                return logits, dspark_hidden
+            return logits
+        if return_dspark_hidden:
+            raise AssertionError("unreachable DSpark capture branch")
+        return self.lm_head(output)
+
+    def make_dspark_cache(self) -> list[RotatingKVCache]:
+        return [RotatingKVCache(max_size=self.args.sliding_window) for _ in self.mtp]
+
+    def dspark_forward(
+        self,
+        anchor_ids: mx.array,
+        main_hidden: mx.array,
+        cache: list[RotatingKVCache],
+    ) -> tuple[mx.array, mx.array, mx.array] | None:
+        if not self.mtp:
+            return None
+        first = self.mtp[0]
+        main_x = first.main_norm(first.main_proj(main_hidden))
+        initial_prefill = cache[0].offset == 0
+        for block, layer_cache in zip(self.mtp, cache):
+            block.attn.update_main(main_x, layer_cache)
+        if initial_prefill:
+            return None
+
+        K = self.args.dspark_block_size
+        draft_ids = mx.full(
+            (anchor_ids.shape[0], K),
+            self.args.dspark_noise_token_id,
+            dtype=anchor_ids.dtype,
+        )
+        draft_ids[:, 0] = anchor_ids[:, -1]
+        h = self.model.embed_tokens(draft_ids)
+        h = mx.broadcast_to(
+            h[:, :, None, :],
+            (h.shape[0], h.shape[1], self.args.hc_mult, h.shape[-1]),
+        )
+        for block, layer_cache in zip(self.mtp, cache):
+            h = block(
+                h,
+                main_x[:, -1:],
+                layer_cache,
+                draft_ids,
+                update_main=False,
+            )
+
+        last = self.mtp[-1]
+        collapsed = last.hc_head(h)
+        draft_logits = self.lm_head(last.norm(collapsed))
+        output_ids = mx.zeros((anchor_ids.shape[0], K + 1), dtype=anchor_ids.dtype)
+        output_ids[:, 0] = anchor_ids[:, -1]
+        for idx in range(K):
+            bias, _ = last.markov_head(output_ids[:, idx])
+            draft_logits[:, idx] = draft_logits[:, idx] + bias
+            output_ids[:, idx + 1] = mx.argmax(draft_logits[:, idx], axis=-1)
+        return output_ids, draft_logits
 
     @property
     def layers(self):
@@ -1162,7 +1370,9 @@ class Model(nn.Module):
 
         new_weights = {}
         for k, v in weights.items():
-            if k.startswith("mtp."):
+            if k.startswith("mtp.") and not self.mtp:
+                continue
+            if ".confidence_head." in k:
                 continue
             parts = k.split(".")
             if len(parts) >= 2 and parts[0] == "layers":
@@ -1224,6 +1434,9 @@ class Model(nn.Module):
             for sub in ("attn", "ffn"):
                 for param in ("fn", "base", "scale"):
                     nk = nk.replace(f".hc_{sub}_{param}", f".{sub}_hc.{param}")
+            nk = nk.replace(".hc_head_fn", ".hc_head.fn")
+            nk = nk.replace(".hc_head_base", ".hc_head.base")
+            nk = nk.replace(".hc_head_scale", ".hc_head.scale")
             for old, new in w_remap.items():
                 nk = nk.replace(f".shared_experts.{old}.", f".shared_experts.{new}.")
             remapped[nk] = v
@@ -1247,9 +1460,36 @@ class Model(nn.Module):
                             f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
                         ] = mx.stack(stacked)
 
+        for stage_idx in range(len(self.mtp)):
+            prefix = f"mtp.{stage_idx}.ffn.experts"
+            for src, dst in (
+                ("w1", "gate_proj"),
+                ("w2", "down_proj"),
+                ("w3", "up_proj"),
+            ):
+                for suffix in ("weight", "scales"):
+                    key0 = f"{prefix}.0.{src}.{suffix}"
+                    if key0 in weights:
+                        stacked = [
+                            weights.pop(f"{prefix}.{e}.{src}.{suffix}")
+                            for e in range(self.args.n_routed_experts)
+                        ]
+                        weights[f"mtp.{stage_idx}.ffn.switch_mlp.{dst}.{suffix}"] = (
+                            mx.stack(stacked)
+                        )
+
         # Fuse routed expert gate/up projections by concatenating output rows.
         for layer_idx in range(n_layers):
             prefix = f"model.layers.{layer_idx}.ffn.switch_mlp"
+            for suffix in ("weight", "scales"):
+                gate_key = f"{prefix}.gate_proj.{suffix}"
+                up_key = f"{prefix}.up_proj.{suffix}"
+                if gate_key in weights and up_key in weights:
+                    weights[gate_key] = mx.concatenate(
+                        [weights.pop(gate_key), weights.pop(up_key)], axis=1
+                    )
+        for stage_idx in range(len(self.mtp)):
+            prefix = f"mtp.{stage_idx}.ffn.switch_mlp"
             for suffix in ("weight", "scales"):
                 gate_key = f"{prefix}.gate_proj.{suffix}"
                 up_key = f"{prefix}.up_proj.{suffix}"
@@ -1261,6 +1501,13 @@ class Model(nn.Module):
         # Reshape wo_a from nn.Linear (2D) to MultiLinear (3D) for all layers
         for layer_idx in range(n_layers):
             prefix = f"model.layers.{layer_idx}.attn.wo_a"
+            for key in (f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"):
+                if key in weights and weights[key].ndim == 2:
+                    weights[key] = weights[key].reshape(
+                        self.args.o_groups, self.args.o_lora_rank, -1
+                    )
+        for stage_idx in range(len(self.mtp)):
+            prefix = f"mtp.{stage_idx}.attn.wo_a"
             for key in (f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"):
                 if key in weights and weights[key].ndim == 2:
                     weights[key] = weights[key].reshape(

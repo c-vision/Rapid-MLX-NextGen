@@ -1225,10 +1225,15 @@ class BatchedEngine(BaseEngine):
             thread_name_prefix="mlx-step",
             initializer=_init_mlx_step_thread,
         )
+        load_kwargs = {"tokenizer_config": tokenizer_config}
+        if self._scheduler_config is not None and (
+            getattr(self._scheduler_config, "spec_decode", "none") == "dspark"
+        ):
+            load_kwargs["enable_dspark"] = True
         self._model, self._tokenizer = self._model_load_executor.submit(
             load_model_with_fallback,
             self._model_name,
-            tokenizer_config=tokenizer_config,
+            **load_kwargs,
         ).result()
 
         # 0.9.13 PR-A: new-arch MTP inject dispatcher (Gemma 4 external
@@ -2132,7 +2137,7 @@ class BatchedEngine(BaseEngine):
         # PR #435 only wired this into ``stream_chat`` so the fix was a no-op
         # for the very SDKs fishloa was hitting; this closes that gap.
         #
-        # Hybrid-only gate: the boundary split routes through
+        # Non-trimmable-cache gate: the boundary split routes through
         # ``BatchGenerator.insert_segments`` which on pure-Transformer models
         # (e.g. gpt-oss-20b-mxfp4-q8 harmony) corrupts the harmony tool-call channel
         # state across multi-turn-with-tools and the agent loops forever.
@@ -2141,7 +2146,7 @@ class BatchedEngine(BaseEngine):
         # (Mamba/DeltaNet+Transformer) have the "can't trim" constraint that
         # PR #435 was built to fix. Gating on ``is_hybrid`` keeps the fix
         # active where it's needed and inert where it broke things.
-        if self._is_hybrid_model():
+        if self._needs_prefix_boundary_snapshot():
             prefix_boundary = self._compute_prefix_boundary(messages, tools)
             if prefix_boundary > 0:
                 kwargs["prefix_boundary"] = prefix_boundary
@@ -2187,6 +2192,24 @@ class BatchedEngine(BaseEngine):
         try:
             return bool(self._engine.engine.model_config.is_hybrid)
         except (AttributeError, TypeError):
+            return False
+
+    def _needs_prefix_boundary_snapshot(self) -> bool:
+        """Whether growing conversations need an explicit message boundary.
+
+        Hybrid models need this because their recurrent cache state cannot be
+        trimmed.  Some pure-attention models have the same constraint (for
+        example DeepSeek V4's pooling KV cache).  The CLI detects those caches
+        and enables ``hybrid_cache_entries``; use that signal here instead of
+        incorrectly assuming every pure-attention cache is trimmable.
+        """
+        if self._is_hybrid_model():
+            return True
+        try:
+            return (
+                int(getattr(self._scheduler_config, "hybrid_cache_entries", 0) or 0) > 0
+            )
+        except (TypeError, ValueError):
             return False
 
     def _compute_prefix_boundary(
@@ -2633,11 +2656,11 @@ class BatchedEngine(BaseEngine):
         if forced_assistant_prefix:
             prompt = prompt + forced_assistant_prefix
 
-        # Compute prefix boundary for cache — hybrid-only gate, see
+        # Compute prefix boundary for cache — non-trimmable-cache gate, see
         # ``chat()`` for the rationale. Path parity: stream and non-stream
         # must apply the same gating condition so a future change can't
         # silently regress one path while keeping the other green.
-        if self._is_hybrid_model():
+        if self._needs_prefix_boundary_snapshot():
             prefix_boundary = self._compute_prefix_boundary(messages, tools)
             if prefix_boundary > 0:
                 kwargs["prefix_boundary"] = prefix_boundary

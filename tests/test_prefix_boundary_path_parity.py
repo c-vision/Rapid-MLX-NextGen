@@ -17,6 +17,7 @@ boundary handoff, the non-streaming path must do too.
 """
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 from vllm_mlx.engine.batched import BatchedEngine
@@ -210,3 +211,27 @@ def test_non_hybrid_model_skips_boundary_both_paths(monkeypatch):
         f"stream path: non-hybrid model leaked boundary "
         f"into kwargs={stub.last_generate_kwargs!r}"
     )
+
+
+def test_nontrimmable_pure_attention_forwards_boundary_both_paths(monkeypatch):
+    """Pure attention with a detected non-trimmable cache needs snapshots."""
+    engine, stub = _build_engine(monkeypatch, is_hybrid=False)
+    engine._scheduler_config = SimpleNamespace(hybrid_cache_entries=8)
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+    ]
+
+    asyncio.run(engine.chat(messages=messages))
+    assert stub.last_generate_kwargs.get("prefix_boundary") == _SENTINEL_BOUNDARY
+
+    stub.last_generate_kwargs = None
+
+    async def _drain():
+        async for _ in engine.stream_chat(messages=messages):
+            break
+
+    asyncio.run(_drain())
+    assert stub.last_generate_kwargs.get("prefix_boundary") == _SENTINEL_BOUNDARY

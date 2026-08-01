@@ -370,6 +370,10 @@ class SchedulerConfig:
     # that retention bound is also useful to callers with ordinary caches.
     non_trimmable_exact_prefix_reuse: bool = False
 
+    # DeepSeek V4's checkpoint-native DSpark block drafter. This stays at the
+    # end of the dataclass field list to preserve positional compatibility.
+    dspark_num_speculative_tokens: int = 5
+
     def __post_init__(self) -> None:
         if self.response_cache_entries < 0:
             raise ValueError("response_cache_entries must be >= 0")
@@ -399,12 +403,21 @@ class SchedulerConfig:
             # (codex R3: silent rewrite to ``'none'`` was UX drift).
             self.enable_suffix_decoding = True
 
-        if self.spec_decode not in (None, "none", "mtp", "dflash", "suffix"):
+        if self.spec_decode not in (
+            None,
+            "none",
+            "mtp",
+            "dflash",
+            "dspark",
+            "suffix",
+        ):
             raise ValueError(
                 f"SchedulerConfig(spec_decode={self.spec_decode!r}) is not "
-                "supported; expected one of 'none', 'mtp', 'dflash', or 'suffix'."
+                "supported; expected one of 'none', 'mtp', 'dflash', "
+                "'dspark', or 'suffix'."
             )
-
+        if self.dspark_num_speculative_tokens <= 0:
+            raise ValueError("dspark_num_speculative_tokens must be > 0")
         if self.mtp_optimistic and self.spec_decode == "mtp":
             # Unified spec-decode interface (PR #1050) always routes MTP
             # through the vendored ``mtp_generate_step`` hot loop, which
@@ -1366,6 +1379,348 @@ def _config_vetted_mtp_supports_spec_decode(model_type: str | None) -> bool:
     """
 
     return model_type in {"qwen3_5", "qwen3_5_moe", "hy_v3"}
+
+
+def _replay_dspark_committed(
+    model: Any,
+    cache_snapshot: list[Any],
+    verify_input: mx.array,
+    token_count: int,
+) -> list[Any]:
+    """Replay only committed target tokens into a pre-verify cache snapshot."""
+
+    committed = verify_input[:, :token_count]
+    replay_logits = model(committed, cache=cache_snapshot)
+    mx.eval(replay_logits, model._last_dspark_hidden)
+    return cache_snapshot
+
+
+def _install_dspark(
+    batch_gen: "BatchGenerator",
+    model: Any,
+    requests: dict[str, Any],
+    uid_to_request_id: dict[int, str],
+    max_draft: int,
+) -> bool:
+    """Install DeepSeek V4's checkpoint-native DSpark draft/verify loop.
+
+    V1 is deliberately single-request and greedy. Target verification remains
+    authoritative, including request logits processors; finite-precision batch
+    evaluation may still choose a different token when target logits are tied.
+    """
+
+    if not all(
+        hasattr(model, name)
+        for name in ("dspark_forward", "make_dspark_cache", "_last_dspark_hidden")
+    ):
+        logger.warning("[DSpark] disabled: loaded model lacks DSpark runtime hooks")
+        return False
+    if not getattr(model, "mtp", None):
+        logger.warning("[DSpark] disabled: checkpoint did not load DSpark weights")
+        return False
+
+    checkpoint_k = int(getattr(model.args, "dspark_block_size", 0))
+    if checkpoint_k <= 0:
+        logger.warning("[DSpark] disabled: checkpoint has no valid block size")
+        return False
+    draft_k = min(int(max_draft), checkpoint_k)
+    gb = getattr(batch_gen, "_generation_batch", None)
+    if gb is None:
+        logger.warning("[DSpark] disabled: incompatible mlx-lm BatchGenerator")
+        return False
+
+    _orig_step = gb._step
+    _orig_next = gb.next
+    _caches: dict[int, list[Any]] = {}
+    _pending: dict[int, list[tuple[int, mx.array]]] = {}
+    # Retain enough state to roll back a verify round if a stop condition is
+    # reached part-way through its accepted tokens. DeepSeek V4's pooling
+    # caches are not trimmable, so exact replay is the only safe rollback.
+    _pending_replay: dict[int, tuple[Any, mx.array]] = {}
+    _disabled_uids: set[int] = set()
+    _stats = {
+        "verify_steps": 0,
+        "draft_tokens_proposed": 0,
+        "tokens_accepted": 0,
+        "fallthrough_steps": 0,
+        "errors": 0,
+        "full_accept_rounds": 0,
+    }
+    _uid_stats: dict[int, dict[str, float | int]] = {}
+
+    def _request_stats(uid: int) -> dict[str, float | int]:
+        return _uid_stats.setdefault(
+            uid,
+            {
+                "verify_steps": 0,
+                "draft_tokens_proposed": 0,
+                "tokens_accepted": 0,
+                "full_accept_rounds": 0,
+            },
+        )
+
+    def _is_greedy(uid: int) -> bool:
+        request_id = uid_to_request_id.get(uid)
+        request = requests.get(request_id) if request_id else None
+        params = getattr(request, "sampling_params", None)
+        return params is None or params.temperature in (None, 0.0)
+
+    def _dspark_step():
+        if (
+            gb._next_tokens is None
+            or gb._next_tokens.shape[0] != 1
+            or len(gb.uids) != 1
+        ):
+            _stats["fallthrough_steps"] += 1
+            return _orig_step()
+        uid = gb.uids[0]
+        uid_stats = _request_stats(uid)
+        if uid in _disabled_uids:
+            _stats["fallthrough_steps"] += 1
+            return _orig_step()
+        if not _is_greedy(uid):
+            _stats["fallthrough_steps"] += 1
+            return _orig_step()
+        processors = getattr(gb, "logits_processors", None)
+        request_processors = processors[0] if processors and processors[0] else []
+
+        inputs = gb._next_tokens
+        last_token = int(inputs[0].item())
+        hidden = getattr(model, "_last_dspark_hidden", None)
+        if hidden is None or hidden.shape[0] != 1:
+            _stats["fallthrough_steps"] += 1
+            return _orig_step()
+        dspark_cache = _caches.setdefault(uid, model.make_dspark_cache())
+        offsets_before = [cache.offset for cache in dspark_cache]
+        try:
+            proposal = model.dspark_forward(inputs[:, None], hidden, dspark_cache)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[DSpark] draft failed; falling back: %r", exc)
+            _stats["errors"] += 1
+            _caches.pop(uid, None)
+            return _orig_step()
+        if proposal is None:
+            return _orig_step()
+
+        output_ids, _ = proposal
+        draft = [int(v) for v in output_ids[0, 1 : draft_k + 1].tolist()]
+        K = len(draft)
+        _stats["verify_steps"] += 1
+        _stats["draft_tokens_proposed"] += K
+        uid_stats["verify_steps"] += 1
+        uid_stats["draft_tokens_proposed"] += K
+        import copy
+
+        target_cache_snapshot = copy.deepcopy(gb.prompt_cache)
+        try:
+            verify_input = mx.concatenate(
+                [inputs[:, None], mx.array([draft], dtype=inputs.dtype)], axis=1
+            )
+            verify_logits = model(verify_input, cache=gb.prompt_cache)
+            verify_hidden = model._last_dspark_hidden
+            mx.eval(verify_logits, verify_hidden)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[DSpark] verify failed; falling back: %r", exc)
+            _stats["errors"] += 1
+            # Verification may have advanced a non-trimmable target cache
+            # before raising.  Baseline decoding must resume from the exact
+            # pre-verify state, never from speculative state.
+            gb.prompt_cache = target_cache_snapshot
+            for cache, old_offset in zip(dspark_cache, offsets_before):
+                delta = cache.offset - old_offset
+                if delta > 0 and cache.is_trimmable():
+                    cache.trim(delta)
+            _caches.pop(uid, None)
+            return _orig_step()
+
+        accepted = 0
+        preds_list: list[int] = []
+        processed_logprobs: list[mx.array] = []
+        token_context = None
+        if request_processors:
+            token_context = gb._token_context[0].update_and_fetch(inputs)
+        for idx in range(K + 1):
+            sample_logits = verify_logits[0:1, idx]
+            for processor in request_processors:
+                sample_logits = processor(token_context, sample_logits)
+            logprobs = sample_logits - mx.logsumexp(
+                sample_logits, axis=-1, keepdims=True
+            )
+            pred = int(mx.argmax(logprobs[0], axis=-1).item())
+            preds_list.append(pred)
+            processed_logprobs.append(logprobs[0])
+            if idx == K or pred != draft[idx]:
+                break
+            accepted += 1
+            if request_processors:
+                token_context = gb._token_context[0].update_and_fetch(
+                    mx.array([draft[idx]], dtype=inputs.dtype)
+                )
+        rejected = K - accepted
+        if accepted == K:
+            _stats["full_accept_rounds"] += 1
+            uid_stats["full_accept_rounds"] += 1
+        if rejected:
+            # DeepSeek V4 pooling caches cannot trim once a compressed window
+            # has been materialised. Restore the pre-verify snapshot and replay
+            # only the committed prefix instead. This is the lossless fallback
+            # for partial acceptance; full-accept rounds keep the fast path.
+            gb.prompt_cache = target_cache_snapshot
+            committed_input = verify_input[:, : accepted + 1]
+            replay_logits = model(committed_input, cache=gb.prompt_cache)
+            replay_hidden = model._last_dspark_hidden
+            mx.eval(replay_logits, replay_hidden)
+            verify_hidden = replay_hidden
+
+        # Only target states for committed inputs may seed the next proposal.
+        model._last_dspark_hidden = verify_hidden[:, : accepted + 1]
+        primary_lp = (
+            gb._next_logprobs[0]
+            if gb._next_logprobs is not None and len(gb._next_logprobs) > 0
+            else processed_logprobs[0]
+        )
+        extras = draft[:accepted]
+        extra_lps = processed_logprobs[:accepted]
+        bonus = preds_list[accepted]
+        bonus_lp = processed_logprobs[accepted]
+        gb._next_tokens = mx.array([bonus], dtype=inputs.dtype)
+        gb._next_logprobs = [bonus_lp]
+        mx.async_eval(gb._next_tokens, bonus_lp)
+        gb.tokens[0].append(last_token)
+        _pending[uid] = list(zip(extras, extra_lps))
+        if extras:
+            _pending_replay[uid] = (target_cache_snapshot, verify_input)
+        _stats["tokens_accepted"] += accepted
+        uid_stats["tokens_accepted"] += accepted
+        rounds = int(uid_stats["verify_steps"])
+        average_accept = float(uid_stats["tokens_accepted"]) / float(rounds)
+        if (rounds >= 3 and average_accept < 1.5) or (
+            rounds >= 6 and average_accept < 2.0
+        ):
+            _disabled_uids.add(uid)
+        return [last_token], [primary_lp]
+
+    def _finish_uid(uid: int) -> None:
+        request_stats = _uid_stats.pop(uid, {})
+        attempts = int(request_stats.get("draft_tokens_proposed", 0))
+        accepts = int(request_stats.get("tokens_accepted", 0))
+        rounds = int(request_stats.get("verify_steps", 0))
+        logger.info(
+            "[DSpark] completed uid=%s rounds=%d accepted=%d/%d "
+            "avg_accept=%.2f full_accept=%d/%d adaptive_fallback=%s",
+            uid,
+            rounds,
+            accepts,
+            attempts,
+            accepts / rounds if rounds else 0.0,
+            int(request_stats.get("full_accept_rounds", 0)),
+            rounds,
+            uid in _disabled_uids,
+        )
+        _pending.pop(uid, None)
+        _pending_replay.pop(uid, None)
+        _caches.pop(uid, None)
+        _disabled_uids.discard(uid)
+
+    def _dspark_next():
+        responses = _orig_next()
+        if not responses:
+            return responses
+        for response in responses:
+            if response.finish_reason is not None:
+                replay_state = _pending_replay.get(response.uid)
+                if replay_state is not None:
+                    snapshot, verify_input = replay_state
+                    # ``GenerationBatch.next`` has already extracted the
+                    # finishing row and filtered it out of the live batch.
+                    # Rebuild the response-owned cache with only the primary
+                    # token that was actually surfaced, excluding queued
+                    # accepted draft tokens.
+                    restored = _replay_dspark_committed(
+                        model, snapshot, verify_input, 1
+                    )
+                    response.prompt_cache = [cache.extract(0) for cache in restored]
+                _finish_uid(response.uid)
+        if not _pending:
+            return responses
+
+        augmented = list(responses)
+        for response in responses:
+            if response.finish_reason is not None:
+                continue
+            pending = _pending.pop(response.uid, None)
+            replay_state = _pending_replay.pop(response.uid, None)
+            if not pending:
+                continue
+            try:
+                row = gb.uids.index(response.uid)
+            except ValueError:
+                continue
+            for emit_idx, (token, logprobs) in enumerate(pending):
+                gb.tokens[row].append(token)
+                gb._num_tokens[row] += 1
+                finish_reason = None
+                match_sequence = None
+                current_state = None
+                try:
+                    new_state, match_sequence, current_state = gb.state_machines[
+                        row
+                    ].match(gb._matcher_states[row], token)
+                    gb._matcher_states[row] = new_state
+                    if match_sequence is not None and current_state is None:
+                        finish_reason = "stop"
+                except Exception:  # noqa: BLE001
+                    pass
+                if finish_reason is None and gb._num_tokens[row] >= gb.max_tokens[row]:
+                    finish_reason = "length"
+                if finish_reason is not None:
+                    unused = len(pending) - emit_idx - 1
+                    if unused and replay_state is not None:
+                        snapshot, verify_input = replay_state
+                        gb.prompt_cache = snapshot
+                        # Commit the primary plus only the accepted tokens that
+                        # have actually been surfaced through this response.
+                        committed = verify_input[:, : emit_idx + 2]
+                        replay_logits = model(committed, cache=gb.prompt_cache)
+                        mx.eval(replay_logits, model._last_dspark_hidden)
+                    augmented.append(
+                        gb.Response(
+                            uid=response.uid,
+                            token=token,
+                            logprobs=logprobs,
+                            finish_reason=finish_reason,
+                            current_state=current_state,
+                            match_sequence=match_sequence,
+                            prompt_cache=gb.extract_cache(row),
+                            all_tokens=gb.tokens[row],
+                        )
+                    )
+                    gb.filter([i for i in range(len(gb.uids)) if i != row])
+                    _finish_uid(response.uid)
+                    break
+                augmented.append(
+                    gb.Response(
+                        uid=response.uid,
+                        token=token,
+                        logprobs=logprobs,
+                        finish_reason=None,
+                        current_state=current_state,
+                        match_sequence=match_sequence,
+                        prompt_cache=None,
+                        all_tokens=None,
+                    )
+                )
+        return augmented
+
+    gb._step = _dspark_step
+    gb.next = _dspark_next
+    batch_gen._dspark_stats = _stats
+    logger.info(
+        "[DSpark] installed (greedy B=1, checkpoint K=%d, max K=%d)",
+        checkpoint_k,
+        draft_k,
+    )
+    return True
 
 
 def _install_suffix_decoding(
@@ -2676,6 +3031,15 @@ class Scheduler:
                     if getattr(self, "model_config", None) is not None
                     else None,
                 )
+
+        if getattr(self.config, "spec_decode", "none") == "dspark":
+            _install_dspark(
+                bg,
+                model=self.model,
+                requests=self.requests,
+                uid_to_request_id=self.uid_to_request_id,
+                max_draft=getattr(self.config, "dspark_num_speculative_tokens", 5),
+            )
 
         # Install SuffixDecoding (drafter-free spec-decode).
         if self.config.enable_suffix_decoding:

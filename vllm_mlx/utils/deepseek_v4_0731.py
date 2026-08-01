@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from typing import Any
 
 BOS = "<｜begin▁of▁sentence｜>"
@@ -28,8 +29,46 @@ def _json(value: Any) -> str:
 
 
 def _tool_schemas(tools: list[dict]) -> str:
-    definitions = [t.get("function", t) for t in tools]
-    schemas = "\n".join(_json(t) for t in definitions)
+    # Only function-schema fields affect model tool calling. Agent clients may
+    # attach runtime connector metadata (for example a changing nested
+    # ``tools`` inventory on Codex's GitHub gateway); serialising that metadata
+    # into the prompt invalidates a 30K+ prefix without changing semantics.
+    definitions = [
+        {
+            key: copy.deepcopy(value)
+            for key, value in t.get("function", t).items()
+            if key in {"name", "description", "parameters", "strict"}
+        }
+        for t in tools
+    ]
+    for definition in definitions:
+        description = definition.get("description")
+        if isinstance(description, str):
+            paragraphs = description.split("\n\n")
+            if (
+                paragraphs
+                and "Required for some features such as Codex" in paragraphs[0]
+            ):
+                description = "\n\n".join(paragraphs[1:])
+            # Codex decorates connector tools with this redundant suffix after
+            # the connector is activated.  Removing it keeps the otherwise
+            # identical 30K+ system/tool prefix cacheable across tool rounds.
+            description = re.sub(
+                r" This tool is part of plugin `[^`]+`\.", "", description
+            )
+            # The decorator also inserts a sentence-delimiter period when the
+            # source description did not already have one.  Canonicalising a
+            # final period is semantically neutral and keeps Codex's 30K+
+            # system/tool prefix stable after connector activation.
+            definition["description"] = description.rstrip().removesuffix(".")
+    # Agent clients may reorder otherwise-identical tools (and JSON object
+    # keys) between turns.  Since the schemas live in the system prefix, that
+    # turns a harmless wire-order change into a 30K-token prefix-cache miss.
+    # Tool order has no semantic meaning, so canonicalise both levels.
+    definitions.sort(key=lambda item: str(item.get("name", "")))
+    schemas = "\n".join(
+        json.dumps(item, ensure_ascii=False, sort_keys=True) for item in definitions
+    )
     return f"""## Tools
 
 You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<{DSML}tool_calls>" block like the following:

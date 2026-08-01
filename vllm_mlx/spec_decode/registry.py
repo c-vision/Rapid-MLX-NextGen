@@ -78,6 +78,13 @@ register_spec_decoder(
 )
 register_spec_decoder(
     SpecDecoderPlugin(
+        method="dspark",
+        description="DeepSeek V4 native semi-autoregressive block drafter",
+        config_enabled=True,
+    )
+)
+register_spec_decoder(
+    SpecDecoderPlugin(
         method="mtp",
         description="Model-side multi-token prediction head",
         config_enabled=True,
