@@ -140,6 +140,19 @@ class TestResolveHybridCacheEntries:
         )
         assert result == 0
 
+    def test_auto_defaults_for_deepseek_v4_0731_local_path(self, monkeypatch):
+        """DeepSeek's pooling/rotating caches need bounded trim-free reuse."""
+        monkeypatch.setattr(
+            "vllm_mlx.model_aliases.resolve_profile", lambda _name: None
+        )
+        result = _resolve_hybrid_cache_entries(
+            enable_prefix_cache=True,
+            explicit_value=0,
+            user_set_explicit=False,
+            model_name=("/models/DeepSeek-V4-Flash-0731-MXFP4-MLX"),
+        )
+        assert result == _DEFAULT_HYBRID_CACHE_ENTRIES
+
     def test_no_auto_default_without_prefix_cache(self, monkeypatch):
         """Hybrid model but prefix cache disabled → stays 0."""
         _patch_resolve_profile(monkeypatch, is_hybrid=True)

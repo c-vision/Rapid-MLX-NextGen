@@ -85,6 +85,70 @@ class TestPromptCacheSnapshot:
         assert stored_tokens == prompt_tokens
         assert stored_cache is fake_cache_layers
 
+    def test_prompt_only_snapshot_does_not_mask_internal_n_minus_one_boundary(self):
+        scheduler = _make_scheduler_with_cache()
+        scheduler.config.hybrid_cache_entries = 8
+        scheduler.config.non_trimmable_exact_prefix_reuse = True
+        request = _register(
+            scheduler, "req-boundary", uid=102, prompt_tokens=[10, 20, 30, 40]
+        )
+        request._cache_snapshot_boundary = 3
+        request._cache_snapshot_is_internal = True
+        request._cache_snapshot_stored = True
+        scheduler.memory_aware_cache.store = MagicMock(return_value=True)
+
+        scheduler._prompt_cache_save_cb(102, [object()])
+
+        scheduler.memory_aware_cache.store.assert_not_called()
+
+    def test_failed_internal_boundary_falls_back_to_prompt_snapshot(self):
+        scheduler = _make_scheduler_with_cache()
+        request = _register(
+            scheduler, "req-failed-boundary", uid=104, prompt_tokens=[10, 20]
+        )
+        request._cache_snapshot_boundary = 1
+        request._cache_snapshot_is_internal = True
+        request._cache_snapshot_stored = False
+        scheduler.memory_aware_cache.store = MagicMock(return_value=True)
+
+        cache_layers = [object()]
+        scheduler._prompt_cache_save_cb(104, cache_layers)
+
+        scheduler.memory_aware_cache.store.assert_called_once_with(
+            [10, 20], cache_layers, evict_prefixes=False
+        )
+
+    def test_semantic_boundary_does_not_suppress_full_prompt_snapshot(self):
+        scheduler = _make_scheduler_with_cache()
+        scheduler.config.non_trimmable_exact_prefix_reuse = True
+        request = _register(
+            scheduler, "req-semantic-boundary", uid=105, prompt_tokens=[10, 20, 30]
+        )
+        request.prefix_boundary = 2
+        request._cache_snapshot_stored = True
+        scheduler.memory_aware_cache.store = MagicMock(return_value=True)
+
+        cache_layers = [object()]
+        scheduler._prompt_cache_save_cb(105, cache_layers)
+
+        scheduler.memory_aware_cache.store.assert_called_once_with(
+            [10, 20, 30], cache_layers, evict_prefixes=False
+        )
+
+    def test_prompt_only_snapshot_still_saves_without_internal_boundary(self):
+        """A bounded cache must preserve the normal path for tiny prompts."""
+        scheduler = _make_scheduler_with_cache()
+        scheduler.config.hybrid_cache_entries = 8
+        _register(scheduler, "req-one-token", uid=103, prompt_tokens=[10])
+        scheduler.memory_aware_cache.store = MagicMock(return_value=True)
+
+        cache_layers = [object()]
+        scheduler._prompt_cache_save_cb(103, cache_layers)
+
+        scheduler.memory_aware_cache.store.assert_called_once_with(
+            [10], cache_layers, evict_prefixes=False
+        )
+
     def test_snapshot_skips_mid_prompt_chunks(self):
         scheduler = _make_scheduler_with_cache()
         _register(scheduler, "req-1", uid=101, prompt_tokens=[1, 2, 3])
@@ -272,6 +336,49 @@ class TestBoundarySnapshot:
             scheduler.memory_aware_cache.store.call_args.kwargs.get("evict_prefixes")
             is False
         )
+
+    def test_snapshot_stores_at_internal_exact_hit_boundary(self):
+        """N-1 snapshots make non-trimmable exact repeats prefix extensions."""
+        scheduler = _make_scheduler_with_cache()
+        scheduler._extract_cache_states = MagicMock(return_value=[{"k": "v"}])
+        scheduler._reconstruct_cache_from_states = MagicMock(
+            return_value=["reconstructed-cache"]
+        )
+        prompt_tokens = list(range(10))
+        request = self._register_with_boundary(
+            scheduler,
+            "req-exact",
+            uid=102,
+            prompt_tokens=prompt_tokens,
+            prefix_boundary=0,
+        )
+        request._cache_snapshot_boundary = 9
+        request._cache_snapshot_is_internal = True
+
+        bg = MagicMock()
+        bg.extract_cache.return_value = {102: (["raw-cache"], prompt_tokens[:9])}
+        scheduler.batch_generator = bg
+        scheduler.memory_aware_cache.store = MagicMock(return_value=True)
+
+        scheduler._snapshot_boundary_segments(
+            [
+                SimpleNamespace(
+                    uid=102,
+                    progress=(9, 10),
+                    # A regular prefill chunk can end exactly at N-1 without
+                    # being an explicit segment boundary. This must still
+                    # trigger the internal snapshot.
+                    end_of_segment=False,
+                    end_of_prompt=False,
+                )
+            ]
+        )
+
+        stored_tokens = scheduler.memory_aware_cache.store.call_args.args[0]
+        assert stored_tokens == prompt_tokens[:-1]
+        assert scheduler.memory_aware_cache.store.call_args.args[1] == [
+            "reconstructed-cache"
+        ]
 
     def test_snapshot_skips_end_of_prompt_responses(self):
         """end_of_prompt is the whole-prompt promotion — handled by the

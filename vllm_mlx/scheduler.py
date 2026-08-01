@@ -358,10 +358,16 @@ class SchedulerConfig:
     # SchedulerConfig purely so the CLI plumbs it through the same
     # construction sites as every other cache knob.
     #
-    # Keep this field last: positional ``SchedulerConfig(...)`` construction
-    # binds by position, so appending new fields at the end avoids shifting
-    # the position of any existing field.
+    # Keep newly-added fields below the historical configuration surface:
+    # positional ``SchedulerConfig(...)`` construction binds by position, so
+    # appending avoids shifting the position of any existing field.
     response_cache_entries: int = 0
+
+    # Enables the N-1 snapshot strategy for models whose cache state can be
+    # continued at an exact prefix but cannot safely trim an exact full-prompt
+    # hit by one token. Kept separate from ``hybrid_cache_entries`` because
+    # that retention bound is also useful to callers with ordinary caches.
+    non_trimmable_exact_prefix_reuse: bool = False
 
     def __post_init__(self) -> None:
         if self.response_cache_entries < 0:
@@ -2717,6 +2723,18 @@ class Scheduler:
             if _pflash_compressed(request):
                 return
 
+            # Bounded trim-free reuse deliberately segments a cold request at
+            # N-1. Saving an additional exact N-token entry would win lookup
+            # priority, fail trim-one kickoff on non-trimmable caches, and mask
+            # the reusable N-1 prefix. The boundary snapshot is the prompt
+            # cache for this path; completion still stores prompt + output.
+            if (
+                getattr(self.config, "non_trimmable_exact_prefix_reuse", False)
+                and getattr(request, "_cache_snapshot_is_internal", False)
+                and getattr(request, "_cache_snapshot_stored", False)
+            ):
+                return
+
             prompt_tokens = list(request.prompt_token_ids)
             _t0 = _time.monotonic()
             # evict_prefixes=False: keep mid-prefill boundary entries so
@@ -2811,8 +2829,6 @@ class Scheduler:
 
         boundary_uids: list[int] = []
         for resp in prompt_responses:
-            if not getattr(resp, "end_of_segment", False):
-                continue
             # end_of_prompt promotions are handled by
             # _snapshot_promoted_prompts (whole-prompt entry, issue #163).
             # We only want the *inter*-segment boundary here.
@@ -2822,7 +2838,14 @@ class Scheduler:
             if not request_id:
                 continue
             request = self.requests.get(request_id)
-            if not request or getattr(request, "prefix_boundary", 0) <= 0:
+            if not request:
+                continue
+            snapshot_boundary = getattr(
+                request,
+                "_cache_snapshot_boundary",
+                getattr(request, "prefix_boundary", 0),
+            )
+            if snapshot_boundary <= 0:
                 continue
             # Defense-in-depth: validate progress[0] equals the
             # expected boundary offset. mlx-lm 0.31+ rewrites
@@ -2833,7 +2856,16 @@ class Scheduler:
             # The `_boundary_snapshot_taken` guard below blocks the
             # second fire, but this progress check skips it deterministically.
             progress = getattr(resp, "progress", None)
-            expected_offset = request.prefix_boundary - (request.cached_tokens or 0)
+            expected_offset = snapshot_boundary - (request.cached_tokens or 0)
+            aligned_internal_chunk = (
+                getattr(request, "_cache_snapshot_is_internal", False)
+                and progress is not None
+                and isinstance(progress, tuple)
+                and len(progress) >= 1
+                and progress[0] == expected_offset
+            )
+            if not (getattr(resp, "end_of_segment", False) or aligned_internal_chunk):
+                continue
             if (
                 progress is not None
                 and isinstance(progress, tuple)
@@ -2877,7 +2909,11 @@ class Scheduler:
             # the trie.
             if _pflash_compressed(request):
                 continue
-            prefix_boundary = getattr(request, "prefix_boundary", 0)
+            prefix_boundary = getattr(
+                request,
+                "_cache_snapshot_boundary",
+                getattr(request, "prefix_boundary", 0),
+            )
             if prefix_boundary <= 0:
                 continue
 
@@ -2910,6 +2946,7 @@ class Scheduler:
             # busy — retrying every step would be pure waste. DeepSeek
             # finding #2 on PR #435.
             request._boundary_snapshot_taken = True
+            request._cache_snapshot_stored = stored
 
             if stored:
                 logger.info(
@@ -3183,6 +3220,48 @@ class Scheduler:
                         cache.keys = keys
                         cache.values = values
                         cache.offset = keys.shape[2] if hasattr(keys, "shape") else 0
+                    elif cache_cls.__name__ == "CacheList":
+                        # CacheList.from_state resolves nested class names only
+                        # from mlx_lm.models.cache globals. Vendored DeepSeek
+                        # pooling caches intentionally do not live there, so
+                        # reconstruct the wrapper with an explicit local map.
+                        from mlx_lm.models import cache as _mlx_cache
+                        from mlx_lm.models.cache import CacheList as _CacheList
+
+                        from vllm_mlx.models.deepseek_v4_cache import (
+                            BatchDeepseekV4PoolingCache,
+                            BatchPoolingCache,
+                            DeepseekV4PoolingCache,
+                            PoolingCache,
+                        )
+
+                        vendored = {
+                            cls.__name__: cls
+                            for cls in (
+                                PoolingCache,
+                                BatchPoolingCache,
+                                DeepseekV4PoolingCache,
+                                BatchDeepseekV4PoolingCache,
+                            )
+                        }
+                        names, nested_meta = meta_state
+                        if not (len(state) == len(names) == len(nested_meta)):
+                            raise ValueError(
+                                "CacheList state/metadata length mismatch: "
+                                f"state={len(state)}, names={len(names)}, "
+                                f"metadata={len(nested_meta)}"
+                            )
+                        nested = []
+                        for nested_state, name, nested_m in zip(
+                            state, names, nested_meta
+                        ):
+                            nested_cls = getattr(
+                                _mlx_cache, name, None
+                            ) or vendored.get(name)
+                            if nested_cls is None:
+                                raise ValueError(f"Unknown nested cache class {name!r}")
+                            nested.append(nested_cls.from_state(nested_state, nested_m))
+                        cache = _CacheList(*nested)
                     else:
                         cache = cache_cls.from_state(state, meta_state)
                 else:
@@ -4990,12 +5069,27 @@ class Scheduler:
             # lies strictly inside the tokens we're about to process —
             # otherwise there's nothing new to capture at the boundary.
             boundary_local_split: int | None = None
+            snapshot_boundary = getattr(request, "prefix_boundary", 0)
+            # A non-trimmable exact hit cannot use the usual trim-one then
+            # re-forward-last-token kickoff. Capture the cold prompt at N-1;
+            # an identical repeat becomes a safe one-token prefix extension.
+            if (
+                snapshot_boundary <= 0
+                and self.memory_aware_cache is not None
+                and getattr(self.config, "hybrid_cache_entries", 0) > 0
+                and getattr(self.config, "non_trimmable_exact_prefix_reuse", False)
+                and not request.prompt_cache
+                and len(request.prompt_token_ids) > 1
+            ):
+                snapshot_boundary = len(request.prompt_token_ids) - 1
+                request._cache_snapshot_boundary = snapshot_boundary
+                request._cache_snapshot_is_internal = True
             if (
                 self.memory_aware_cache is not None
-                and getattr(request, "prefix_boundary", 0) > 0
+                and snapshot_boundary > 0
                 and len(tokens_to_process) > 1
             ):
-                _pb = request.prefix_boundary
+                _pb = snapshot_boundary
                 _cached = request.cached_tokens or 0
                 _local = _pb - _cached
                 if 0 < _local < len(tokens_to_process):
@@ -5036,16 +5130,19 @@ class Scheduler:
                     tokens_to_process = request.prompt_token_ids
                     # Recompute split against the now-full prompt
                     # (cached_tokens=0 so boundary == split).
-                    if (
-                        self.memory_aware_cache is not None
-                        and getattr(request, "prefix_boundary", 0) > 0
-                        and 0 < request.prefix_boundary < len(tokens_to_process)
+                    retry_boundary = getattr(
+                        request,
+                        "_cache_snapshot_boundary",
+                        getattr(request, "prefix_boundary", 0),
+                    )
+                    if self.memory_aware_cache is not None and 0 < retry_boundary < len(
+                        tokens_to_process
                     ):
                         uids = self.batch_generator.insert_segments(
                             [
                                 [
-                                    tokens_to_process[: request.prefix_boundary],
-                                    tokens_to_process[request.prefix_boundary :],
+                                    tokens_to_process[:retry_boundary],
+                                    tokens_to_process[retry_boundary:],
                                 ]
                             ],
                             max_tokens=[request.sampling_params.max_tokens],

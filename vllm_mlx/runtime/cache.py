@@ -104,17 +104,21 @@ def _load_radix_index_after_cache(engine, cache_dir: str) -> None:
     radix = getattr(cache, "_radix_index", None)
     if radix is None:
         return
-    radix_path = os.path.join(cache_dir, "radix.index")
-    if radix.load(radix_path):
-        return
-    # Fallback: reconstruct from currently loaded entries. Reads
-    # ``_entries.keys()`` under the cache's lock to stay coherent with
-    # any concurrent store/evict — though boot is single-threaded so
-    # this is belt-and-suspenders.
+    # The KV entries are authoritative. A prior shutdown may have failed
+    # to serialize every cache entry while leaving an older ``radix.index``
+    # behind, so accepting the radix solely because its JSON parses can
+    # create terminal keys with no corresponding KV state.
     try:
         with cache._lock:  # noqa: SLF001 — coordinated rebuild
             keys = list(cache._entries.keys())  # noqa: SLF001
-        if keys:
+        radix_path = os.path.join(cache_dir, "radix.index")
+        loaded_radix = radix.load(radix_path)
+        radix_matches_entries = (
+            loaded_radix
+            and len(radix) == len(keys)
+            and all(key in radix for key in keys)
+        )
+        if not radix_matches_entries:
             radix.rebuild_from_keys(keys)
             logger.info(f"[radix] rebuilt index from {len(keys)} loaded cache entries")
     except Exception as e:  # pragma: no cover — defensive
@@ -206,7 +210,8 @@ def save_prefix_cache_to_disk(budget_sec: float | None = None) -> None:
         # ``radix.index`` referencing entries that didn't make it to
         # disk. The radix is a best-effort accelerator — if this fails,
         # the next boot just rebuilds from ``_entries``.
-        _save_radix_index_after_cache(cfg.engine, d)
+        if saved:
+            _save_radix_index_after_cache(cfg.engine, d)
     except Exception as e:
         logger.warning(f"[lifespan] Failed to save cache to disk: {e}", exc_info=True)
 

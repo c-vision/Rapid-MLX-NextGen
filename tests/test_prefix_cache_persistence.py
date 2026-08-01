@@ -1533,6 +1533,48 @@ def test_save_prefix_cache_to_disk_no_retry_on_internal_typeerror(monkeypatch):
     )
 
 
+def test_radix_load_rebuilds_stale_index_from_authoritative_entries(tmp_path):
+    """A parseable radix file must not resurrect keys whose KV save failed."""
+    import threading
+    from types import SimpleNamespace
+
+    from vllm_mlx.runtime import cache as _cache_mod
+    from vllm_mlx.runtime.radix_index import RadixPrefixIndex
+
+    persisted = RadixPrefixIndex()
+    persisted.insert([1, 2, 3])
+    persisted.save(str(tmp_path / "radix.index"))
+
+    radix = RadixPrefixIndex()
+    cache = SimpleNamespace(_entries={}, _lock=threading.RLock(), _radix_index=radix)
+    engine = SimpleNamespace(scheduler=SimpleNamespace(memory_aware_cache=cache))
+
+    _cache_mod._load_radix_index_after_cache(engine, str(tmp_path))
+
+    assert len(radix) == 0
+    assert [1, 2, 3] not in radix
+
+
+def test_failed_kv_save_does_not_publish_live_radix(tmp_path, monkeypatch):
+    """The lookup accelerator is persisted only after a KV snapshot commits."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from vllm_mlx.runtime import cache as _cache_mod
+
+    engine = SimpleNamespace(save_cache_to_disk=MagicMock(return_value=False))
+    save_radix = MagicMock()
+    monkeypatch.setattr(
+        _cache_mod, "get_config", lambda: SimpleNamespace(engine=engine)
+    )
+    monkeypatch.setattr(_cache_mod, "get_cache_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(_cache_mod, "_save_radix_index_after_cache", save_radix)
+
+    _cache_mod.save_prefix_cache_to_disk(budget_sec=0)
+
+    save_radix.assert_not_called()
+
+
 def test_save_to_disk_predicts_entry_zero_from_bootstrap_floor(tmp_path):
     """Codex PR #667 round 3 BLOCKING-1.
 

@@ -221,6 +221,52 @@ def test_batch_pooling_cache_merge_preserves_projection_dtypes():
     assert merged.buf_gate.dtype == mx.float32
 
 
+def test_scheduler_reconstructs_vendored_cache_list_at_prefill_boundary():
+    mx = pytest.importorskip("mlx.core")
+
+    from mlx_lm.models.cache import CacheList, RotatingKVCache
+
+    from vllm_mlx.models.deepseek_v4_cache import DeepseekV4PoolingCache
+    from vllm_mlx.scheduler import Scheduler
+
+    rotating = RotatingKVCache(max_size=128)
+    keys = mx.zeros((1, 1, 3, 4))
+    rotating.update_and_fetch(keys, keys)
+    pooling = DeepseekV4PoolingCache(ratio=4)
+    pooling.accumulate_windows(mx.zeros((1, 3, 4)), mx.zeros((1, 3, 2)), 0)
+    original = [CacheList(rotating, pooling)]
+    scheduler = Scheduler.__new__(Scheduler)
+
+    states = scheduler._extract_cache_states(original)
+    restored = scheduler._reconstruct_cache_from_states(states)
+
+    assert restored is not None
+    assert isinstance(restored[0], CacheList)
+    assert isinstance(restored[0].caches[1], DeepseekV4PoolingCache)
+    assert restored[0].caches[0].offset == rotating.offset
+    assert restored[0].caches[1].remainder == pooling.remainder
+
+
+def test_scheduler_rejects_mismatched_vendored_cache_list_metadata():
+    pytest.importorskip("mlx.core")
+
+    from mlx_lm.models.cache import CacheList
+
+    from vllm_mlx.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    states = [
+        {
+            "class_name": "CacheList",
+            "class_ref": CacheList,
+            "state": [([], None)],
+            "meta_state": (["KVCache", "DeepseekV4PoolingCache"], [None]),
+        }
+    ]
+
+    assert scheduler._reconstruct_cache_from_states(states) is None
+
+
 def test_tiny_model_forward_pass():
     """Smoke test the full forward path on a CPU-sized synthetic config.
 
