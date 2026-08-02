@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -138,6 +139,99 @@ def _find_g7_invocation(text: str) -> int:
     return match.start() if match else -1
 
 
+def _guard_tail_block(text: str, guard_idx: int) -> str | None:
+    """Return the complete ``if ... fi`` guard block starting at
+    ``guard_idx``, letting bash itself decide the block boundary.
+
+    We do NOT hand-roll a shell lexer (which would be blind to ANSI-C
+    ``$'...'`` quotes, heredocs, command substitution, etc.). Instead we
+    extend the source from the guard head one logical line at a time and ask
+    bash to parse the prefix with ``bash -n``: the first prefix that parses
+    cleanly is exactly the block bash treats as balanced, so nested
+    ``if``/``for``/``case`` and keywords inside comments/strings cannot
+    confuse the boundary. We require the suspicious head (the
+    ``RAPID_MLX_BASE_URL`` vs ``_expected_base`` comparison) to still be
+    present in the candidate, so we never mistake a *different* ``if`` for
+    the guard.
+    """
+    if not re.match(r"\s*if\b", text[guard_idx:]):
+        return None
+    lines = text[guard_idx:].splitlines()
+    head = lines[0]
+    if "RAPID_MLX_BASE_URL" not in head or "_expected_base" not in head:
+        return None
+    for k in range(1, len(lines) + 1):
+        candidate = "\n".join(lines[:k])
+        # bash -n: syntax check only, never executes.
+        syntax = subprocess.run(
+            ["bash", "-n", "-c", candidate], capture_output=True, text=True
+        )
+        if syntax.returncode == 0:
+            block = candidate
+            # Confirm the block's own fi closed at the right place and that
+            # the RAPID_MLX_BASE_URL guard is still the semantic head.
+            if "RAPID_MLX_BASE_URL" in block and "_expected_base" in block:
+                return block + "\n"
+            return None
+    return None
+
+
+def _guard_is_fail_loud(block: str) -> bool:
+    """Return True only if ``block`` (a real bash ``if ... fi`` guard) bails
+    out with an actual ``exit`` builtin when ``RAPID_MLX_BASE_URL`` no longer
+    points at the gauntlet port.
+
+    We never guess with a shell regex. We shadow the ``exit`` builtin with a
+    function that touches a temp sentinel file and then calls the real
+    ``builtin exit``, then run the whole block in bash. Only a genuine
+    ``exit`` writes the sentinel, and the process must actually terminate
+    with status 1 -- so ``exit 1`` buried in a comment, a quoted string, an
+    ``echo exit 1``, an else/elif branch, a ``false``/``return 1``/``set -e``
+    tail, or a survived ``( exit 1 )`` subshell cannot fake a fail-loud
+    guard.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        sentinel = Path(td) / "g7_exit_sentinel"
+        # Controlled, hermetic environment: do NOT inherit the caller's
+        # shell-startup vars (BASH_ENV/ENV can install EXIT traps that
+        # would write the sentinel through the shadow) -- only what the
+        # wrapped guard needs.
+        env = {"G7_SENTINEL": str(sentinel), "PATH": "/usr/bin:/bin"}
+        prefix = (
+            'RAPID_MLX_BASE_URL="http://127.0.0.1:9999/v1"\n'
+            'PORT="8000"\n'
+            '_expected_base="http://127.0.0.1:${PORT}/v1"\n'
+        )
+        # Only a real `exit` in the top-level shell touches the sentinel:
+        # BASH_SUBSHELL is 0 at the top level (and inside a plain function,
+        # which calls the real builtin exit) and >0 inside a `( ... )`
+        # subshell, so a survived `( exit 1 )` can never write it. The path
+        # travels via the quoted $G7_SENTINEL variable, so a TMPDIR with
+        # spaces or metacharacters is safe.
+        shadow = (
+            'exit() { if [ "${BASH_SUBSHELL:-0}" = 0 ]; then : > "$G7_SENTINEL"; fi; '
+            'builtin exit "$@"; }\n' + prefix + block + "\n"
+        )
+        if (
+            subprocess.run(
+                ["bash", "-n", "-c", shadow], capture_output=True, text=True, env=env
+            ).returncode
+            != 0
+        ):
+            return False
+        try:
+            proc = subprocess.run(
+                ["bash", "-c", shadow],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            return False
+        return proc.returncode == 1 and sentinel.exists()
+
+
 def test_script_asserts_g7_env_matches_port() -> None:
     """The G7 block MUST include a fail-loud assertion that
     ``RAPID_MLX_BASE_URL`` still points at the gauntlet PORT. Without
@@ -161,10 +255,15 @@ def test_script_asserts_g7_env_matches_port() -> None:
     assert guard_idx < invocation_idx, (
         "G7 RAPID_MLX_BASE_URL guard must run before test_anthropic_sdk.py"
     )
-    # The guard must be fail-loud: it must bail out (exit) on mismatch,
-    # not merely log a warning and continue.
-    guard_slice = text[guard_idx:invocation_idx]
-    assert re.search(r"\bexit\s+1\b", guard_slice), (
+    # The guard must be fail-loud: feeding an unrelated RAPID_MLX_BASE_URL
+    # must make the guard bail out (bash exit 1), not merely warn and
+    # continue. We cut the guard's own if..fi block out (bash decides the
+    # boundary) and evaluate it with bash itself, so an `exit 1` hidden in a
+    # comment, quoted string, elif/else branch, or an `echo exit 1` can
+    # never fake a fail-loud guard.
+    guard_block = _guard_tail_block(text, guard_idx)
+    assert guard_block is not None, "could not extract G7 guard block"
+    assert _guard_is_fail_loud(guard_block), (
         "G7 RAPID_MLX_BASE_URL guard must exit 1 on mismatch"
     )
 
@@ -202,6 +301,144 @@ def test_g7_section_located_by_semantic_marker_regardless_of_banner() -> None:
         guard_idx = _find_g7_guard(text)
         assert guard_idx != -1, f"banner {banner!r} hides guard"
         assert guard_idx < invocation_idx, f"banner {banner!r} reorders guard"
+
+
+def test_guard_fail_loud_scoped_to_its_own_block() -> None:
+    """Evaluate the guard with a mismatched ``RAPID_MLX_BASE_URL`` in real
+    bash. A guard is only fail-loud if bash actually ``exit 1``s on mismatch —
+    an ``exit 1`` in a comment, a quoted string, an ``echo exit 1``, an
+    ``elif``/``else`` branch, after the block, or a trailing ``false`` /
+    ``return 1`` must not count (issue #974 hole)."""
+    cond = 'if [ "${RAPID_MLX_BASE_URL:-}" != "$_expected_base" ]; then\n'
+
+    def fail_loud(body: str) -> bool:
+        return _guard_is_fail_loud(cond + body + "fi\n")
+
+    # Real guard: the mismatch branch directly exits 1.
+    assert fail_loud('  echo "ERROR: env mismatch" >&2\n  exit 1\n')
+    # exit 1 in a comment must not count.
+    assert not fail_loud('  echo "warn" >&2  # TODO: exit 1 if this regresses\n')
+    # A comment *before* a real exit on its own line must not hide the exit.
+    assert fail_loud("  # informational comment\n  exit 1\n")
+    # exit 1 inside a quoted string (including escaped quotes) must not count.
+    assert not fail_loud('  echo "you should exit 1 but we do not"\n')
+    assert not fail_loud('  echo "warning: \\"exit 1\\""\n')
+    # An `exit 1` emitted by an echo command is not a fail-loud exit.
+    assert not fail_loud("  echo exit 1\n")
+    # A failed command (false), return 1, or a stdout-closing fallthrough
+    # (exec 1>&-) is not an explicit fail-loud exit.
+    assert not fail_loud("  echo warn >&2\n  false\n")
+    assert not fail_loud("  echo warn >&2\n  return 1\n")
+    assert not fail_loud("  set -e\n  false\n")
+    assert not fail_loud("  exec 1>&-\n")
+    # An exit in a subshell that the guard survives must not count.
+    assert not fail_loud("  ( exit 1 )\n  echo continuing\n")
+    # A guard whose mismatch branch *ends* in `( exit 1 )` must also not be
+    # fail-loud: the subshell raises its own status to the parent (so the
+    # process returns 1) but the parent shell never exits -- the BASHPID
+    # guard in the exit shadow is what distinguishes this from a real exit.
+    assert not fail_loud("  ( exit 1 )\n")
+    # exit 1 in the else (match) branch must not count.
+    assert not fail_loud('  echo "WARNING: mismatch, continuing" >&2\nelse\n  exit 1\n')
+    # exit 1 in an elif branch must not prove the mismatch branch fail-loud.
+    assert not fail_loud(
+        '  echo "WARNING: mismatch, continuing" >&2\n'
+        'elif [ -n "${_RAPID_MLX_G7_EXTRA_SENTINEL:-}" ]; then\n  exit 1\n'
+    )
+    # exit 1 only inside a nested conditional must not count.
+    assert not fail_loud(
+        '  if [ -n "${_RAPID_MLX_G7_EXTRA_SENTINEL:-}" ]; then\n    exit 1\n  fi\n'
+    )
+
+
+def test_guard_extraction_scoped_to_guard_only() -> None:
+    """``_guard_tail_block`` must stop at the guard's own ``fi`` and not
+    swallow an executable ``exit 1`` that sits after it (which would fake a
+    fail-loud result for a guard that only warns)."""
+    script = (
+        'if [ "${RAPID_MLX_BASE_URL:-}" != "$_expected_base" ]; then\n'
+        '  echo "WARNING: mismatch, continuing" >&2\n'
+        "fi\n"
+        "exit 1\n"
+    )
+    idx = script.find('if [ "${RAPID_MLX_BASE_URL')
+    block = _guard_tail_block(script, idx)
+    assert block is not None
+    assert block.rstrip().endswith("fi")
+    # The guard itself is NOT fail-loud; the trailing exit 1 is outside it.
+    assert not _guard_is_fail_loud(block)
+
+
+def test_guard_extraction_ignores_keywords_in_comments_and_quotes() -> None:
+    """Keywords inside comments, quoted strings, or command arguments must
+    not distort the block boundary (bash decides it), and an unclosed guard
+    must be rejected."""
+    # A comment containing `if`, a quoted ``"fi"``, and `echo if` args all
+    # sit *inside* the guard before its real fi. None of them may change the
+    # boundary: extraction must still stop at the guard's real fi.
+    script = (
+        'if [ "${RAPID_MLX_BASE_URL:-}" != "$_expected_base" ]; then\n'
+        '  echo "fi inside quotes" >&2\n'
+        "  echo if\n"
+        "  # if this changes, keep the guard fail-loud\n"
+        "  exit 1\n"
+        "fi\n"
+        "exit 1\n"
+    )
+    idx = script.find('if [ "${RAPID_MLX_BASE_URL')
+    block = _guard_tail_block(script, idx)
+    assert block is not None
+    assert block.rstrip().endswith("fi")
+    assert not block.rstrip().endswith("exit 1")
+    # It really is a fail-loud guard (exits 1 on mismatch).
+    assert _guard_is_fail_loud(block)
+
+    # A guard whose body puts `if`/`for`/`while`/`case` as echo args (not
+    # shell keywords) must stay fail-loud.
+    args = (
+        'if [ "${RAPID_MLX_BASE_URL:-}" != "$_expected_base" ]; then\n'
+        "  echo if for while case\n"
+        "  exit 1\n"
+        "fi\n"
+    )
+    assert _guard_is_fail_loud(_guard_tail_block(args, 0))
+
+    # A multi-line double-quoted string containing `fi` must not end the
+    # block early (quote state must persist across lines).
+    multiline = (
+        'if [ "${RAPID_MLX_BASE_URL:-}" != "$_expected_base" ]; then\n'
+        '  echo "line one fi\n'
+        'also two" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+    )
+    assert _guard_is_fail_loud(_guard_tail_block(multiline, 0))
+
+    # A literal `#` inside a parameter expansion (${value#prefix}) is not a
+    # comment and must not hide the guard's closing `fi` on that line.
+    param_exp = (
+        'if [ "${RAPID_MLX_BASE_URL:-}" != "$_expected_base" ]; then\n'
+        '  x="${URL#http}"\n'
+        "  exit 1\n"
+        "fi\n"
+    )
+    assert _guard_is_fail_loud(_guard_tail_block(param_exp, 0))
+
+    # An unclosed guard must be rejected (fail closed), not silently
+    # truncated into a partial block.
+    unclosed = (
+        'if [ "${RAPID_MLX_BASE_URL:-}" != "$_expected_base" ]; then\n  echo warn\n'
+    )
+    assert _guard_tail_block(unclosed, 0) is None
+
+    # A `#` glued to the end of a quoted word (echo "x"#suffix) is PART of
+    # the word in bash, so the block must still extract (staying fail-loud).
+    glued_hash = (
+        'if [ "${RAPID_MLX_BASE_URL:-}" != "$_expected_base" ]; then\n'
+        '  echo "warning"#suffix; exit 1\n'
+        "fi\n"
+    )
+    assert _guard_is_fail_loud(_guard_tail_block(glued_hash, 0))
 
 
 def test_every_integration_base_url_env_is_covered() -> None:
