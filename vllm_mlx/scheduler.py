@@ -6356,6 +6356,9 @@ class Scheduler:
             except Exception as e:
                 import traceback
 
+                abort_error = (
+                    f"Inference aborted after generation error: {type(e).__name__}: {e}"
+                )
                 logger.error(
                     f"Error in batch generation step: {e}\n{traceback.format_exc()}"
                 )
@@ -6367,14 +6370,12 @@ class Scheduler:
                         RequestOutput(
                             request_id=rid,
                             finished=True,
-                            # OpenAI ChatCompletion only accepts {stop, length,
-                            # tool_calls, content_filter, function_call}. We
-                            # report "length" for aborted requests so spec-
-                            # validating clients (openai-python, pydantic-ai)
-                            # can parse the response; callers reading
-                            # ``RequestOutput.error`` still see the abort
-                            # details. (#v0.6.63 onboarding sweep)
-                            finish_reason="length",
+                            # This is an internal terminal output.  The engine
+                            # raises on ``error`` before route serializers see
+                            # it, so keep its state truthful rather than
+                            # masquerading as a successful token-budget cap.
+                            finish_reason="abort",
+                            error=abort_error,
                         )
                     )
                 output.finished_request_ids = aborted_ids
