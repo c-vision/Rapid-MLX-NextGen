@@ -42,6 +42,9 @@ import array
 import json
 import logging
 import os
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -53,6 +56,8 @@ save_prompt_cache = pytest.importorskip("mlx_lm.models.cache").save_prompt_cache
 from vllm_mlx.memory_cache import (  # noqa: E402
     MemoryAwarePrefixCache,
     MemoryCacheConfig,
+    _load_prompt_cache_compat,
+    _save_prompt_cache_compat,
 )
 
 # --------------------------------------------------------------------------
@@ -119,6 +124,137 @@ def test_clean_roundtrip_save_then_load(tmp_path):
     # Must hold for any well-formed entry: KV state is exactly as long
     # as the token sequence it claims to represent.
     assert entry.cache[0].offset == len(entry.tokens)
+
+
+@pytest.mark.parametrize("optional_shape", ["none", "empty"])
+def test_deepseek_v4_cachelist_optional_state_roundtrip(tmp_path, optional_shape):
+    """Vendored DeepSeek state must survive mlx safetensors limitations."""
+    from mlx_lm.models.cache import CacheList, RotatingKVCache
+
+    from vllm_mlx.models.deepseek_v4_cache import DeepseekV4PoolingCache
+
+    rotating = RotatingKVCache(max_size=128)
+    values = mx.arange(12, dtype=mx.float32).reshape(1, 1, 3, 4)
+    rotating.update_and_fetch(values, -values)
+    pooling = DeepseekV4PoolingCache(ratio=4)
+    if optional_shape == "empty":
+        pooling.pooled = mx.zeros((1, 0, 4), dtype=mx.float16)
+        pooling._buf = pooling.pooled
+
+    path = str(tmp_path / "deepseek.safetensors")
+    _save_prompt_cache_compat(path, [CacheList(rotating, pooling)], {})
+    hit = _load_prompt_cache_compat(path)
+    assert isinstance(hit[0], CacheList)
+    restored_pooling = hit[0].caches[1]
+    assert isinstance(restored_pooling, DeepseekV4PoolingCache)
+    if optional_shape == "none":
+        assert restored_pooling.pooled is None
+    else:
+        assert restored_pooling.pooled.shape == (1, 0, 4)
+        assert restored_pooling.pooled.dtype == mx.float16
+
+
+def test_deepseek_v4_populated_cache_uses_vendored_class_on_load(tmp_path):
+    """Unmarked upstream-format files still restore vendored cache classes."""
+    from mlx_lm.models.cache import CacheList, RotatingKVCache
+
+    from vllm_mlx.models.deepseek_v4_cache import DeepseekV4PoolingCache
+
+    rotating = RotatingKVCache(max_size=128)
+    values = mx.arange(12, dtype=mx.float32).reshape(1, 1, 3, 4)
+    rotating.update_and_fetch(values, -values)
+    pooling = DeepseekV4PoolingCache(ratio=4)
+    pooling.update_and_fetch(values.squeeze(axis=1))
+    pooling.buf_kv = mx.ones((1, 4, 4), dtype=mx.float32)
+    pooling.buf_gate = mx.ones((1, 4, 4), dtype=mx.float32)
+    pooling.remainder = 1
+    pooling.overlap_kv = mx.ones((1, 1, 2), dtype=mx.float32)
+    pooling.overlap_gate = mx.ones((1, 1, 2), dtype=mx.float32)
+
+    path = str(tmp_path / "deepseek-populated.safetensors")
+    save_prompt_cache(path, [CacheList(rotating, pooling)], metadata={})
+    restored = _load_prompt_cache_compat(path)
+
+    restored_pooling = restored[0].caches[1]
+    assert isinstance(restored_pooling, DeepseekV4PoolingCache)
+    mx.eval(restored_pooling.state)
+
+
+def test_deepseek_v4_prefix_cache_survives_real_process_restart(tmp_path):
+    """Process A saves; fresh process B loads and serves a strict-prefix hit."""
+    cache_dir = str(tmp_path / "deepseek-restart")
+    common = textwrap.dedent(
+        """
+        import json
+        import mlx.core as mx
+        from mlx_lm.models.cache import CacheList, RotatingKVCache
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+        from vllm_mlx.models.deepseek_v4_cache import DeepseekV4PoolingCache
+
+        def fresh():
+            return MemoryAwarePrefixCache(
+                object(),
+                MemoryCacheConfig(
+                    max_memory_mb=64,
+                    max_entries=8,
+                    hybrid_reuse_max_entries=8,
+                ),
+            )
+        """
+    )
+    writer = common + textwrap.dedent(
+        f"""
+        rotating = RotatingKVCache(max_size=128)
+        values = mx.arange(12, dtype=mx.float32).reshape(1, 1, 3, 4)
+        rotating.update_and_fetch(values, -values)
+        pooling = DeepseekV4PoolingCache(ratio=4)
+        source = fresh()
+        assert source.store([10, 20, 30], [CacheList(rotating, pooling)])
+        assert source.save_to_disk({cache_dir!r})
+        print(json.dumps({{"saved": len(source)}}))
+        """
+    )
+    reader = common + textwrap.dedent(
+        f"""
+        restored = fresh()
+        loaded = restored.load_from_disk({cache_dir!r})
+        hit, remaining = restored.fetch([10, 20, 30, 40])
+        layer = hit[0].caches[0]
+        mx.eval(layer.state)
+        print(json.dumps({{
+            "loaded": loaded,
+            "remaining": remaining,
+            "offset": layer.offset,
+            "key_sum": float(mx.sum(layer.keys).item()),
+            "value_sum": float(mx.sum(layer.values).item()),
+            "pool_type": type(hit[0].caches[1]).__name__,
+        }}, sort_keys=True))
+        """
+    )
+
+    first = subprocess.run(
+        [sys.executable, "-c", writer],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    second = subprocess.run(
+        [sys.executable, "-c", reader],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert json.loads(first.stdout.strip()) == {"saved": 1}
+    assert json.loads(second.stdout.strip()) == {
+        "key_sum": 66.0,
+        "loaded": 1,
+        "offset": 3,
+        "pool_type": "DeepseekV4PoolingCache",
+        "remaining": [40],
+        "value_sum": -66.0,
+    }
 
 
 def test_persistence_logs_entries_at_debug_and_summaries_at_info(tmp_path, caplog):
