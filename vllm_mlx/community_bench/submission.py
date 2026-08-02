@@ -9,14 +9,21 @@ Three responsibilities, in order:
 2. **Consent** — pretty-print the payload to the terminal and require
    an explicit ``y`` keystroke. Default is no. The bytes that get
    shown ARE the bytes that get written; we don't decorate-then-strip.
-3. **Open PR** — write the file to ``community-benchmarks/submissions/``
-   in the user's local checkout, create a branch, commit, and shell out
-   to ``gh pr create``. A contributor who cloned upstream directly gets
-   a fork created/reused via ``gh repo fork``; the branch is never pushed
-   to upstream unless the authenticated GitHub user owns it. If ``gh``
-   isn't installed or the user is offline, print fork-first recovery
-   commands. No silent failure — the file is always on disk before any
-   git work, so the user can always recover from the generated JSON.
+3. **Submit** — save a local copy, then POST the payload to the
+   community board. See ``upload.py``.
+
+   This step used to commit the file into a checkout of Rapid-MLX and
+   open a pull request via ``gh``. That gated the feature on the cwd
+   being a git repo with a remote pointing at upstream — which nobody
+   who ran ``pip install rapid-mlx`` or ``brew install rapid-mlx`` has,
+   so ``--submit`` returned exit 2 for the entire install base before it
+   ever collected a number. The local copy is written BEFORE the network
+   call, so a submission is never lost to an offline machine: the user
+   can retry, and the server dedupes on ``submission_id``.
+
+   The git/``gh`` helpers below are no longer reachable from this flow;
+   they are removed in a follow-up so this change stays reviewable as a
+   behaviour change rather than a 2,000-line deletion.
 
 Imports are deferred inside functions so loading the module on a
 non-Apple-Silicon dev box (for unit testing) doesn't drag in MLX.
@@ -73,6 +80,8 @@ def build_submission_payload(
     tier: str | None = None,
     smoke_result: dict | None = None,
     harness_result: dict | None = None,
+    spec_decode: dict | None = None,
+    run_group: str | None = None,
 ) -> dict:
     """Build the full JSON payload for one submission.
 
@@ -144,7 +153,9 @@ def build_submission_payload(
         "hardware": asdict(hardware),
         "software": asdict(software),
         "model": {"alias": alias, "hf_path": hf_path},
-        "config": standardized_config_dict(bench.sampling, bench.prompt_hash),
+        "config": standardized_config_dict(
+            bench.sampling, bench.prompt_hash, spec_decode=spec_decode
+        ),
         "buckets": {
             "short": bench.short.to_schema_dict(),
             "long": bench.long.to_schema_dict(),
@@ -164,6 +175,13 @@ def build_submission_payload(
         payload["smoke_result"] = smoke_result
     if harness_result is not None:
         payload["harness_result"] = harness_result
+    # v3: links the arms of one A/B. Only meaningful when the same
+    # invocation produced both a baseline and an accelerated run on this
+    # machine — the board refuses to compute a speedup without it, because
+    # comparing medians across contributors is how a leaderboard ends up
+    # publishing numbers nobody can reproduce.
+    if run_group is not None:
+        payload["run_group"] = run_group
     return payload
 
 
@@ -187,7 +205,9 @@ def _pretty(payload: dict) -> str:
     return json.dumps(payload, indent=2, sort_keys=False, ensure_ascii=False)
 
 
-def _ask_consent(payload: dict, *, stdin=None, stdout=None) -> bool:
+def _ask_consent(
+    payload: dict, *, target: str | None = None, stdin=None, stdout=None
+) -> bool:
     """Show the payload and read a single y/N line.
 
     Default = N. Only ``y`` or ``yes`` (case-insensitive, stripped)
@@ -200,22 +220,38 @@ def _ask_consent(payload: dict, *, stdin=None, stdout=None) -> bool:
     inp = stdin or sys.stdin
 
     print("", file=out)
+    dest = target or "https://rapidmlx.com/api/benchmarks"
     print(
-        "About to submit the following payload to community-benchmarks:",
+        f"About to publish the following to the community benchmark board at {dest}:",
         file=out,
     )
     print("=" * 72, file=out)
     print(_pretty(payload), file=out)
     print("=" * 72, file=out)
+    # This text must describe what actually happens. It previously described
+    # `git fetch` / fork creation / `gh pr create` — accurate for the old PR
+    # flow, and a lie the moment submission became an HTTP POST. A consent
+    # prompt that misdescribes the action is worse than no prompt.
     print(
-        "Nothing has left your machine yet. Pressing [y] consents to GitHub "
-        "network operations: `git fetch` of upstream `main`, creating or "
-        "reusing your fork when `origin` points at upstream, `git push` to a "
-        "GitHub remote you can write, then `gh pr create` against "
-        "raullenchai/Rapid-MLX. They run under your existing git/gh "
-        "credentials. Press [Enter] to cancel.",
+        "Everything shown above becomes PUBLIC, including your Mac's chip "
+        "and RAM size. Nothing has left your machine yet.",
         file=out,
     )
+    # The destination is interpolated, never hardcoded: RAPID_MLX_BENCH_BOARD_URL
+    # can point this anywhere, and a consent screen that names a host the
+    # payload is not going to is worse than no consent screen at all.
+    print(
+        f"Pressing [y] does two things: saves a copy under ~/.rapid-mlx/ and "
+        f"sends one HTTPS POST to {dest}. What you see above is everything "
+        f"that is sent \u2014 nothing is added on the way out. Your prompts, "
+        f"your files and your IP address are not in it, and neither is any "
+        f"hardware serial: the id attached to your submission is random per "
+        f"install and resettable by deleting ~/.rapid-mlx/bench-install-id. "
+        f"(If another run on this machine registers an id first, that one "
+        f"is used instead and the change is printed.)",
+        file=out,
+    )
+    print("Press [Enter] to cancel.", file=out)
     out.flush()
 
     try:
@@ -1015,126 +1051,152 @@ def _print_thanks(payload: dict, *, stdout) -> None:
         file=stdout,
     )
     print(
-        "  Once the PR merges, your numbers will show up at "
-        "https://rapidmlx.com/#models.",
+        "  Your numbers are on the board at https://rapidmlx.com/leaderboard.",
         file=stdout,
     )
 
 
+def _local_copy_dir() -> Path:
+    """Where a submitted run is archived on the contributor's own machine."""
+    import os
+
+    root = os.environ.get("RAPID_MLX_HOME", "").strip()
+    base = Path(root) if root else Path.home() / ".rapid-mlx"
+    return base / "bench-submissions"
+
+
+def _save_local_copy(payload: dict) -> Path | None:
+    """Write the payload next to the user's config. Never raises.
+
+    Deliberately BEFORE the network call. If the board is unreachable the
+    run is still on disk, so a contributor never loses a 5-round sweep to a
+    flaky connection — they can retry and the server dedupes on
+    ``submission_id``.
+    """
+    try:
+        d = _local_copy_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / _submission_filename(payload)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n")
+        return path
+    except OSError:
+        return None
+
+
 def submit_interactive(
     payload: dict,
-    repo_root: Path,
+    repo_root: Path | None = None,
     *,
     stdin=None,
     stdout=None,
+    url: str | None = None,
 ) -> int:
-    """End-to-end interactive submission flow. Returns exit code.
+    """Consent, archive locally, then POST to the community board.
 
-    Returns 0 on success or graceful user-cancel, non-zero only on
-    setup errors (not a valid git repo, etc.) where we want CI / the
-    caller to notice. A user typing 'n' is not an error.
+    Returns 0 on success or graceful user-cancel (typing 'n' is not an
+    error), non-zero when the board refused or was unreachable so a
+    scripted matrix run notices.
+
+    ``repo_root`` is accepted and ignored. It was required when submission
+    meant opening a pull request from a checkout; keeping the parameter
+    means ``--repo-root`` and existing callers do not break.
     """
     out = stdout or sys.stdout
 
-    # Use ``git rev-parse --show-toplevel`` instead of probing for a
-    # ``.git`` directory: ``.git`` is a *file* (not a dir) in linked
-    # worktrees (``git worktree add``), and refusing those would shut
-    # out a legitimate workflow. (Codex PR #582 round-2 NIT.) The
-    # subprocess returns the canonical repo root which we then use as
-    # the cwd for every subsequent git/gh call.
-    probe = subprocess.run(
-        ["git", "-C", str(repo_root.resolve()), "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-        check=False,
+    from .upload import (
+        SubmitError,
+        board_url,
+        commit_install_id,
+        peek_install_id,
+        post_submission,
     )
-    if probe.returncode != 0:
-        print(
-            f"  Error: {repo_root} is not a git repository root. "
-            f"--submit needs to commit the submission file into a "
-            f"checkout of github.com/raullenchai/Rapid-MLX.",
-            file=out,
-        )
-        return 2
-    repo = Path(probe.stdout.strip())
 
-    # Verify the resolved repo is associated with raullenchai/Rapid-MLX
-    # before we touch any branches or open a PR. Accepted shapes:
-    #   - ``origin`` = raullenchai/Rapid-MLX (maintainer's direct checkout)
-    #   - ``origin`` = <user>/Rapid-MLX fork + some other remote (typically
-    #     ``upstream``) pointing at raullenchai/Rapid-MLX (standard
-    #     community fork workflow)
-    # Without the fork case the only people who could submit are users
-    # with write access to upstream — the entire community contribution
-    # path was unreachable. (Codex PR #582 round-6 BLOCKING.) We also
-    # require origin's host to be exactly ``github.com`` so an attacker
-    # can't redirect the push by setting a malicious origin while
-    # leaving a real upstream remote as a decoy.
-    upstream_remote = _find_upstream_remote(repo)
-    origin_ok, origin_owner = _origin_is_safe_github(repo)
-    if upstream_remote is None or not origin_ok or origin_owner is None:
-        print(
-            f"  Error: {repo} is a git repo but no remote points at "
-            f"github.com/{UPSTREAM_OWNER_REPO}, or 'origin' (including any "
-            f"pushurl override) is not a single GitHub repo. --submit "
-            f"needs either a direct checkout of raullenchai/Rapid-MLX or "
-            f"a fork with an upstream remote: "
-            f"\n    git remote add upstream https://github.com/{UPSTREAM_REPO_FOR_GH}",
-            file=out,
-        )
+    # Resolve the destination FIRST and inside the guarded region: an invalid
+    # RAPID_MLX_BENCH_BOARD_URL raises, and an uncaught traceback is not the
+    # documented "non-zero exit" contract.
+    try:
+        target = url or board_url()
+    except SubmitError as exc:
+        print(f"  Error: {exc}", file=out)
         return 2
 
-    if not _ask_consent(payload, stdin=stdin, stdout=out):
+    # Peek, do not persist. The consent screen shows the exact payload and
+    # says nothing has been written — so declining must leave no trace,
+    # including no id file.
+    candidate = peek_install_id()
+    wire = dict(payload)
+    # install_id is a v3 field, and the schema forbids a payload that declares
+    # an older version from carrying newer fields — otherwise schema_version
+    # tells the aggregator nothing.
+    v3 = int(wire.get("schema_version", SCHEMA_VERSION)) >= 3
+    if v3:
+        wire["install_id"] = candidate
+
+    if not _ask_consent(wire, target=target, stdin=stdin, stdout=out):
         print("\n  Submission cancelled. Nothing was written or sent.", file=out)
         return 0
 
-    # Snapshot the working-tree state BEFORE writing — otherwise the
-    # newly-created submission file shows up as untracked in `git status`
-    # and every clean checkout looks dirty, making the auto-PR path
-    # unreachable. (Codex PR #582 BLOCKING.)
-    tree_was_clean = _git_is_clean(repo)
+    # Consent given: now the id may be committed. If another process won the
+    # race we adopt its value, so one machine never reports as two installs.
+    if v3:
+        settled = commit_install_id(candidate)
+        wire["install_id"] = settled
+        if settled != candidate:
+            print(
+                f"  (another run on this machine registered first; your board "
+                f"id is {settled})",
+                file=out,
+            )
 
-    submission_path = _write_payload_file(repo, payload)
-    print(f"\n  Wrote submission to {submission_path}", file=out)
-
-    if not tree_was_clean:
-        # User has other uncommitted work — don't sweep it into the PR.
-        # The submission file IS on disk; we just stop short of git ops.
+    # The archive records the submission that was sent, so a contributor can
+    # compare their copy against what the board publishes.
+    saved = _save_local_copy(wire)
+    if saved is not None:
+        print(f"\n  Saved a local copy to {saved}", file=out)
+    else:
         print(
-            "\n  Your working tree had other uncommitted changes before "
-            "this submission was written; the automated PR step is "
-            "skipped to avoid mixing your work into the community-bench "
-            "commit.",
+            "\n  WARNING: could not save a local copy (is the disk full or "
+            "read-only?). If the upload below fails, this run is lost and you "
+            "will have to rerun the benchmark.",
             file=out,
         )
-        _print_manual_fallback(repo, submission_path, payload, stdout=out)
-        _print_thanks(payload, stdout=out)
-        return 0
 
-    (
-        pr_ok,
-        completed_steps,
-        selected_head_owner,
-        failed_push_remote,
-    ) = _make_pr_via_gh(
-        repo,
-        submission_path,
-        payload,
-        stdout=out,
-        origin_owner=origin_owner,
-        upstream_remote=upstream_remote,
-    )
-    if pr_ok:
-        print("\n  PR opened successfully.", file=out)
+    print(f"  Submitting to {target} …", file=out)
+    try:
+        resp = post_submission(wire, url=target)
+    except SubmitError as exc:
+        print(f"\n  Submission failed: {exc}", file=out)
+        # Recovery advice comes from here, where `saved` is actually known.
+        if saved is not None:
+            print(
+                f"  Your run is safe at {saved} — rerun the same command to "
+                f"retry; duplicate sends are ignored by the board.",
+                file=out,
+            )
+        else:
+            print(
+                "  No local copy was written, so this run is gone — rerun the "
+                "benchmark to try again.",
+                file=out,
+            )
+        return 1
+
+    if isinstance(resp, dict) and resp.get("already"):
+        print("  Already on the board (duplicate submission ignored).", file=out)
     else:
-        _print_manual_fallback(
-            repo,
-            submission_path,
-            payload,
-            stdout=out,
-            completed=completed_steps,
-            selected_head_owner=selected_head_owner,
-            excluded_push_remote=failed_push_remote,
+        print("  Accepted.", file=out)
+
+    # The board derives a stable pseudonym from the install id and echoes it
+    # here. We print what the SERVER said rather than deriving it locally:
+    # two word lists in two languages would eventually drift, and the first
+    # drift makes this line announce a name that is not on the board.
+    who = (resp.get("contributor") if isinstance(resp, dict) else None) or {}
+    if who.get("name"):
+        tag = who.get("tag")
+        print(
+            f"  You appear on the board as: {who['name']}"
+            + (f"\u00b7{tag}" if tag else ""),
+            file=out,
         )
 
     _print_thanks(payload, stdout=out)

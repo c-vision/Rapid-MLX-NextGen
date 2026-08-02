@@ -684,14 +684,22 @@ def test_ask_consent_yes() -> None:
     stdout = io.StringIO()
     assert _ask_consent({"key": "val"}, stdin=stdin, stdout=stdout) is True
     assert "[y]" in stdout.getvalue()
-    # Round-7 BLOCKING: consent text must disclose BOTH network ops,
-    # not just `gh pr create`. A user who just wanted to "open a PR"
-    # should know git push runs first.
+    # The original assertion here required the text to disclose `git fetch`,
+    # `git push`, fork creation and `gh pr create` — correct while submitting
+    # meant opening a pull request, and false the moment it became one POST.
+    # The contract is unchanged in spirit: name every network operation, and
+    # nothing that does not happen.
     text = stdout.getvalue()
-    assert "git push" in text
-    assert "git fetch" in text
-    assert "gh pr create" in text
-    assert "creating or reusing your fork" in text
+    assert "POST" in text
+    assert "rapidmlx.com" in text
+    for stale in ("git push", "git fetch", "gh pr create", "fork"):
+        assert stale not in text, f"consent text still promises {stale!r}"
+    # The payload is printed in full above this text, so the disclosure must
+    # not claim anything is withheld that is in fact on the wire — an earlier
+    # draft said "no model names beyond the alias" while hf_path was being
+    # sent.
+    assert "everything that is sent" in text
+    assert "bench-install-id" in text, "the reset path must be discoverable"
 
 
 def test_ask_consent_default_no() -> None:
@@ -728,82 +736,135 @@ def test_ask_consent_anything_other_than_y_is_no() -> None:
         assert _ask_consent({}, stdin=stdin, stdout=stdout) is False, ans
 
 
-def test_submit_interactive_user_cancels(tmp_path: Path) -> None:
-    """A 'no' answer must not write the JSON file or touch git."""
-    from vllm_mlx.community_bench.submission import submit_interactive
+def test_submit_interactive_user_cancels(tmp_path: Path, monkeypatch) -> None:
+    """A 'no' answer must not write a local copy or hit the network."""
+    from vllm_mlx.community_bench import submission as sub
 
-    # Real `git init` so `git rev-parse --show-toplevel` succeeds.
-    # We also wire `origin` to the canonical Rapid-MLX URL so the
-    # remote-verification guard (codex round-3 BLOCKING) accepts it.
-    subprocess.run(
-        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
-    )
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            str(tmp_path),
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/raullenchai/Rapid-MLX.git",
-        ],
-        check=True,
-        capture_output=True,
+    monkeypatch.setenv("RAPID_MLX_HOME", str(tmp_path))
+    called = []
+    monkeypatch.setattr(
+        "vllm_mlx.community_bench.upload.post_submission",
+        lambda *a, **k: called.append(1) or {"ok": True},
     )
     payload = {
         "schema_version": 1,
         "submission_id": "abcdef012345",
         "submitted_at": "2026-06-15T10:30:00+00:00",
-        "hardware": {"chip": "Apple M4 Pro"},
+        "hardware": {"chip": "Apple M4 Pro", "ram_gb": 24},
         "model": {"alias": "qwen3.5-9b-4bit"},
     }
-    rc = submit_interactive(
+    rc = sub.submit_interactive(
         payload, tmp_path, stdin=io.StringIO("n\n"), stdout=io.StringIO()
     )
     assert rc == 0
-    assert not (tmp_path / "community-benchmarks").exists()
+    assert called == [], "declining consent must not send anything"
+    assert not (tmp_path / "bench-submissions").exists()
 
 
-def test_submit_interactive_requires_git_repo(tmp_path: Path) -> None:
-    """Non-repo paths should return rc=2 (configuration error)."""
-    from vllm_mlx.community_bench.submission import submit_interactive
+def test_submit_interactive_does_not_require_a_git_checkout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The whole point of the POST path.
 
-    payload = {"submission_id": "abcdef012345"}
-    rc = submit_interactive(
-        payload, tmp_path, stdin=io.StringIO("y\n"), stdout=io.StringIO()
-    )
-    assert rc == 2
-
-
-def test_submit_interactive_rejects_wrong_repo(tmp_path: Path) -> None:
-    """Regression: a git repo whose origin is not raullenchai/Rapid-MLX
-    must be rejected with rc=2. (Codex PR #582 round-3 BLOCKING.)
+    The previous flow returned rc=2 for anyone whose cwd was not a checkout
+    of Rapid-MLX with an upstream remote — i.e. every pip/brew install. A
+    plain empty directory must now submit successfully.
     """
-    from vllm_mlx.community_bench.submission import submit_interactive
+    from vllm_mlx.community_bench import submission as sub
 
-    subprocess.run(
-        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    monkeypatch.setenv("RAPID_MLX_HOME", str(tmp_path))
+    sent = {}
+    monkeypatch.setattr(
+        "vllm_mlx.community_bench.upload.post_submission",
+        lambda payload, **k: sent.update(payload) or {"ok": True},
     )
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            str(tmp_path),
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/some-other/repo.git",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    payload = {"submission_id": "abcdef012345"}
+    payload = {
+        "schema_version": 3,
+        "submission_id": "abcdef012345",
+        "submitted_at": "2026-06-15T10:30:00+00:00",
+        "hardware": {"chip": "Apple M4 Pro", "ram_gb": 24},
+        "model": {"alias": "qwen3.5-9b-4bit"},
+    }
     out = io.StringIO()
-    rc = submit_interactive(payload, tmp_path, stdin=io.StringIO("y\n"), stdout=out)
-    assert rc == 2
-    text = out.getvalue()
-    assert "raullenchai/Rapid-MLX" in text
+    rc = sub.submit_interactive(payload, tmp_path, stdin=io.StringIO("y\n"), stdout=out)
+    assert rc == 0, out.getvalue()
+    assert sent["submission_id"] == "abcdef012345"
+
+
+def test_submit_interactive_saves_local_copy_before_sending(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A network failure must never cost the contributor their run."""
+    from vllm_mlx.community_bench import submission as sub
+    from vllm_mlx.community_bench.upload import SubmitError
+
+    monkeypatch.setenv("RAPID_MLX_HOME", str(tmp_path))
+
+    def boom(*a, **k):
+        raise SubmitError("network is down")
+
+    monkeypatch.setattr("vllm_mlx.community_bench.upload.post_submission", boom)
+    payload = {
+        "schema_version": 3,
+        "submission_id": "abcdef012345",
+        "submitted_at": "2026-06-15T10:30:00+00:00",
+        "hardware": {"chip": "Apple M4 Pro", "ram_gb": 24},
+        "model": {"alias": "qwen3.5-9b-4bit"},
+    }
+    out = io.StringIO()
+    rc = sub.submit_interactive(payload, tmp_path, stdin=io.StringIO("y\n"), stdout=out)
+    assert rc == 1, "an unreachable board is an error a script must notice"
+    saved = list((tmp_path / "bench-submissions").glob("*.json"))
+    assert len(saved) == 1, "the run must be on disk even though the send failed"
+    assert "abcdef012345" in json.loads(saved[0].read_text())["submission_id"]
+
+
+def test_the_archived_copy_is_the_submission_that_was_sent(
+    tmp_path, monkeypatch
+) -> None:
+    """The archive has to BE the submission, not a redacted version of it.
+
+    Content, not bytes: the archive is pretty-printed for a human to read
+    while the wire body is compact. An earlier revision of this test claimed
+    byte-identity and compared parsed dicts, so it asserted something weaker
+    than its own name — codex round 4 caught the gap.
+
+    An earlier revision attached install_id after consent so the archived copy
+    would be "the run, not the run plus an identifier". Codex round 2 pointed
+    out the cost: the consent screen promises that what it prints is what goes
+    out, and appending anything afterwards makes that promise false. The
+    identifier is now attached before consent, which also makes the archive
+    diffable against what the board publishes.
+    """
+    from vllm_mlx.community_bench import submission as sub
+
+    monkeypatch.setenv("RAPID_MLX_HOME", str(tmp_path))
+    sent = {}
+    monkeypatch.setattr(
+        "vllm_mlx.community_bench.upload.post_submission",
+        lambda payload, **k: sent.update(payload) or {"ok": True},
+    )
+    payload = {
+        "schema_version": 3,
+        "submission_id": "abcdef012345",
+        "submitted_at": "2026-06-15T10:30:00+00:00",
+        "hardware": {"chip": "Apple M4 Pro", "ram_gb": 24},
+        "model": {"alias": "qwen3.5-9b-4bit"},
+    }
+    out = io.StringIO()
+    rc = sub.submit_interactive(payload, tmp_path, stdin=io.StringIO("y\n"), stdout=out)
+    assert rc == 0, out.getvalue()
+
+    assert len(sent["install_id"]) == 12
+    assert "install_id" not in payload, "the caller's payload must not be mutated"
+
+    saved = list((tmp_path / "bench-submissions").glob("*.json"))
+    assert len(saved) == 1
+    archived = json.loads(saved[0].read_text())
+    assert archived == sent, "the archive must equal the submission that was sent"
+
+    # The consent screen printed the id, so the promise it makes is true.
+    assert sent["install_id"] in out.getvalue()
 
 
 def test_find_upstream_remote_accepts_ssh_and_https(
@@ -1393,162 +1454,6 @@ def test_find_upstream_remote_rejects_evil_github_lookalike(
         capture_output=True,
     )
     assert _find_upstream_remote(tmp_path) is None
-
-
-def test_submit_interactive_writes_file_then_falls_back_on_dirty_tree(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """When git is dirty, the file IS written but no PR is opened.
-
-    Privacy contract: the user can always recover the file and finish
-    the PR by hand — we never block them on automation working.
-    """
-    from vllm_mlx.community_bench import submission as sub_mod
-
-    # Real `git init` so `git rev-parse --show-toplevel` succeeds.
-    # We also wire `origin` to the canonical Rapid-MLX URL so the
-    # remote-verification guard (codex round-3 BLOCKING) accepts it.
-    subprocess.run(
-        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
-    )
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            str(tmp_path),
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/raullenchai/Rapid-MLX.git",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    # Force ``_git_is_clean`` to report dirty without invoking real git.
-    monkeypatch.setattr(sub_mod, "_git_is_clean", lambda repo: False)
-
-    payload = {
-        "schema_version": 1,
-        "submission_id": "abcdef012345",
-        "submitted_at": "2026-06-15T10:30:00+00:00",
-        "hardware": {"chip": "Apple M4 Pro", "ram_gb": 24},
-        "model": {"alias": "qwen3.5-9b-4bit", "hf_path": "x/y"},
-        "buckets": {
-            "short": {"decode_tps": {"median": 1.0}},
-            "long": {"decode_tps": {"median": 1.0}},
-        },
-        "config": {"sampling": "greedy"},
-        "software": {"rapid_mlx": "0.7.6", "mlx": "0.31.2"},
-    }
-
-    stdout = io.StringIO()
-    rc = sub_mod.submit_interactive(
-        payload, tmp_path, stdin=io.StringIO("y\n"), stdout=stdout
-    )
-    assert rc == 0
-    # ``_slugify`` collapses '.' to '-' so the alias slug is "qwen3-5-9b-4bit",
-    # not the literal alias key.
-    expected_file = (
-        tmp_path
-        / "community-benchmarks"
-        / "submissions"
-        / "20260615-apple-m4-pro-qwen3-5-9b-4bit-abcdef012345.json"
-    )
-    assert expected_file.exists()
-    text = stdout.getvalue()
-    assert "Thank you" in text
-    assert "git checkout -b community-bench/abcdef012345" in text
-
-
-def test_submit_interactive_clean_tree_reaches_pr_step(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """Regression: ``_git_is_clean`` must be sampled BEFORE the new file
-    is written, otherwise the newly-untracked submission file makes
-    every clean checkout look dirty and the auto-PR path is never
-    reachable. (Codex PR #582 BLOCKING #2.)
-
-    We stub ``_git_is_clean`` to read the actual filesystem state at
-    the time it's called: returns True iff the submissions/ dir is
-    still empty when probed. With the bug present, the writer has
-    already deposited the file before the check, so the stub returns
-    False and ``_make_pr_via_gh`` is skipped. With the fix, the check
-    runs first and ``_make_pr_via_gh`` is invoked.
-    """
-    from vllm_mlx.community_bench import submission as sub_mod
-
-    # Real `git init` so `git rev-parse --show-toplevel` succeeds.
-    # We also wire `origin` to the canonical Rapid-MLX URL so the
-    # remote-verification guard (codex round-3 BLOCKING) accepts it.
-    subprocess.run(
-        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
-    )
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            str(tmp_path),
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/raullenchai/Rapid-MLX.git",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    submissions_dir = tmp_path / "community-benchmarks" / "submissions"
-    pr_invoked: list[bool] = []
-
-    def fake_clean(repo):
-        return not submissions_dir.exists() or not any(submissions_dir.iterdir())
-
-    def fake_pr(repo, path, payload, *, stdout, origin_owner, upstream_remote):
-        pr_invoked.append(True)
-        # State-aware fallback receives completed steps, head owner, and any
-        # failed push remote.
-        return (
-            True,
-            {
-                "fetch_base",
-                "checkout",
-                "stage",
-                "commit",
-                "push",
-                "pr_create",
-            },
-            "raullenchai",
-            None,
-        )
-
-    monkeypatch.setattr(sub_mod, "_git_is_clean", fake_clean)
-    monkeypatch.setattr(sub_mod, "_make_pr_via_gh", fake_pr)
-
-    payload = {
-        "schema_version": 1,
-        "submission_id": "abcdef012345",
-        "submitted_at": "2026-06-15T10:30:00+00:00",
-        "hardware": {"chip": "Apple M4 Pro", "ram_gb": 24},
-        "model": {"alias": "qwen3.5-9b-4bit", "hf_path": "x/y"},
-        "buckets": {
-            "short": {"decode_tps": {"median": 1.0}},
-            "long": {"decode_tps": {"median": 1.0}},
-        },
-        "config": {"sampling": "greedy"},
-        "software": {"rapid_mlx": "0.7.6", "mlx": "0.31.2"},
-    }
-    rc = sub_mod.submit_interactive(
-        payload, tmp_path, stdin=io.StringIO("y\n"), stdout=io.StringIO()
-    )
-    assert rc == 0
-    assert pr_invoked == [True], (
-        "auto-PR path was not reached on a clean tree — likely the "
-        "_git_is_clean ordering regression has returned"
-    )
-
-
-# ---------------------------------------------------------------------------
-# validate.py — schema + sanity gate
-# ---------------------------------------------------------------------------
 
 
 def _good_payload() -> dict:
