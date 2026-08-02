@@ -25,6 +25,7 @@ from vllm_mlx.runtime import video_lane
 from vllm_mlx.runtime.video_lane import (
     VideoEngine,
     VideoRuntimeError,
+    _resolve_ffmpeg,
     require_video_runtime_or_exit,
 )
 
@@ -56,6 +57,7 @@ def test_video_runtime_preflight_fails_before_download(
 ) -> None:
     monkeypatch.setattr("importlib.util.find_spec", lambda _: None)
     monkeypatch.setattr("shutil.which", lambda _: None)
+    monkeypatch.setattr(video_lane, "_FFMPEG_FALLBACK_PATHS", ())
 
     with pytest.raises(SystemExit) as exc:
         require_video_runtime_or_exit()
@@ -64,6 +66,94 @@ def test_video_runtime_preflight_fails_before_download(
     error = capsys.readouterr().err
     assert "rapid-mlx[video]" in error
     assert "brew install ffmpeg" in error
+
+
+def test_ffmpeg_resolver_uses_homebrew_fallback_when_path_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = tmp_path / "ffmpeg-real"
+    binary.write_bytes(b"#!/bin/sh\n")
+    binary.chmod(0o755)
+    homebrew_link = tmp_path / "ffmpeg"
+    homebrew_link.symlink_to(binary)
+    monkeypatch.delenv("FFMPEG_BINARY", raising=False)
+    monkeypatch.setattr(video_lane.shutil, "which", lambda _: None)
+    monkeypatch.setattr(video_lane, "_FFMPEG_FALLBACK_PATHS", (homebrew_link,))
+
+    assert _resolve_ffmpeg() == str(homebrew_link)
+
+
+def test_ffmpeg_resolver_honors_executable_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    override = tmp_path / "custom-ffmpeg"
+    override.write_bytes(b"#!/bin/sh\n")
+    override.chmod(0o755)
+    monkeypatch.setenv("FFMPEG_BINARY", str(override))
+    monkeypatch.setattr(
+        video_lane.shutil,
+        "which",
+        lambda _: pytest.fail("PATH lookup must not override FFMPEG_BINARY"),
+    )
+
+    assert _resolve_ffmpeg() == str(override)
+
+
+def test_ffmpeg_resolver_makes_relative_override_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    override = tmp_path / "custom-ffmpeg"
+    override.write_bytes(b"#!/bin/sh\n")
+    override.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FFMPEG_BINARY", "./custom-ffmpeg")
+
+    assert _resolve_ffmpeg() == str(override)
+
+
+def test_ffmpeg_resolver_makes_relative_path_result_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FFMPEG_BINARY", raising=False)
+    monkeypatch.setattr(video_lane.shutil, "which", lambda _: "bin/ffmpeg")
+
+    assert _resolve_ffmpeg() == str(tmp_path / "bin" / "ffmpeg")
+
+
+def test_ffmpeg_resolver_does_not_treat_bare_override_as_local_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local_binary = tmp_path / "ffmpeg"
+    local_binary.write_bytes(b"#!/bin/sh\n")
+    local_binary.chmod(0o755)
+    safe_binary = "/trusted/bin/ffmpeg"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FFMPEG_BINARY", "ffmpeg")
+    monkeypatch.setattr(video_lane.shutil, "which", lambda _: safe_binary)
+
+    assert _resolve_ffmpeg() == safe_binary
+
+
+def test_video_remux_uses_resolved_ffmpeg_absolute_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "result.mp4"
+    output.write_bytes(b"mp4-with-audio")
+    resolved = "/opt/homebrew/bin/ffmpeg"
+    calls: list[list[str]] = []
+    monkeypatch.setattr(video_lane, "_resolve_ffmpeg", lambda: resolved)
+
+    def remux(command, **kwargs) -> None:
+        calls.append(command)
+        Path(command[-1]).write_bytes(b"video-only")
+
+    monkeypatch.setattr(video_lane.subprocess, "run", remux)
+
+    VideoEngine._remove_audio_track(output)
+
+    assert calls[0][0] == resolved
+    assert output.read_bytes() == b"video-only"
 
 
 def test_video_runtime_preflight_reports_python_311_floor(
