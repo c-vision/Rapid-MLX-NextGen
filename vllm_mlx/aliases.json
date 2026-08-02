@@ -388,28 +388,28 @@
   "deepseek-v4-flash-2bit": {
     "hf_path": "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
     "tool_call_parser": "deepseek",
-    "reasoning_parser": "deepseek_r1",
+    "reasoning_parser": "deepseek_v4",
     "is_hybrid": false,
     "supports_spec_decode": true
   },
   "deepseek-v4-flash-8bit": {
     "hf_path": "mlx-community/DeepSeek-V4-Flash-8bit",
     "tool_call_parser": "deepseek",
-    "reasoning_parser": "deepseek_r1",
+    "reasoning_parser": "deepseek_v4",
     "is_hybrid": false,
     "supports_spec_decode": true
   },
   "deepseek-v4-flash-4bit": {
     "hf_path": "mlx-community/DeepSeek-V4-Flash-4bit",
     "tool_call_parser": "deepseek",
-    "reasoning_parser": "deepseek_r1",
+    "reasoning_parser": "deepseek_v4",
     "is_hybrid": false,
     "supports_spec_decode": true
   },
   "deepseek-v4-flash-0731-mxfp4": {
     "hf_path": "Vontra/DeepSeek-V4-Flash-0731-MXFP4-MLX",
     "tool_call_parser": "deepseek_v4_0731",
-    "reasoning_parser": "deepseek_r1",
+    "reasoning_parser": "deepseek_v4",
     "is_hybrid": false,
     "is_moe": true,
     "supports_spec_decode": false,

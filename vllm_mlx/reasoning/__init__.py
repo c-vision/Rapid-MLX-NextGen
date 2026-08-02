@@ -84,6 +84,7 @@ def _register_builtin_parsers():
         DeepSeekR1ReasoningParser,
         VibeThinkerReasoningParser,
     )
+    from .deepseek_v4_parser import DeepSeekV4ReasoningParser
     from .gemma4_parser import Gemma4ReasoningParser
     from .glm4_parser import Glm4ReasoningParser
     from .gpt_oss_parser import GptOssReasoningParser
@@ -100,6 +101,7 @@ def _register_builtin_parsers():
     register_parser("hy_v3", Hy3ReasoningParser)
     register_parser("hy3", Hy3ReasoningParser)
     register_parser("deepseek_r1", DeepSeekR1ReasoningParser)
+    register_parser("deepseek_v4", DeepSeekV4ReasoningParser)
     # ``vibethinker`` — DeepSeek-R1 variant with a 1024-char no-tag
     # threshold (vs. 64) to accommodate VibeThinker's preamble-before-
     # ``<think>`` shape. See ``VibeThinkerReasoningParser`` docstring

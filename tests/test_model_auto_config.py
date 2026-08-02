@@ -183,17 +183,9 @@ class TestDetectModelConfig:
         config = detect_model_config(model_path)
         assert config is not None
         assert config.tool_call_parser == "deepseek"
-        # V4-Flash chat template emits `<think>...</think>` blocks gated
-        # by ``thinking_mode``; ``deepseek_r1`` handles that format. The
-        # base ``deepseek-ai/DeepSeek-V4`` path is resolved via family
-        # detection (no aliases.json entry), so it currently gets no
-        # reasoning_parser — only the MLX variants benefit from the
-        # alias wiring. Track both shapes here so a refactor that flips
-        # the family default has to update this test consciously.
-        if model_path == "deepseek-ai/DeepSeek-V4":
-            assert config.reasoning_parser is None
-        else:
-            assert config.reasoning_parser == "deepseek_r1"
+        # Match vLLM/SGLang: V4 has a dedicated state machine which absorbs
+        # the protocol's bare ``</think>`` even when thinking is disabled.
+        assert config.reasoning_parser == "deepseek_v4"
         assert config.is_hybrid is False
         assert config.supports_spec_decode is True
 
@@ -201,7 +193,7 @@ class TestDetectModelConfig:
         """A local 0731 snapshot must retain the alias' dedicated wire format."""
         cfg = detect_model_config("/Volumes/models/DeepSeek-V4-Flash-0731-MXFP4-MLX")
         assert cfg.tool_call_parser == "deepseek_v4_0731"
-        assert cfg.reasoning_parser == "deepseek_r1"
+        assert cfg.reasoning_parser == "deepseek_v4"
         assert cfg.is_hybrid is False
         assert cfg.supports_spec_decode is False
 

@@ -25,7 +25,7 @@ def test_alias_points_at_0731_mxfp4_with_ultra_memory_floor():
     profile = list_profiles()["deepseek-v4-flash-0731-mxfp4"]
     assert profile.hf_path == "Vontra/DeepSeek-V4-Flash-0731-MXFP4-MLX"
     assert profile.tool_call_parser == "deepseek_v4_0731"
-    assert profile.reasoning_parser == "deepseek_r1"
+    assert profile.reasoning_parser == "deepseek_v4"
     assert profile.is_moe is True
     assert profile.min_memory_gb == 192
     assert profile.supports_spec_decode is False

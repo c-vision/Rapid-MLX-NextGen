@@ -98,6 +98,7 @@ from ..service.helpers import (
     _scan_messages_for_lone_surrogates,
     _should_start_in_thinking,
     _tool_use_required_named_suffix,
+    _uses_deepseek_v4_reasoning,
     _validate_model_name,
     _validate_response_format,
     _validate_tool_call_params,
@@ -5645,16 +5646,23 @@ async def _create_chat_completion_impl(
         prompt_thinking_active = _should_start_in_thinking(
             _chat_template_str, resolved_thinking
         )
-        final_content = _rescue_silent_drop_from_reasoning(
-            final_content,
-            reasoning_text,
-            tool_calls,
-            finish_reason=finish_reason,
-            raw_text=output.raw_text or output.text,
-            reasoning_is_case4=reasoning_is_case4,
-            matched_stop=getattr(output, "matched_stop", None),
-            prompt_thinking_active=prompt_thinking_active,
+        deepseek_v4_mid_think = bool(
+            _uses_deepseek_v4_reasoning(cfg)
+            and finish_reason == "length"
+            and reasoning_text
+            and not final_content
         )
+        if not deepseek_v4_mid_think:
+            final_content = _rescue_silent_drop_from_reasoning(
+                final_content,
+                reasoning_text,
+                tool_calls,
+                finish_reason=finish_reason,
+                raw_text=output.raw_text or output.text,
+                reasoning_is_case4=reasoning_is_case4,
+                matched_stop=getattr(output, "matched_stop", None),
+                prompt_thinking_active=prompt_thinking_active,
+            )
         # Issue #858: cutoff sentinel is ON by default — restores PR #802
         # (H-01) semantics after the R-01 (#815) opt-in flip produced
         # empty-bubble regressions in every GUI client that only renders
@@ -5669,6 +5677,7 @@ async def _create_chat_completion_impl(
             reasoning_text,
             tool_calls,
             finish_reason,
+            include_reasoning_tail=not _uses_deepseek_v4_reasoning(cfg),
         )
 
     # Build logprobs for response if requested.
@@ -6486,16 +6495,24 @@ async def stream_chat_completion(
                 _effective_matched_stop = stream_matched_stop or getattr(
                     finish_event, "matched_stop", None
                 )
-                rescued_content = _rescue_silent_drop_from_reasoning(
-                    terminal_content or None,
-                    processor.accumulated_reasoning,
-                    None,
-                    finish_reason=finish_event.finish_reason,
-                    raw_text=synthetic_raw,
-                    reasoning_is_case4=reasoning_is_case4_stream,
-                    matched_stop=_effective_matched_stop,
-                    prompt_thinking_active=prompt_thinking_active_stream,
+                deepseek_v4_mid_think_stream = bool(
+                    _uses_deepseek_v4_reasoning(cfg, rp)
+                    and finish_event.finish_reason == "length"
+                    and processor.accumulated_reasoning
+                    and not terminal_content
                 )
+                rescued_content = terminal_content or None
+                if not deepseek_v4_mid_think_stream:
+                    rescued_content = _rescue_silent_drop_from_reasoning(
+                        terminal_content or None,
+                        processor.accumulated_reasoning,
+                        None,
+                        finish_reason=finish_event.finish_reason,
+                        raw_text=synthetic_raw,
+                        reasoning_is_case4=reasoning_is_case4_stream,
+                        matched_stop=_effective_matched_stop,
+                        prompt_thinking_active=prompt_thinking_active_stream,
+                    )
                 # The helper returns the rescued reasoning ONLY when
                 # all four predicates pass (empty/whitespace content,
                 # no tool calls, non-empty/non-whitespace reasoning).
@@ -6533,6 +6550,9 @@ async def stream_chat_completion(
                     processor.accumulated_reasoning,
                     None,
                     finish_event.finish_reason,
+                    include_reasoning_tail=not _uses_deepseek_v4_reasoning(
+                        cfg, processor.reasoning_parser
+                    ),
                 )
                 if cutoff_content and cutoff_content != (terminal_content or None):
                     terminal_content = cutoff_content

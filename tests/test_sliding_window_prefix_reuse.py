@@ -116,7 +116,8 @@ def test_trim1_cannot_undo_last_token_on_rotated_cache():
 
 def test_hybrid_gate_retains_and_serves_rotated_sliding_window_entry():
     """#1103's knob is class-agnostic: N>0 retains a rotated RotatingKVCache
-    entry and serves it on exact + prefix-extension fetch; N=0 drops it."""
+    entry and serves prefix extensions; an exact request cannot reuse it
+    because generation kickoff would require trim(1). N=0 drops it."""
 
     def _mixed(n):
         kv = KVCache()
@@ -137,9 +138,9 @@ def test_hybrid_gate_retains_and_serves_rotated_sliding_window_entry():
     assert on.store(toks, _mixed(40), evict_prefixes=False) is True  # retained
 
     exact, remaining = on.fetch(toks)
-    assert exact is not None
-    assert on._last_match_type == "exact"
-    assert remaining == []
+    assert exact is None
+    assert on._last_match_type == "miss"
+    assert remaining == toks
 
     ext, remaining = on.fetch(toks + [40, 41, 42])
     assert ext is not None

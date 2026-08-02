@@ -695,7 +695,7 @@ def test_bonsai_ternary_alias_wiring() -> None:
         )
 
 
-def test_deepseek_v4_flash_family_wires_deepseek_r1_reasoning_parser() -> None:
+def test_deepseek_v4_flash_family_wires_dedicated_reasoning_parser() -> None:
     """The DeepSeek-V4-Flash chat template emits ``<think>...</think>``
     blocks (gated by ``thinking_mode``). Without ``reasoning_parser`` set,
     that text leaks into ``choices[0].message.content`` as user-visible
@@ -714,8 +714,8 @@ def test_deepseek_v4_flash_family_wires_deepseek_r1_reasoning_parser() -> None:
     ]
     for alias in family:
         assert alias in profiles, f"{alias} missing from aliases.json"
-        assert profiles[alias].reasoning_parser == "deepseek_r1", (
-            f"{alias}: reasoning_parser must be 'deepseek_r1' (V4-Flash emits "
+        assert profiles[alias].reasoning_parser == "deepseek_v4", (
+            f"{alias}: reasoning_parser must be 'deepseek_v4' (V4-Flash emits "
             f"`<think>` blocks). Got {profiles[alias].reasoning_parser!r}."
         )
 

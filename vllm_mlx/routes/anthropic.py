@@ -55,6 +55,7 @@ from ..service.helpers import (
     _resolve_temperature,
     _resolve_top_p,
     _tool_use_required_named_suffix,
+    _uses_deepseek_v4_reasoning,
     _validate_model_name,
     _validate_tool_call_params,
     _wait_with_disconnect,
@@ -1036,6 +1037,7 @@ async def create_anthropic_message(
             reasoning_text,
             tool_calls,
             finish_reason,
+            include_reasoning_tail=not _uses_deepseek_v4_reasoning(cfg),
         )
 
         openai_response = ChatCompletionResponse(
@@ -1944,7 +1946,11 @@ async def _stream_anthropic_messages(
     # bypass at postprocessor.py:217. The think_router branch below picks
     # up the work, and `_should_start_in_thinking` already returns False
     # for enable_thinking=False, so the answer streams as text.
-    if chat_kwargs.get("enable_thinking") is False:
+    if (
+        chat_kwargs.get("enable_thinking") is False
+        and getattr(reasoning_parser, "sanitize_when_thinking_disabled", False)
+        is not True
+    ):
         reasoning_parser = None
     # Issue #702 codex r2 BLOCKING: when the per-request alias is NOT
     # reasoning-capable, also bypass the parser entirely. Implicit-mode
@@ -1962,7 +1968,11 @@ async def _stream_anthropic_messages(
     if not _reasoning_enabled:
         reasoning_parser = None
     if reasoning_parser:
-        reasoning_parser.reset_state()
+        configure_request = getattr(reasoning_parser, "configure_request", None)
+        if callable(configure_request):
+            configure_request(enable_thinking=chat_kwargs.get("enable_thinking"))
+        else:
+            reasoning_parser.reset_state()
 
     # Per-request reasoning cap (upstream vLLM PR #20859 / #42396 backport).
     # Same chars-÷4 heuristic the OpenAI route uses so the same effective

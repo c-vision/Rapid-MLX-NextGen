@@ -310,6 +310,12 @@ class StreamingPostProcessor:
         # ``enable_thinking`` via the non-streaming ``extract_reasoning``
         # kwarg path or via their own template-driven branching.
         if self.reasoning_parser is not None:
+            _configure = getattr(self.reasoning_parser, "configure_request", None)
+            if callable(_configure):
+                # Request-aware parser configuration is a safety boundary:
+                # continuing after failure can route implicit scratch text to
+                # content using the parser's constructor defaults.
+                _configure(enable_thinking=enable_thinking)
             _set = getattr(self.reasoning_parser, "set_enable_thinking", None)
             if callable(_set):
                 try:
@@ -1460,6 +1466,15 @@ class StreamingPostProcessor:
         """
         if self.enable_thinking is not False:
             return True
+        # DeepSeek V4's protocol permits a bare ``</think>`` while already
+        # in CONTENT state.  Its dedicated parser therefore remains on even
+        # when thinking was disabled, matching vLLM's CONTENT/THINK_END
+        # transition (absorb marker, stay in CONTENT).
+        if (
+            getattr(self.reasoning_parser, "sanitize_when_thinking_disabled", False)
+            is True
+        ):
+            return True
         if self._explicit_think_seen:
             return True
         # R10-C7 (2026-06-23): if ``_process_standard`` has already
@@ -2351,7 +2366,11 @@ class StreamingPostProcessor:
         self._standard_content_observed = False
 
         if self.reasoning_parser:
-            self.reasoning_parser.reset_state()
+            _configure = getattr(self.reasoning_parser, "configure_request", None)
+            if callable(_configure):
+                _configure(enable_thinking=self.enable_thinking)
+            else:
+                self.reasoning_parser.reset_state()
             # R10-M1: ``reset_state`` clears the parser's per-request
             # ``enable_thinking`` override; re-propagate the dispatcher's
             # captured value so a re-used processor continues to honour

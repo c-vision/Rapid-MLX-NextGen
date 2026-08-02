@@ -86,7 +86,7 @@ _MODEL_PATTERNS: list[tuple[re.Pattern, ModelConfig]] = [
         re.compile(r"deepseek.*v4.*flash.*0731", re.IGNORECASE),
         ModelConfig(
             tool_call_parser="deepseek_v4_0731",
-            reasoning_parser="deepseek_r1",
+            reasoning_parser="deepseek_v4",
             is_hybrid=False,
             supports_spec_decode=False,
         ),
@@ -100,7 +100,7 @@ _MODEL_PATTERNS: list[tuple[re.Pattern, ModelConfig]] = [
         re.compile(r"deepseek.*v4", re.IGNORECASE),
         ModelConfig(
             tool_call_parser="deepseek",
-            reasoning_parser=None,
+            reasoning_parser="deepseek_v4",
         ),
     ),
     # DeepSeek V3.1 (thinking-channel wire shape: NAME<sep>{json}).
