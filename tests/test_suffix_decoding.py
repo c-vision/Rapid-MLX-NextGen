@@ -220,7 +220,12 @@ class TestInstallSuffixDecoding:
         gb.next = lambda: []  # original next
 
         class _BG:
-            pass
+            def __init__(self):
+                self.removed = []
+
+            def remove(self, uids, return_prompt_caches=False):
+                self.removed.append(list(uids))
+                return {}
 
         bg = _BG()
         bg._generation_batch = gb
@@ -383,6 +388,48 @@ class TestInstallSuffixDecoding:
         assert "ft_non_trimmable_cache" in bg._suffix_stats
         assert bg._suffix_stats["ft_non_trimmable_cache"] == 0
 
+    def test_local_stats_have_a_reason_key_for_every_fallthrough(self):
+        """``_suffix_stats``'s documented invariant is that the ``ft_*``
+        breakdown sums to ``fallthrough_steps``.
+
+        The error paths bumped ``fallthrough_steps`` and ``errors`` but had
+        no ``ft_error`` bucket, so the breakdown stopped reconciling
+        precisely when something was failing — which is when an operator
+        reads it. Pinning the key set here rather than the arithmetic,
+        because the arithmetic is only reachable through a real verify
+        forward (covered by ``test_suffix_counter.py`` for the exported
+        counter).
+        """
+        from unittest.mock import MagicMock
+
+        from vllm_mlx.scheduler import _install_suffix_decoding
+
+        bg, _gb = self._make_fake_bg()
+
+        _install_suffix_decoding(
+            bg,
+            model=MagicMock(),
+            profile=None,
+            max_draft=8,
+            max_suffix_len=4,
+            min_confidence=0.3,
+            requests={},
+            uid_to_request_id={},
+        )
+
+        stats = bg._suffix_stats
+        for reason in (
+            "batch_size",
+            "uids_size",
+            "non_greedy",
+            "logits_processors",
+            "no_draft",
+            "cooldown",
+            "non_trimmable_cache",
+            "error",
+        ):
+            assert f"ft_{reason}" in stats, f"no local bucket for ft_{reason}"
+
     def test_drafter_pruned_when_primary_finishes(self):
         """Per-uid drafters must be dropped when the primary finishes.
 
@@ -425,3 +472,143 @@ class TestInstallSuffixDecoding:
         assert 42 not in drafters, (
             "Drafter for finished uid was retained — _drafters leak"
         )
+
+    def test_abort_reaps_uid_state_and_drafter(self):
+        """An aborted uid never produces a Response, so ``next()``'s
+        finish sweep never sees it.
+
+        ``Scheduler._do_abort_request`` reaches the BatchGenerator through
+        ``remove()`` only. Before the ``remove()`` wrapper, every client
+        cancellation left behind that uid's drafter *and* its ``_uid_state``
+        entry — and the latter's ``pending`` list holds unread mlx arrays
+        (up to ``_COOLDOWN_MAX`` of them), i.e. live GPU buffers, on the
+        one path a disconnecting client hits repeatedly.
+
+        MUTATION-KILL: reverting to reaping only inside ``next()`` leaves
+        both dicts populated here.
+        """
+        from unittest.mock import MagicMock
+
+        from vllm_mlx.scheduler import _install_suffix_decoding
+        from vllm_mlx.speculative.suffix_decoding import SuffixDecodingDrafter
+
+        bg, gb = self._make_fake_bg()
+
+        _install_suffix_decoding(
+            bg,
+            model=MagicMock(),
+            profile=None,
+            max_draft=8,
+            max_suffix_len=4,
+            min_confidence=0.3,
+            requests={},
+            uid_to_request_id={},
+        )
+
+        drafters = gb._suffix_drafters
+        uid_state = gb._suffix_uid_state
+        # Mimic a request that drafted, backed off, and queued emits —
+        # then got cancelled mid-flight.
+        drafters[7] = SuffixDecodingDrafter()
+        uid_state[7] = {
+            "cooldown": 5,
+            "level": 2,
+            "zeros": 3,
+            "k": 4,
+            "pending": [1, 2],
+        }
+        # A second uid stays live; the abort must not touch it.
+        drafters[9] = SuffixDecodingDrafter()
+        uid_state[9] = {"cooldown": 0, "level": 0, "zeros": 0, "k": 2, "pending": []}
+
+        bg.remove([7])
+
+        assert bg.removed == [[7]], "wrapper must still delegate to the real remove()"
+        assert 7 not in drafters, "aborted uid's drafter leaked"
+        assert 7 not in uid_state, (
+            "aborted uid's _uid_state (and its queued arrays) leaked"
+        )
+        assert 9 in drafters and 9 in uid_state, "abort reaped an unrelated live uid"
+
+    def _install_with_failing_remove(self, still_present):
+        """Fake whose ``remove`` raises, and whose ``_find_uids`` reports
+        ``still_present`` as surviving the failed call."""
+        from unittest.mock import MagicMock
+
+        from vllm_mlx.scheduler import _install_suffix_decoding
+        from vllm_mlx.speculative.suffix_decoding import SuffixDecodingDrafter
+
+        bg, gb = self._make_fake_bg()
+
+        def _boom(uids, return_prompt_caches=False):
+            raise KeyError("removal failed part-way")
+
+        bg.remove = _boom
+        bg._find_uids = lambda uids: {u: (2, 0) for u in uids if u in still_present}
+
+        _install_suffix_decoding(
+            bg,
+            model=MagicMock(),
+            profile=None,
+            max_draft=8,
+            max_suffix_len=4,
+            min_confidence=0.3,
+            requests={},
+            uid_to_request_id={},
+        )
+
+        gb._suffix_drafters[3] = SuffixDecodingDrafter()
+        gb._suffix_uid_state[3] = {
+            "cooldown": 0,
+            "level": 0,
+            "zeros": 0,
+            "k": 2,
+            "pending": ["queued-emit"],
+        }
+        return bg, gb
+
+    def test_failed_remove_still_reaps_a_uid_that_did_leave(self):
+        """``remove`` can raise part-way through a multi-uid call. A uid
+        that did leave the batch will never be stepped again, so its state
+        is pure leak — reap it."""
+        bg, gb = self._install_with_failing_remove(still_present=set())
+
+        with pytest.raises(KeyError):
+            bg.remove([3])
+
+        assert 3 not in gb._suffix_drafters
+        assert 3 not in gb._suffix_uid_state
+
+    def test_failed_remove_keeps_state_for_a_uid_still_in_the_batch(self):
+        """The inverse, and the more dangerous direction.
+
+        ``remove(return_prompt_caches=True)` calls ``extract_cache`` FIRST,
+        so a raise there leaves the uid fully live. Reaping it would throw
+        away ``pending`` — accepted draft tokens whose KV is already
+        committed to the cache — silently losing output and desyncing the
+        rebuilt drafter history from the cache. A leak is recoverable;
+        this is not.
+
+        MUTATION-KILL: reaping in a blanket ``finally`` fails here.
+        """
+        bg, gb = self._install_with_failing_remove(still_present={3})
+
+        with pytest.raises(KeyError):
+            bg.remove([3])
+
+        assert 3 in gb._suffix_drafters, "reaped a uid that is still in the batch"
+        assert gb._suffix_uid_state[3]["pending"] == ["queued-emit"], (
+            "dropped queued emits for a still-live uid"
+        )
+
+    def test_failed_remove_without_find_uids_keeps_state(self):
+        """No way to establish membership → assume live and leak rather
+        than risk discarding a live request's queued emits."""
+        bg, gb = self._install_with_failing_remove(still_present=set())
+        del bg._find_uids
+
+        with pytest.raises(KeyError):
+            bg.remove([3])
+
+        assert 3 in gb._suffix_drafters
+        assert 3 in gb._suffix_uid_state
