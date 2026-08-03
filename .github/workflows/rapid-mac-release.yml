@@ -68,6 +68,14 @@ jobs:
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
       AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+      # Signing is OPTIONAL. When the Developer ID + notary secrets are all
+      # present we Developer-ID sign + notarise (a clean, double-clickable
+      # release). When they are absent (e.g. an early internal-testing build
+      # before the Apple account is wired up) the job still runs: it produces
+      # an AD-HOC signed, un-notarised DMG and publishes it as a PRE-RELEASE
+      # with a "right-click → Open" note. Re-running the same tag once the
+      # secrets land upgrades it to a proper signed release.
+      SIGNED: ${{ secrets.MACOS_DEVID_CERT_P12_BASE64 != '' && secrets.MACOS_DEVID_CERT_PASSWORD != '' && secrets.AC_API_KEY_P8_BASE64 != '' && secrets.AC_API_KEY_ID != '' && secrets.AC_API_ISSUER_ID != '' }}
       # Absolute .app size ceiling — enforced by the "Bundle size gate"
       # step. The bundled sidecar (Contents/Resources/rapid-mlx) dominates.
       BUNDLE_SIZE_CAP_MB: "500"
@@ -100,6 +108,7 @@ jobs:
           python-version: '3.12'
 
       - name: Import Developer ID certificate into a temp keychain
+        if: env.SIGNED == 'true'
         env:
           CERT_P12_BASE64: ${{ secrets.MACOS_DEVID_CERT_P12_BASE64 }}
           CERT_PASSWORD: ${{ secrets.MACOS_DEVID_CERT_PASSWORD }}
@@ -142,6 +151,7 @@ jobs:
           echo "Imported identity: $IDENTITY"
 
       - name: Decode notarisation API key
+        if: env.SIGNED == 'true'
         env:
           AC_API_KEY_P8_BASE64: ${{ secrets.AC_API_KEY_P8_BASE64 }}
         run: |
@@ -225,6 +235,7 @@ jobs:
           fi
 
       - name: Notarise + staple Rapid-MLX Desktop.app
+        if: env.SIGNED == 'true'
         run: |
           set -euo pipefail
           ditto -c -k --keepParent "build/Rapid-MLX Desktop.app" "build/Rapid-MLX-Desktop.zip"
@@ -280,6 +291,7 @@ jobs:
         run: bash scripts/validate-dmg.sh build/rapid-mlx-desktop.dmg
 
       - name: Notarise + staple rapid-mlx-desktop.dmg
+        if: env.SIGNED == 'true'
         run: bash scripts/notarize.sh build/rapid-mlx-desktop.dmg build/rapid-mlx-desktop.dmg
 
       - name: Upload workflow artifact
@@ -309,6 +321,26 @@ jobs:
           if [[ -z "$NOTES_FILE" || ! -s "$NOTES_FILE" ]]; then
             echo "::error::RELEASE_NOTES_FILE is unset or empty."
             exit 1
+          fi
+          # Unsigned build: this DMG is ad-hoc signed + un-notarised, so it is
+          # ALWAYS a pre-release and carries a Gatekeeper note. macOS quarantines
+          # anything downloaded, and Gatekeeper hard-blocks an un-notarised app
+          # ("damaged / can't be opened"), so the download won't just
+          # double-click — prepend the standard right-click / xattr workaround.
+          if [[ "${SIGNED:-}" != "true" ]]; then
+            PRERELEASE="--prerelease"
+            {
+              echo "> ⚠️ **Unsigned internal build.** This DMG is ad-hoc signed and NOT notarised."
+              echo "> macOS Gatekeeper will block it on first open. To run it:"
+              echo ">"
+              echo "> 1. Drag **Rapid-MLX Desktop** to Applications, then **right-click the app → Open** (once), or"
+              echo "> 2. \`xattr -dr com.apple.quarantine \"/Applications/Rapid-MLX Desktop.app\"\`"
+              echo ">"
+              echo "> A signed + notarised build that opens with a normal double-click will replace this once signing is configured."
+              echo ""
+              cat "$NOTES_FILE"
+            } > "$NOTES_FILE.unsigned"
+            NOTES_FILE="$NOTES_FILE.unsigned"
           fi
           # The release object may already exist or not — handle both.
           if gh release view "$TAG" >/dev/null 2>&1; then

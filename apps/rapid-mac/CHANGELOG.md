@@ -13,6 +13,37 @@ can actually understand.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-08-02
+
+The first release of Rapid-MLX Desktop as an **open-source** app in the
+`raullenchai/Rapid-MLX` monorepo (Apache-2.0). An internal-testing build
+ahead of 1.0.
+
+### App
+
+- **Ollama / ChatGPT-style layout.** A single-column chat with an inline
+  model picker in the compose box; the model starts on your first message
+  (no start/stop buttons). A sidebar with New Chat, a Launch page of
+  connect-your-tools cards, and your conversation history.
+- **Conversation history** persists privately on device (owner-only file
+  permissions) and survives quit.
+- **"Speed on this Mac"** benchmarks the current model on your hardware, with
+  an optional submit to the community leaderboard.
+- Fixed a dead close button on the Launch page.
+
+### Engine
+
+- Bundles the **Rapid-MLX 0.11.9** inference engine (plus the latest merged
+  fixes), including the freeform `bench` fix so "Speed on this Mac" reports a
+  real number.
+
+### Privacy
+
+- Telemetry stays **opt-in** and anonymous; the app and the embedded engine
+  share one client ID so an install is never double-counted. A new
+  loopback-only `RAPID_MLX_TELEMETRY_ENDPOINT` lets you audit exactly what is
+  sent by pointing it at a local server.
+
 ## [0.11.0] — 2026-07-28
 
 This release upgrades the bundled inference engine to **Rapid-MLX 0.11.1**
