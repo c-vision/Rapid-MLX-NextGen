@@ -1362,7 +1362,7 @@ def test_deepseek_codex_exec_priming_is_bounded_to_early_tool_phase():
     assert _should_prime_deepseek_codex_exec(first, "qwen3") is False
 
 
-def test_codex_progress_reminder_switches_from_edit_to_test():
+def test_codex_progress_reminder_does_not_assume_five_reads_are_enough():
     from vllm_mlx.api.responses_models import ResponsesRequest
     from vllm_mlx.routes.responses import (
         _codex_action_command_prefix,
@@ -1379,8 +1379,8 @@ def test_codex_progress_reminder_switches_from_edit_to_test():
     ]
     request = ResponsesRequest(model="deepseek-v4", input=outputs)
     reminded = _inject_codex_progress_reminder([], request)
-    assert "must make the requested edit" in reminded[-1]["content"]
-    assert _codex_action_command_prefix(request).endswith(">apply_patch")
+    assert reminded == []
+    assert _codex_action_command_prefix(request) is None
 
     request.input = [
         {
@@ -1392,10 +1392,8 @@ def test_codex_progress_reminder_switches_from_edit_to_test():
         *outputs,
     ]
     reminded = _inject_codex_progress_reminder([], request)
-    assert "running focused tests" in reminded[-1]["content"]
+    assert reminded == []
     assert _codex_action_command_prefix(request) is None
-    assert "every explicit acceptance constraint" in reminded[-1]["content"]
-    assert "do not rerun the same failing test unchanged" in reminded[-1]["content"]
 
     request.input.extend(
         [
@@ -1442,13 +1440,15 @@ def test_codex_progress_does_not_mistake_prose_passed_for_test_success():
     )
 
     reminded = _inject_codex_progress_reminder([], request)
-    assert "running focused tests" in reminded[-1]["content"]
-    assert "provide the final answer" not in reminded[-1]["content"]
+    assert reminded == []
 
 
-def test_codex_action_prefix_breaks_post_edit_search_loop():
+def test_codex_action_prefix_only_breaks_exact_post_edit_loop():
     from vllm_mlx.api.responses_models import ResponsesRequest
-    from vllm_mlx.routes.responses import _codex_action_command_prefix
+    from vllm_mlx.routes.responses import (
+        _codex_action_command_prefix,
+        _inject_codex_progress_reminder,
+    )
 
     items = [
         {"type": "function_call_output", "call_id": f"seed_{index}", "output": "ok"}
@@ -1479,13 +1479,71 @@ def test_codex_action_prefix_breaks_post_edit_search_loop():
             ]
         )
     request = ResponsesRequest(model="m", input=items)
-    assert _codex_action_command_prefix(request).endswith(">apply_patch")
+    assert _codex_action_command_prefix(request) is None
 
     items[5]["arguments"] = (
         '{"cmd":"apply_patch <<PATCH\\n*** Update File: tests/test_x.py"}'
     )
     request = ResponsesRequest(model="m", input=items)
-    assert _codex_action_command_prefix(request).endswith(">python3 -m pytest")
+    assert _codex_action_command_prefix(request) is None
+
+    # Only an exact, unchanged command loop is strong enough evidence to
+    # override the model's next action.  Different searches can be necessary
+    # evidence gathering in a cross-file engineering task.
+    for index in range(3):
+        items.extend(
+            [
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": f"repeat_{index}",
+                    "arguments": '{"cmd":"rg symbol vllm_mlx"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": f"repeat_{index}",
+                    "output": "same output",
+                },
+            ]
+        )
+    request = ResponsesRequest(model="m", input=items)
+    assert _codex_action_command_prefix(request).endswith(">apply_patch")
+    reminded = _inject_codex_progress_reminder([], request)
+    assert "repeated unchanged three times" in reminded[-1]["content"]
+
+    pending = items[:-6]
+    for index in range(3):
+        pending.append(
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": f"pending_{index}",
+                "arguments": '{"cmd":"rg symbol vllm_mlx"}',
+            }
+        )
+    request = ResponsesRequest(model="m", input=pending)
+    assert _codex_action_command_prefix(request) is None
+
+    interleaved = items[:-4]
+    interleaved.extend(
+        [
+            {
+                "type": "function_call",
+                "name": "read_file",
+                "call_id": "different_tool",
+                "arguments": '{"path":"vllm_mlx/routes/responses.py"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "different_tool",
+                "output": "new evidence",
+            },
+            *items[-4:],
+        ]
+    )
+    request = ResponsesRequest(model="m", input=interleaved)
+    assert _codex_action_command_prefix(request) is None
+    assert _inject_codex_progress_reminder([], request) == []
 
     items.extend(
         [

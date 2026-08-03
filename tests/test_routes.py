@@ -598,6 +598,14 @@ class TestModelsRoutes:
                 "Make repository changes with apply_patch"
                 in catalog["test-model"]["base_instructions"]
             )
+            assert (
+                "without using a fixed command limit"
+                in catalog["test-model"]["base_instructions"]
+            )
+            assert (
+                "preserve it for subsequent test runs"
+                in catalog["test-model"]["base_instructions"]
+            )
         finally:
             self._restore(orig)
 

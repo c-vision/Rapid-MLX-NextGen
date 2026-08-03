@@ -196,23 +196,25 @@ def _is_deepseek_codex_surface(
 def _inject_codex_progress_reminder(
     messages: list[dict], responses_request: ResponsesRequest
 ) -> list[dict]:
-    """Put an action reminder near the generation boundary after exploration."""
+    """Nudge completed work or a proven command loop without guessing task scope."""
     items = responses_request.input
     if not isinstance(items, list):
         return messages
-    completed = 0
     has_edited = False
     has_test_passed = False
     has_test_failed = False
+    actions: list[tuple[str, str]] = []
     calls: dict[str, str] = {}
+    call_names: dict[str, str] = {}
     for item in items:
         data = item.model_dump() if hasattr(item, "model_dump") else item
         if not isinstance(data, dict):
             continue
         if data.get("type") == "function_call_output":
-            completed += 1
             output = str(data.get("output") or "")
-            command = calls.get(str(data.get("call_id") or ""), "")
+            call_id = str(data.get("call_id") or "")
+            command = calls.get(call_id, "")
+            actions.append((call_names.get(call_id, ""), command))
             is_test = any(
                 marker in command
                 for marker in ("pytest", "unittest", "tox", "nox", "ruff", "mypy")
@@ -226,39 +228,31 @@ def _inject_codex_progress_reminder(
                 has_test_failed = True
         if data.get("type") == "function_call":
             arguments = str(data.get("arguments") or "")
-            calls[str(data.get("call_id") or "")] = arguments
+            call_id = str(data.get("call_id") or "")
+            calls[call_id] = arguments
+            call_names[call_id] = str(data.get("name") or "")
             if "apply_patch" in arguments:
                 has_edited = True
                 has_test_passed = False
                 has_test_failed = False
-    if completed < 5:
-        return messages
+                actions = []
 
-    reminder = (
-        "Engineering progress checkpoint: enough repository context has been "
-        "collected. Do not run another search or repeat a file read. "
-    )
-    if has_edited:
-        if has_test_passed and not has_test_failed:
-            reminder += (
-                "Focused tests have passed. Do not rerun the same tests. Compare the "
-                "diff against the original acceptance constraints once, then provide "
-                "the final answer without another search or test command."
-            )
-        else:
-            reminder += (
-                "Before testing, compare the diff against every explicit acceptance "
-                "constraint in the original request. Correct any mismatch first. Continue "
-                "by running focused tests with the repository's supported interpreter/toolchain. "
-                "If a command fails because of the environment, diagnose and change the "
-                "environment or command; do not rerun the same failing test unchanged."
-            )
-    else:
-        reminder += (
-            "First re-check the original request's explicit acceptance constraints. "
-            "The next tool call must make the requested edit satisfying all of them; invoke "
-            "apply_patch through exec_command now."
+    if has_edited and has_test_passed and not has_test_failed:
+        reminder = (
+            "Engineering completion checkpoint: focused tests have passed. Do not "
+            "rerun the same tests unchanged. Compare the diff against the original "
+            "acceptance constraints, run any still-required broader validation, then "
+            "provide the final answer with an accurate validation summary."
         )
+    elif _has_unchanged_exec_loop(actions):
+        reminder = (
+            "Engineering loop checkpoint: the last command was repeated unchanged "
+            "three times. Use its existing result. Re-check the requested constraints "
+            "and choose a materially different evidence-gathering, editing, or testing "
+            "action. Preserve any user-specified interpreter and toolchain."
+        )
+    else:
+        return messages
     return [*messages, {"role": "developer", "content": reminder}]
 
 
@@ -267,22 +261,22 @@ def _codex_action_command_prefix(responses_request: ResponsesRequest) -> str | N
     items = responses_request.input
     if not isinstance(items, list):
         return None
-    completed = 0
     has_edited = False
-    has_test_edit = False
     has_unresolved_failure = False
     has_successful_test = False
-    commands_after_edit: list[str] = []
+    actions_after_edit: list[tuple[str, str]] = []
     calls: dict[str, str] = {}
+    call_names: dict[str, str] = {}
     for item in items:
         data = item.model_dump() if hasattr(item, "model_dump") else item
         if not isinstance(data, dict):
             continue
         if data.get("type") == "function_call_output":
-            completed += 1
             if has_edited:
                 output = str(data.get("output") or "")
-                command = calls.get(str(data.get("call_id") or ""), "")
+                call_id = str(data.get("call_id") or "")
+                command = calls.get(call_id, "")
+                actions_after_edit.append((call_names.get(call_id, ""), command))
                 is_test = any(
                     marker in command
                     for marker in (
@@ -315,46 +309,49 @@ def _codex_action_command_prefix(responses_request: ResponsesRequest) -> str | N
                         has_successful_test = True
         if data.get("type") == "function_call":
             arguments = str(data.get("arguments") or "")
-            calls[str(data.get("call_id") or "")] = arguments
+            call_id = str(data.get("call_id") or "")
+            calls[call_id] = arguments
+            call_names[call_id] = str(data.get("name") or "")
             if "apply_patch" in arguments:
                 has_edited = True
-                has_test_edit = has_test_edit or any(
-                    marker in arguments for marker in ("tests/", "test_", "_test.")
-                )
                 has_unresolved_failure = False
                 has_successful_test = False
-                commands_after_edit = []
-            elif has_edited:
-                commands_after_edit.append(arguments)
-    if completed < 5:
+                actions_after_edit = []
+    if has_successful_test or has_unresolved_failure:
         return None
     if has_edited:
-        if has_successful_test and not has_unresolved_failure:
-            return None
         # Let the model diagnose a grounded tool failure. Prefixing another
         # command here can force the exact unavailable interpreter forever
         # (for example ``python`` on a macOS host exposing only ``python3``).
         if has_unresolved_failure:
             return None
-        # Give the model room to review its diff, but stop the common semantic
-        # loop where it varies the path/pattern of the same grep indefinitely.
-        # If three post-edit tool turns pass without a regression-test edit,
-        # move it back into the edit phase.  Once tests exist, move it into a
-        # supported Python test invocation (Codex inherits the user's PATH).
-        if len(commands_after_edit) < 3:
+        # Only force a return to editing when the transcript proves an exact
+        # unchanged loop. Distinct searches/reads are legitimate evidence in
+        # large cross-file tasks, and choosing an interpreter here can override
+        # an explicit venv supplied by the user.
+        if not _has_unchanged_exec_loop(actions_after_edit):
             return None
-        command = (
-            "python3 -m pytest"
-            if has_test_edit and not has_unresolved_failure
-            else "apply_patch"
-        )
-    else:
         command = "apply_patch"
+    else:
+        return None
     return (
         "<｜DSML｜tool_calls>\n"
         '<｜DSML｜invoke name="exec_command">\n'
         '<｜DSML｜parameter name="cmd" string="true">'
         f"{command}"
+    )
+
+
+def _has_unchanged_exec_loop(actions: list[tuple[str, str]]) -> bool:
+    """Return whether the last three completed actions repeat one shell command."""
+    if len(actions) < 3:
+        return False
+    tail = actions[-3:]
+    name, arguments = tail[0]
+    return (
+        name == "exec_command"
+        and "apply_patch" not in arguments
+        and len(set(tail)) == 1
     )
 
 
