@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import uuid
 from collections.abc import Sequence
 from typing import Any
@@ -73,6 +74,20 @@ class DeepSeekV40731ToolParser(ToolParser):
                     except json.JSONDecodeError:
                         value = raw
                 arguments[param.group("name")] = value
+            # DeepSeek occasionally serializes Codex's reusable approval
+            # prefix as a shell-like scalar even though it is an argv prefix.
+            # Preserve argument boundaries while normalizing it for strict
+            # schema validation. Leave malformed quoting unchanged so the
+            # validator rejects it instead of silently changing its meaning.
+            if match.group("name") == "exec_command" and isinstance(
+                arguments.get("prefix_rule"), str
+            ):
+                try:
+                    prefix_rule = shlex.split(arguments["prefix_rule"])
+                    if prefix_rule:
+                        arguments["prefix_rule"] = prefix_rule
+                except ValueError:
+                    pass
             calls.append(
                 {
                     "id": f"call_{uuid.uuid4().hex[:8]}",
