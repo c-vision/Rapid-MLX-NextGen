@@ -1296,7 +1296,7 @@ class TestResponsesStreamR10C3:
         assert resp_obj["status"] == "completed"
 
 
-def test_deepseek_codex_exec_priming_is_bounded_to_early_tool_phase():
+def test_deepseek_codex_exec_priming_is_only_the_initial_tool_turn():
     from vllm_mlx.api.responses_models import ResponsesRequest
     from vllm_mlx.routes.responses import _should_prime_deepseek_codex_exec
 
@@ -1336,7 +1336,7 @@ def test_deepseek_codex_exec_priming_is_bounded_to_early_tool_phase():
         ],
         tools=tools,
     )
-    assert _should_prime_deepseek_codex_exec(continued, "deepseek_v4_0731") is True
+    assert _should_prime_deepseek_codex_exec(continued, "deepseek_v4_0731") is False
 
     exhausted_items = []
     for index in range(6):

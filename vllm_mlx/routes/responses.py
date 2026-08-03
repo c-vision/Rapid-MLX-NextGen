@@ -118,13 +118,14 @@ router = APIRouter()
 def _should_prime_deepseek_codex_exec(
     responses_request: ResponsesRequest, tool_parser: str | None
 ) -> bool:
-    """Return whether an early DeepSeek Codex turn should pin exec_command.
+    """Return whether DeepSeek Codex's first turn should pin exec_command.
 
     DeepSeek V4 reliably emits a valid DSML invocation when the tool name is
-    primed, but stochastic ``auto`` selection often stops in hidden output or
-    emits a prose plan before the first repository inspection.  Pin only the
-    bounded early tool phase. After six completed calls, release ``auto`` so
-    the model can either select a non-shell tool or provide its final answer.
+    primed, but stochastic ``auto`` selection can stop in hidden output before
+    the first repository inspection. Pin exactly the initial locating action;
+    after any completed call, release ``auto`` so a small grounded task can
+    edit immediately and larger tasks can gather evidence proportional to
+    their scope.
     """
     if tool_parser != "deepseek_v4_0731":
         return False
@@ -157,7 +158,7 @@ def _should_prime_deepseek_codex_exec(
         data = item.model_dump() if hasattr(item, "model_dump") else item
         if isinstance(data, dict) and data.get("type") == "function_call_output":
             completed_calls += 1
-    return completed_calls < 6
+    return completed_calls == 0
 
 
 def _is_deepseek_codex_surface(
@@ -692,8 +693,8 @@ async def create_response(request: Request):
             "name": "exec_command",
         }
         logger.info(
-            "DeepSeek Codex bounded tool-phase priming: pinning exec_command "
-            "during the first 6 completed tool rounds"
+            "DeepSeek Codex first-action priming: pinning exec_command for "
+            "the initial repository locating turn"
         )
     validate_responses_tool_types(responses_request.tools)
     # Yuki F6 (0.8.5 dogfood): mirror the chat-completions tool_choice

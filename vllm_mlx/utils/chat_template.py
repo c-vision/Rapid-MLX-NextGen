@@ -61,8 +61,28 @@ _CHAT_TEMPLATE_ROLE_MARKERS = (
     "<|return|>",
 )
 
+_REASONING_SENTINELS = {
+    "<think>",
+    "</think>",
+    "<reasoning>",
+    "</reasoning>",
+    "<｜DSML｜",
+    "</｜DSML｜",
+}
+_EXISTING_CONTROL_ESCAPE = re.compile(
+    r"<(?P<esc>\u200b+)(?=(?:/?(?:think|reasoning)>|/?｜DSML｜))"
+)
 
-def _collect_role_markers(template_applicator) -> set[str]:
+
+def _double_existing_control_escapes(text: str) -> str:
+    return _EXISTING_CONTROL_ESCAPE.sub(
+        lambda match: "<" + (match.group("esc") * 2), text
+    )
+
+
+def _collect_role_markers(
+    template_applicator, *, include_reasoning_sentinels: bool = False
+) -> set[str]:
     """Return the set of chat-template role markers that must be neutralized
     in user-supplied content for ``template_applicator``.
 
@@ -81,7 +101,10 @@ def _collect_role_markers(template_applicator) -> set[str]:
     # which are not role markers but ARE still untrusted-input vectors,
     # so we include them too.
     if hasattr(tokenizer, "tokenizer"):
-        markers |= _collect_role_markers(tokenizer.tokenizer)
+        markers |= _collect_role_markers(
+            tokenizer.tokenizer,
+            include_reasoning_sentinels=include_reasoning_sentinels,
+        )
 
     candidates: list[str] = []
     for attr in ("all_special_tokens", "additional_special_tokens"):
@@ -95,6 +118,12 @@ def _collect_role_markers(template_applicator) -> set[str]:
                 candidates.append(v)
             elif isinstance(v, (list, tuple)):
                 candidates.extend(str(x) for x in v)
+    # DeepSeek V4's tool prompt explicitly teaches the model to remove the
+    # neutralising U+200B when copying repository bytes into a tool argument.
+    # Do not mutate reasoning-tag text for unrelated model families which do
+    # not receive that restoration contract.
+    if include_reasoning_sentinels:
+        markers.update(_REASONING_SENTINELS)
     # Only treat sequences that LOOK like a template delimiter as
     # neutralisation targets — picking up every special token would
     # also strip ``<pad>`` / ``<unk>`` etc. from user text, which is
@@ -180,8 +209,32 @@ def _sanitize_message_content(
     return content
 
 
+def _double_existing_control_escapes_in_content(content):
+    """Quote pre-existing framing bytes before adding protocol framing."""
+    if isinstance(content, str):
+        return _double_existing_control_escapes(content)
+    if isinstance(content, list):
+        new_parts = []
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            ):
+                new_part = dict(part)
+                new_part["text"] = _double_existing_control_escapes(part["text"])
+                new_parts.append(new_part)
+            else:
+                new_parts.append(part)
+        return new_parts
+    return content
+
+
 def _sanitize_messages_for_template(
-    messages: list[dict], template_applicator
+    messages: list[dict],
+    template_applicator,
+    *,
+    include_reasoning_sentinels: bool = False,
 ) -> list[dict]:
     """Strip / neutralize chat-template control tokens from user-supplied
     message content.
@@ -208,7 +261,10 @@ def _sanitize_messages_for_template(
     interpretation is neutralised. See ``_neutralize_in_string`` for
     the rationale.
     """
-    markers = _collect_role_markers(template_applicator)
+    markers = _collect_role_markers(
+        template_applicator,
+        include_reasoning_sentinels=include_reasoning_sentinels,
+    )
     pattern = _build_marker_pattern(markers)
     if pattern is None:
         return messages
@@ -218,6 +274,8 @@ def _sanitize_messages_for_template(
             sanitized.append(msg)
             continue
         content = msg.get("content")
+        if include_reasoning_sentinels:
+            content = _double_existing_control_escapes_in_content(content)
         new_content = _sanitize_message_content(content, pattern)
         if new_content is content:
             sanitized.append(msg)
@@ -729,7 +787,9 @@ def _baseline_sanitize_tools(tools):
     return _walk_tools_iter(tools, lambda s: _neutralize_in_string(s, baseline_pattern))
 
 
-def _sanitize_tools_for_template(tools, template_applicator):
+def _sanitize_tools_for_template(
+    tools, template_applicator, *, include_reasoning_sentinels: bool = False
+):
     """Neutralise chat-template role markers in user-supplied tool
     definitions (names, descriptions, parameter schemas).
 
@@ -756,11 +816,20 @@ def _sanitize_tools_for_template(tools, template_applicator):
     """
     if not tools:
         return tools
-    markers = _collect_role_markers(template_applicator)
+    markers = _collect_role_markers(
+        template_applicator,
+        include_reasoning_sentinels=include_reasoning_sentinels,
+    )
     pattern = _build_marker_pattern(markers)
     if pattern is None:
         return tools
-    return _walk_tools_iter(tools, lambda s: _neutralize_in_string(s, pattern))
+
+    def _sanitize_tool_string(value: str) -> str:
+        if include_reasoning_sentinels:
+            value = _double_existing_control_escapes(value)
+        return _neutralize_in_string(value, pattern)
+
+    return _walk_tools_iter(tools, _sanitize_tool_string)
 
 
 def _build_tool_injection_text(tools: list[dict]) -> str:
@@ -975,6 +1044,10 @@ def apply_chat_template(
         ``role: content`` format if the applicator has no
         ``apply_chat_template`` method.
     """
+    from .deepseek_v4_0731 import encode_messages, is_deepseek_v4_0731
+
+    is_deepseek_v4 = is_deepseek_v4_0731(model_name)
+
     # F-111: flatten text-only OpenAI-o1+ content arrays
     # (``content: [{"type":"text","text":"X"}]``) into the plain string
     # the HF chat templates expect. Runs FIRST so the sanitiser and the
@@ -1014,7 +1087,11 @@ def apply_chat_template(
     # vector this PR closes (codex r7 BLOCKING — same fallback shape as
     # ``vllm_mlx/models/mllm.py::_apply_native_video_template``).
     try:
-        messages = _sanitize_messages_for_template(messages, template_applicator)
+        messages = _sanitize_messages_for_template(
+            messages,
+            template_applicator,
+            include_reasoning_sentinels=is_deepseek_v4,
+        )
     except Exception as e:
         logger.debug(
             "Chat-template marker sanitisation failed (%s); applying "
@@ -1027,7 +1104,11 @@ def apply_chat_template(
     # template's ``tools=`` kwarg or the system-prompt injection
     # fallback (``_inject_tools_into_messages``).
     try:
-        tools = _sanitize_tools_for_template(tools, template_applicator)
+        tools = _sanitize_tools_for_template(
+            tools,
+            template_applicator,
+            include_reasoning_sentinels=is_deepseek_v4,
+        )
     except Exception as e:
         logger.debug(
             "Chat-template tool-marker sanitisation failed (%s); applying "
@@ -1039,9 +1120,7 @@ def apply_chat_template(
     # DeepSeek-V4-Flash-0731 intentionally ships a Python encoder instead of
     # a Jinja template.  Route by model identity before the generic tokenizer
     # fallback (which would otherwise silently apply ChatML).
-    from .deepseek_v4_0731 import encode_messages, is_deepseek_v4_0731
-
-    if is_deepseek_v4_0731(model_name):
+    if is_deepseek_v4:
         return encode_messages(
             messages,
             tools=tools,

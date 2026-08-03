@@ -16,6 +16,36 @@ from .abstract_tool_parser import (
     ToolParserManager,
 )
 
+_ESCAPED_CONTROL_LITERAL = re.compile(
+    r"<(?P<esc>\u200b+)(?=(?:/?(?:think|reasoning)>|/?｜DSML｜))"
+)
+
+
+def _restore_string_parameter(value: str) -> str:
+    """Decode DSML's U+200B escape for literal control-looking text."""
+
+    def _restore(match: re.Match) -> str:
+        original_count = len(match.group("esc")) // 2
+        return "<" + ("\u200b" * original_count)
+
+    return _ESCAPED_CONTROL_LITERAL.sub(_restore, value)
+
+
+def _restore_argument_value(value: Any) -> Any:
+    """Recursively reverse framing in string leaves and JSON object keys."""
+    if isinstance(value, str):
+        return _restore_string_parameter(value)
+    if isinstance(value, list):
+        return [_restore_argument_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _restore_string_parameter(key) if isinstance(key, str) else key: (
+                _restore_argument_value(item)
+            )
+            for key, item in value.items()
+        }
+    return value
+
 
 @ToolParserManager.register_module(["deepseek_v4_0731"])
 class DeepSeekV40731ToolParser(ToolParser):
@@ -67,12 +97,12 @@ class DeepSeekV40731ToolParser(ToolParser):
             for param in self.PARAM.finditer(match.group("body")):
                 raw = param.group("value")
                 if param.group("string") == "true":
-                    value: Any = raw
+                    value: Any = _restore_argument_value(raw)
                 else:
                     try:
-                        value = json.loads(raw)
+                        value = _restore_argument_value(json.loads(raw))
                     except json.JSONDecodeError:
-                        value = raw
+                        value = _restore_argument_value(raw)
                 arguments[param.group("name")] = value
             # DeepSeek occasionally serializes Codex's reusable approval
             # prefix as a shell-like scalar even though it is an argv prefix.

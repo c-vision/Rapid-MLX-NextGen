@@ -21,6 +21,35 @@ LATEST_REMINDER = "<｜latest_reminder｜>"
 THINK_START = "<think>"
 THINK_END = "</think>"
 DSML = "｜DSML｜"
+_CONTROL_LITERAL_START = re.compile(r"<(?=(?:/?(?:think|reasoning)>|/?｜DSML｜))")
+_EXISTING_CONTROL_ESCAPE = re.compile(
+    r"<(?P<esc>\u200b+)(?=(?:/?(?:think|reasoning)>|/?｜DSML｜))"
+)
+
+
+def _escape_string_parameter(value: str) -> str:
+    """Frame control-looking source text safely inside a DSML string value."""
+    value = _EXISTING_CONTROL_ESCAPE.sub(
+        lambda match: "<" + (match.group("esc") * 2), value
+    )
+    return _CONTROL_LITERAL_START.sub("<\u200b", value)
+
+
+def _escape_argument_value(value: Any) -> Any:
+    """Recursively frame every string leaf, including JSON object keys."""
+    if isinstance(value, str):
+        return _escape_string_parameter(value)
+    if isinstance(value, list):
+        return [_escape_argument_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _escape_string_parameter(key) if isinstance(key, str) else key: (
+                _escape_argument_value(item)
+            )
+            for key, item in value.items()
+        }
+    return value
+
 
 # Keep the small, universal engineering surface near the beginning of large
 # agent tool catalogs.  Codex can submit well over one hundred connector and
@@ -112,6 +141,8 @@ You have access to a set of tools to help answer the user's question. You can in
 
 String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
 
+Inside a `string="true"` parameter, escape literal control-looking text by inserting one invisible U+200B immediately after its opening `<`. This applies to `<think>`, `</think>`, `<reasoning>`, `</reasoning>`, and any literal `<｜DSML｜...>` or `</｜DSML｜...>` text in the parameter value. If repository text already has one or more U+200B bytes there, double their count instead. Never escape the structural DSML wrapper tags themselves. The tool parser reverses this framing before invoking the tool, so the tool receives the repository's exact literal bytes.
+
 If thinking_mode is enabled (triggered by {THINK_START}), you MUST output your complete reasoning inside {THINK_START}...{THINK_END} BEFORE any tool calls or final response.
 
 Otherwise, output directly after {THINK_END} with tool calls or final response.
@@ -137,7 +168,8 @@ def _encode_call(call: dict) -> str:
     params = []
     for key, value in arguments.items():
         is_string = isinstance(value, str)
-        rendered = value if is_string else _json(value)
+        escaped_value = _escape_argument_value(value)
+        rendered = escaped_value if is_string else _json(escaped_value)
         params.append(
             f'<{DSML}parameter name="{key}" string="{str(is_string).lower()}">'
             f"{rendered}</{DSML}parameter>"

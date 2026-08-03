@@ -487,6 +487,17 @@ class TestQwen3ThinkRouting:
         assert result["content"] == "Answer"
         assert result["tool_calls"] is None
 
+    def test_late_think_tag_reopens_reasoning(self):
+        """A genuine late think transition must not become public content."""
+        router = OutputRouter.from_tokenizer(QWEN3_TOKENIZER)
+        assert router is not None
+
+        result = router.feed_sequence([248068, 1, 248069, 3, 248068, 4, 248069, 3])
+
+        assert result["reasoning"] == "ReasonPlain"
+        assert result["content"] == "AnswerAnswer"
+        assert result["tool_calls"] is None
+
 
 class TestDeepSeekR1ThinkRouting:
     """Test DeepSeek R1 <think> routing."""
