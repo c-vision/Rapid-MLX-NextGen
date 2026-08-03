@@ -1095,7 +1095,12 @@ class TestResponsesStreamR10C3:
         names = [e[0] for e in events]
         text_done = names.index("response.output_text.done")
         part_done = names.index("response.content_part.done")
-        item_done = names.index("response.output_item.done")
+        item_done = next(
+            i
+            for i, (name, data) in enumerate(events)
+            if name == "response.output_item.done"
+            and data.get("item", {}).get("type") == "message"
+        )
         assert text_done < part_done < item_done
 
         # ``output_text.done`` must carry the full concatenated text.

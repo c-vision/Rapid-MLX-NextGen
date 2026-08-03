@@ -32,6 +32,8 @@ regress real-world tool schemas that ship loose ``pattern`` /
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi import HTTPException
 
@@ -274,6 +276,24 @@ class TestValidPasses:
         _validate_tool_call_params([_call("set_score", '{"score": 0}')], tools)
         _validate_tool_call_params([_call("set_score", '{"score": 100}')], tools)
 
+    def test_schema_valid_repeated_string_argument_is_allowed(self):
+        from vllm_mlx.service.helpers import _validate_tool_call_params
+
+        tools = [_tool("exec_command", {"cmd": {"type": "string"}})]
+        repeated = "grep -rn get_stats " + ("metrics " * 200)
+        calls = [_call("exec_command", json.dumps({"cmd": repeated}))]
+
+        _validate_tool_call_params(calls, tools)
+
+    def test_long_diverse_string_argument_is_allowed(self):
+        from vllm_mlx.service.helpers import _validate_tool_call_params
+
+        tools = [_tool("apply_patch", {"patch": {"type": "string"}})]
+        diverse = " ".join(f"line_{index}" for index in range(200))
+        _validate_tool_call_params(
+            [_call("apply_patch", json.dumps({"patch": diverse}))], tools
+        )
+
 
 # ---------------------------------------------------------------------------
 # Deferred — `pattern` and `format` MUST still pass-through (NOT enforced)
@@ -290,13 +310,12 @@ class TestDeferredPassThrough:
     F-141a (PR following #736) flipped ``pattern`` / ``format`` /
     ``multipleOf`` / ``uniqueItems`` to enforcement — those have moved
     to ``tests/test_tool_param_enforcement_f141a.py``. The remaining
-    deferred set (``required``, ``oneOf``, ``anyOf``, ``allOf``,
+    deferred set (``oneOf``, ``anyOf``, ``allOf``,
     ``additionalProperties``) still pass-through.
     """
 
-    def test_required_missing_key_does_not_raise(self):
-        """``required`` violation: schema requires ``"x"`` but the model
-        emitted ``{}``. Compound semantics — deferred for now."""
+    def test_required_missing_key_raises(self):
+        """Required properties are enforced before a tool reaches an agent."""
         from vllm_mlx.service.helpers import _validate_tool_call_params
 
         tools = [
@@ -307,7 +326,27 @@ class TestDeferredPassThrough:
         ]
         # Inject ``required`` into the parameters block.
         tools[0]["function"]["parameters"]["required"] = ["x"]
-        _validate_tool_call_params([_call("f", "{}")], tools)
+        with pytest.raises(HTTPException, match="missing required argument"):
+            _validate_tool_call_params([_call("f", "{}")], tools, enforce_required=True)
+
+    @pytest.mark.parametrize("arguments", ["", "[]", '"text"'])
+    def test_required_mode_rejects_non_object_arguments(self, arguments):
+        from vllm_mlx.service.helpers import _validate_tool_call_params
+
+        tools = [_tool("f", {"x": {"type": "string"}})]
+        tools[0]["function"]["parameters"]["required"] = ["x"]
+        with pytest.raises(HTTPException, match="JSON object"):
+            _validate_tool_call_params(
+                [_call("f", arguments)], tools, enforce_required=True
+            )
+
+    def test_schema_valid_repetitive_string_is_not_rejected(self):
+        """Repeated patches/test fixtures remain valid executable input."""
+        from vllm_mlx.service.helpers import _validate_tool_call_params
+
+        tools = [_tool("apply", {"patch": {"type": "string"}})]
+        payload = json.dumps({"patch": "+same line\n" * 200})
+        _validate_tool_call_params([_call("apply", payload)], tools)
 
     def test_one_of_violation_does_not_raise(self):
         """``oneOf`` (and ``anyOf`` / ``allOf``) violations remain

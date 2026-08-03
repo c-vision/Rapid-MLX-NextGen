@@ -182,6 +182,59 @@ class _ReasoningOnlyStopEngine:
             )
 
 
+class _ReasoningThenWhitespaceStopEngine:
+    """DeepSeek/Codex failure shape: reasoning closes, but the public
+    message contains only formatting whitespace before EOS."""
+
+    preserve_native_tool_format = False
+
+    def __init__(self):
+        self.tokenizer = _Tokenizer()
+
+    async def stream_chat(self, messages, **kwargs):
+        yield _GenerationOutput(
+            text="I should inspect the file.",
+            new_text="I should inspect the file.",
+            prompt_tokens=7,
+            completion_tokens=6,
+            finish_reason=None,
+            finished=False,
+            channel="reasoning",
+        )
+        yield _GenerationOutput(
+            text="\n\n",
+            new_text="\n\n",
+            prompt_tokens=0,
+            completion_tokens=7,
+            finish_reason="stop",
+            finished=True,
+            channel="content",
+        )
+
+
+class _ToolIntentOnlyStopEngine:
+    """Codex semantic stall: promises a repository action, calls no tool."""
+
+    preserve_native_tool_format = False
+
+    def __init__(self):
+        self.tokenizer = _Tokenizer()
+
+    async def stream_chat(self, messages, **kwargs):
+        # Leading punctuation is common in sampled DeepSeek output and must
+        # not turn the same no-action announcement into a successful turn.
+        text = ": I'll inspect the branch and target file. Let me check the repo state."
+        yield _GenerationOutput(
+            text=text,
+            new_text=text,
+            prompt_tokens=7,
+            completion_tokens=15,
+            finish_reason="stop",
+            finished=True,
+            channel="content",
+        )
+
+
 class _TerminalReasoningOnlyStopEngine:
     """Engine/router shape where reasoning is available only on the
     terminal sentinel as ``reasoning_text`` while ``new_text`` is only a
@@ -505,6 +558,20 @@ def reasoning_only_stop_client(monkeypatch):
 
 
 @pytest.fixture
+def reasoning_then_whitespace_stop_client(monkeypatch):
+    holder = _build_client(monkeypatch, _ReasoningThenWhitespaceStopEngine)
+    yield holder
+    holder.cleanup()
+
+
+@pytest.fixture
+def tool_intent_only_stop_client(monkeypatch):
+    holder = _build_client(monkeypatch, _ToolIntentOnlyStopEngine)
+    yield holder
+    holder.cleanup()
+
+
+@pytest.fixture
 def terminal_reasoning_only_stop_client(monkeypatch):
     holder = _build_client(monkeypatch, _TerminalReasoningOnlyStopEngine)
     yield holder
@@ -672,6 +739,29 @@ class TestResponsesNonStreamFailureEnvelope:
         )
         assert "error" not in body, body
 
+    def test_immediate_stop_with_tools_is_retryable_failure(
+        self, immediate_stop_client
+    ):
+        resp = immediate_stop_client.client.post(
+            "/v1/responses",
+            json={
+                **PAYLOAD,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "shell",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+            },
+            headers=HEADERS,
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "failed"
+        assert body["error"]["code"] == "model_no_final_answer"
+
 
 # =============================================================================
 # Stream — engine wedge → response.failed instead of response.completed
@@ -762,6 +852,31 @@ class TestResponsesStreamFailureEnvelope:
             f"stop-reason zero-token stream: {names}"
         )
 
+    def test_immediate_stop_with_tools_is_retryable_failure(
+        self, immediate_stop_client
+    ):
+        """An agent cannot consume an empty successful tool-capable turn."""
+        payload = {
+            **PAYLOAD,
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "shell",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        }
+        with immediate_stop_client.client.stream(
+            "POST", "/v1/responses", json=payload, headers=HEADERS
+        ) as resp:
+            events = _parse_sse("".join(resp.iter_text()))
+        names = [name for name, _ in events]
+        assert "response.failed" in names, names
+        assert "response.completed" not in names, names
+        failed = next(data for name, data in events if name == "response.failed")
+        assert failed["response"]["error"]["code"] == "model_no_final_answer"
+
     def test_reasoning_only_stop_stream_emits_response_failed(
         self, reasoning_only_stop_client
     ):
@@ -797,6 +912,50 @@ class TestResponsesStreamFailureEnvelope:
         assert envelope["output"][0]["summary"][0]["text"] == (
             "I should answer, but I never reach final."
         )
+
+    def test_reasoning_then_whitespace_stop_stream_emits_response_failed(
+        self, reasoning_then_whitespace_stop_client
+    ):
+        """Opening a message item is not proof of a consumable answer.
+
+        Formatting-only content must trigger the same retryable failure as a
+        reasoning-only stop instead of making Codex accept a blank success.
+        """
+        with reasoning_then_whitespace_stop_client.client.stream(
+            "POST",
+            "/v1/responses",
+            json={**PAYLOAD, "stream": True},
+            headers=HEADERS,
+        ) as resp:
+            body = "".join(resp.iter_text())
+        events = _parse_sse(body)
+        names = [name for name, _ in events]
+        assert "response.failed" in names, names
+        assert "response.completed" not in names, names
+        failed = next(data for name, data in events if name == "response.failed")
+        assert failed["response"]["error"]["code"] == "model_no_final_answer"
+
+    def test_auto_tool_choice_allows_textual_action_language(
+        self, tool_intent_only_stop_client
+    ):
+        payload = {
+            **PAYLOAD,
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "shell",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        }
+        with tool_intent_only_stop_client.client.stream(
+            "POST", "/v1/responses", json=payload, headers=HEADERS
+        ) as resp:
+            events = _parse_sse("".join(resp.iter_text()))
+
+        assert any(name == "response.completed" for name, _ in events)
+        assert not any(name == "response.failed" for name, _ in events)
 
     def test_reasoning_only_stop_does_not_promote_reasoning_to_text(
         self, reasoning_only_stop_client

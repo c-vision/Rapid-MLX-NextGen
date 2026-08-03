@@ -150,6 +150,10 @@ class RequestOutputCollector:
             completion_tokens=new.completion_tokens,
             cached_tokens=new.cached_tokens,
             logprobs=new.logprobs,  # Use latest token's logprobs
+            # Terminal scheduler failures (exact repetition, explicit abort,
+            # Metal recovery) must survive aggregation. Dropping this field
+            # turns an aborted generation into a successful blank response.
+            error=new.error or existing.error,
             # H-03: prefer the newer chunk's matched_stop (the scheduler
             # pins it exactly once on the chunk where the stop fires);
             # fall back to the existing buf so we never demote a

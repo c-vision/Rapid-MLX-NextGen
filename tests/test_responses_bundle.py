@@ -461,6 +461,105 @@ class TestDeepSeekV4ResponsesStreaming:
         assert len(completed_calls) == 1
         assert json.loads(completed_calls[0]["arguments"]) == {"cmd": "pwd && ls"}
 
+    def test_empty_dsml_invoke_for_required_tool_fails_instead_of_reaching_codex(
+        self, make_responses_client
+    ):
+        import vllm_mlx.tool_parsers.deepseek_v4_0731_tool_parser  # noqa: F401
+
+        wire = (
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="exec_command">'
+            "</｜DSML｜invoke></｜DSML｜tool_calls>"
+        )
+        state = make_responses_client(
+            text=wire,
+            stream_chunks=[
+                "<｜DSML｜tool_calls>\n",
+                '<｜DSML｜invoke name="exec_command">\n',
+                "</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            ],
+            finish_reason="tool_calls",
+        )
+        state.cfg.enable_auto_tool_choice = True
+        state.cfg.tool_call_parser = "deepseek_v4_0731"
+
+        with state.client.stream(
+            "POST",
+            "/v1/responses",
+            json=_payload(
+                stream=True,
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "exec_command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"cmd": {"type": "string"}},
+                            "required": ["cmd"],
+                        },
+                    }
+                ],
+            ),
+            headers=_AUTH,
+        ) as resp:
+            assert resp.status_code == 200, resp.text
+            events = _parse_sse("".join(resp.iter_text()))
+
+        failed = [data for name, data in events if name == "response.failed"]
+        assert len(failed) == 1, events
+        assert failed[0]["response"]["error"]["code"] == "invalid_tool_arguments"
+        assert "cmd" in failed[0]["response"]["error"]["message"]
+        assert not any(name == "response.completed" for name, _ in events)
+        assert not any(
+            name == "response.output_item.added"
+            and data.get("item", {}).get("type") == "function_call"
+            for name, data in events
+        )
+
+    def test_non_stream_empty_required_tool_call_returns_failed_envelope(
+        self, make_responses_client
+    ):
+        import vllm_mlx.tool_parsers.deepseek_v4_0731_tool_parser  # noqa: F401
+
+        wire = (
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="exec_command">'
+            "</｜DSML｜invoke></｜DSML｜tool_calls>"
+        )
+        state = make_responses_client(
+            text=wire,
+            stream_chunks=[
+                "<｜DSML｜tool_calls>",
+                '<｜DSML｜invoke name="exec_command"></｜DSML｜invoke>',
+                "</｜DSML｜tool_calls>",
+            ],
+            finish_reason="tool_calls",
+        )
+        state.cfg.enable_auto_tool_choice = True
+        state.cfg.tool_call_parser = "deepseek_v4_0731"
+
+        response = state.client.post(
+            "/v1/responses",
+            json=_payload(
+                stream=False,
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "exec_command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"cmd": {"type": "string"}},
+                            "required": ["cmd"],
+                        },
+                    }
+                ],
+            ),
+            headers=_AUTH,
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "failed"
+        assert body["error"]["code"] == "invalid_tool_arguments"
+
 
 class TestF6ToolChoiceEnforcement:
     """Yuki F6 (0.8.5 dogfood): ``tool_choice="required"`` and the
@@ -913,11 +1012,21 @@ class TestF8StreamingSseEvents:
         # Spec order: created → output_item.added (message) →
         # content_part.added → output_text.delta → output_text.done →
         # content_part.done → output_item.done → completed.
-        added_idx = event_names.index("response.output_item.added")
+        added_idx = next(
+            i
+            for i, (name, data) in enumerate(events)
+            if name == "response.output_item.added"
+            and data.get("item", {}).get("type") == "message"
+        )
         cpa_idx = event_names.index("response.content_part.added")
         delta_idx = event_names.index("response.output_text.delta")
         otd_idx = event_names.index("response.output_text.done")
-        item_done_idx = event_names.index("response.output_item.done")
+        item_done_idx = next(
+            i
+            for i, (name, data) in enumerate(events)
+            if name == "response.output_item.done"
+            and data.get("item", {}).get("type") == "message"
+        )
         completed_idx = event_names.index("response.completed")
         assert (
             added_idx < cpa_idx < delta_idx < otd_idx < item_done_idx < completed_idx

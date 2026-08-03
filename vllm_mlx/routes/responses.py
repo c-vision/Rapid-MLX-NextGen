@@ -96,6 +96,7 @@ from ..service.helpers import (
     _resolve_top_p,
     _uses_deepseek_v4_reasoning,
     _validate_model_name,
+    _validate_tool_call_params,
     _wait_with_disconnect,
     build_extended_sampling_kwargs,
     enforce_context_length,
@@ -1487,9 +1488,42 @@ async def _non_stream(
     # synthesis to honour the OpenAI ``tool_call guaranteed`` contract.
     # Without this, both shapes silently degraded to ``auto`` and Yuki
     # F6 saw zero tool_calls on the wire.
-    tool_calls = _enforce_responses_tool_choice(
-        tool_calls, responses_request, openai_request
-    )
+    try:
+        tool_calls = _enforce_responses_tool_choice(
+            tool_calls, responses_request, openai_request
+        )
+        if tool_calls and openai_request.tools:
+            _validate_tool_call_params(
+                tool_calls, openai_request.tools, enforce_required=True
+            )
+    except HTTPException as tool_error:
+        detail = tool_error.detail
+        classified_code = getattr(tool_error, "rapid_mlx_error_code", None)
+        if classified_code is None:
+            raise
+        if isinstance(detail, dict):
+            envelope = detail.get("error", {})
+            code = envelope.get("code", "tool_choice_unfulfilled")
+            message = envelope.get("message", "tool choice could not be fulfilled")
+        else:
+            code = classified_code
+            message = str(detail)
+        failed_payload = ResponsesResponse(
+            id=f"resp_{uuid.uuid4().hex[:24]}",
+            created_at=created_at,
+            model=cfg.model_name or responses_request.model,
+            status="failed",
+            output=[],
+            usage=ResponsesUsage(
+                input_tokens=output.prompt_tokens or 0,
+                output_tokens=output.completion_tokens or 0,
+                total_tokens=(output.prompt_tokens or 0)
+                + (output.completion_tokens or 0),
+            ),
+        )
+        payload = failed_payload.model_dump(exclude_none=True)
+        payload["error"] = {"code": code, "message": message}
+        return Response(content=json.dumps(payload), media_type="application/json")
 
     cleaned_text, reasoning_text = _finalize_content_and_reasoning(
         raw_text=output.raw_text or output.text,
@@ -1552,6 +1586,35 @@ async def _non_stream(
         finish_reason,
         include_reasoning_tail=not _uses_deepseek_v4_reasoning(cfg),
     )
+
+    if (
+        output.finish_reason == "stop"
+        and responses_request.tools
+        and not tool_calls
+        and not (final_content or "").strip()
+    ):
+        failed_payload = ResponsesResponse(
+            id=f"resp_{uuid.uuid4().hex[:24]}",
+            created_at=created_at,
+            model=cfg.model_name or responses_request.model,
+            status="failed",
+            output=[],
+            usage=ResponsesUsage(
+                input_tokens=output.prompt_tokens or 0,
+                output_tokens=output.completion_tokens or 0,
+                total_tokens=(output.prompt_tokens or 0)
+                + (output.completion_tokens or 0),
+            ),
+        )
+        payload = failed_payload.model_dump(exclude_none=True)
+        payload["error"] = {
+            "code": "model_no_final_answer",
+            "message": (
+                "The model stopped without producing a final answer or tool "
+                "call. Retry the request."
+            ),
+        }
+        return Response(content=json.dumps(payload), media_type="application/json")
 
     openai_response = ChatCompletionResponse(
         model=cfg.model_name or openai_request.model,
@@ -1987,6 +2050,8 @@ async def _stream_responses(
         # ``_open_message_item``) so the post-loop reasoning emitter
         # knows whether it still needs to ship ``added`` or only ``done``.
         reasoning_item_added = False
+        reasoning_item_finalized = False
+        reasoning_item_payload_done: dict | None = None
 
         # Per-request reasoning parser instance (matches anthropic.py).
         reasoning_parser = None
@@ -2104,6 +2169,94 @@ async def _stream_responses(
                 )
             return events
 
+        def _close_reasoning_before_message() -> list[str]:
+            """Close the active reasoning ladder before opening a message.
+
+            Codex's Responses stream reducer tracks one active output item.
+            Interleaving ``reasoning added -> message added/done -> reasoning
+            summary/done`` loses the reasoning item and produces
+            ``ReasoningSummaryPartAdded without active item``.  Once public
+            content arrives the reasoning phase is necessarily complete, so
+            its summary can be finalized immediately and contiguously.
+            """
+            nonlocal reasoning_item_finalized, reasoning_item_payload_done
+            if reasoning_item_finalized or not reasoning_item_added:
+                return []
+            assert reasoning_item_id is not None
+            assert reasoning_output_index is not None
+
+            events: list[str] = []
+            summary = []
+            if accumulated_reasoning_text:
+                summary_part = {
+                    "type": "summary_text",
+                    "text": accumulated_reasoning_text,
+                }
+                events.extend(
+                    [
+                        _emit(
+                            "response.reasoning_summary_part.added",
+                            {
+                                "type": "response.reasoning_summary_part.added",
+                                "item_id": reasoning_item_id,
+                                "output_index": reasoning_output_index,
+                                "summary_index": 0,
+                                "part": {"type": "summary_text", "text": ""},
+                            },
+                        ),
+                        _emit(
+                            "response.reasoning_summary_text.delta",
+                            {
+                                "type": "response.reasoning_summary_text.delta",
+                                "item_id": reasoning_item_id,
+                                "output_index": reasoning_output_index,
+                                "summary_index": 0,
+                                "delta": accumulated_reasoning_text,
+                            },
+                        ),
+                        _emit(
+                            "response.reasoning_summary_text.done",
+                            {
+                                "type": "response.reasoning_summary_text.done",
+                                "item_id": reasoning_item_id,
+                                "output_index": reasoning_output_index,
+                                "summary_index": 0,
+                                "text": accumulated_reasoning_text,
+                            },
+                        ),
+                        _emit(
+                            "response.reasoning_summary_part.done",
+                            {
+                                "type": "response.reasoning_summary_part.done",
+                                "item_id": reasoning_item_id,
+                                "output_index": reasoning_output_index,
+                                "summary_index": 0,
+                                "part": summary_part,
+                            },
+                        ),
+                    ]
+                )
+                summary = [summary_part]
+
+            reasoning_item_payload_done = {
+                "type": "reasoning",
+                "id": reasoning_item_id,
+                "status": "completed",
+                "summary": summary,
+            }
+            events.append(
+                _emit(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": reasoning_output_index,
+                        "item": reasoning_item_payload_done,
+                    },
+                )
+            )
+            reasoning_item_finalized = True
+            return events
+
         async def _open_message_item() -> list[str]:
             """Emit response.output_item.added + response.content_part.added.
 
@@ -2133,6 +2286,7 @@ async def _stream_responses(
                 content_part_open
             # Flush any leading items first — the ordering invariant.
             leading_events = _emit_pending_leading_items()
+            leading_events.extend(_close_reasoning_before_message())
             message_item_id = f"msg_{uuid.uuid4().hex[:24]}"
             # Leading-item count drives the message's output_index. Today
             # the only leading item is reasoning (index 0 when emitted), so
@@ -2767,6 +2921,14 @@ async def _stream_responses(
             tool_calls = _enforce_responses_tool_choice(
                 parsed_tool_calls, responses_request, openai_request
             )
+            if (
+                tool_calls
+                and openai_request.tools
+                and cfg.tool_call_parser == "deepseek_v4_0731"
+            ):
+                _validate_tool_call_params(
+                    tool_calls, openai_request.tools, enforce_required=True
+                )
         except HTTPException as forced_choice_err:
             # Drop any deferred buffered text — the request failed
             # under forced choice, the deferred prose has no
@@ -2780,7 +2942,11 @@ async def _stream_responses(
                     "message", "tool_choice could not be fulfilled"
                 )
             else:
-                err_code = "tool_choice_unfulfilled"
+                err_code = getattr(
+                    forced_choice_err,
+                    "rapid_mlx_error_code",
+                    "tool_choice_unfulfilled",
+                )
                 err_msg = str(err_detail)
             yield _emit(
                 "response.failed",
@@ -2841,7 +3007,7 @@ async def _stream_responses(
         # consistent with what the wire actually showed.
         _reasoning_slot_reserved = reasoning_item_added
         if _reasoning_slot_reserved:
-            completed_output.append({})  # placeholder filled below
+            completed_output.append(reasoning_item_payload_done or {})
 
         def _stream_usage_payload() -> dict:
             # #591 P2 (item 6): floor-clamp before the upper clamp. A buggy
@@ -2971,8 +3137,11 @@ async def _stream_responses(
 
         def _finalize_reasoning_item_events() -> tuple[list[str], dict | None, bool]:
             nonlocal reasoning_item_id, reasoning_output_index, reasoning_item_added
+            nonlocal reasoning_item_finalized, reasoning_item_payload_done
             events: list[str] = []
             uses_reserved_slot = bool(reasoning_item_added)
+            if reasoning_item_finalized:
+                return events, reasoning_item_payload_done, uses_reserved_slot
             if reasoning_item_added:
                 if reasoning_output_index is None:
                     reasoning_output_index = 0
@@ -3012,6 +3181,7 @@ async def _stream_responses(
                     },
                 )
             )
+            reasoning_item_finalized = True
             return events, reasoning_item_payload_done, uses_reserved_slot
 
         # Close the message item if we ever opened it.
@@ -3134,7 +3304,12 @@ async def _stream_responses(
         # ``downstream_output_seen`` signal above for the length-cutoff
         # mid-think decision, but gate stop-reason success on output the
         # Responses client can actually consume.
-        consumable_output_seen = bool(tool_calls or message_open)
+        # A lazily-opened message can still contain only formatting
+        # whitespace (observed with DeepSeek V4 Flash ending immediately
+        # after ``</think>``).  Codex renders that as a successful blank turn
+        # and never retries or executes a tool.  Require semantic text, not
+        # merely a message event ladder, before declaring the turn consumable.
+        consumable_output_seen = bool(tool_calls or accumulated_text.strip())
         # R12-M3 codex r1 BLOCKING: ``mid_think_cutoff`` is the
         # "cut off while still inside ``<think>``" signal; it must
         # additionally require reasoning bytes actually accumulated.
@@ -3169,8 +3344,44 @@ async def _stream_responses(
         no_final_answer_stop = (
             last_finish_reason == "stop"
             and not consumable_output_seen
-            and no_final_answer_generated_signal
+            # Immediate EOS remains a valid empty response for ordinary prose
+            # requests.  It is not valid for an agent turn that supplied tools:
+            # Codex has nothing to render or execute and otherwise treats the
+            # empty turn as success instead of retrying.
+            and (no_final_answer_generated_signal or bool(responses_request.tools))
         )
+
+        # A reasoning parser that returns to the reasoning channel after
+        # public content has started violates the Responses item ordering
+        # contract. The reasoning item is already closed at that point and
+        # Codex cannot accept another summary ladder after the message item.
+        # Fail explicitly instead of silently dropping the late bytes.
+        emitted_reasoning = ""
+        if reasoning_item_payload_done is not None:
+            emitted_reasoning = "".join(
+                str(part.get("text") or "")
+                for part in reasoning_item_payload_done.get("summary", [])
+                if isinstance(part, dict)
+            )
+        if reasoning_item_finalized and emitted_reasoning != accumulated_reasoning_text:
+            yield _emit(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": _stream_response_payload(
+                        "failed",
+                        error={
+                            "code": "invalid_reasoning_event_order",
+                            "message": (
+                                "The model emitted reasoning after public content; "
+                                "retry the request."
+                            ),
+                        },
+                    ),
+                },
+            )
+            return
+
         if no_final_answer_stop:
             reasoning_events, reasoning_item_payload_done, uses_reserved_slot = (
                 _finalize_reasoning_item_events()
@@ -3184,10 +3395,17 @@ async def _stream_responses(
                     )
                 else:
                     completed_output.append(reasoning_item_payload_done)
+            error_code = "model_no_final_answer"
+            error_message = (
+                "The model stopped after generating hidden output but did "
+                "not produce a final answer or tool call. Retry the "
+                "request; if it repeats, reduce the prompt or reasoning "
+                "budget."
+            )
             logger.warning(
-                "Responses (stream): model stopped after hidden output "
-                "but before any final message/tool_call; surfacing as "
+                "Responses (stream): non-progress stop (%s); surfacing as "
                 "response.failed (completion_tokens=%d)",
+                error_code,
                 completion_tokens,
             )
             yield _emit(
@@ -3197,13 +3415,8 @@ async def _stream_responses(
                     "response": _stream_response_payload(
                         "failed",
                         error={
-                            "code": "model_no_final_answer",
-                            "message": (
-                                "The model stopped after generating hidden output "
-                                "but did not produce a final answer or tool "
-                                "call. Retry the request; if it repeats, "
-                                "reduce the prompt or reasoning budget."
-                            ),
+                            "code": error_code,
+                            "message": error_message,
                         },
                     ),
                 },

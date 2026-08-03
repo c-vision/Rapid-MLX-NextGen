@@ -308,7 +308,8 @@ class TestResponsesStreamEventOrder:
             headers=HEADERS,
         ) as resp:
             body = "".join(resp.iter_text())
-        names = [n for n, _ in _parse_sse(body)]
+        events = _parse_sse(body)
+        names = [n for n, _ in events]
 
         # Each of these must appear at least once.
         expected_singletons = [
@@ -324,12 +325,24 @@ class TestResponsesStreamEventOrder:
 
         # Ordering — pull the first index of each landmark and assert
         # they're monotonically increasing.
+        message_added_idx = next(
+            i
+            for i, (name, data) in enumerate(events)
+            if name == "response.output_item.added"
+            and data.get("item", {}).get("type") == "message"
+        )
+        message_done_idx = next(
+            i
+            for i, (name, data) in enumerate(events)
+            if name == "response.output_item.done"
+            and data.get("item", {}).get("type") == "message"
+        )
         landmarks = [
             ("response.created", names.index("response.created")),
             ("response.in_progress", names.index("response.in_progress")),
             (
                 "response.output_item.added",
-                names.index("response.output_item.added"),
+                message_added_idx,
             ),
             (
                 "response.output_text.delta",
@@ -341,7 +354,7 @@ class TestResponsesStreamEventOrder:
             ),
             (
                 "response.output_item.done",
-                names.index("response.output_item.done"),
+                message_done_idx,
             ),
             ("response.completed", names.index("response.completed")),
         ]

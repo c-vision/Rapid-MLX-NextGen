@@ -996,6 +996,22 @@ class TestValidateToolCallParams:
             self._make_tools(),
         )
 
+    def test_missing_required_argument_raises_400(self):
+        from fastapi import HTTPException
+
+        from vllm_mlx.server import _validate_tool_call_params
+
+        tools = self._make_tools()
+        tools[0]["function"]["parameters"]["required"] = ["location"]
+        with pytest.raises(HTTPException) as exc_info:
+            _validate_tool_call_params(
+                self._make_tool_calls(arguments="{}"),
+                tools,
+                enforce_required=True,
+            )
+        assert exc_info.value.status_code == 400
+        assert "location" in exc_info.value.detail
+
     def test_type_mismatch_raises_400(self):
         """F-141: type violation now enforced as HTTPException(400)."""
         from fastapi import HTTPException
