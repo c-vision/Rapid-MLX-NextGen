@@ -14,8 +14,35 @@ import Foundation
 /// specific extras (``error_type``, ``stack_frames``, ``context``)
 /// without forking the Worker.
 enum TelemetryConfig {
-    /// Where event batches POST.
-    static let endpoint = URL(string: "https://telemetry.rapidmlx.com/v1/events")!
+    /// Production endpoint. See ``endpoint`` for the (loopback-only)
+    /// developer override.
+    static let productionEndpoint = URL(string: "https://telemetry.rapidmlx.com/v1/events")!
+
+    /// Where event batches POST. Normally ``productionEndpoint``. A
+    /// developer may set ``RAPID_MLX_TELEMETRY_ENDPOINT`` to a **loopback**
+    /// URL (`http://127.0.0.1:…` / `http://localhost:…`) to point the
+    /// pipeline at a local capture server and audit exactly what the app
+    /// sends. The override is restricted to loopback + `http` so it can
+    /// never redirect a real user's telemetry to an arbitrary remote host.
+    static var endpoint: URL {
+        resolveEndpoint(environment: ProcessInfo.processInfo.environment)
+    }
+
+    /// Testable core of ``endpoint``. Honors ``RAPID_MLX_TELEMETRY_ENDPOINT``
+    /// ONLY when it parses to a loopback ``http`` URL (``127.0.0.1`` /
+    /// ``localhost``); a remote host, an ``https`` remote, or garbage all
+    /// fall back to ``productionEndpoint`` so the override can never exfil
+    /// a real user's telemetry off-box.
+    static func resolveEndpoint(environment: [String: String]) -> URL {
+        if let raw = environment["RAPID_MLX_TELEMETRY_ENDPOINT"],
+           let url = URL(string: raw),
+           url.scheme == "http",
+           let host = url.host,
+           host == "127.0.0.1" || host == "localhost" {
+            return url
+        }
+        return productionEndpoint
+    }
 
     /// Schema version the Worker requires on every event.
     static let schemaVersion = 1
