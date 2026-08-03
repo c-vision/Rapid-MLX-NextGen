@@ -3335,6 +3335,10 @@ def serve_command(args):
         # #1103/#1122: bounded trim-free hybrid (recurrent-state) prefix reuse.
         # Auto-defaulted to 8 for hybrid models when prefix cache is enabled.
         hybrid_cache_entries=_hybrid_cache_entries,
+        # Operator override for the D-METAL-CAP projection; 0 keeps the
+        # architecture-aware auto-derivation. Needed by quantized-KV
+        # deployments, whose real footprint the fp16 estimate over-states.
+        metal_cap_kv_bytes_per_token=getattr(args, "metal_cap_kv_bytes_per_token", 0),
         non_trimmable_exact_prefix_reuse=(
             _hybrid_cache_entries > 0
             and _needs_bounded_trim_free_reuse(
@@ -3980,7 +3984,6 @@ def _run_submit_flow(
     from pathlib import Path
 
     from huggingface_hub.utils import RepositoryNotFoundError
-    from mlx_lm import load
 
     from .community_bench.hardware import collect as collect_hw
     from .community_bench.hardware import is_apple_silicon
@@ -3992,6 +3995,11 @@ def _run_submit_flow(
     from .engine_core import AsyncEngineCore, EngineConfig
     from .model_aliases import resolve_profile
     from .scheduler import SchedulerConfig
+
+    # Same gemma4 routing fix as ``bench_command``: ``mlx_lm.load`` cannot
+    # construct ``gemma4_unified``, so every ``gemma-4-12b-*`` alias failed
+    # to load here and could never be submitted to the community corpus.
+    from .utils.tokenizer import load_model_with_fallback as load
 
     if not is_apple_silicon():
         print(
@@ -4325,8 +4333,14 @@ def bench_command(args):
     if getattr(args, "submit", False):
         sys.exit(_run_submit_flow(args))
 
-    from mlx_lm import load
-
+    # Use the SAME loader ``serve`` uses, not the bare ``mlx_lm.load``.
+    # ``mlx_lm`` has no ``gemma4_unified`` architecture (the model classes
+    # live in mlx-vlm), so a bare ``load`` raises "Model type
+    # gemma4_unified not supported" for EVERY ``gemma-4-12b-*`` alias and
+    # bench can never run them — even though ``serve`` runs them fine.
+    # ``load_model_with_fallback`` carries the gemma4 router (plus the
+    # vendored-arch and tokenizer-fallback routes) and calls
+    # ``validate_local_model_file`` internally.
     from .engine_core import AsyncEngineCore, EngineConfig
     from .pflash import config_from_args as _pflash_config_from_args
     from .pflash import resolve_pflash_mode_default as _pflash_resolve_default
@@ -4334,6 +4348,7 @@ def bench_command(args):
     from .request import SamplingParams
     from .scheduler import SchedulerConfig
     from .utils.model_file_guard import validate_local_model_file
+    from .utils.tokenizer import load_model_with_fallback as load
 
     _check_disk_space(args.model, force=getattr(args, "force_disk_check", False))
     _check_memory_capacity(args.model)
@@ -7482,6 +7497,33 @@ Examples:
             "workloads. An identical exact re-request of a rotated "
             "sliding-window prompt falls back to a full prefill (byte-equal to "
             "cold)."
+        ),
+    )
+    # Operator override for the D-METAL-CAP admission projection. The
+    # auto-derived figure assumes an UNCOMPRESSED fp16 KV cache — see
+    # ``Scheduler._infer_kv_dtype_bytes``, which documents that quantized-KV
+    # deployments are not auto-detected and names this knob as the escape
+    # hatch. It was reachable only from the Python API, so a CLI user running
+    # ``--kv-cache-turboquant`` / ``--kv-cache-quantization`` got an admission
+    # projection that ignored the codec entirely and 503'd long prompts the
+    # codec would have fit. Default 0 preserves auto-derivation exactly.
+    serve_parser.add_argument(
+        "--metal-cap-kv-bytes-per-token",
+        type=non_negative_int,
+        default=0,
+        metavar="BYTES",
+        help=(
+            "Override the per-token KV-cache size the D-METAL-CAP admission "
+            "gate projects, in bytes. 0 (default) auto-derives an "
+            "architecture-aware fp16 figure. Set this when running a "
+            "quantized KV cache (--kv-cache-turboquant / "
+            "--kv-cache-quantization), whose real footprint the auto-derived "
+            "figure over-estimates — an over-estimate only costs you spurious "
+            "503s, but on a memory-tight Mac that is the difference between a "
+            "long prompt being served and being rejected. UNDER-setting it "
+            "risks the OOM cliff the gate exists to prevent: lower it only to "
+            "a value you have measured. Overrides the architecture-aware "
+            "estimator wholesale (sliding-window and recurrent terms included)."
         ),
     )
     # Opt-in prompt-deterministic RESPONSE CACHE (exact-match short-circuit).
