@@ -2215,13 +2215,17 @@ class BatchedEngine(BaseEngine):
     def _compute_prefix_boundary(
         self, messages: list[dict[str, Any]], tools: list[dict] | None = None
     ) -> int:
-        """Compute token count for the shared prefix across message variations.
+        """Compute the latest prefix that is stable across the next turn.
 
-        Uses a two-tokenization approach: tokenize the full prompt twice
-        (once as-is, once with the last user message replaced by a dummy)
-        and find the longest common prefix (LCP).  This gives the exact
-        boundary where different user suffixes diverge, avoiding template
-        discrepancies (e.g. Qwen3 <think> markers on last assistant).
+        The preferred boundary is the prompt rendered *without* the assistant
+        generation marker.  That includes the latest user message but excludes
+        the template-only suffix which is replaced by the real assistant turn
+        on the next request.  Saving there prevents non-trimmable hybrid and
+        DeepSeek-V4 caches from lagging one conversation turn.
+
+        Some third-party templates do not make the no-generation rendering a
+        strict prefix of the generation rendering.  For those, retain the
+        historical dummy-last-user LCP boundary as a conservative fallback.
         """
         # Find index of last user message
         last_user_idx = None
@@ -2234,10 +2238,55 @@ class BatchedEngine(BaseEngine):
         try:
             template_tools = convert_tools_for_template(tools) if tools else None
 
-            # Tokenize the real prompt
-            real_prompt = self._apply_chat_template(messages, template_tools)
+            # Tokenize the real generation prompt and the same conversation
+            # before its transient assistant-generation marker is appended.
+            real_prompt = self._apply_chat_template(
+                messages, template_tools, add_generation_prompt=True
+            )
+            stable_prompt = self._apply_chat_template(
+                messages, template_tools, add_generation_prompt=False
+            )
+            next_turn_prompt = self._apply_chat_template(
+                [
+                    *messages,
+                    {
+                        "role": "assistant",
+                        "content": "__rapid_mlx_boundary_probe__",
+                    },
+                ],
+                template_tools,
+                add_generation_prompt=False,
+            )
 
-            # Build a dummy variant with different last user content
+            tokenizer = self.tokenizer
+            if hasattr(tokenizer, "tokenizer"):
+                tokenizer = tokenizer.tokenizer
+
+            real_tokens = tokenizer.encode(real_prompt)
+            stable_tokens = tokenizer.encode(stable_prompt)
+            next_turn_tokens = tokenizer.encode(next_turn_prompt)
+            stable_lcp = 0
+            for real_token, stable_token in zip(real_tokens, stable_tokens):
+                if real_token != stable_token:
+                    break
+                stable_lcp += 1
+
+            # A useful snapshot must be strictly inside the generation prompt;
+            # equality produces no inter-segment boundary in BatchGenerator.
+            next_turn_lcp = 0
+            for real_token, next_token in zip(real_tokens, next_turn_tokens):
+                if real_token != next_token:
+                    break
+                next_turn_lcp += 1
+            if (
+                stable_lcp == len(stable_tokens)
+                and next_turn_lcp >= len(stable_tokens)
+                and stable_lcp < len(real_tokens)
+            ):
+                return stable_lcp
+
+            # Conservative fallback for templates whose no-generation form is
+            # not a strict prefix of their generation form.
             dummy_messages = list(messages)
             dummy_messages[last_user_idx] = {
                 **messages[last_user_idx],
@@ -2245,11 +2294,6 @@ class BatchedEngine(BaseEngine):
             }
             dummy_prompt = self._apply_chat_template(dummy_messages, template_tools)
 
-            tokenizer = self.tokenizer
-            if hasattr(tokenizer, "tokenizer"):
-                tokenizer = tokenizer.tokenizer
-
-            real_tokens = tokenizer.encode(real_prompt)
             dummy_tokens = tokenizer.encode(dummy_prompt)
 
             # Find LCP — the point where the two diverge is the boundary
@@ -2259,7 +2303,7 @@ class BatchedEngine(BaseEngine):
                     break
                 lcp = j + 1
 
-            return lcp
+            return min(lcp, next_turn_lcp) if stable_lcp else lcp
         except Exception:
             return 0
 

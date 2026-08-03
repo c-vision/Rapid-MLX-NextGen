@@ -25,6 +25,11 @@ from vllm_mlx.engine.batched import BatchedEngine
 _SENTINEL_BOUNDARY = 42
 
 
+class _CharacterTokenizer:
+    def encode(self, text):
+        return [ord(char) for char in text]
+
+
 class _StubOutput:
     """Minimal stand-in for the GenerationOutput type returned by
     ``self._engine.generate`` / ``stream_generate``. Carries the fields
@@ -235,3 +240,81 @@ def test_nontrimmable_pure_attention_forwards_boundary_both_paths(monkeypatch):
 
     asyncio.run(_drain())
     assert stub.last_generate_kwargs.get("prefix_boundary") == _SENTINEL_BOUNDARY
+
+
+def test_prefix_boundary_prefers_latest_stable_message_boundary(monkeypatch):
+    """Exclude the transient generation suffix, not the latest user turn."""
+    engine, _ = _build_engine(monkeypatch)
+    engine._compute_prefix_boundary = BatchedEngine._compute_prefix_boundary.__get__(
+        engine, BatchedEngine
+    )
+    engine._tokenizer = _CharacterTokenizer()
+
+    def render(messages, tools=None, *, add_generation_prompt=True, **kwargs):
+        body = "|".join(str(message.get("content", "")) for message in messages)
+        return body + ("|ASSISTANT_GENERATION" if add_generation_prompt else "")
+
+    monkeypatch.setattr(engine, "_apply_chat_template", render)
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "latest"},
+    ]
+    stable = render(messages, add_generation_prompt=False)
+
+    assert engine._compute_prefix_boundary(messages) == len(stable)
+
+
+def test_prefix_boundary_falls_back_when_no_generation_form_is_not_prefix(
+    monkeypatch,
+):
+    """Third-party template drift keeps the conservative dummy-user LCP."""
+    engine, _ = _build_engine(monkeypatch)
+    engine._compute_prefix_boundary = BatchedEngine._compute_prefix_boundary.__get__(
+        engine, BatchedEngine
+    )
+    engine._tokenizer = _CharacterTokenizer()
+
+    def render(messages, tools=None, *, add_generation_prompt=True, **kwargs):
+        if not add_generation_prompt:
+            return "not-a-prefix"
+        latest = messages[-1].get("content", "")
+        return f"shared-history|{latest}|generation"
+
+    monkeypatch.setattr(engine, "_apply_chat_template", render)
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "latest"},
+    ]
+
+    assert engine._compute_prefix_boundary(messages) == len("shared-history|")
+
+
+def test_prefix_boundary_rejects_last_user_rewrite_on_next_turn(monkeypatch):
+    engine, _ = _build_engine(monkeypatch)
+    engine._compute_prefix_boundary = BatchedEngine._compute_prefix_boundary.__get__(
+        engine, BatchedEngine
+    )
+    engine._tokenizer = _CharacterTokenizer()
+
+    def render(messages, tools=None, *, add_generation_prompt=True, **kwargs):
+        parts = []
+        for index, message in enumerate(messages):
+            content = str(message.get("content", ""))
+            is_final_user = index == len(messages) - 1 and message.get("role") == "user"
+            parts.append(f"LAST:{content}" if is_final_user else f"TURN:{content}")
+        body = "shared|" + "|".join(parts)
+        return body + ("|GEN" if add_generation_prompt else "")
+
+    monkeypatch.setattr(engine, "_apply_chat_template", render)
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "latest"},
+    ]
+
+    boundary = engine._compute_prefix_boundary(messages)
+    assert boundary < len(render(messages, add_generation_prompt=False))
+    assert boundary == len("shared|TURN:system|")

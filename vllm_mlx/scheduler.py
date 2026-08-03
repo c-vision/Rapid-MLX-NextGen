@@ -378,6 +378,20 @@ class SchedulerConfig:
     # end of the dataclass field list to preserve positional compatibility.
     dspark_num_speculative_tokens: int = 5
 
+    # Long-context prefill guard. mlx-lm already processes one bounded prompt
+    # chunk per BatchGenerator.next() and materializes cache state between
+    # chunks. What it cannot know is how much unified-memory headroom the
+    # surrounding server (model + retained prefixes + other requests) has.
+    # Appended here to preserve positional SchedulerConfig compatibility.
+    adaptive_prefill: bool = True
+    adaptive_prefill_min_tokens: int = 32_768
+    adaptive_prefill_min_chunk_size: int = 256
+    # The ordinary Metal free-cache limit is intentionally generous for
+    # decode throughput. During a very long prefill that same cache competes
+    # with growing KV state and the current forward's transient allocations.
+    # Temporarily cap it, then restore the device-scaled default when prefill
+    # completes. Zero disables only this cache-limit guard.
+
     def __post_init__(self) -> None:
         if self.response_cache_entries < 0:
             raise ValueError("response_cache_entries must be >= 0")
@@ -2637,6 +2651,9 @@ class Scheduler:
         self._step_count = 0
         self._clear_cache_interval = 32
         self._memory_log_interval = 256
+        self._last_adaptive_prefill_size = self.config.prefill_step_size
+        self._adaptive_prefill_protected_chunks = 0
+        self._adaptive_prefill_reduced_chunks = 0
         # D-METAL-CAP / D-METAL-PFX: cached hard cap in bytes for fast
         # admission checks. Computed lazily on first use so unit tests
         # that build a Scheduler against a fake model with no Metal
@@ -3767,6 +3784,162 @@ class Scheduler:
             return int(mx.get_active_memory())
         except Exception:
             return 0
+
+    def _current_process_resident_bytes(self) -> int:
+        """Best-effort process footprint for unified-memory pressure.
+
+        MLX active memory omits Python objects, token buffers and some Metal
+        driver allocations. macOS ``phys_footprint`` is the authoritative
+        kernel ledger; RSS is retained as a portable fallback for Linux CI.
+        """
+        try:
+            from .runtime.process_memory import get_phys_footprint
+
+            footprint = get_phys_footprint()
+            if footprint > 0:
+                return footprint
+        except Exception:
+            pass
+        try:
+            import psutil
+
+            return int(psutil.Process().memory_info().rss)
+        except Exception:
+            return 0
+
+    def _active_prefill_token_count(self) -> int:
+        """Return the largest final context offset currently prefetched.
+
+        Workspace at a long attention offset can be large even when a prefix
+        hit leaves only a tiny suffix. Count cached/all-token history plus the
+        remaining segments, not merely the suffix workload.
+        """
+        bg = getattr(self, "batch_generator", None)
+        processing = getattr(bg, "_currently_processing", ()) if bg else ()
+        prompt_batch = getattr(bg, "_prompt_batch", None) if bg else None
+        prior_tokens = getattr(prompt_batch, "tokens", ()) if prompt_batch else ()
+        largest = 0
+        for index, item in enumerate(processing):
+            try:
+                already_cached = (
+                    len(prior_tokens[index]) if index < len(prior_tokens) else 0
+                )
+                processed = int(item[1])
+                remaining = max(0, int(item[2]) - processed)
+                largest = max(largest, already_cached + remaining)
+            except (IndexError, TypeError, ValueError):
+                continue
+        # Requests have not entered ``_currently_processing`` on their first
+        # scheduler tick yet. Include queued BatchGenerator segments so the
+        # first cold chunk is guarded too.
+        queued = getattr(bg, "_unprocessed_sequences", ()) if bg else ()
+        for item in queued:
+            try:
+                largest = max(
+                    largest,
+                    len(item[4]) + sum(len(seg) for seg in item[1]),
+                )
+            except (IndexError, TypeError):
+                continue
+        # mlx-lm may represent a prefix-cache hit as a fresh prompt batch
+        # containing only the uncached suffix. In that transition window
+        # ``prior_tokens`` therefore understates the resident KV offset. The
+        # public Request retains the full model prompt length; use it while a
+        # prefill queue is actually active, but never during decode (where it
+        # would keep the low cache ceiling armed for the whole completion).
+        if processing or queued:
+            for request in getattr(self, "running", {}).values():
+                try:
+                    largest = max(
+                        largest,
+                        int(request.model_prompt_tokens or request.num_prompt_tokens),
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    continue
+        return largest
+
+    def _select_adaptive_prefill_size(self) -> int:
+        """Choose a memory-safe size for the next long-prompt chunk.
+
+        The thresholds intentionally start tightening at 70%: the 97k-token
+        DeepSeek-V4 repro showed a roughly 50 GB transient gap between steady
+        active memory and the prefill peak, so waiting until 90% is too late.
+        """
+        configured = max(1, int(getattr(self.config, "prefill_step_size", 2048)))
+        if not getattr(self.config, "adaptive_prefill", True):
+            return configured
+        minimum_prompt = max(
+            1, int(getattr(self.config, "adaptive_prefill_min_tokens", 32_768))
+        )
+        if self._active_prefill_token_count() < minimum_prompt:
+            return configured
+        cap = self._resolve_metal_cap_bytes()
+        if cap <= 0:
+            return configured
+        footprint = max(
+            self._current_metal_active_bytes(), self._current_process_resident_bytes()
+        )
+        ratio = footprint / cap
+        floor = max(
+            1, int(getattr(self.config, "adaptive_prefill_min_chunk_size", 256))
+        )
+        if ratio >= 0.88:
+            target = 256
+        elif ratio >= 0.80:
+            target = 512
+        elif ratio >= 0.70:
+            target = 1024
+        else:
+            target = configured
+        return min(configured, max(floor, target))
+
+    def _apply_adaptive_prefill_size(self) -> int:
+        """Apply the selected size to mlx-lm's current and future batches."""
+        bg = getattr(self, "batch_generator", None)
+        if bg is None:
+            return 0
+        configured = max(1, int(getattr(self.config, "prefill_step_size", 2048)))
+        if not getattr(self.config, "adaptive_prefill", True):
+            bg.prefill_step_size = configured
+            prompt_batch = getattr(bg, "_prompt_batch", None)
+            if prompt_batch is not None:
+                prompt_batch.prefill_step_size = configured
+            self._last_adaptive_prefill_size = configured
+            return configured
+        selected = self._select_adaptive_prefill_size()
+        prompt_tokens = self._active_prefill_token_count()
+        minimum_prompt = max(
+            1, int(getattr(self.config, "adaptive_prefill_min_tokens", 32_768))
+        )
+        if prompt_tokens >= minimum_prompt:
+            # Pressure samples can wobble around a threshold as allocator
+            # slabs are materialized and released. Growing the chunk again in
+            # the same prefill causes oscillation and can recreate the peak we
+            # just avoided. A completed prompt naturally restores configured
+            # size on the next decode/idle tick.
+            previous = getattr(self, "_last_adaptive_prefill_size", configured)
+            selected = min(selected, previous)
+            self._adaptive_prefill_protected_chunks += 1
+            if selected < configured:
+                self._adaptive_prefill_reduced_chunks += 1
+        bg.prefill_step_size = selected
+        prompt_batch = getattr(bg, "_prompt_batch", None)
+        if prompt_batch is not None:
+            prompt_batch.prefill_step_size = selected
+        previous = getattr(self, "_last_adaptive_prefill_size", None)
+        if previous != selected:
+            logger.info(
+                "[adaptive_prefill] chunk %s -> %s tokens prompt=%s "
+                "metal=%.1fGB rss=%.1fGB cap=%.1fGB",
+                previous,
+                selected,
+                prompt_tokens,
+                self._current_metal_active_bytes() / 1e9,
+                self._current_process_resident_bytes() / 1e9,
+                self._resolve_metal_cap_bytes() / 1e9,
+            )
+            self._last_adaptive_prefill_size = selected
+        return selected
 
     def _infer_kv_dtype_bytes(self, model_config: Any) -> int:
         """Best-effort KV-cache dtype-bytes inference.
@@ -6392,6 +6565,10 @@ class Scheduler:
                     # the plain decode hot path (codex #558-PR3).
                     if self._realign_guard_armed():
                         self._realign_grammar_logits_processors()
+                    # mlx-lm consumes at most one prompt chunk in this call.
+                    # Tighten that chunk before dispatch when a long cold or
+                    # cache-miss prefill is approaching the unified-memory cap.
+                    self._apply_adaptive_prefill_size()
                     raw_next = self.batch_generator.next()
                     output.has_work = True
 
@@ -6707,6 +6884,15 @@ class Scheduler:
             "num_metal_cap_violations": self.num_metal_cap_violations,
             "num_prefix_cache_pressure_evictions": (
                 self.num_prefix_cache_pressure_evictions
+            ),
+            "adaptive_prefill_chunk_size": getattr(
+                self, "_last_adaptive_prefill_size", self.config.prefill_step_size
+            ),
+            "adaptive_prefill_protected_chunks": getattr(
+                self, "_adaptive_prefill_protected_chunks", 0
+            ),
+            "adaptive_prefill_reduced_chunks": getattr(
+                self, "_adaptive_prefill_reduced_chunks", 0
             ),
         }
         # R15-P1 (task #296): disk-backed KV checkpoint counters.

@@ -293,6 +293,11 @@ async def status():
         "total_completion_tokens": stats.get("total_completion_tokens", 0),
         "generation_tps": _tps("generation_tps"),
         "prompt_tps": _tps("prompt_tps"),
+        "adaptive_prefill": {
+            "chunk_size": stats.get("adaptive_prefill_chunk_size"),
+            "protected_chunks": stats.get("adaptive_prefill_protected_chunks", 0),
+            "reduced_chunks": stats.get("adaptive_prefill_reduced_chunks", 0),
+        },
         "metal": {
             "active_memory_gb": stats.get("metal_active_memory_gb"),
             "peak_memory_gb": stats.get("metal_peak_memory_gb"),
