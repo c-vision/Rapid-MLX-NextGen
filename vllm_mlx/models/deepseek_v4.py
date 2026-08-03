@@ -5,7 +5,7 @@
 
 import math
 from dataclasses import dataclass, field
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -29,6 +29,11 @@ from mlx_lm.models.mla import MultiLinear
 from mlx_lm.models.pipeline import PipelineMixin
 
 from .deepseek_v4_cache import DeepseekV4PoolingCache, PoolingCache
+from .deepseek_v4_rollback import install_rotating_undo
+from .deepseek_v4_verify import install as install_dspark_verify
+
+install_rotating_undo()
+install_dspark_verify()
 from .deepseek_v4_hyper_connection import HyperConnection, HyperHead, hc_expand
 from .deepseek_v4_switch import FusedSwitchGLU
 
@@ -568,15 +573,17 @@ class Compressor(nn.Module):
             freq_scale=compress_ratio,
         )
 
-    def __call__(
+    def project(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        return self.wkv(x), self.wgate(x)
+
+    def consume(
         self,
-        x: mx.array,
+        kv: mx.array,
+        gate: mx.array,
         pool_cache: Optional[PoolingCache],
         offset: Union[int, mx.array],
     ) -> mx.array:
-        B, _, _ = x.shape
-        kv = self.wkv(x)
-        gate = self.wgate(x)
+        B = kv.shape[0]
         if pool_cache is None:
             usable = (kv.shape[1] // self.compress_ratio) * self.compress_ratio
             ready_kv, ready_gate = kv[:, :usable], gate[:, :usable]
@@ -587,7 +594,7 @@ class Compressor(nn.Module):
             )
 
         if ready_kv.size == 0:
-            new_pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
+            new_pooled = mx.zeros((B, 0, self.head_dim), dtype=kv.dtype)
         else:
             kv = mx.unflatten(ready_kv, 1, (-1, self.compress_ratio))
             gate = mx.unflatten(ready_gate, 1, (-1, self.compress_ratio))
@@ -623,6 +630,14 @@ class Compressor(nn.Module):
             new_pooled = pool_cache.update_and_fetch(new_pooled)
 
         return new_pooled
+
+    def __call__(
+        self,
+        x: mx.array,
+        pool_cache: Optional[PoolingCache],
+        offset: Union[int, mx.array],
+    ) -> mx.array:
+        return self.consume(*self.project(x), pool_cache, offset)
 
 
 class Indexer(nn.Module):
@@ -676,6 +691,192 @@ class Indexer(nn.Module):
             )
         k = min(self.index_topk, pooled.shape[1])
         return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+
+
+def _dspark_verify_active(batch: int, length: int) -> bool:
+    from .deepseek_v4_rollback import is_armed
+
+    return is_armed() and batch == 1 and 1 < length <= 6
+
+
+def _consume_rotating_verify_rows(cache, kv: mx.array) -> list[mx.array]:
+    """Advance a B=1 ring as ordinary M=1 decode and retain every view."""
+    steps = int(kv.shape[2])
+    if cache is None:
+        return [kv[..., : idx + 1, :] for idx in range(steps)]
+    empty = mx.zeros((*kv.shape[:-1], 0), dtype=kv.dtype)
+    rows = []
+    for idx in range(steps):
+        row, _ = cache.update_and_fetch(
+            kv[..., idx : idx + 1, :], empty[..., idx : idx + 1, :]
+        )
+        rows.append(row + 0)
+    return rows
+
+
+@lru_cache(maxsize=128)
+def _rotating_snapshot_indices(ring_size: int, slots: tuple[int, ...]) -> mx.array:
+    rows = []
+    for upto in range(len(slots)):
+        indices = list(range(ring_size))
+        for update in range(upto + 1):
+            indices[slots[update]] = ring_size + update
+        rows.append(indices)
+    return mx.array(rows, dtype=mx.uint32)
+
+
+@dataclass(frozen=True)
+class _RotatingVerifyView:
+    source: mx.array
+    indices: mx.array
+
+
+def _stage_rotating_verify_view(cache, kv: mx.array) -> Optional[_RotatingVerifyView]:
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        if not fast.has_symbol("dspark_ring_gemm"):
+            return None
+    except Exception:
+        return None
+    if cache is None or cache.keys is None:
+        return None
+    logical = int(getattr(cache, "_offset", cache.offset))
+    ring_size = int(cache.max_size)
+    if int(cache.keys.shape[2]) != ring_size or logical < ring_size:
+        return None
+    steps = int(kv.shape[2])
+    fields = ("keys", "values", "offset", "_idx")
+    if hasattr(cache, "_offset"):
+        fields += ("left_padding", "_offset", "rotated")
+    snapshot = {
+        name: (
+            getattr(cache, name) + 0
+            if isinstance(getattr(cache, name), mx.array)
+            else getattr(cache, name)
+        )
+        for name in fields
+    }
+    empty = mx.zeros((*kv.shape[:-1], 0), dtype=kv.dtype)
+    cache._rapid_undo = (snapshot, kv, empty)
+
+    write_idx = int(cache._idx)
+    slots = []
+    rotated = bool(getattr(cache, "rotated", False))
+    rotated_writes = 0
+    for _ in range(steps):
+        if write_idx == ring_size:
+            write_idx = 0 if hasattr(cache, "_offset") else int(cache.keep)
+            rotated = True
+        if rotated:
+            rotated_writes += 1
+        slots.append(write_idx)
+        write_idx += 1
+    source = mx.concatenate([cache.keys, kv], axis=2)
+    indices = _rotating_snapshot_indices(ring_size, tuple(slots))
+    cache.keys = mx.take(source, indices[-1], axis=2)
+    cache._idx = write_idx
+    cache.offset = cache.offset + steps
+    if hasattr(cache, "_offset"):
+        cache._offset += steps
+        cache.rotated = rotated
+        if rotated_writes:
+            cache.left_padding = cache.left_padding - rotated_writes
+        cache.keys = mx.depends(cache.keys, (cache.left_padding, cache.offset))
+    return _RotatingVerifyView(source=source[0, 0], indices=indices)
+
+
+def _ring_mm(lhs, view: _RotatingVerifyView, transpose_rhs: bool):
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    return fast.dspark_ring_gemm(
+        mx.contiguous(lhs[:, 0]),
+        mx.contiguous(view.source),
+        mx.contiguous(view.indices),
+        transpose_rhs,
+    )[:, None]
+
+
+def _materialize_rotating_verify_rows(view: _RotatingVerifyView) -> list[mx.array]:
+    rows = mx.take(view.source, view.indices, axis=0)
+    return [rows[idx : idx + 1, None] for idx in range(int(rows.shape[0]))]
+
+
+def _ring_sparse_attention(q, view, pooled, topk, scale, sinks):
+    idx = topk[:, None, :, :, None]
+    pooled = mx.take_along_axis(
+        mx.broadcast_to(
+            pooled[:, None, None],
+            (pooled.shape[0], 1, 1, pooled.shape[1], pooled.shape[2]),
+        ),
+        mx.broadcast_to(idx, idx.shape[:-1] + (pooled.shape[2],)),
+        axis=3,
+    ).squeeze(1)
+    q_rows = q * scale
+    local_scores = _ring_mm(q_rows.transpose(0, 2, 1, 3), view, True)
+    pooled_scores = q_rows.transpose(0, 2, 1, 3) @ pooled.swapaxes(-1, -2)
+    local_scores = local_scores.transpose(0, 2, 1, 3)
+    pooled_scores = pooled_scores.transpose(0, 2, 1, 3)
+    normalizer = mx.logaddexp(
+        mx.logsumexp(local_scores, -1, keepdims=True),
+        mx.logsumexp(pooled_scores, -1, keepdims=True),
+    )
+    normalizer = mx.logaddexp(normalizer, sinks[None, :, None, None])
+    local_weights = mx.exp(local_scores - normalizer)
+    pooled_weights = mx.exp(pooled_scores - normalizer)
+    local_out = _ring_mm(local_weights.transpose(0, 2, 1, 3), view, False)
+    pooled_out = pooled_weights.transpose(0, 2, 1, 3) @ pooled
+    return (local_out + pooled_out).transpose(0, 2, 1, 3).astype(q.dtype)
+
+
+def _consume_pooling_verify_rows(
+    compressor: Compressor,
+    kv: mx.array,
+    gate: mx.array,
+    cache: Optional[PoolingCache],
+    offset: Union[int, mx.array],
+) -> list[mx.array]:
+    """Expose the pooled cache visible after each M=1 verify token."""
+    return [
+        compressor.consume(
+            kv[:, idx : idx + 1],
+            gate[:, idx : idx + 1],
+            cache,
+            offset + idx,
+        )
+        for idx in range(int(kv.shape[1]))
+    ]
+
+
+def _decode_consistent_attention(
+    q: mx.array,
+    key_rows: list[mx.array],
+    scale: float,
+    sinks: mx.array,
+) -> mx.array:
+    from .deepseek_v4_verify_attention import exact_attention
+
+    return exact_attention(q, key_rows, scale, sinks)
+
+
+def _project_attention_output(attn, out: mx.array, offset) -> mx.array:
+    out = attn.rope(out, offset, inverse=True)
+    B, _, L, _ = out.shape
+    prepared = out.reshape(B, attn.o_groups, -1, L, attn.head_dim)
+    prepared = prepared.transpose(0, 1, 3, 2, 4).flatten(-2)
+    if _dspark_verify_active(B, L):
+        from .deepseek_v4_verify_qmv import (
+            exact_verify_multi_qmv,
+            multi_eligible,
+        )
+
+        if multi_eligible(attn.wo_a, prepared[0]):
+            projected = exact_verify_multi_qmv(attn.wo_a, prepared[0])[None]
+        else:
+            projected = attn.wo_a(prepared)
+    else:
+        projected = attn.wo_a(prepared)
+    return attn.wo_b(projected.transpose(0, 2, 1, 3).flatten(-2))
 
 
 class LocalAttention(nn.Module):
@@ -739,26 +940,26 @@ class LocalAttention(nn.Module):
 
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
-        if cache is not None:
+        verify_rows = _dspark_verify_active(B, L)
+        if verify_rows:
+            key_rows = _consume_rotating_verify_rows(cache, kv)
+            out = _decode_consistent_attention(
+                q, key_rows, self.scale, self.attn_sink.astype(q.dtype)
+            )
+        elif cache is not None:
             kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
-        mask = _align_local_mask(mask, kv.shape[2])
-
-        out = scaled_dot_product_attention(
-            q,
-            kv,
-            kv,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attn_sink.astype(q.dtype),
-        )
-        out = self.rope(out, offset, inverse=True)
-
-        out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
-        out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
-        out = self.wo_a(out)
-        out = out.transpose(0, 2, 1, 3).flatten(-2)
-        out = self.wo_b(out)
+        if not verify_rows:
+            mask = _align_local_mask(mask, kv.shape[2])
+            out = scaled_dot_product_attention(
+                q,
+                kv,
+                kv,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.attn_sink.astype(q.dtype),
+            )
+        out = _project_attention_output(self, out, offset)
 
         if self.sharding_group is not None:
             out = mx.distributed.all_sum(out, group=self.sharding_group)
@@ -831,39 +1032,50 @@ class CompressedAttention(nn.Module):
 
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
-        if local_cache is not None:
-            kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
-        mask = _align_local_mask(mask, kv.shape[2])
-
-        # Pool tokens into compressed KV and concatenate with local KV
-        pooled = self.compressor(x, pool_cache, offset)
-        pooled_mask = None
-        if pooled.shape[1] > 0:
-            pooled_mask = (
-                pool_cache.make_mask(L, offset)
-                if pool_cache is not None
-                else _pooled_mask(L, pooled.shape[1], self.compress_ratio, offset)
+        verify_rows = _dspark_verify_active(B, L)
+        if verify_rows:
+            compressed_kv, compressed_gate = self.compressor.project(x)
+            pooled_rows = _consume_pooling_verify_rows(
+                self.compressor,
+                compressed_kv,
+                compressed_gate,
+                pool_cache,
+                offset,
             )
-            kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-
-        mask = _extend_mask(mask, pooled_mask, kv.shape[2])
-
-        out = scaled_dot_product_attention(
-            q,
-            kv,
-            kv,
-            cache=local_cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attn_sink.astype(q.dtype),
-        )
-        out = self.rope(out, offset, inverse=True)
-
-        out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
-        out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
-        out = self.wo_a(out)
-        out = out.transpose(0, 2, 1, 3).flatten(-2)
-        out = self.wo_b(out)
+            local_rows = _consume_rotating_verify_rows(local_cache, kv)
+            key_rows = [
+                mx.concatenate([local, pooled[:, None]], axis=2)
+                if pooled.shape[1]
+                else local
+                for local, pooled in zip(local_rows, pooled_rows)
+            ]
+            out = _decode_consistent_attention(
+                q, key_rows, self.scale, self.attn_sink.astype(q.dtype)
+            )
+        elif local_cache is not None:
+            kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+        if not verify_rows:
+            mask = _align_local_mask(mask, kv.shape[2])
+            pooled = self.compressor(x, pool_cache, offset)
+            pooled_mask = None
+            if pooled.shape[1] > 0:
+                pooled_mask = (
+                    pool_cache.make_mask(L, offset)
+                    if pool_cache is not None
+                    else _pooled_mask(L, pooled.shape[1], self.compress_ratio, offset)
+                )
+                kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+            mask = _extend_mask(mask, pooled_mask, kv.shape[2])
+            out = scaled_dot_product_attention(
+                q,
+                kv,
+                kv,
+                cache=local_cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.attn_sink.astype(q.dtype),
+            )
+        out = _project_attention_output(self, out, offset)
 
         if self.sharding_group is not None:
             out = mx.distributed.all_sum(out, group=self.sharding_group)
@@ -937,76 +1149,163 @@ class SparseCompressedAttention(nn.Module):
 
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
-        if local_cache is not None:
+        verify_rows = _dspark_verify_active(B, L)
+        if verify_rows:
+            comp_kv, comp_gate = self.compressor.project(x)
+            idx_kv, idx_gate = self.indexer.compressor.project(x)
+            pooled_rows = _consume_pooling_verify_rows(
+                self.compressor, comp_kv, comp_gate, comp_cache, offset
+            )
+            index_rows = _consume_pooling_verify_rows(
+                self.indexer.compressor, idx_kv, idx_gate, idx_cache, offset
+            )
+            ring_view = _stage_rotating_verify_view(local_cache, kv)
+            local_rows = (
+                None
+                if ring_view is not None
+                else _consume_rotating_verify_rows(local_cache, kv)
+            )
+            index_q = self.indexer.wq_b(q_residual).reshape(
+                B, L, self.indexer.n_heads, self.indexer.head_dim
+            )
+            index_q = self.rope(index_q.transpose(0, 2, 1, 3), offset)
+            index_weights = self.indexer.weights_proj(x).astype(mx.float32)
+            outputs = [None] * L
+            sparse_rows = []
+            sinks = self.attn_sink.astype(q.dtype)
+            for idx, (local, pooled, index_pooled) in enumerate(
+                zip(local_rows or [None] * L, pooled_rows, index_rows)
+            ):
+                q_row = q[:, :, idx : idx + 1]
+                if pooled.shape[1] == 0:
+                    if local is None:
+                        local = _materialize_rotating_verify_rows(ring_view)[idx]
+                    row_out = _decode_consistent_attention(
+                        q_row, [local], self.scale, sinks
+                    )
+                elif pooled.shape[1] <= self.indexer.index_topk:
+                    if local is None:
+                        local = _materialize_rotating_verify_rows(ring_view)[idx]
+                    full = mx.concatenate([local, pooled[:, None]], axis=2)
+                    row_out = _decode_consistent_attention(
+                        q_row, [full], self.scale, sinks
+                    )
+                else:
+                    iq = index_q[:, :, idx : idx + 1].astype(mx.float32)
+                    scores = iq @ index_pooled[:, None].swapaxes(-1, -2).astype(
+                        mx.float32
+                    )
+                    scores = mx.maximum(scores, 0) * self.indexer.scale
+                    weights = index_weights[:, idx : idx + 1]
+                    weights = weights * (self.indexer.n_heads**-0.5)
+                    scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
+                    k = min(self.indexer.index_topk, index_pooled.shape[1])
+                    topk = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+                    if ring_view is not None:
+                        sparse_rows.append((idx, q_row, pooled, topk))
+                        continue
+                    else:
+                        row_out = _sparse_pooled_attention(
+                            q_row,
+                            local,
+                            pooled,
+                            topk,
+                            None,
+                            None,
+                            self.scale,
+                            sinks,
+                        )
+                outputs[idx] = row_out
+
+            # Pooling can cross at most one compression boundary in a DSpark
+            # verify block. Batch rows with the same pooled length so the native
+            # ring kernel sees all candidate tokens in one launch instead of L
+            # independent single-row launches.
+            while sparse_rows:
+                pooled_length = int(sparse_rows[0][2].shape[1])
+                group = [
+                    row for row in sparse_rows if int(row[2].shape[1]) == pooled_length
+                ]
+                sparse_rows = [
+                    row for row in sparse_rows if int(row[2].shape[1]) != pooled_length
+                ]
+                indices = [row[0] for row in group]
+                q_batch = mx.concatenate(
+                    [row[1].transpose(0, 2, 1, 3) for row in group], axis=0
+                ).transpose(0, 2, 1, 3)
+                pooled_batch = mx.concatenate([row[2] for row in group], axis=0)
+                topk_batch = mx.concatenate([row[3] for row in group], axis=0)
+                group_view = _RotatingVerifyView(
+                    source=ring_view.source,
+                    indices=mx.take(ring_view.indices, mx.array(indices), axis=0),
+                )
+                group_out = _ring_sparse_attention(
+                    q_batch,
+                    group_view,
+                    pooled_batch,
+                    topk_batch,
+                    self.scale,
+                    sinks,
+                )
+                for group_idx, output_idx in enumerate(indices):
+                    outputs[output_idx] = group_out[group_idx : group_idx + 1]
+            out = mx.concatenate(outputs, axis=2)
+        elif local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
-        mask = _align_local_mask(mask, kv.shape[2])
-
-        pooled = self.compressor(x, comp_cache, offset)
-        pmask = (
-            comp_cache.make_mask(L, offset)
-            if comp_cache is not None
-            else (
-                _pooled_mask(L, pooled.shape[1], self.compress_ratio, offset)
-                if pooled.shape[1] > 0
-                else None
+        if not verify_rows:
+            mask = _align_local_mask(mask, kv.shape[2])
+            pooled = self.compressor(x, comp_cache, offset)
+            pmask = (
+                comp_cache.make_mask(L, offset)
+                if comp_cache is not None
+                else (
+                    _pooled_mask(L, pooled.shape[1], self.compress_ratio, offset)
+                    if pooled.shape[1] > 0
+                    else None
+                )
             )
-        )
-        topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
-        sinks = self.attn_sink.astype(q.dtype)
-
-        # Local attention
-        if pooled.shape[1] == 0:
-            out = scaled_dot_product_attention(
-                q,
-                kv,
-                kv,
-                cache=local_cache,
-                scale=self.scale,
-                mask=mask,
-                sinks=sinks,
-            )
-
-        # Compressed attention
-        elif pooled.shape[1] <= self.indexer.index_topk:
-            full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-            mask = _extend_mask(mask, pmask, full_kv.shape[2])
-            out = scaled_dot_product_attention(
-                q,
-                full_kv,
-                full_kv,
-                cache=local_cache,
-                scale=self.scale,
-                mask=mask,
-                sinks=sinks,
-            )
-
-        # Sparse compressed attention
-        else:
-            sparse_mask = None
-            if pmask is not None:
-                sparse_mask = mx.take_along_axis(
-                    pmask[None] if pmask.ndim == 2 else pmask,
+            topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
+            sinks = self.attn_sink.astype(q.dtype)
+            if pooled.shape[1] == 0:
+                out = scaled_dot_product_attention(
+                    q,
+                    kv,
+                    kv,
+                    cache=local_cache,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=sinks,
+                )
+            elif pooled.shape[1] <= self.indexer.index_topk:
+                full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+                mask = _extend_mask(mask, pmask, full_kv.shape[2])
+                out = scaled_dot_product_attention(
+                    q,
+                    full_kv,
+                    full_kv,
+                    cache=local_cache,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=sinks,
+                )
+            else:
+                sparse_mask = None
+                if pmask is not None:
+                    sparse_mask = mx.take_along_axis(
+                        pmask[None] if pmask.ndim == 2 else pmask, topk, axis=2
+                    )[:, None]
+                out = _sparse_pooled_attention(
+                    q,
+                    kv,
+                    pooled,
                     topk,
-                    axis=2,
-                )[:, None]
-            out = _sparse_pooled_attention(
-                q,
-                kv,
-                pooled,
-                topk,
-                mask,
-                sparse_mask,
-                self.scale,
-                sinks,
-            )
+                    mask,
+                    sparse_mask,
+                    self.scale,
+                    sinks,
+                )
 
-        out = self.rope(out, offset, inverse=True)
-
-        out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
-        out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
-        out = self.wo_a(out)
-        out = out.transpose(0, 2, 1, 3).flatten(-2)
-        out = self.wo_b(out)
+        out = _project_attention_output(self, out, offset)
 
         if self.sharding_group is not None:
             out = mx.distributed.all_sum(out, group=self.sharding_group)
@@ -1251,6 +1550,76 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.mtp = [DSparkBlock(config, idx) for idx in range(config.dspark_num_layers)]
         self._last_dspark_hidden: mx.array | None = None
+        self._dspark_prime_ctx: dict[int, tuple[object, list, int]] = {}
+
+    @staticmethod
+    def _target_cache_offset(cache) -> int | None:
+        if not cache:
+            return None
+        for entry in cache:
+            candidates = (entry, *(getattr(entry, "caches", ()) or ()))
+            for candidate in candidates:
+                offset = getattr(candidate, "offset", None)
+                if type(offset) is int:
+                    return offset
+                if offset is not None and getattr(offset, "size", 0) == 1:
+                    return int(offset.reshape(()).item())
+        return None
+
+    def _capture_dspark_prompt(self, inputs, hidden, target_cache) -> None:
+        """Fold B=1 prefill chunks into a committed DSpark context cache."""
+        if inputs.ndim != 2 or inputs.shape[0] != 1 or inputs.shape[1] <= 1:
+            return
+        offset_after = self._target_cache_offset(target_cache)
+        if offset_after is None:
+            return
+        start = offset_after - int(inputs.shape[1])
+        cache_key = id(target_cache)
+        contexts = getattr(self, "_dspark_prime_ctx", None)
+        ctx = contexts.get(cache_key) if isinstance(contexts, dict) else None
+        if ctx is None:
+            # A target prefix-cache hit only evaluates the uncached suffix, so
+            # the corresponding target-layer hidden history is unavailable.
+            # Never manufacture an empty rotating cache at a large logical
+            # offset: RotatingKVCache quite correctly rejects that inconsistent
+            # physical/logical state (and Codex then loses DSpark for the
+            # request). Start a fresh DSpark history from subsequently decoded
+            # tokens instead.
+            if start != 0:
+                return
+            caches = self.make_dspark_cache()
+            ctx = (target_cache, caches, start)
+        elif ctx[0] is not target_cache or ctx[2] != start:
+            if isinstance(contexts, dict):
+                contexts.pop(cache_key, None)
+            return
+        caches = ctx[1]
+        first = self.mtp[0]
+        main_x = first.main_norm(first.main_proj(hidden))
+        for block, layer_cache in zip(self.mtp, caches):
+            block.attn.update_main(main_x, layer_cache)
+        if not isinstance(contexts, dict):
+            contexts = {}
+            self._dspark_prime_ctx = contexts
+        # Retain and verify the cache object itself.  A bounded strong
+        # reference prevents Python from reusing its id for a later request
+        # while stale priming state is still present.
+        contexts[cache_key] = (target_cache, caches, offset_after)
+        while len(contexts) > 32:
+            contexts.pop(next(iter(contexts)))
+        mx.async_eval([cache.keys for cache in caches if cache.keys is not None])
+
+    def take_dspark_primed(self, target_cache):
+        contexts = getattr(self, "_dspark_prime_ctx", None)
+        ctx = (
+            contexts.pop(id(target_cache), None) if isinstance(contexts, dict) else None
+        )
+        if ctx is None:
+            return None
+        offset = self._target_cache_offset(target_cache)
+        if offset is None or ctx[0] is not target_cache or ctx[2] != offset - 1:
+            return None
+        return ctx[1]
 
     def __call__(
         self,
@@ -1264,6 +1633,10 @@ class Model(nn.Module):
         if capture_dspark:
             hidden, dspark_hidden = output
             self._last_dspark_hidden = dspark_hidden
+            from .deepseek_v4_rollback import is_armed
+
+            if cache is not None and not is_armed():
+                self._capture_dspark_prompt(inputs, dspark_hidden, cache)
             logits = self.lm_head(hidden)
             if return_dspark_hidden:
                 return logits, dspark_hidden
@@ -1281,6 +1654,7 @@ class Model(nn.Module):
         main_hidden: mx.array,
         cache: list[RotatingKVCache],
         max_draft_tokens: int | None = None,
+        draft_sampler=None,
     ) -> tuple[mx.array, mx.array, mx.array] | None:
         if not self.mtp:
             return None
@@ -1323,7 +1697,12 @@ class Model(nn.Module):
         for idx in range(K):
             bias, _ = last.markov_head(output_ids[:, idx])
             draft_logits[:, idx] = draft_logits[:, idx] + bias
-            output_ids[:, idx + 1] = mx.argmax(draft_logits[:, idx], axis=-1)
+            row = draft_logits[:, idx]
+            output_ids[:, idx + 1] = (
+                draft_sampler(row, idx)
+                if draft_sampler is not None
+                else mx.argmax(row, axis=-1)
+            )
         return output_ids, draft_logits
 
     @property

@@ -8,12 +8,23 @@ from .. import _mlx_compat as _mlx_compat
 
 _mlx_compat.install()
 
-from mlx_lm.models.switch_layers import (
-    SwiGLU,
-    SwitchLinear,
-    _gather_sort,
-    _scatter_unsort,
-)
+try:
+    # oMLX's audited Apple-Silicon extension supplies MXFP4 block-list MoE
+    # kernels.  Keep this optional: stock Rapid-MLX continues to use mlx-lm
+    # when the native bundle is not installed.
+    from omlx.patches.deepseek_v4.switch_layers import (
+        SwiGLU,
+        SwitchLinear,
+        _gather_sort,
+        _scatter_unsort,
+    )
+except (ImportError, OSError):
+    from mlx_lm.models.switch_layers import (
+        SwiGLU,
+        SwitchLinear,
+        _gather_sort,
+        _scatter_unsort,
+    )
 
 
 class FusedSwitchGLU(nn.Module):
@@ -37,7 +48,12 @@ class FusedSwitchGLU(nn.Module):
 
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
-        do_sort = indices.size >= 64
+        # DSpark verifies at most six rows; with eight routed experts that is
+        # 48 routes.  The native block-list kernel is already profitable at
+        # this size on M3 Ultra, while mlx-lm's generic path keeps its original
+        # 64-route sorting threshold.
+        native_blocks = SwitchLinear.__module__.startswith("omlx.")
+        do_sort = indices.size >= (32 if native_blocks else 64)
         idx = indices
         inv_order = None
         if do_sort:

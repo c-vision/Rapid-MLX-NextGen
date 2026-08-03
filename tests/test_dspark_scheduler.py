@@ -13,6 +13,82 @@ from vllm_mlx.scheduler import (
 )
 
 
+def test_pooling_cache_rolls_back_across_compression_boundary() -> None:
+    from vllm_mlx.models.deepseek_v4_cache import PoolingCache
+    from vllm_mlx.models.deepseek_v4_rollback import armed, trim_all
+
+    cache = PoolingCache(4)
+    # Establish three pending values, then verify four inputs. Keeping the
+    # confirmed input crosses one boundary; the rejected suffix must vanish.
+    cache.accumulate_windows(mx.ones((1, 3, 2)), mx.ones((1, 3, 2)), 0)
+    with armed():
+        ready, _gate, _base = cache.accumulate_windows(
+            mx.ones((1, 4, 2)), mx.ones((1, 4, 2)), 3
+        )
+        cache.update_and_fetch(mx.ones((1, ready.shape[1] // 4, 2)))
+
+    assert trim_all([cache], 3)
+    assert cache.offset == 1
+    assert cache.remainder == 0
+
+
+def test_rotating_cache_rolls_back_after_rotation() -> None:
+    from mlx_lm.models.cache import RotatingKVCache
+
+    from vllm_mlx.models.deepseek_v4_rollback import (
+        armed,
+        install_rotating_undo,
+        trim_all,
+    )
+
+    install_rotating_undo()
+    reference = RotatingKVCache(max_size=4)
+    reference.update_and_fetch(mx.zeros((1, 1, 4, 2)), mx.zeros((1, 1, 4, 2)))
+    reference.update_and_fetch(mx.ones((1, 1, 1, 2)), mx.ones((1, 1, 1, 2)))
+    cache = RotatingKVCache(max_size=4)
+    cache.update_and_fetch(mx.zeros((1, 1, 4, 2)), mx.zeros((1, 1, 4, 2)))
+    with armed():
+        cache.update_and_fetch(mx.ones((1, 1, 4, 2)), mx.ones((1, 1, 4, 2)))
+
+    assert trim_all([cache], 3)
+    assert (cache.offset, cache._idx) == (reference.offset, reference._idx)
+    assert mx.array_equal(cache.keys, reference.keys).item()
+    assert mx.array_equal(cache.values, reference.values).item()
+    assert mx.array_equal(
+        cache._temporal_order(cache.keys), reference._temporal_order(reference.keys)
+    ).item()
+
+
+def test_batch_rotating_cache_rolls_back_after_rotation() -> None:
+    from mlx_lm.models.cache import BatchRotatingKVCache
+
+    from vllm_mlx.models.deepseek_v4_rollback import (
+        armed,
+        install_rotating_undo,
+        trim_all,
+    )
+
+    install_rotating_undo()
+    reference = BatchRotatingKVCache(max_size=4, left_padding=[0])
+    reference.update_and_fetch(mx.zeros((1, 1, 4, 2)), mx.zeros((1, 1, 4, 2)))
+    reference.update_and_fetch(mx.ones((1, 1, 1, 2)), mx.ones((1, 1, 1, 2)))
+    cache = BatchRotatingKVCache(max_size=4, left_padding=[0])
+    cache.update_and_fetch(mx.zeros((1, 1, 4, 2)), mx.zeros((1, 1, 4, 2)))
+    with armed():
+        cache.update_and_fetch(mx.ones((1, 1, 4, 2)), mx.ones((1, 1, 4, 2)))
+
+    assert trim_all([cache], 3)
+    assert (cache._offset, cache._idx, cache.rotated) == (
+        reference._offset,
+        reference._idx,
+        reference.rotated,
+    )
+    assert mx.array_equal(cache.offset, reference.offset).item()
+    assert mx.array_equal(cache.left_padding, reference.left_padding).item()
+    assert mx.array_equal(cache.keys, reference.keys).item()
+    assert mx.array_equal(cache.values, reference.values).item()
+
+
 def test_adaptive_depth_shrinks_cools_down_and_recovers() -> None:
     depth, streak, cooldown = _adapt_dspark_depth(5, 5, 1, 5, 0)
     assert (depth, streak, cooldown) == (4, 1, False)
@@ -52,6 +128,27 @@ def test_replay_dspark_committed_excludes_unsurfaced_drafts() -> None:
     )
 
     assert restored[0].values == [10, 11]
+
+
+def test_prompt_capture_does_not_fabricate_dspark_history_after_prefix_hit() -> None:
+    from vllm_mlx.models.deepseek_v4 import Model
+
+    fake = SimpleNamespace(
+        _dspark_prime_ctx=None,
+        _target_cache_offset=lambda _cache: 100,
+        make_dspark_cache=lambda: (_ for _ in ()).throw(
+            AssertionError("must not create a logically offset empty cache")
+        ),
+    )
+
+    Model._capture_dspark_prompt(
+        fake,
+        mx.ones((1, 4), dtype=mx.uint32),
+        mx.zeros((1, 4, 8)),
+        [object()],
+    )
+
+    assert fake._dspark_prime_ctx is None
 
 
 def test_verify_failure_restores_target_cache_before_baseline_fallback() -> None:
@@ -102,3 +199,48 @@ def test_verify_failure_restores_target_cache_before_baseline_fallback() -> None
 
     assert tokens == [1]
     assert batch_gen._dspark_stats["errors"] == 1
+
+
+def test_stochastic_request_uses_plain_decode_until_multiround_gate_exists() -> None:
+    class _Model:
+        args = SimpleNamespace(dspark_block_size=5)
+        mtp = [object()]
+        _last_dspark_hidden = mx.zeros((1, 1, 2))
+
+        def make_dspark_cache(self):
+            return []
+
+        def dspark_forward(self, *_args, **_kwargs):
+            raise AssertionError("stochastic request must not enter DSpark")
+
+    class _GenerationBatch:
+        pass
+
+    gb = _GenerationBatch()
+    gb._next_tokens = mx.array([1])
+    gb.uids = [7]
+    gb.next = lambda: []
+    baseline_calls = []
+
+    def baseline_step():
+        baseline_calls.append(True)
+        return [9], [mx.zeros((8,))]
+
+    gb._step = baseline_step
+    request = SimpleNamespace(
+        sampling_params=SimpleNamespace(temperature=1.0, seed=None)
+    )
+    batch_gen = SimpleNamespace(_generation_batch=gb)
+
+    assert _install_dspark(
+        batch_gen,
+        _Model(),
+        {"request-7": request},
+        {7: "request-7"},
+        max_draft=5,
+    )
+    tokens, _logprobs = gb._step()
+
+    assert tokens == [9]
+    assert baseline_calls == [True]
+    assert batch_gen._dspark_stats["fallthrough_steps"] == 1

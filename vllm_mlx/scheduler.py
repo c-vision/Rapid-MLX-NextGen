@@ -1433,6 +1433,26 @@ def _adapt_dspark_depth(
     return current_depth, 0, False
 
 
+def _dspark_sampling_logprobs(logits: mx.array, params: Any) -> mx.array:
+    """Return the exact normalized distribution used by mlx-lm sampling."""
+    from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
+
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    top_p = float(getattr(params, "top_p", 0.0) or 0.0)
+    min_p = float(getattr(params, "min_p", 0.0) or 0.0)
+    top_k = int(getattr(params, "top_k", 0) or 0)
+    temperature = float(getattr(params, "temperature", 0.0) or 0.0)
+    if 0.0 < top_p < 1.0:
+        logprobs = apply_top_p(logprobs, top_p)
+    if min_p:
+        logprobs = apply_min_p(logprobs, min_p)
+    if 0 < top_k < logprobs.shape[-1]:
+        logprobs = apply_top_k(logprobs, top_k)
+    if temperature > 0.0:
+        logprobs = logprobs / temperature
+    return logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)
+
+
 def _install_dspark(
     batch_gen: "BatchGenerator",
     model: Any,
@@ -1477,9 +1497,16 @@ def _install_dspark(
     _pending_replay: dict[int, tuple[Any, mx.array]] = {}
     _depths: dict[int, int] = {}
     _cooldowns: dict[int, int] = {}
-    _supports_variable_depth = (
-        "max_draft_tokens" in inspect.signature(model.dspark_forward).parameters
-    )
+    _dspark_parameters = inspect.signature(model.dspark_forward).parameters
+    _supports_variable_depth = "max_draft_tokens" in _dspark_parameters
+    _supports_draft_sampler = "draft_sampler" in _dspark_parameters
+    # The 0731 checkpoint predicts five rows, but the target verify kernel has
+    # a measured K=5 shape cliff on Apple Silicon: compared with K=4 it costs
+    # ~54% more for only ~6% more committed tokens on a coding workload. Keep
+    # the checkpoint capability intact while capping the adaptive runtime at
+    # the empirically efficient shape. Non-variable third-party hooks retain
+    # their original fixed depth.
+    runtime_max_k = min(draft_k, 4) if _supports_variable_depth else draft_k
     _stats = {
         "verify_steps": 0,
         "draft_tokens_proposed": 0,
@@ -1488,9 +1515,9 @@ def _install_dspark(
         "errors": 0,
         "full_accept_rounds": 0,
     }
-    _uid_stats: dict[int, dict[str, float | int]] = {}
+    _uid_stats: dict[int, dict[str, Any]] = {}
 
-    def _request_stats(uid: int) -> dict[str, float | int]:
+    def _request_stats(uid: int) -> dict[str, Any]:
         return _uid_stats.setdefault(
             uid,
             {
@@ -1499,17 +1526,21 @@ def _install_dspark(
                 "tokens_accepted": 0,
                 "full_accept_rounds": 0,
                 "fallback_events": 0,
+                "draft_ms": 0.0,
+                "verify_ms": 0.0,
+                "sample_ms": 0.0,
+                "rollback_ms": 0.0,
                 "low_accept_streak": 0,
-                "min_depth": draft_k,
-                "max_depth": draft_k,
+                "min_depth": runtime_max_k,
+                "max_depth": runtime_max_k,
+                "depth_stats": {},
             },
         )
 
-    def _is_greedy(uid: int) -> bool:
+    def _sampling_params(uid: int):
         request_id = uid_to_request_id.get(uid)
         request = requests.get(request_id) if request_id else None
-        params = getattr(request, "sampling_params", None)
-        return params is None or params.temperature in (None, 0.0)
+        return getattr(request, "sampling_params", None)
 
     def _dspark_step():
         if (
@@ -1526,11 +1557,26 @@ def _install_dspark(
             _cooldowns[uid] = cooldown - 1
             _stats["fallthrough_steps"] += 1
             return _orig_step()
-        if not _is_greedy(uid):
+        params = _sampling_params(uid)
+        # Seeded decoding has a stricter baseline-stream reproducibility
+        # contract. Keep it on the ordinary path until DSpark owns a separate
+        # per-request acceptance key without perturbing the target sampler.
+        if params is not None and getattr(params, "seed", None) is not None:
             _stats["fallthrough_steps"] += 1
             return _orig_step()
         processors = getattr(gb, "logits_processors", None)
         request_processors = processors[0] if processors and processors[0] else []
+        stochastic = params is not None and params.temperature not in (None, 0.0)
+        if stochastic:
+            # The residual sampler is mathematically correct for one isolated
+            # proposal, but real multi-round Codex runs exposed state/RNG
+            # divergence and severe repetition at temperature=1. Keep user
+            # output authoritative by taking mlx-lm's ordinary sampler until
+            # stochastic DSpark has a per-request RNG stream plus a real-model
+            # multi-round distribution-equivalence gate. Greedy DSpark remains
+            # enabled and retains its speedup.
+            _stats["fallthrough_steps"] += 1
+            return _orig_step()
 
         inputs = gb._next_tokens
         last_token = int(inputs[0].item())
@@ -1538,19 +1584,41 @@ def _install_dspark(
         if hidden is None or hidden.shape[0] != 1:
             _stats["fallthrough_steps"] += 1
             return _orig_step()
-        dspark_cache = _caches.setdefault(uid, model.make_dspark_cache())
-        current_k = _depths.setdefault(uid, draft_k)
+        dspark_cache = _caches.get(uid)
+        if dspark_cache is None:
+            take_primed = getattr(model, "take_dspark_primed", None)
+            dspark_cache = take_primed(gb.prompt_cache) if take_primed else None
+            if dspark_cache is None:
+                dspark_cache = model.make_dspark_cache()
+            _caches[uid] = dspark_cache
+        current_k = _depths.setdefault(uid, runtime_max_k)
         offsets_before = [cache.offset for cache in dspark_cache]
+        q_logprobs: list[mx.array] = []
+        q_context = None
+        if request_processors:
+            q_context = mx.concatenate([gb._token_context[0].tokens, inputs])
+
+        def _sample_draft(row_logits, _idx):
+            nonlocal q_context
+            for processor in request_processors:
+                row_logits = processor(q_context, row_logits)
+            row_q = _dspark_sampling_logprobs(row_logits, params)
+            token = mx.random.categorical(row_q)
+            q_logprobs.append(row_q[0])
+            if request_processors:
+                q_context = mx.concatenate([q_context, token.reshape(-1)])
+            return token
+
+        phase_t0 = time.perf_counter()
         try:
+            draft_kwargs: dict[str, Any] = {}
             if _supports_variable_depth:
-                proposal = model.dspark_forward(
-                    inputs[:, None],
-                    hidden,
-                    dspark_cache,
-                    max_draft_tokens=current_k,
-                )
-            else:
-                proposal = model.dspark_forward(inputs[:, None], hidden, dspark_cache)
+                draft_kwargs["max_draft_tokens"] = current_k
+            if _supports_draft_sampler:
+                draft_kwargs["draft_sampler"] = _sample_draft if stochastic else None
+            proposal = model.dspark_forward(
+                inputs[:, None], hidden, dspark_cache, **draft_kwargs
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[DSpark] draft failed; falling back: %r", exc)
             _stats["errors"] += 1
@@ -1561,6 +1629,9 @@ def _install_dspark(
 
         output_ids, _ = proposal
         draft = [int(v) for v in output_ids[0, 1 : current_k + 1].tolist()]
+        uid_stats["draft_ms"] = (
+            float(uid_stats["draft_ms"]) + (time.perf_counter() - phase_t0) * 1000
+        )
         K = len(draft)
         _stats["verify_steps"] += 1
         _stats["draft_tokens_proposed"] += K
@@ -1569,13 +1640,19 @@ def _install_dspark(
         import copy
 
         target_cache_snapshot = copy.deepcopy(gb.prompt_cache)
+        phase_t0 = time.perf_counter()
         try:
             verify_input = mx.concatenate(
                 [inputs[:, None], mx.array([draft], dtype=inputs.dtype)], axis=1
             )
-            verify_logits = model(verify_input, cache=gb.prompt_cache)
+            from .models.deepseek_v4_rollback import armed
+
+            with armed():
+                verify_logits = model(verify_input, cache=gb.prompt_cache)
             verify_hidden = model._last_dspark_hidden
             mx.eval(verify_logits, verify_hidden)
+            verify_elapsed_ms = (time.perf_counter() - phase_t0) * 1000
+            uid_stats["verify_ms"] = float(uid_stats["verify_ms"]) + verify_elapsed_ms
         except Exception as exc:  # noqa: BLE001
             logger.warning("[DSpark] verify failed; falling back: %r", exc)
             _stats["errors"] += 1
@@ -1590,6 +1667,7 @@ def _install_dspark(
             _caches.pop(uid, None)
             return _orig_step()
 
+        phase_t0 = time.perf_counter()
         accepted = 0
         preds_list: list[int] = []
         processed_logprobs: list[mx.array] = []
@@ -1600,10 +1678,20 @@ def _install_dspark(
             sample_logits = verify_logits[0:1, idx]
             for processor in request_processors:
                 sample_logits = processor(token_context, sample_logits)
-            logprobs = sample_logits - mx.logsumexp(
-                sample_logits, axis=-1, keepdims=True
+            logprobs = (
+                _dspark_sampling_logprobs(sample_logits, params)
+                if stochastic
+                else sample_logits - mx.logsumexp(sample_logits, axis=-1, keepdims=True)
             )
-            pred = int(mx.argmax(logprobs[0], axis=-1).item())
+            if stochastic:
+                processed_logprobs.append(logprobs[0])
+                if idx < K and request_processors:
+                    token_context = mx.concatenate(
+                        [token_context, mx.array([draft[idx]], dtype=inputs.dtype)]
+                    )
+                continue
+            else:
+                pred = int(mx.argmax(logprobs[0], axis=-1).item())
             preds_list.append(pred)
             processed_logprobs.append(logprobs[0])
             if idx == K or pred != draft[idx]:
@@ -1613,21 +1701,71 @@ def _install_dspark(
                 token_context = gb._token_context[0].update_and_fetch(
                     mx.array([draft[idx]], dtype=inputs.dtype)
                 )
+        if stochastic:
+            p_rows = mx.stack(processed_logprobs[:K])
+            q_rows = mx.stack(q_logprobs)
+            draft_idx = mx.array(draft, dtype=mx.uint32)[:, None]
+            p_token = mx.take_along_axis(mx.exp(p_rows), draft_idx, axis=1).squeeze(1)
+            q_token = mx.take_along_axis(mx.exp(q_rows), draft_idx, axis=1).squeeze(1)
+            accept_flags = mx.random.uniform(shape=(K,)) < mx.minimum(
+                1.0, p_token / q_token
+            )
+            residual = mx.maximum(mx.exp(p_rows) - mx.exp(q_rows), 0)
+            residual_sum = mx.sum(residual, axis=-1, keepdims=True)
+            residual = mx.where(
+                residual_sum > 0,
+                residual / residual_sum,
+                mx.exp(p_rows),
+            )
+            residual_tokens = mx.random.categorical(mx.log(residual))
+            bonus_token = mx.random.categorical(processed_logprobs[K])
+            resolved = mx.concatenate(
+                [
+                    accept_flags.astype(mx.int32),
+                    residual_tokens.astype(mx.int32),
+                    bonus_token.reshape(1).astype(mx.int32),
+                ]
+            ).tolist()
+            flags = resolved[:K]
+            accepted = next((idx for idx, flag in enumerate(flags) if not flag), K)
+            bonus = resolved[K + accepted] if accepted < K else resolved[-1]
+            preds_list = draft[:accepted] + [bonus]
+        uid_stats["sample_ms"] = (
+            float(uid_stats["sample_ms"]) + (time.perf_counter() - phase_t0) * 1000
+        )
         rejected = K - accepted
         if accepted == K:
             _stats["full_accept_rounds"] += 1
             uid_stats["full_accept_rounds"] += 1
         if rejected:
-            # DeepSeek V4 pooling caches cannot trim once a compressed window
-            # has been materialised. Restore the pre-verify snapshot and replay
-            # only the committed prefix instead. This is the lossless fallback
-            # for partial acceptance; full-accept rounds keep the fast path.
-            gb.prompt_cache = target_cache_snapshot
-            committed_input = verify_input[:, : accepted + 1]
-            replay_logits = model(committed_input, cache=gb.prompt_cache)
-            replay_hidden = model._last_dspark_hidden
-            mx.eval(replay_logits, replay_hidden)
-            verify_hidden = replay_hidden
+            from .models.deepseek_v4_rollback import trim_all
+
+            phase_t0 = time.perf_counter()
+            rollback_error = None
+            try:
+                rollback_ok = trim_all(gb.prompt_cache, rejected)
+            except Exception as exc:  # noqa: BLE001
+                rollback_error = exc
+                rollback_ok = False
+            if not rollback_ok:
+                # Compatibility fallback for an unknown/new cache class. It
+                # is exact but expensive; supported DeepSeek caches use their
+                # short-window undo records and never replay the backbone.
+                logger.warning(
+                    "[DSpark] cache rollback %s; replaying committed prefix%s",
+                    "failed" if rollback_error is not None else "unsupported",
+                    f": {rollback_error!r}" if rollback_error is not None else "",
+                )
+                gb.prompt_cache = target_cache_snapshot
+                committed_input = verify_input[:, : accepted + 1]
+                replay_logits = model(committed_input, cache=gb.prompt_cache)
+                replay_hidden = model._last_dspark_hidden
+                mx.eval(replay_logits, replay_hidden)
+                verify_hidden = replay_hidden
+            uid_stats["rollback_ms"] = (
+                float(uid_stats["rollback_ms"])
+                + (time.perf_counter() - phase_t0) * 1000
+            )
 
         # Only target states for committed inputs may seed the next proposal.
         model._last_dspark_hidden = verify_hidden[:, : accepted + 1]
@@ -1649,6 +1787,14 @@ def _install_dspark(
             _pending_replay[uid] = (target_cache_snapshot, verify_input)
         _stats["tokens_accepted"] += accepted
         uid_stats["tokens_accepted"] += accepted
+        depth_stats = uid_stats["depth_stats"]
+        depth_bucket = depth_stats.setdefault(
+            current_k, {"rounds": 0, "accepted": 0, "proposed": 0, "verify_ms": 0.0}
+        )
+        depth_bucket["rounds"] += 1
+        depth_bucket["accepted"] += accepted
+        depth_bucket["proposed"] += K
+        depth_bucket["verify_ms"] += verify_elapsed_ms
         # oMLX's most important operational lesson is that a fixed speculative
         # depth is wrong for coding agents: acceptance changes sharply across
         # prose, JSON and tool-call boundaries.  Use a conservative AIMD-like
@@ -1657,7 +1803,7 @@ def _install_dspark(
         # instead of permanently disabling DSpark for the rest of the request.
         current_k, low_streak, needs_cooldown = _adapt_dspark_depth(
             current_k,
-            draft_k,
+            runtime_max_k,
             accepted,
             K,
             int(uid_stats["low_accept_streak"]),
@@ -1676,10 +1822,16 @@ def _install_dspark(
         attempts = int(request_stats.get("draft_tokens_proposed", 0))
         accepts = int(request_stats.get("tokens_accepted", 0))
         rounds = int(request_stats.get("verify_steps", 0))
+        depth_stats = request_stats.get("depth_stats", {})
+        depth_summary = ",".join(
+            f"k{k}:{v['rounds']}r/{v['accepted']}a/{v['proposed']}p/{v['verify_ms']:.0f}ms"
+            for k, v in sorted(depth_stats.items())
+        )
         logger.info(
             "[DSpark] completed uid=%s rounds=%d accepted=%d/%d "
             "avg_accept=%.2f full_accept=%d/%d depth=%d..%d "
-            "fallback_events=%d",
+            "fallback_events=%d timing[draft=%.1fms verify=%.1fms "
+            "sample=%.1fms rollback=%.1fms] by_depth=[%s]",
             uid,
             rounds,
             accepts,
@@ -1690,6 +1842,11 @@ def _install_dspark(
             int(request_stats.get("min_depth", 0)),
             int(request_stats.get("max_depth", 0)),
             int(request_stats.get("fallback_events", 0)),
+            float(request_stats.get("draft_ms", 0.0)),
+            float(request_stats.get("verify_ms", 0.0)),
+            float(request_stats.get("sample_ms", 0.0)),
+            float(request_stats.get("rollback_ms", 0.0)),
+            depth_summary,
         )
         _pending.pop(uid, None)
         _pending_replay.pop(uid, None)
@@ -1791,9 +1948,10 @@ def _install_dspark(
     gb.next = _dspark_next
     batch_gen._dspark_stats = _stats
     logger.info(
-        "[DSpark] installed (greedy B=1, checkpoint K=%d, max K=%d)",
+        "[DSpark] installed (greedy-only; stochastic requests use plain "
+        "decode, checkpoint K=%d, runtime max K=%d)",
         checkpoint_k,
-        draft_k,
+        runtime_max_k,
     )
     return True
 

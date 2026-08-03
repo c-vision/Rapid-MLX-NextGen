@@ -60,6 +60,31 @@ def test_register_vendored_archs_is_idempotent():
     assert first is second
 
 
+def test_restored_pooling_cache_without_legacy_undo_field_is_safe():
+    """Persisted pre-rollback caches must remain inspectable after upgrade."""
+    import mlx.core as mx
+
+    from vllm_mlx.models.deepseek_v4_cache import PoolingCache
+
+    cache = PoolingCache.__new__(PoolingCache)
+    cache.pooled = mx.zeros((1, 1, 4))
+    cache.remainder = 0
+    assert not hasattr(cache, "_undo")
+    assert cache.is_trimmable() is False
+
+
+def test_restored_batch_pooling_cache_without_legacy_undo_field_is_safe():
+    import mlx.core as mx
+
+    from vllm_mlx.models.deepseek_v4_cache import BatchPoolingCache
+
+    cache = BatchPoolingCache.__new__(BatchPoolingCache)
+    cache.pooled = mx.zeros((1, 1, 4))
+    cache.remainder = [0]
+    assert not hasattr(cache, "_undo")
+    assert cache.is_trimmable() is False
+
+
 def test_deepseek_v4_rope_applies_per_row_integer_offsets():
     """Continuous batches may contain caches at different positions."""
     mx = pytest.importorskip("mlx.core")
@@ -469,3 +494,75 @@ def test_deepseek_v4_dspark_drafts_checkpoint_block():
     mx.eval(short_ids, short_logits)
     assert short_ids.shape == (1, 3)
     assert short_logits.shape == (1, 2, 128)
+
+
+def test_dspark_verify_matches_sequential_decode_cache_views():
+    """M-row verification must observe the same state as M ordinary steps."""
+    import copy
+
+    import mlx.core as mx
+
+    from vllm_mlx.models.deepseek_v4 import Model, ModelArgs
+    from vllm_mlx.models.deepseek_v4_rollback import armed
+
+    args = ModelArgs(
+        vocab_size=128,
+        hidden_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        q_lora_rank=16,
+        qk_rope_head_dim=4,
+        head_dim=16,
+        compress_ratios=[0, 4, 128, 0],
+        index_n_heads=4,
+        index_head_dim=8,
+        index_topk=4,
+        moe_intermediate_size=16,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        num_hash_layers=1,
+        hc_mult=2,
+        sliding_window=16,
+        o_groups=2,
+        o_lora_rank=8,
+        dspark_num_layers=3,
+        dspark_block_size=5,
+        dspark_noise_token_id=127,
+        dspark_target_layer_ids=[0, 1, 2],
+        dspark_markov_rank=8,
+    )
+    model = Model(args)
+    cache = model.make_cache()
+    prefix = mx.array([[i % 127 for i in range(20)]], dtype=mx.int32)
+    mx.eval(model(prefix, cache=cache), [entry.state for entry in cache])
+    sequential_cache = copy.deepcopy(cache)
+    verify_cache = copy.deepcopy(cache)
+    verify = mx.array([[21, 22, 23, 24, 25, 26]], dtype=mx.int32)
+
+    rows = []
+    for idx in range(verify.shape[1]):
+        rows.append(model(verify[:, idx : idx + 1], cache=sequential_cache))
+    sequential = mx.concatenate(rows, axis=1)
+    with armed():
+        batched = model(verify, cache=verify_cache)
+    mx.eval(sequential, batched)
+
+    assert mx.allclose(sequential, batched, rtol=2e-3, atol=2e-3).item()
+    sequential_offsets = [
+        entry[0].offset if hasattr(entry, "caches") else entry.offset
+        for entry in sequential_cache
+    ]
+    verify_offsets = [
+        entry[0].offset if hasattr(entry, "caches") else entry.offset
+        for entry in verify_cache
+    ]
+    assert sequential_offsets == verify_offsets
+
+    # Cache equivalence must survive the verify call, not merely produce the
+    # same rows once.  The following ordinary decode observes all cache state.
+    next_token = mx.array([[27]], dtype=mx.int32)
+    sequential_next = model(next_token, cache=sequential_cache)
+    verify_next = model(next_token, cache=verify_cache)
+    mx.eval(sequential_next, verify_next)
+    assert mx.allclose(sequential_next, verify_next, rtol=2e-3, atol=2e-3).item()

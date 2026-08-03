@@ -36,6 +36,7 @@ class PoolingCache(_BaseCache):
         # self.pooled is a logical-size view; mutation sites keep them in sync.
         self._buf = None
         self.pooled = None
+        self._undo = None
 
     @property
     def offset(self):
@@ -48,6 +49,31 @@ class PoolingCache(_BaseCache):
         if self.buf_kv is None:
             self.buf_kv = mx.zeros((B, self.ratio, D1), dtype=kv.dtype)
             self.buf_gate = mx.zeros((B, self.ratio, D2), dtype=gate.dtype)
+
+        from .deepseek_v4_rollback import is_armed
+
+        if is_armed() and L <= 8:
+            if L == 1 and self._undo is not None:
+                undo = self._undo
+                self._undo = (
+                    *undo[:4],
+                    mx.concatenate([undo[4], kv], axis=1),
+                    mx.concatenate([undo[5], gate], axis=1),
+                    *undo[6:],
+                )
+            else:
+                self._undo = (
+                    None if self.remainder == 0 else self.buf_kv[:, : self.remainder] + 0,
+                    None if self.remainder == 0 else self.buf_gate[:, : self.remainder] + 0,
+                    self.remainder,
+                    0 if self.pooled is None else self.pooled.shape[1],
+                    kv,
+                    gate,
+                    getattr(self, "overlap_kv", None),
+                    getattr(self, "overlap_gate", None),
+                )
+        else:
+            self._undo = None
 
         # Prompt mode
         if L > 1:
@@ -150,6 +176,11 @@ class PoolingCache(_BaseCache):
     @state.setter
     def state(self, v):
         buf_kv, buf_gate, pooled = v
+        # Rollback history is generation-ephemeral and is intentionally not
+        # serialized. Older persisted prefix entries may also have been
+        # created before the field existed, so every restore must initialize
+        # it explicitly before is_trimmable() can inspect the cache.
+        self._undo = None
         self.remainder = 0
         self.buf_kv = self.buf_gate = None
         if buf_kv is not None:
@@ -173,11 +204,56 @@ class PoolingCache(_BaseCache):
         return obj
 
     def is_trimmable(self):
-        return self.pooled is None
+        return self.pooled is None or self.remainder > 0 or self._can_undo(1)
+
+    def _can_undo(self, n):
+        undo = getattr(self, "_undo", None)
+        return undo is not None and undo[4].shape[1] >= n
 
     def trim(self, n):
-        n = min(self.remainder, n)
-        self.remainder -= n
+        if n <= self.remainder:
+            self.remainder -= n
+            self._undo = None
+            return n
+        if not self._can_undo(n):
+            return 0
+        (
+            buf_kv,
+            buf_gate,
+            old_remainder,
+            old_pool_len,
+            kv,
+            gate,
+            old_overlap_kv,
+            old_overlap_gate,
+        ) = self._undo
+        self._undo = None
+        keep = kv.shape[1] - n
+        prefix_kv = kv[:, :keep]
+        prefix_gate = gate[:, :keep]
+        if buf_kv is not None:
+            prefix_kv = mx.concatenate([buf_kv, prefix_kv], axis=1)
+            prefix_gate = mx.concatenate([buf_gate, prefix_gate], axis=1)
+        completed = prefix_kv.shape[1] // self.ratio
+        pool_len = old_pool_len + completed
+        self.pooled = None if pool_len == 0 else self._buf[:, :pool_len]
+        used = completed * self.ratio
+        remainder_kv = prefix_kv[:, used:]
+        remainder_gate = prefix_gate[:, used:]
+        self.remainder = remainder_kv.shape[1]
+        if self.remainder:
+            self.buf_kv[:, : self.remainder] = remainder_kv
+            self.buf_gate[:, : self.remainder] = remainder_gate
+        if hasattr(self, "overlap_kv"):
+            if completed:
+                last_kv = mx.unflatten(prefix_kv[:, used - self.ratio : used], 1, (-1, self.ratio))[:, -1]
+                last_gate = mx.unflatten(prefix_gate[:, used - self.ratio : used], 1, (-1, self.ratio))[:, -1]
+                half = last_kv.shape[-1] // 2
+                self.overlap_kv = last_kv[..., :half]
+                self.overlap_gate = last_gate[..., :half]
+            else:
+                self.overlap_kv = old_overlap_kv
+                self.overlap_gate = old_overlap_gate
         return n
 
     def size(self):
@@ -225,6 +301,7 @@ class BatchPoolingCache(_BaseCache):
 
         self._lengths = [2**31] * batch_size
         self._processed = [0] * batch_size
+        self._undo = None
 
     @property
     def offset(self):
@@ -250,6 +327,32 @@ class BatchPoolingCache(_BaseCache):
         if self.buf_kv is None:
             self.buf_kv = mx.zeros((B, ratio, D1), dtype=kv.dtype)
             self.buf_gate = mx.zeros((B, ratio, D2), dtype=gate.dtype)
+
+        from .deepseek_v4_rollback import is_armed
+
+        if is_armed() and B == 1 and L <= 8:
+            if L == 1 and self._undo is not None:
+                undo = self._undo
+                self._undo = (
+                    *undo[:5],
+                    mx.concatenate([undo[5], kv], axis=1),
+                    mx.concatenate([undo[6], gate], axis=1),
+                    *undo[7:],
+                )
+            else:
+                self._undo = (
+                    self.buf_kv + 0,
+                    self.buf_gate + 0,
+                    list(self.remainder),
+                    list(self._pool_lengths),
+                    list(self._processed),
+                    kv,
+                    gate,
+                    getattr(self, "overlap_kv", None),
+                    getattr(self, "overlap_gate", None),
+                )
+        else:
+            self._undo = None
 
         valid_lengths = [min(l - p, L) for l, p in zip(self._lengths, self._processed)]
         if max(valid_lengths) != L:
@@ -407,6 +510,7 @@ class BatchPoolingCache(_BaseCache):
     def state(self, v):
         self.buf_kv, self.buf_gate, self.pooled = v
         self._buf = self.pooled
+        self._undo = None
 
     @property
     def meta_state(self):
@@ -421,13 +525,66 @@ class BatchPoolingCache(_BaseCache):
         self._lengths = [2**31] * len(self._pool_lengths)
 
     def is_trimmable(self):
-        return self.pooled is None
+        return self.pooled is None or min(self.remainder) > 0 or self._can_undo(1)
+
+    def _can_undo(self, n):
+        undo = getattr(self, "_undo", None)
+        return (
+            undo is not None
+            and len(self.remainder) == 1
+            and undo[5].shape[1] >= n
+        )
 
     def trim(self, n):
-        n = min(min(self.remainder), n)
-        for i in range(len(self.remainder)):
-            self.remainder[i] -= n
-            self._processed[i] -= n
+        if n <= min(self.remainder):
+            for i in range(len(self.remainder)):
+                self.remainder[i] -= n
+                self._processed[i] -= n
+            self._undo = None
+            return n
+        if not self._can_undo(n):
+            return 0
+        (
+            buf_kv,
+            buf_gate,
+            old_remainder,
+            old_pool_lengths,
+            old_processed,
+            kv,
+            gate,
+            old_overlap_kv,
+            old_overlap_gate,
+        ) = self._undo
+        self._undo = None
+        keep = kv.shape[1] - n
+        prefix_kv = mx.concatenate([buf_kv[:, : old_remainder[0]], kv[:, :keep]], axis=1)
+        prefix_gate = mx.concatenate(
+            [buf_gate[:, : old_remainder[0]], gate[:, :keep]], axis=1
+        )
+        completed = prefix_kv.shape[1] // self.ratio
+        pool_len = old_pool_lengths[0] + completed
+        self._pool_lengths = [pool_len]
+        self._processed = [old_processed[0] + keep]
+        self.pooled = None if pool_len == 0 else self._buf[:, :pool_len]
+        used = completed * self.ratio
+        remainder_kv = prefix_kv[:, used:]
+        remainder_gate = prefix_gate[:, used:]
+        self.remainder = [remainder_kv.shape[1]]
+        self.buf_kv = buf_kv
+        self.buf_gate = buf_gate
+        if self.remainder[0]:
+            self.buf_kv[:, : self.remainder[0]] = remainder_kv
+            self.buf_gate[:, : self.remainder[0]] = remainder_gate
+        if hasattr(self, "overlap_kv"):
+            if completed:
+                last_kv = mx.unflatten(prefix_kv[:, used - self.ratio : used], 1, (-1, self.ratio))[:, -1]
+                last_gate = mx.unflatten(prefix_gate[:, used - self.ratio : used], 1, (-1, self.ratio))[:, -1]
+                half = last_kv.shape[-1] // 2
+                self.overlap_kv = last_kv[..., :half]
+                self.overlap_gate = last_gate[..., :half]
+            else:
+                self.overlap_kv = old_overlap_kv
+                self.overlap_gate = old_overlap_gate
         return n
 
     def size(self):
