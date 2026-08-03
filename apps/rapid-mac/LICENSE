@@ -1,0 +1,55 @@
+Rapid Desktop — End User License Agreement
+Copyright (c) 2026 MachineFi. All rights reserved.
+
+This software ("Rapid", "the App") is licensed, not sold, to you by
+MachineFi under the terms below.
+
+1. Grant of License. MachineFi grants you a non-exclusive,
+   non-transferable, revocable license to install and use the App on
+   Apple computers you own or control, including in commercial and
+   workplace settings. No separate license or registration is required
+   for use inside a company, team, or organization. This matches the
+   permissive end-user pattern adopted by LM Studio and similar local-AI
+   tooling so a team can simply install and use the App at work.
+
+2. Restrictions. You may not:
+   * redistribute, sell, rent, lease, sublicense, or otherwise transfer
+     the App or any portion of it to a third party
+   * reverse-engineer, decompile, disassemble, or attempt to derive the
+     source code of the App, except to the extent permitted by law
+   * remove or alter any proprietary notices in or on the App
+   * use the App in any application or context that violates applicable
+     law
+
+3. Ownership. The App and all intellectual property rights in and to
+   the App remain the exclusive property of MachineFi. This agreement
+   does not transfer any ownership rights to you.
+
+4. Third-Party Components. The App incorporates open-source components
+   licensed by their respective copyright holders under permissive
+   licenses (Apache 2.0, MIT, BSD). See THIRD_PARTY.md for the full
+   list and license texts.
+
+5. No Warranty. THE APP IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+   KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+   OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+   NON-INFRINGEMENT.
+
+6. Limitation of Liability. TO THE MAXIMUM EXTENT PERMITTED BY
+   APPLICABLE LAW, IN NO EVENT SHALL MACHINEFI BE LIABLE FOR ANY
+   INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES
+   ARISING OUT OF OR RELATING TO YOUR USE OF THE APP.
+
+7. Termination. This license is effective until terminated. It will
+   terminate automatically without notice if you fail to comply with
+   any term. Upon termination you must cease all use of the App and
+   destroy all copies.
+
+8. Privacy. The App's data handling is described in PRIVACY.md. By
+   using the App you agree to the data practices described there.
+
+9. Governing Law. This agreement is governed by the laws of the
+   jurisdiction in which MachineFi is registered, without regard to
+   conflict-of-laws principles.
+
+For questions, contact: legal@machinefi.com

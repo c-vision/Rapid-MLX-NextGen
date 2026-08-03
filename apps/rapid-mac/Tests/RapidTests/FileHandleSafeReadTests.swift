@@ -1,0 +1,162 @@
+import Darwin
+import Foundation
+import Testing
+@testable import Rapid
+
+/// Regression coverage for the crash-safe pipe read helpers
+/// (`FileHandleSafeRead.swift`).
+///
+/// - `readSafely` / `readToEndSafely` replace the `availableData` /
+///   `readDataToEndOfFile()` family, which raises an uncatchable
+///   `NSFileHandleOperationException` on a bad descriptor (SIGABRT).
+/// - `PipeDrainer` is the non-blocking, crash-safe drainer used by every
+///   subprocess-pipe readabilityHandler AND the SidecarExtractor
+///   terminationHandler tail. It must: read buffered bytes, never block on
+///   a write end still held open, never crash on a bad FD, report genuine
+///   EOF distinctly from "nothing right now", and — because it sets
+///   `O_NONBLOCK` once and never toggles per-drain — stay safe under
+///   concurrent drains of the same pipe (the codex r2 BLOCKING).
+@Suite("Crash-safe FileHandle reads")
+struct FileHandleSafeReadTests {
+
+    /// `PipeDrainer` returns whatever is already buffered, not at EOF while
+    /// the write end stays open.
+    @Test("PipeDrainer drains already-buffered bytes")
+    func drainReturnsBufferedBytes() throws {
+        let pipe = Pipe()
+        let drainer = PipeDrainer(pipe.fileHandleForReading)   // live handle
+        let payload = Data("tail".utf8)
+        try pipe.fileHandleForWriting.write(contentsOf: payload)
+        let result = drainer.drain()
+        #expect(result.data == payload)
+        #expect(result.atEOF == false)          // writer still open
+        try? pipe.fileHandleForWriting.close()
+        try? pipe.fileHandleForReading.close()
+    }
+
+    /// The critical no-hang contract: with the write end held OPEN and
+    /// nothing buffered — a descendant still holding stderr — a blocking
+    /// read would stall forever. `PipeDrainer` must return empty at once
+    /// (not EOF). The 1-minute limit turns a regression-to-blocking into a
+    /// clean failure instead of wedging the whole suite.
+    @Test(
+        "PipeDrainer returns empty (never blocks) while the write end stays open",
+        .timeLimit(.minutes(1))
+    )
+    func drainDoesNotHangWithOpenWriteEnd() {
+        let pipe = Pipe()
+        let drainer = PipeDrainer(pipe.fileHandleForReading)
+        let writer = pipe.fileHandleForWriting  // stays open, nothing written
+        let reader = pipe.fileHandleForReading
+        defer {
+            try? writer.close()
+            try? reader.close()
+        }
+        let result = drainer.drain()
+        #expect(result.data.isEmpty)
+        #expect(result.atEOF == false)          // EAGAIN, not EOF
+    }
+
+    /// A closed write end signals EOF: the drain reports `atEOF` so a
+    /// handler can detach. (Detaching on empty-only would misfire on the
+    /// no-data case above.)
+    @Test("PipeDrainer reports atEOF once every writer closes")
+    func drainReportsEOFOnClosedWriter() throws {
+        let pipe = Pipe()
+        let drainer = PipeDrainer(pipe.fileHandleForReading)
+        try pipe.fileHandleForWriting.close()   // no more writers → EOF
+        let result = drainer.drain()
+        #expect(result.data.isEmpty)
+        #expect(result.atEOF == true)
+        try? pipe.fileHandleForReading.close()
+    }
+
+    /// A descriptor closed UNDERNEATH the drainer (the fd-reuse race the
+    /// owning-handle design guards) must degrade to empty rather than
+    /// crashing — raw `read(2)` surfaces EBADF as -1, never an NSException.
+    @Test("PipeDrainer returns empty on a bad descriptor instead of crashing")
+    func drainOnBadDescriptorDoesNotCrash() throws {
+        let pipe = Pipe()
+        let drainer = PipeDrainer(pipe.fileHandleForReading)  // constructed live
+        // Close the read handle out from under the drainer, then drain.
+        try pipe.fileHandleForReading.close()
+        try? pipe.fileHandleForWriting.close()
+        let result = drainer.drain()
+        #expect(result.data.isEmpty)            // no crash, no bytes
+    }
+
+    /// The codex r2 BLOCKING regression: two drains of the SAME pipe running
+    /// concurrently, write end held open. With permanent `O_NONBLOCK` (no
+    /// per-drain toggle) neither can strand the other in a blocking read;
+    /// together they consume exactly the buffered bytes and both return
+    /// promptly. The time limit fails cleanly if a regression re-introduces
+    /// the toggle race and one drain wedges.
+    @Test(
+        "concurrent drains of one pipe never block and split the bytes exactly",
+        .timeLimit(.minutes(1))
+    )
+    func concurrentDrainsDoNotBlockOrRace() async throws {
+        let pipe = Pipe()
+        let readerFD = pipe.fileHandleForReading.fileDescriptor
+        let drainer = PipeDrainer(pipe.fileHandleForReading)
+        let writer = pipe.fileHandleForWriting  // stays OPEN → no EOF
+
+        // Direct, order-independent guard against the old per-drain toggle:
+        // construction must set O_NONBLOCK once and leave it set. This holds
+        // even if the two detached drains below happen to run serially (so
+        // the toggle bug couldn't be masked by lack of true overlap).
+        func isNonBlocking() -> Bool {
+            let flags = fcntl(readerFD, F_GETFL)
+            return flags != -1 && (flags & O_NONBLOCK) != 0
+        }
+        #expect(isNonBlocking())                 // set at construction
+
+        let payload = Data(repeating: 0x41, count: 8 * 1024)
+        try writer.write(contentsOf: payload)
+
+        // Two concurrent drains share the one drainer.
+        async let a = Task.detached { drainer.drain().data }.value
+        async let b = Task.detached { drainer.drain().data }.value
+        let total = await a.count + b.count
+        // Every buffered byte is read exactly once across the two drains
+        // (raw read consumes disjoint slices); no byte is lost or doubled.
+        #expect(total == payload.count)
+        // …and still non-blocking afterwards — a drain never restores
+        // blocking mode underneath a concurrent one (codex r2 BLOCKING).
+        #expect(isNonBlocking())
+
+        try? writer.close()
+        try? pipe.fileHandleForReading.close()
+    }
+
+    /// `readSafely` fills-to-count/EOF (see its doc comment): it blocks
+    /// until `count` bytes arrive OR the write end signals EOF. With the
+    /// writer closed FIRST, the pipe holds exactly `payload` then reports
+    /// EOF, so the read returns the buffered bytes instead of blocking
+    /// forever. The 1-minute limit turns a regression-to-unbounded-block
+    /// (e.g. someone dropping the pre-close) into a clean failure rather
+    /// than a wedged suite.
+    @Test(
+        "readSafely returns buffered bytes once the writer closes (EOF)",
+        .timeLimit(.minutes(1))
+    )
+    func readSafelyReturnsBufferedBytes() throws {
+        let pipe = Pipe()
+        let payload = Data("hello".utf8)
+        try pipe.fileHandleForWriting.write(contentsOf: payload)
+        try pipe.fileHandleForWriting.close()   // EOF after the 5 bytes
+        #expect(pipe.fileHandleForReading.readSafely(upToCount: safePipeChunkBytes) == payload)
+        try? pipe.fileHandleForReading.close()
+    }
+
+    /// A closed descriptor must degrade to empty `Data` rather than
+    /// raising the uncatchable `NSFileHandleOperationException`.
+    @Test("readSafely + readToEndSafely return empty on a closed descriptor instead of crashing")
+    func safeReadsOnClosedDescriptorDoNotCrash() throws {
+        let pipe = Pipe()
+        let reader = pipe.fileHandleForReading
+        try reader.close()
+        #expect(reader.readSafely(upToCount: safePipeChunkBytes).isEmpty)
+        #expect(reader.readToEndSafely().isEmpty)
+    }
+}

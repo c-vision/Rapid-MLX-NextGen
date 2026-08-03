@@ -1,0 +1,748 @@
+import SwiftUI
+
+/// Main window content. Minimal menu-bar app: a model picker at the
+/// top, the chat transcript in the middle, a status footer at the
+/// bottom. The chat surface is gated on ``ServerState`` — before the
+/// server is ready the picker's Start button owns the flow, and a
+/// brand-new user with no model on disk sees the Quickstart card.
+struct ContentView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// #459: hard window-width floor (kept ≤ 640 so half-screen tiling
+    /// never overflows the window on a built-in MacBook display).
+    static let minWindowWidth: CGFloat = 640
+    static let minWindowHeight: CGFloat = 560
+
+    @Environment(ServerManager.self) private var server
+    @Environment(DownloadManager.self) private var downloads
+    @Environment(ChatViewModel.self) private var chat
+    @Environment(SamplingConfig.self) private var sampling
+    @Environment(UpdateChecker.self) private var updater
+    @Environment(QuickstartCoordinator.self) private var quickstart
+
+    @State private var alias: String = ""
+    /// Which detail surface the sidebar shows (chat vs the Launch page).
+    @State private var section: SidebarSection = .chat
+    /// An absent telemetry preference is an undecided first run, not
+    /// implicit consent.
+    @State private var telemetryConsentPending = TelemetryConsent.needsDecision()
+    /// Set when the user picks a different alias while a server is
+    /// already serving a different one — drives the reload confirm.
+    @State private var pendingReloadAlias: String?
+    /// Set by "Switch and reload" so the implicit dismiss doesn't roll
+    /// ``alias`` back to the old model.
+    @State private var switchConfirmed: Bool = false
+    /// Alias the user confirmed via "Switch and reload" whose footprint
+    /// classifies ``.tooBig`` — drives a follow-up OOM confirm alert.
+    @State private var pendingTooBigSwitch: String?
+    @State private var switchAlertHardware: MacHardware = MacHardware.detect()
+    @SceneStorage("Rapid.showLogs") private var showLogs: Bool = false
+    /// Per-session "browse all models" dismissal of the Quickstart card.
+    @State private var quickstartDismissedThisSession: Bool = false
+    /// #223: launch-time auto-start "needs download" state — the empty
+    /// state names the pending pull when non-nil.
+    @State private var autoStartPendingDownload: (alias: String, sizeText: String?)?
+    /// FU-1: persisted opt-out for the launch-time auto-start path.
+    @AppStorage(AutoStartPreference.storageKey) private var autoStartOnLaunch: Bool = AutoStartPreference.defaultValue
+
+    var body: some View {
+        // Ollama-style layout: a left sidebar (New Chat / Launch / — later —
+        // history) + a detail pane. No top model-control bar; the model
+        // picker lives inline in the compose box (see ChatView) and the
+        // model comes up on first send (implicit lifecycle). macOS gives us
+        // the sidebar-collapse toggle in the toolbar for free.
+        NavigationSplitView {
+            SidebarView(
+                selection: $section,
+                chat: chat,
+                onNewChat: {
+                    chat.newConversation()
+                    section = .chat
+                },
+                onSelectConversation: { id in
+                    chat.selectConversation(id)
+                    section = .chat
+                }
+            )
+            .navigationSplitViewColumnWidth(min: 190, ideal: 230, max: 300)
+        } detail: {
+            detailArea
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 520, minHeight: Self.minWindowHeight)
+                .background(RapidTheme.canvas)
+        }
+        .onChange(of: server.state) { _, newState in
+            // #223: clear the download-prompt CTA the moment the server
+            // moves out of ``.idle``.
+            if case .idle = newState {} else { autoStartPendingDownload = nil }
+            // A stale "couldn't reach the model" banner is actioned once
+            // the server reaches ``.ready`` again.
+            if case .ready = newState {
+                chat.clearStaleErrorBanner()
+                if server.downloadProgress.hasObservedGrowth {
+                    downloads.markCacheChanged()
+                }
+            }
+        }
+        .onChange(of: alias) { _, newValue in
+            // Auto-reload affordance: picking a new model while another
+            // is running surfaces a confirm rather than stranding the
+            // user in a manual Stop → Start dance.
+            guard !newValue.isEmpty else { return }
+            if server.servingAlias == newValue { return }
+            if let running = runningAlias, running != newValue {
+                pendingReloadAlias = newValue
+            }
+        }
+        .onChange(of: server.state) { _, newState in
+            // Sync the picker breadcrumb when the server lands in
+            // ``.ready(<alias>)`` against a different alias than shown.
+            if case .ready(let serving) = newState, !serving.isEmpty, serving != alias {
+                alias = serving
+            }
+        }
+        .confirmationDialog(
+            "Switch to \(pendingReloadAlias ?? "")?",
+            isPresented: Binding(
+                get: { pendingReloadAlias != nil },
+                set: { presented in
+                    if !presented {
+                        if !switchConfirmed, let running = runningAlias {
+                            alias = running
+                        }
+                        switchConfirmed = false
+                        pendingReloadAlias = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingReloadAlias
+        ) { newAlias in
+            Button("Switch and reload") {
+                switchConfirmed = true
+                alias = newAlias
+                let fit = ModelSizing.classify(
+                    ModelSizing.estimate(alias: newAlias),
+                    on: switchAlertHardware
+                )
+                if fit == .tooBig {
+                    pendingReloadAlias = nil
+                    pendingTooBigSwitch = newAlias
+                    return
+                }
+                Task {
+                    await server.stop()
+                    await server.start(alias: newAlias)
+                    pendingReloadAlias = nil
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                if let running = runningAlias { alias = running }
+                pendingReloadAlias = nil
+            }
+        } message: { newAlias in
+            Text("Stops the current model and loads \(newAlias). Chat history stays put.")
+        }
+        .alert(
+            ModelPickerBar.tooBigAlertTitle(
+                alias: pendingTooBigSwitch ?? "",
+                physicalRAMGB: switchAlertHardware.physicalRAMGB
+            ),
+            isPresented: Binding(
+                get: { pendingTooBigSwitch != nil },
+                set: { if !$0 { pendingTooBigSwitch = nil } }
+            ),
+            presenting: pendingTooBigSwitch
+        ) { aliasToStart in
+            Button("Cancel", role: .cancel) {
+                if let running = runningAlias { alias = running }
+                pendingTooBigSwitch = nil
+            }
+            Button("Start anyway", role: .destructive) {
+                let confirmed = aliasToStart
+                pendingTooBigSwitch = nil
+                Task {
+                    await server.stop()
+                    await server.start(alias: confirmed)
+                }
+            }
+        } message: { aliasToStart in
+            Text(
+                ModelPickerBar.tooBigAlertMessage(
+                    alias: aliasToStart,
+                    footprint: ModelSizing.estimate(alias: aliasToStart),
+                    hardware: switchAlertHardware
+                )
+            )
+        }
+        .sheet(isPresented: firstRunSheetPresented) {
+            firstRunSheet
+        }
+        .task { await runLaunchAutoStart() }
+    }
+
+    // MARK: - Detail routing
+
+    /// The detail pane: the chat surface, or the Launch page, per the
+    /// sidebar selection.
+    @ViewBuilder
+    private var detailArea: some View {
+        switch section {
+        case .chat:
+            mainArea
+        case .launch:
+            LaunchView(server: server, alias: alias)
+        }
+    }
+
+    // MARK: - Main area
+
+    @ViewBuilder
+    private var mainArea: some View {
+        switch ContentView.mainAreaBranch(for: server.state) {
+        case .chat(let serverReady):
+            if quickstartVisible {
+                QuickstartView(
+                    coordinator: quickstart,
+                    downloads: downloads,
+                    server: server,
+                    onBrowseAll: { quickstartDismissedThisSession = true },
+                    onSeedWelcome: { true }
+                )
+            } else {
+                ChatView(
+                    viewModel: chat,
+                    server: server,
+                    alias: $alias,
+                    serverReady: serverReady,
+                    autoStartPendingDownload: autoStartPendingDownload
+                )
+            }
+        case .missing:
+            missingOverlay
+        }
+    }
+
+    /// True when the Quickstart card should render in place of the chat
+    /// surface — brand-new user with no model on disk and the server
+    /// hasn't engaged a different alias.
+    private var quickstartVisible: Bool {
+        guard !quickstartDismissedThisSession else { return false }
+        if ContentView.serverEngagedWithDifferentAlias(
+            state: server.state,
+            quickstartAlias: quickstart.selection.alias
+        ) {
+            return false
+        }
+        let hubCacheRoot = BundledModel.userHFCacheURL(
+            environment: ProcessInfo.processInfo.environment
+        )
+        let hasAnyCachedAlias = ModelCatalog.hasAnyCachedHFRepo(hubCacheRoot: hubCacheRoot)
+        if QuickstartCoordinator.isEligible(
+            done: quickstart.done,
+            lastServedAlias: ServerManager.lastServedAlias(),
+            serverState: server.state,
+            hasAnyCachedAlias: hasAnyCachedAlias
+        ) {
+            return true
+        }
+        // Keep the card up while the user is mid-flow (download / start).
+        switch quickstart.phase {
+        case .downloading, .starting, .failed, .lowDiskWarning:
+            return true
+        case .idle, .ready:
+            return false
+        }
+    }
+
+    /// Alias the server is actively serving, or ``nil`` if no live state.
+    private var runningAlias: String? {
+        switch server.state {
+        case .ready(let a), .starting(let a):
+            return a
+        case .idle, .stopped, .missing, .crashed:
+            return nil
+        }
+    }
+
+    // MARK: - First-run telemetry consent
+
+    private var firstRunSheetPresented: Binding<Bool> {
+        Binding(
+            get: { telemetryConsentPending },
+            set: { presented in
+                // Swallow external dismiss attempts while undecided.
+                _ = presented
+            }
+        )
+    }
+
+    @ViewBuilder
+    private var firstRunSheet: some View {
+        if telemetryConsentPending {
+            TelemetryConsentView(onDecision: decideTelemetry)
+                .interactiveDismissDisabled()
+        }
+    }
+
+    private func decideTelemetry(_ enabled: Bool) {
+        TelemetryConsent.record(enabled: enabled)
+        telemetryConsentPending = false
+        guard enabled else { return }
+        Task { await TelemetrySession.sendStartIfNeeded() }
+    }
+
+    // MARK: - Missing-sidecar overlay
+
+    @ViewBuilder
+    private var missingOverlay: some View {
+        VStack {
+            Spacer()
+            VStack(spacing: 20) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(RapidTheme.brandTint)
+                        .frame(width: 60, height: 60)
+                    Image(systemName: "arrow.down.circle")
+                        .font(.system(size: 28, weight: .regular))
+                        .foregroundStyle(RapidTheme.brand)
+                }
+                VStack(spacing: 8) {
+                    Text("Setup didn't finish")
+                        .font(.title2.weight(.semibold))
+                    Text("Rapid isn't fully set up yet. Reopen Rapid-MLX to run the one-time setup again.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .lineSpacing(2)
+                }
+                if let release = updater.availableUpdate,
+                   let downloadURL = ContentView.missingOverlayDownloadURL(for: release) {
+                    VStack(spacing: 8) {
+                        Button {
+                            NSWorkspace.shared.open(downloadURL)
+                        } label: {
+                            Text("Download update \(release.version)")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        HStack(spacing: 12) {
+                            Button("Recheck") { server.refreshBinary() }
+                                .controlSize(.large)
+                            Button("Quit Rapid-MLX") { NSApp.terminate(nil) }
+                                .controlSize(.large)
+                        }
+                    }
+                } else {
+                    HStack(spacing: 12) {
+                        Button {
+                            NSApp.terminate(nil)
+                        } label: {
+                            Text("Quit Rapid-MLX")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        Button("Recheck") { server.refreshBinary() }
+                            .controlSize(.large)
+                    }
+                }
+                Text("Rapid-MLX runs AI models on your Mac. Your chats stay on this computer — no messages are sent to the cloud.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 4)
+            }
+            .padding(28)
+            .frame(width: 420)
+            .background(
+                RoundedRectangle(cornerRadius: RapidTheme.cardRadius, style: .continuous)
+                    .fill(RapidTheme.card)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: RapidTheme.cardRadius, style: .continuous)
+                    .stroke(RapidTheme.hairline, lineWidth: 1)
+            )
+            .shadow(color: Color.black.opacity(0.06), radius: 18, x: 0, y: 8)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(LeopardSpots(opacity: 0.06))
+    }
+
+    // MARK: - Status footer
+
+    private var statusFooter: some View {
+        HStack(spacing: 8) {
+            SettingsGearButton()
+            Button {
+                withAnimation(RapidMotion.resolve(RapidMotion.standard, reduceMotion: reduceMotion)) {
+                    showLogs.toggle()
+                }
+            } label: {
+                Image(systemName: "terminal")
+                    .font(.system(size: 13))
+                    .foregroundStyle(showLogs ? RapidTheme.brand : Color.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help(showLogs ? "Hide logs" : "Show logs")
+            .accessibilityLabel(showLogs ? "Hide logs" : "Show logs")
+            Spacer()
+            TokensPerSecondPill(messages: chat.messages)
+            CPUPill()
+            GPUPill()
+            MemoryPill()
+            DesktopVersionPill(updater: updater)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .frame(minHeight: 30)
+        .background(.bar)
+    }
+
+    // MARK: - Launch auto-start (Flow A/B)
+
+    private func runLaunchAutoStart() async {
+        guard autoStartOnLaunch else {
+            autoStartPendingDownload = nil
+            return
+        }
+        guard case .idle = server.state else { return }
+
+        _ = BundledModel.installBundledSnapshotSymlink()
+        _ = QuickstartModel.installAllSnapshotSymlinks()
+
+        let aliasAtEntry = alias
+        var cachedAliases: Set<String> = []
+        if let binary = server.binaryPath {
+            let entries = await ModelCatalog.load(binary: binary)
+            cachedAliases = Set(entries.filter { $0.cached }.map(\.alias))
+        }
+        guard case .idle = server.state else {
+            autoStartPendingDownload = nil
+            return
+        }
+        if alias != aliasAtEntry, !alias.isEmpty {
+            autoStartPendingDownload = nil
+            return
+        }
+        let hardware = MacHardware.detect()
+        let rejectsAlias: (String) -> Bool = { candidate in
+            ModelSizing.classify(ModelSizing.estimate(alias: candidate), on: hardware) == .tooBig
+        }
+        let decision = AutoStartDecision.decide(
+            lastServedAlias: ServerManager.lastServedAlias(),
+            bundledFallbackAlias: BundledModel.firstLaunchAlias(lastServedAlias: nil),
+            binaryReachable: server.binaryPath != nil,
+            cachedAliases: cachedAliases,
+            serverState: server.state,
+            rejectsAlias: rejectsAlias,
+            userOptedIn: autoStartOnLaunch
+        )
+        switch decision {
+        case .start(let resume):
+            alias = resume
+            autoStartPendingDownload = nil
+            await server.start(alias: resume)
+        case .promptDownload(let pending):
+            let footprint = ModelSizing.estimate(alias: pending)
+            let sizeText: String? = footprint.paramsBillions == nil
+                ? nil
+                : String(format: "~%.1f GB", footprint.weightsGB)
+            autoStartPendingDownload = (alias: pending, sizeText: sizeText)
+            alias = pending
+        case .skip:
+            autoStartPendingDownload = nil
+        }
+    }
+
+    // MARK: - Pure helpers (testable seams)
+
+    static func missingOverlayDownloadURL(
+        for availableUpdate: UpdateChecker.Release?
+    ) -> URL? {
+        guard let release = availableUpdate,
+              let url = URL(string: release.htmlURL),
+              url.scheme?.lowercased() == "https",
+              url.user == nil,
+              url.password == nil,
+              let host = url.host?.lowercased(),
+              updateReleaseHostAllowlist.contains(host) else {
+            return nil
+        }
+        return url
+    }
+
+    static func serverEngagedWithDifferentAlias(
+        state: ServerState,
+        quickstartAlias: String
+    ) -> Bool {
+        switch state {
+        case .ready(let a), .starting(let a), .crashed(let a, _):
+            return a != quickstartAlias
+        case .idle, .stopped, .missing:
+            return false
+        }
+    }
+
+    enum MainAreaBranch: Equatable {
+        case chat(serverReady: Bool)
+        case missing
+    }
+
+    static func mainAreaBranch(for state: ServerState) -> MainAreaBranch {
+        switch state {
+        case .ready:
+            return .chat(serverReady: true)
+        case .starting:
+            return .chat(serverReady: false)
+        case .missing:
+            return .missing
+        case .idle, .stopped, .crashed:
+            return .chat(serverReady: false)
+        }
+    }
+}
+
+/// v0.4.37: ChatGPT-Desktop-style gear-icon Settings button. Lives
+/// in the bottom-left corner of ``statusFooter`` so the affordance
+/// is exactly where users trained by ChatGPT / Claude / VS Code
+/// expect to find it. Tooltip mentions the Cmd+, hotkey so power
+/// users keep their muscle memory; the click itself just opens the
+/// Settings scene (no deep-link override — lands on the user's last
+/// selected tab).
+struct SettingsGearButton: View {
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        Button {
+            openSettings()
+        } label: {
+            Image(systemName: "gearshape")
+                .font(.system(size: 14))
+        }
+        .buttonStyle(.borderless)
+        .help("Settings — ⌘,")
+        .accessibilityLabel("Settings")
+    }
+}
+
+/// Always-visible desktop version chip in the bottom status bar.
+///
+/// Replaces the v0.4-era ``CLIStatusPill`` — since v0.6.6 bundled the
+/// rapid-mlx engine as a sidecar, the CLI version is engine trivia
+/// the user can't act on. What they CAN act on is the desktop app's
+/// own version: this pill names it and surfaces the "an update is
+/// available" signal in-place.
+///
+/// Three states, derived purely from ``UpdateChecker``:
+///
+///   * ``upToDate`` — green dot, "Rapid Desktop X.Y.Z · up to date".
+///     ``UpdateChecker`` resolved a release whose version is exactly
+///     equal to the installed version.
+///   * ``updateAvailable`` — amber dot, "Rapid Desktop X.Y.Z · update
+///     A.B.C available". ``availableUpdate`` is non-nil.
+///   * ``unknown`` — no dot, "Rapid Desktop X.Y.Z". First check still
+///     in flight, the worker briefly failed, OR the installed build
+///     is strictly newer than the manifest (dev / pre-release / stale
+///     manifest). We never paint red: a transient blip masquerading
+///     as "broken" is worse than a calm name-only chip, and a dev
+///     build ahead of the manifest is not a fault either.
+///
+/// Clicks deep-link to Settings → App, which is the canonical home
+/// for "update Rapid-MLX Desktop". GitHub is deliberately NOT a
+/// click target: the source repo is private, so a github.com nav
+/// would 404 for end users.
+struct DesktopVersionPill: View {
+    @Bindable var updater: UpdateChecker
+    @Environment(\.openSettings) private var openSettings
+    @Environment(SettingsRouter.self) private var router
+
+    enum PillState: Equatable {
+        case upToDate(version: String)
+        case updateAvailable(current: String, latest: String)
+        case unknown(version: String)
+    }
+
+    /// Pure derivation from ``UpdateChecker`` state to the pill
+    /// state. Lifted out so the truth-table can be pinned by tests
+    /// without standing up a real SwiftUI environment.
+    ///
+    /// "Up to date" is reserved for the case where the manifest
+    /// returned a release whose version is **exactly equal** to the
+    /// installed version. Two adjacent cases used to collapse into
+    /// ``.upToDate`` and produced the v0.7.4 bug:
+    ///
+    ///   1. Dev / pre-release build whose ``currentVersion`` is
+    ///      strictly NEWER than ``latest`` (e.g. unsigned local build
+    ///      at 0.7.4 while ``dl.rapidmlx.com/latest.json`` still
+    ///      advertises 0.6.14 because the publish script hasn't run
+    ///      for the cut tag yet).
+    ///   2. Stale R2 manifest after a release where the static JSON
+    ///      regeneration is still propagating through CF edge.
+    ///
+    /// Both should read ``.unknown`` — "Rapid Desktop X · checking
+    /// for updates" without a green checkmark — rather than the
+    /// reassuring "up to date" that lies to the user. The previous
+    /// gate (``if latest != nil``) treated those cases as proof of
+    /// currency because ``availableUpdate`` is nil whenever
+    /// ``currentVersion >= latest``.
+    static func resolve(
+        currentVersion: String,
+        availableUpdate: UpdateChecker.Release?,
+        latest: UpdateChecker.Release?
+    ) -> PillState {
+        if let upgrade = availableUpdate {
+            return .updateAvailable(current: currentVersion, latest: upgrade.version)
+        }
+        if let latest = latest,
+           !UpdateChecker.isNewer(currentVersion, than: latest.version) {
+            // Manifest released ≥ our installed version AND no
+            // ``availableUpdate`` means they are equal — we are
+            // truly current. (If ``latest`` were strictly newer the
+            // ``availableUpdate`` branch above would have fired.)
+            return .upToDate(version: currentVersion)
+        }
+        // Either no check has landed yet, OR our installed version
+        // is strictly newer than the manifest (dev / pre-release /
+        // stale manifest). Show the version calmly and skip the
+        // misleading "up to date" verdict.
+        return .unknown(version: currentVersion)
+    }
+
+    private var state: PillState {
+        DesktopVersionPill.resolve(
+            currentVersion: updater.currentVersion,
+            availableUpdate: updater.availableUpdate,
+            latest: updater.latest
+        )
+    }
+
+    var body: some View {
+        Button {
+            router.requestedCategory = .app
+            openSettings()
+        } label: {
+            HStack(spacing: 5) {
+                if let tint = dotTint {
+                    Circle()
+                        .fill(tint)
+                        .frame(width: 7, height: 7)
+                }
+                label
+            }
+            .scaledSystemFont(11)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(
+                Capsule().fill(capsuleTint.opacity(0.12))
+            )
+            .overlay(
+                Capsule().strokeBorder(capsuleTint.opacity(0.30), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .help(tooltip)
+        .accessibilityIdentifier("Footer.DesktopVersionPill")
+    }
+
+    @ViewBuilder
+    private var label: some View {
+        switch state {
+        case .upToDate(let version):
+            Text("Rapid-MLX \(version) · up to date")
+        case .updateAvailable(let current, let latest):
+            Text("Rapid-MLX \(current) · update \(latest) available")
+                .fontWeight(.medium)
+        case .unknown(let version):
+            Text("Rapid-MLX \(version)")
+        }
+    }
+
+    /// Green / amber / nil. ``nil`` means "no dot at all" — the
+    /// unknown state deliberately omits the dot rather than painting
+    /// it grey so a flaky network blip doesn't look like a fault.
+    private var dotTint: Color? {
+        switch state {
+        case .upToDate:         return RapidTheme.green
+        case .updateAvailable:  return RapidTheme.amber
+        case .unknown:          return nil
+        }
+    }
+
+    /// Capsule fill / border tint. Mirrors ``dotTint`` for the two
+    /// active states; falls back to ``.secondary`` for unknown so
+    /// the capsule still reads as a real affordance.
+    private var capsuleTint: Color {
+        dotTint ?? .secondary
+    }
+
+    private var tooltip: String {
+        switch state {
+        case .upToDate(let version):
+            return "Rapid-MLX \(version) is the latest release. Click to open Settings → App."
+        case .updateAvailable(let current, let latest):
+            return "Rapid-MLX \(latest) is available (you're on \(current)). Click to install."
+        case .unknown(let version):
+            return "Rapid-MLX \(version). Click to open Settings → App."
+        }
+    }
+}
+
+/// Bottom log drawer. Reuses the same ring buffer the v0.2 ContentView
+/// rendered as a hard-coded panel; here it's collapsible so the chat
+/// surface owns the full window in the common case.
+///
+/// v0.4.28: pins the scroll position to the bottom marker on every
+/// append so the freshly-arrived log line is what the user sees when
+/// they open the drawer mid-session. Previously the ScrollView anchored
+/// to the top of the suffix-80 window — opening the drawer during a
+/// long download showed the oldest visible line first, forcing a
+/// manual scroll to see the in-flight progress.
+private struct LogDrawer: View {
+    @Bindable var server: ServerManager
+
+    /// Stable id for the invisible bottom marker we scroll to on every
+    /// log append. Lives outside the ``ForEach`` so adding rows can't
+    /// invalidate it.
+    private static let bottomAnchor = "Rapid.LogDrawer.bottom"
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 1) {
+                    if server.logLines.isEmpty {
+                        Text("(no output yet)")
+                            .scaledSystemFont(11, design: .monospaced)
+                            .foregroundStyle(.tertiary)
+                    } else {
+                        ForEach(Array(server.logLines.suffix(80).enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .scaledSystemFont(11, design: .monospaced)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    // Invisible sentinel so ``ScrollViewReader`` has a
+                    // stable anchor at the bottom of the content, even
+                    // when the row count is < the drawer height (in
+                    // which case scrolling to a row id would be a no-op).
+                    Color.clear
+                        .frame(height: 1)
+                        .id(Self.bottomAnchor)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .background(Color(nsColor: .textBackgroundColor))
+            .onAppear {
+                proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+            }
+            .onChange(of: server.logLines.count) { _, _ in
+                proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+            }
+        }
+    }
+}

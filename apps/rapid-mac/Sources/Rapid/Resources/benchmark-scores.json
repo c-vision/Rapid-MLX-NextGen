@@ -1,0 +1,407 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-06-30",
+  "default_speed_chip": "Apple M3 Ultra",
+  "axes": {
+    "general_reasoning": {
+      "label_en": "General & Reasoning",
+      "label_zh": "通识和推理",
+      "definition": "arithmetic_mean(mmlu_pro, gpqa_diamond) when both present; otherwise the single available bench",
+      "thresholds": {
+        "good": 50.0,
+        "great": 75.0
+      }
+    },
+    "code": {
+      "label_en": "Code",
+      "source_bench": "LiveCodeBench v6 where published; HumanEval / SWE-bench Verified fallback per model (see each row's code_source). NOT strictly comparable across rows.",
+      "thresholds": {
+        "good": 30.0,
+        "great": 65.0
+      }
+    },
+    "tool": {
+      "label_en": "Tool",
+      "source_bench": "BFCL where published; tau-bench family (tau-bench / Tau2 / TAU3) fallback per model (see each row's tool_source).",
+      "thresholds": {
+        "good": 50.0,
+        "great": 70.0
+      }
+    },
+    "ifeval": {
+      "label_en": "Instruction Following",
+      "source_bench": "IFEval prompt-strict",
+      "thresholds": {
+        "good": 75.0,
+        "great": 88.0
+      }
+    },
+    "speed": {
+      "label_en": "Speed",
+      "unit": "tokens/sec",
+      "source_bench": "community-benchmarks/aggregated.json long.decode_tps.median (Apple M3 Ultra)",
+      "thresholds": {
+        "good": 80.0,
+        "great": 180.0
+      },
+      "normalizer": 300.0
+    }
+  },
+  "models": {
+    "qwen3.5-4b-4bit": {
+      "general_reasoning": 77.65,
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 79.1,
+        "gpqa_diamond": 76.2
+      },
+      "code": 55.8,
+      "code_source": "https://huggingface.co/Qwen/Qwen3.5-4B (LiveCodeBench v6, med-confidence)",
+      "tool": 50.3,
+      "tool_source": "https://huggingface.co/Qwen/Qwen3.5-4B (BFCL-V4, med-confidence)",
+      "ifeval": 89.8,
+      "ifeval_source": "https://huggingface.co/Qwen/Qwen3.5-4B (IFEval, med-confidence)",
+      "speed_tps": 157.6,
+      "speed_source": "vllm-mlx/evals/SCORECARD.md (long decode, M3 Ultra)",
+      "general_reasoning_provenance": "https://huggingface.co/Qwen/Qwen3.5-4B (MMLU-Pro 79.1 + GPQA-Diamond 76.2, high-confidence)"
+    },
+    "qwen3.5-9b-4bit": {
+      "general_reasoning": 82.1,
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 82.5,
+        "gpqa_diamond": 81.7
+      },
+      "code": 65.6,
+      "code_source": "https://huggingface.co/Qwen/Qwen3.5-9B",
+      "tool": 66.1,
+      "tool_source": "https://huggingface.co/Qwen/Qwen3.5-9B (BFCL-V4, comparable magnitude)",
+      "ifeval": 91.5,
+      "ifeval_source": "https://huggingface.co/Qwen/Qwen3.5-9B",
+      "speed_tps": 106.4,
+      "speed_source": "vllm-mlx/evals/SCORECARD.md (long decode, M3 Ultra)"
+    },
+    "gemma3-1b-qat-4bit": {
+      "general_reasoning": 17.0,
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 14.7,
+        "gpqa_diamond": 19.2
+      },
+      "code": null,
+      "tool": null,
+      "tool_null_reason": "not measured",
+      "ifeval": 80.2,
+      "ifeval_source": "https://ai.google.dev/gemma/docs/core/model_card_3",
+      "speed_tps": 262.0,
+      "speed_source": "vllm-mlx/community-benchmarks/aggregated.json (long decode, M3 Ultra)",
+      "code_null_reason": "Gemma 3 1B IT is absent from every coding eval table in the tech report + model card; no published coding score. Prior 1.9 unsourced. Honest gap."
+    },
+    "gemma3-4b-qat-4bit": {
+      "general_reasoning": 37.2,
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 43.6,
+        "gpqa_diamond": 30.8
+      },
+      "code": 12.6,
+      "code_source": "https://ai.google.dev/gemma/docs/core/model_card_3",
+      "tool": null,
+      "tool_null_reason": "not measured",
+      "ifeval": 90.2,
+      "ifeval_source": "https://ai.google.dev/gemma/docs/core/model_card_3",
+      "speed_tps": 152.5,
+      "speed_source": "vllm-mlx/community-benchmarks/aggregated.json (long decode, M3 Ultra)"
+    },
+    "gemma-4-12b-4bit": {
+      "general_reasoning": 78.0,
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 77.2,
+        "gpqa_diamond": 78.8
+      },
+      "code": 72.0,
+      "code_source": "https://ai.google.dev/gemma/docs/core/model_card_4 (LiveCodeBench v6, med-confidence)",
+      "tool": 69.0,
+      "ifeval": null,
+      "speed_tps": null,
+      "speed_tps_null_reason": "not measured (model_scores-locked.md shows only an operator estimate ~35 t/s; treated as unmeasured per no-fabrication policy until a real community-bench row lands)",
+      "general_reasoning_provenance": "https://ai.google.dev/gemma/docs/core/model_card_4 (MMLU-Pro 77.2 + GPQA-Diamond 78.8, med-confidence)",
+      "tool_source": "https://huggingface.co/google/gemma-4-12b-it (Tau2-bench (tau-bench family), med-confidence)",
+      "ifeval_null_reason": "IFEval: no published value (No IFEval row in Gemma 4 12B card/blog.)"
+    },
+    "gemma-4-26b-4bit": {
+      "general_reasoning": 82.5,
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 82.6,
+        "gpqa_diamond": 82.3
+      },
+      "code": 77.1,
+      "code_source": "https://gemma4all.com/blog/gemma-4-benchmarks-performance",
+      "tool": 68.2,
+      "ifeval": null,
+      "ifeval_null_reason": "not measured",
+      "speed_tps": null,
+      "speed_tps_null_reason": "not measured (model_scores-locked.md shows only an operator estimate ~30 t/s; treated as unmeasured per no-fabrication policy)",
+      "tool_source": "https://huggingface.co/google/gemma-4-31b-it (Tau2-bench (tau-bench family), med-confidence)"
+    },
+    "gemma-4-31b-4bit": {
+      "general_reasoning": 84.8,
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 85.2,
+        "gpqa_diamond": 84.3
+      },
+      "code": 80.0,
+      "code_source": "https://gemma4all.com/blog/gemma-4-benchmarks-performance",
+      "tool": 76.9,
+      "ifeval": null,
+      "ifeval_null_reason": "not measured",
+      "speed_tps": null,
+      "speed_tps_null_reason": "not measured (model_scores-locked.md shows only an operator estimate ~26 t/s; treated as unmeasured per no-fabrication policy)",
+      "tool_source": "https://huggingface.co/google/gemma-4-31b-it (Tau2-bench (tau-bench family), med-confidence)"
+    },
+    "phi-4-mini-4bit": {
+      "general_reasoning": 44.9,
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 52.8,
+        "gpqa_diamond": 36.9
+      },
+      "code": 30.5,
+      "code_source": "https://arxiv.org/html/2503.01743v1",
+      "tool": 70.3,
+      "tool_source": "https://arxiv.org/html/2503.01743v1",
+      "ifeval": 70.1,
+      "ifeval_source": "https://arxiv.org/html/2503.01743v1",
+      "speed_tps": 159.4,
+      "speed_source": "vllm-mlx/community-benchmarks/aggregated.json (long decode, M3 Ultra)"
+    },
+    "llama-3.1-8b-4bit": {
+      "general_reasoning": 39.35,
+      "code": 72.6,
+      "tool": 76.1,
+      "ifeval": 80.4,
+      "ifeval_source": "https://github.com/meta-llama/llama3/blob/main/eval_details.md",
+      "speed_tps": 110.4,
+      "speed_source": "vllm-mlx/community-benchmarks/aggregated.json (long decode, M3 Ultra)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 48.3,
+        "gpqa_diamond": 30.4
+      },
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_provenance": "https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct (MMLU-Pro 48.3 + GPQA-Diamond 30.4, high-confidence)",
+      "code_source": "https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/MODEL_CARD.md (HumanEval, high-confidence)",
+      "tool_source": "https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct (BFCL, high-confidence)"
+    },
+    "llama3-3b-4bit": {
+      "general_reasoning": 32.8,
+      "code": null,
+      "code_null_reason": "not measured",
+      "tool": 67.0,
+      "ifeval": 77.4,
+      "speed_tps": null,
+      "speed_tps_null_reason": "not measured",
+      "general_reasoning_basis": {
+        "gpqa_diamond": 32.8
+      },
+      "general_reasoning_source": "gpqa_diamond only",
+      "general_reasoning_provenance": "https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct (GPQA-Diamond 32.8, high-confidence)",
+      "tool_source": "https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct (BFCL v2, high-confidence)",
+      "ifeval_source": "https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct (IFEval, high-confidence)"
+    },
+    "gpt-oss-20b-mxfp4-q8": {
+      "general_reasoning": 71.8,
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 74.8,
+        "gpqa_diamond": 68.8
+      },
+      "code": 77.7,
+      "code_source": "https://arxiv.org/pdf/2508.10925",
+      "tool": 35.0,
+      "ifeval": 69.5,
+      "speed_tps": 124.2,
+      "speed_source": "vllm-mlx/evals/SCORECARD.md (long decode, M3 Ultra)",
+      "tool_source": "https://arxiv.org/html/2508.10925v1 (tau-bench (retail), med-confidence)",
+      "ifeval_source": "https://huggingface.co/blog/welcome-openai-gpt-oss (IFEval, med-confidence)",
+      "general_reasoning_note": "general_reasoning basis is the high-reasoning-effort mode."
+    },
+    "deepseek-coder-v2-lite-16b-4bit": {
+      "general_reasoning": 41.57,
+      "code": 43.4,
+      "code_source": "https://arxiv.org/pdf/2406.11931 (LiveCodeBench)",
+      "tool": null,
+      "tool_null_reason": "not measured",
+      "ifeval": null,
+      "ifeval_null_reason": "not measured",
+      "speed_tps": null,
+      "speed_tps_null_reason": "not measured",
+      "general_reasoning_basis": {
+        "mmlu_pro": 41.57
+      },
+      "general_reasoning_source": "mmlu_pro only",
+      "general_reasoning_provenance": "https://huggingface.co/deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct (MMLU-Pro 41.57, med-confidence)"
+    },
+    "devstral-v2-24b-4bit": {
+      "general_reasoning": null,
+      "code": 65.9,
+      "code_source": "https://mistral.ai/news/devstral/",
+      "tool": null,
+      "tool_null_reason": "Mistral does not publish BFCL for Devstral",
+      "ifeval": null,
+      "speed_tps": 47.2,
+      "speed_source": "vllm-mlx/evals/SCORECARD.md (long decode, M3 Ultra)",
+      "general_reasoning_null_reason": "Devstral Small 2 (2512) publishes only SWE/Terminal-bench; no MMLU-Pro/GPQA on the 2512 card. Prior 77.8 not sourced to this variant. Honest gap.",
+      "ifeval_null_reason": "Devstral Small 2 (2512) publishes no IFEval on the 2512 card. Prior 83.3 not sourced to this variant. Honest gap."
+    },
+    "qwen3-coder-30b-4bit": {
+      "general_reasoning": null,
+      "code": null,
+      "code_null_reason": "Qwen publishes no LiveCodeBench/HumanEval/SWE-bench pass@1 for the Coder variant; the only available number was Artificial Analysis's Coding *Index* (29.0), a normalized composite on a different scale than the pass@1 family the Code axis renders. Shown beside its bucket-mates it put our dedicated coder below every general-purpose model (#468). Honest gap per the no-fabrication / no-incomparable-substitution policy — leave null rather than display a cross-scale number.",
+      "tool": null,
+      "tool_null_reason": "Qwen does not publish BFCL for the Coder variant",
+      "ifeval": null,
+      "speed_tps": 73.5,
+      "speed_source": "vllm-mlx/evals/SCORECARD.md (long decode, M3 Ultra)",
+      "general_reasoning_null_reason": "Qwen does not publish MMLU-Pro/GPQA for the Coder variant; the prior 62.0 was borrowed from the base Qwen3-30B-A3B general model. Honest gap per no-fabrication policy (data/benchmark-ground-truth.json).",
+      "ifeval_null_reason": "Qwen3-Coder-30B-A3B-Instruct card has no IFEval; the prior 84.7 was a base-model substitution. Honest gap."
+    },
+    "qwen3.6-27b-4bit": {
+      "general_reasoning": 87.0,
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 86.2,
+        "gpqa_diamond": 87.8
+      },
+      "code": 83.9,
+      "code_source": "https://huggingface.co/Qwen/Qwen3.6-27B",
+      "tool": null,
+      "tool_null_reason": "Qwen3.6 blog does not publish BFCL — focuses on SWE-bench + Terminal-Bench",
+      "ifeval": null,
+      "ifeval_null_reason": "Qwen3.6 blog does not publish IFEval",
+      "speed_tps": 36.5,
+      "speed_source": "vllm-mlx/evals/SCORECARD.md (long decode, M3 Ultra)"
+    },
+    "qwen3.6-35b-4bit": {
+      "general_reasoning": 85.6,
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 85.2,
+        "gpqa_diamond": 86.0
+      },
+      "code": 80.4,
+      "code_source": "https://qwen.ai/blog?id=qwen3.6-35b-a3b",
+      "tool": null,
+      "tool_null_reason": "Qwen3.6 blog does not publish BFCL",
+      "ifeval": null,
+      "ifeval_null_reason": "Qwen3.6 blog does not publish IFEval",
+      "speed_tps": 95.2,
+      "speed_source": "vllm-mlx/evals/SCORECARD.md (long decode, M3 Ultra)"
+    },
+    "qwen3.6-35b-8bit": {
+      "general_reasoning": 85.6,
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 85.2,
+        "gpqa_diamond": 86.0
+      },
+      "code": 80.4,
+      "code_source": "https://qwen.ai/blog?id=qwen3.6-35b-a3b",
+      "tool": null,
+      "tool_null_reason": "Qwen3.6 blog does not publish BFCL",
+      "ifeval": null,
+      "ifeval_null_reason": "Qwen3.6 blog does not publish IFEval",
+      "speed_tps": 80.0,
+      "speed_source": "vllm-mlx/evals/SCORECARD.md (long decode, M3 Ultra)",
+      "general_reasoning_note": "Same base architecture as qwen3.6-35b-4bit; shares its published numbers."
+    },
+    "qwen3.5-122b-8bit": {
+      "general_reasoning": 86.65,
+      "code": 78.9,
+      "tool": 72.2,
+      "ifeval": 93.4,
+      "speed_tps": 42.7,
+      "speed_source": "vllm-mlx/evals/SCORECARD.md (long decode, M3 Ultra)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 86.7,
+        "gpqa_diamond": 86.6
+      },
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_provenance": "https://huggingface.co/Qwen/Qwen3.5-122B-A10B (MMLU-Pro 86.7 + GPQA-Diamond 86.6, med-confidence)",
+      "code_source": "https://huggingface.co/Qwen/Qwen3.5-122B-A10B (LiveCodeBench v6, med-confidence)",
+      "tool_source": "https://huggingface.co/Qwen/Qwen3.5-122B-A10B (BFCL-V4, med-confidence)",
+      "ifeval_source": "https://huggingface.co/Qwen/Qwen3.5-122B-A10B (IFEval, med-confidence)"
+    },
+    "qwen3.5-122b-mxfp4": {
+      "general_reasoning": 86.65,
+      "code": 78.9,
+      "tool": 72.2,
+      "ifeval": 93.4,
+      "speed_tps": 57.0,
+      "speed_source": "vllm-mlx/evals/SCORECARD.md (long decode, M3 Ultra)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 86.7,
+        "gpqa_diamond": 86.6
+      },
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_provenance": "https://huggingface.co/Qwen/Qwen3.5-122B-A10B (MMLU-Pro 86.7 + GPQA-Diamond 86.6, med-confidence)",
+      "code_source": "https://huggingface.co/Qwen/Qwen3.5-122B-A10B (LiveCodeBench v6, med-confidence)",
+      "tool_source": "https://huggingface.co/Qwen/Qwen3.5-122B-A10B (BFCL-V4, med-confidence)",
+      "ifeval_source": "https://huggingface.co/Qwen/Qwen3.5-122B-A10B (IFEval, med-confidence)"
+    },
+    "qwen3-vl-4b-4bit": {
+      "general_reasoning": 61.5,
+      "code": null,
+      "code_null_reason": "not measured (vision model)",
+      "tool": null,
+      "tool_null_reason": "not measured (vision model)",
+      "ifeval": null,
+      "ifeval_null_reason": "not measured (vision model)",
+      "speed_tps": null,
+      "speed_tps_null_reason": "not measured (model_scores-locked.md cites a ~35-50 t/s range from codersera.com; range treated as unmeasured per no-fabrication policy)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 67.1,
+        "gpqa_diamond": 55.9
+      },
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_provenance": "https://arxiv.org/abs/2511.21631 (MMLU-Pro 67.1 + GPQA-Diamond 55.9, high-confidence)"
+    },
+    "qwen3-vl-8b-4bit": {
+      "general_reasoning": 66.75,
+      "code": null,
+      "code_null_reason": "not measured (vision model)",
+      "tool": null,
+      "tool_null_reason": "not measured (vision model)",
+      "ifeval": null,
+      "ifeval_null_reason": "not measured (vision model)",
+      "speed_tps": null,
+      "speed_tps_null_reason": "not measured (model_scores-locked.md cites a ~30-40 t/s range from codersera.com; range treated as unmeasured per no-fabrication policy)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 71.6,
+        "gpqa_diamond": 61.9
+      },
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_provenance": "https://arxiv.org/abs/2511.21631 (MMLU-Pro 71.6 + GPQA-Diamond 61.9, high-confidence)"
+    },
+    "qwen3-vl-30b-4bit": {
+      "general_reasoning": 74.1,
+      "code": null,
+      "code_null_reason": "not measured (vision model)",
+      "tool": null,
+      "tool_null_reason": "not measured (vision model)",
+      "ifeval": null,
+      "ifeval_null_reason": "not measured (vision model)",
+      "speed_tps": null,
+      "speed_tps_null_reason": "not measured (no community-bench row for the 30B VL variant yet)",
+      "general_reasoning_basis": {
+        "mmlu_pro": 77.8,
+        "gpqa_diamond": 70.4
+      },
+      "general_reasoning_source": "mean(mmlu_pro, gpqa_diamond)",
+      "general_reasoning_provenance": "https://arxiv.org/abs/2511.21631 (MMLU-Pro 77.8 + GPQA-Diamond 70.4, high-confidence)"
+    }
+  },
+  "ground_truth_source": "data/benchmark-ground-truth.json"
+}

@@ -1,0 +1,404 @@
+import Foundation
+
+/// Issue #131: split an assistant message's body into alternating
+/// Markdown and LaTeX segments so the chat view can route each kind
+/// to the right renderer.
+///
+/// Why segment in *our* code rather than write a MarkdownUI plugin:
+/// MarkdownUI's renderer flattens unknown ``$...$`` runs back into
+/// the surrounding paragraph, so the math expression renders as
+/// literal source. By splitting first we hand MarkdownUI only
+/// markdown it understands and reserve the math runs for
+/// ``SwiftMath``'s typesetter.
+///
+/// Delimiter rules (matched against KaTeX / MathJax defaults that
+/// every model in the wild emits):
+///
+/// * ``$$ ... $$`` — display math. Centered, larger glyph metrics.
+///   Can span multiple lines.
+/// * ``$ ... $`` — inline math. Sits inside a Markdown paragraph.
+///   Single-line only (a literal newline ends the inline run so a
+///   stray dollar sign in prose doesn't swallow the rest of the
+///   reply into "math").
+///
+/// Anti-cases we intentionally do NOT treat as math:
+///
+/// * **Inside fenced code blocks** — ``$x$`` written inside
+///   ``\`\`\`bash`` should render as literal source, never as math.
+///   The segmenter scans for ``\`\`\``-fenced blocks first and
+///   leaves their contents untouched.
+/// * **Indented (4-space) code blocks** — same reasoning.
+/// * **Backtick-quoted inline code** — `` `$5.00` `` is literal
+///   shell prose, not math. The segmenter skips ``...`` runs.
+/// * **Escaped dollar** — ``\$`` stays a literal dollar sign and
+///   never opens a math run.
+/// * **Bare dollar in prose** — ``it costs $20 today`` has only one
+///   ``$`` so there's no closing pair; the segmenter requires a
+///   close before the next blank line / EOF before opening math.
+///   Treated as plain markdown if no closer is found.
+/// * **Currency-dollar pairs** (codex r1 P1, #131) — ``$20 to $30``
+///   has TWO ``$`` on one line so the bare-dollar guard above
+///   doesn't catch it. We also reject any ``$`` whose IMMEDIATELY
+///   NEXT character is a digit, mirroring the MathJax convention
+///   that ``$`` followed by ``0-9`` is currency, not math. A real
+///   math opener almost always starts with a backslash control
+///   sequence (``\int``, ``\frac``), a variable letter, or a
+///   bracket — never a bare digit on its own.
+/// * **Indented code blocks** (codex r1 P2, #131) — CommonMark
+///   treats any line indented by 4+ spaces as a code block,
+///   regardless of fence markers. The segmenter recognises these
+///   and skips the entire indented run before scanning for
+///   dollars, so ``    echo "$x"`` stays literal.
+///
+/// The implementation is a single linear scan over the input
+/// string. We track three positions: the start of the current plain
+/// run, the cursor, and the start of the candidate math run. When
+/// math closes, we emit the leading plain segment + the math
+/// segment and slide the plain-run start past the close. EOF emits
+/// the trailing plain segment.
+enum LaTeXSegment: Equatable {
+    /// Markdown body — hand straight to ``MarkdownUI``.
+    case markdown(String)
+    /// LaTeX body (the delimiters are stripped). ``displayMode`` is
+    /// true for ``$$...$$``, false for ``$...$``.
+    case math(latex: String, displayMode: Bool)
+}
+
+enum LaTeXSegmenter {
+
+    /// Split ``input`` into alternating ``.markdown`` / ``.math``
+    /// segments. The returned array reconstructs ``input`` exactly
+    /// when ``.markdown`` bodies are concatenated and ``.math``
+    /// bodies are re-wrapped with their delimiters, so a future
+    /// "round-trip" sanity test can pin the contract.
+    ///
+    /// Empty ``.markdown("")`` segments are NOT emitted — the caller
+    /// just sees ``[.math, .math]`` if two math runs sit
+    /// back-to-back. Same for a math run at the start or end of
+    /// the body.
+    static func segment(_ input: String) -> [LaTeXSegment] {
+        guard !input.isEmpty else { return [] }
+        var segments: [LaTeXSegment] = []
+        var plainStart = input.startIndex
+        var cursor = input.startIndex
+
+        while cursor < input.endIndex {
+            let c = input[cursor]
+
+            // Codex r1 P2 (#131): skip CommonMark indented code
+            // blocks (4+ leading spaces / tab at start of line)
+            // before any dollar scanning. Without this, a snippet
+            // like ``    echo '$x$'`` indented under a list item
+            // would have its ``$x$`` falsely treated as math.
+            if isAtLineStart(input, at: cursor),
+               let codeBlockEnd = endOfIndentedCodeBlock(input, lineStart: cursor) {
+                cursor = codeBlockEnd
+                continue
+            }
+
+            // Skip over a fenced code block — search for the
+            // matching ``` and slide cursor past it. Conservative:
+            // treats ``` at column 0 OR after a newline as a fence.
+            if c == "`", isFenceStart(input, at: cursor) {
+                cursor = endOfFencedBlock(input, fenceStart: cursor)
+                continue
+            }
+
+            // Skip over an inline backtick-quoted run — match the
+            // shortest closing run of the same length. Matches
+            // CommonMark behaviour for `code spans`.
+            if c == "`" {
+                cursor = endOfInlineCode(input, openStart: cursor)
+                continue
+            }
+
+            // Escaped dollar — literal, skip both characters.
+            if c == "\\",
+               input.index(after: cursor) < input.endIndex,
+               input[input.index(after: cursor)] == "$" {
+                cursor = input.index(cursor, offsetBy: 2)
+                continue
+            }
+
+            // Math open candidate.
+            if c == "$" {
+                let next = input.index(after: cursor)
+                let isDisplay = next < input.endIndex && input[next] == "$"
+                let openLen = isDisplay ? 2 : 1
+                let bodyStart = input.index(cursor, offsetBy: openLen)
+                // Codex r1 P1 (#131): currency-dollar guard. Reject
+                // ``$N...`` where N is a digit — that's prose
+                // currency ("$20"), not math. Math openers in the
+                // wild are alphabetic / backslash / bracket; a
+                // bare digit immediately after ``$`` is a strong
+                // signal we're inside finance prose. Applies to
+                // inline only; display ``$$...`` is unambiguous.
+                if !isDisplay,
+                   bodyStart < input.endIndex,
+                   input[bodyStart].isASCII,
+                   input[bodyStart].isNumber {
+                    cursor = input.index(after: cursor)
+                    continue
+                }
+                if let bodyEnd = findClose(input, from: bodyStart, displayMode: isDisplay) {
+                    // Emit any leading plain markdown.
+                    if plainStart < cursor {
+                        segments.append(.markdown(String(input[plainStart..<cursor])))
+                    }
+                    let latex = String(input[bodyStart..<bodyEnd])
+                    segments.append(.math(latex: latex, displayMode: isDisplay))
+                    let closeEnd = input.index(bodyEnd, offsetBy: openLen)
+                    plainStart = closeEnd
+                    cursor = closeEnd
+                    continue
+                }
+                // No matching close → treat the ``$`` as literal.
+                cursor = input.index(after: cursor)
+                continue
+            }
+
+            cursor = input.index(after: cursor)
+        }
+
+        // Trailing plain run.
+        if plainStart < input.endIndex {
+            segments.append(.markdown(String(input[plainStart..<input.endIndex])))
+        }
+
+        return segments
+    }
+
+    // MARK: - Internals
+
+    /// True when ``index`` is at start of a line — start of input
+    /// or just after a newline.
+    private static func isAtLineStart(_ s: String, at index: String.Index) -> Bool {
+        if index == s.startIndex { return true }
+        let prev = s.index(before: index)
+        return s[prev] == "\n"
+    }
+
+    /// Codex r1 P2 (#131): CommonMark indented code block detection.
+    /// Returns the index of the FIRST line that is NOT part of the
+    /// code block (or ``endIndex`` if the whole rest of input is
+    /// indented). Returns ``nil`` when ``lineStart`` is not the
+    /// beginning of an indented-code line.
+    ///
+    /// Rules:
+    ///   * Line must start with at least 4 spaces OR a tab.
+    ///   * The block continues across consecutive indented lines
+    ///     AND across blank lines that are followed by another
+    ///     indented line (CommonMark's "blank-line continuation").
+    ///   * The block ends on the first non-blank line that is NOT
+    ///     indented enough.
+    private static func endOfIndentedCodeBlock(_ s: String, lineStart: String.Index) -> String.Index? {
+        guard isIndentedCodeLine(s, lineStart: lineStart) else { return nil }
+        var i = lineStart
+        var lastConsumedBlockEnd = lineStart
+        while i < s.endIndex {
+            let thisLineStart = i
+            // Advance i to the start of the next line (or endIndex).
+            while i < s.endIndex && s[i] != "\n" {
+                i = s.index(after: i)
+            }
+            let lineEnd = i  // points at "\n" or endIndex
+            if i < s.endIndex { i = s.index(after: i) }
+            if isIndentedCodeLine(s, lineStart: thisLineStart) {
+                lastConsumedBlockEnd = i
+                continue
+            }
+            if isBlankLine(s, lineStart: thisLineStart, lineEnd: lineEnd) {
+                // Blank line continues the block only if the NEXT
+                // non-blank line is also indented code; conservatively
+                // peek ahead.
+                if i < s.endIndex && isIndentedCodeLine(s, lineStart: i) {
+                    lastConsumedBlockEnd = i
+                    continue
+                }
+                // Blank line is NOT part of the code block — back
+                // off so the segmenter scans it as regular markdown.
+                return lastConsumedBlockEnd
+            }
+            // Non-indented, non-blank line — block ends here.
+            return thisLineStart
+        }
+        return lastConsumedBlockEnd
+    }
+
+    private static func isIndentedCodeLine(_ s: String, lineStart: String.Index) -> Bool {
+        guard lineStart < s.endIndex else { return false }
+        if s[lineStart] == "\t" { return true }
+        // At least 4 leading spaces.
+        var spaces = 0
+        var i = lineStart
+        while i < s.endIndex && s[i] == " " && spaces < 4 {
+            spaces += 1
+            i = s.index(after: i)
+        }
+        guard spaces == 4 else { return false }
+        // Also reject blank lines (4 spaces then newline / EOF) —
+        // a blank line is handled by ``isBlankLine`` instead.
+        if i == s.endIndex || s[i] == "\n" { return false }
+        return true
+    }
+
+    private static func isBlankLine(_ s: String, lineStart: String.Index, lineEnd: String.Index) -> Bool {
+        var i = lineStart
+        while i < lineEnd {
+            let c = s[i]
+            if c != " " && c != "\t" { return false }
+            i = s.index(after: i)
+        }
+        return true
+    }
+
+    /// True when ``index`` is at column 0 (start of input or after
+    /// a newline) and the next three characters are ```` ``` ````.
+    private static func isFenceStart(_ s: String, at index: String.Index) -> Bool {
+        // Position check: start of input OR previous char is newline.
+        if index != s.startIndex {
+            let prev = s.index(before: index)
+            if s[prev] != "\n" { return false }
+        }
+        // Three-or-more backticks.
+        var count = 0
+        var i = index
+        while i < s.endIndex && s[i] == "`" {
+            count += 1
+            i = s.index(after: i)
+            if count >= 3 { return true }
+        }
+        return false
+    }
+
+    /// Scan past a fenced block. Returns the index just AFTER the
+    /// closing fence (or ``endIndex`` if the block runs to EOF —
+    /// the caller treats unclosed fences as eating the rest of
+    /// the body, matching CommonMark's tolerant behaviour).
+    private static func endOfFencedBlock(_ s: String, fenceStart: String.Index) -> String.Index {
+        // Count the fence char-length at fenceStart.
+        var fenceLen = 0
+        var i = fenceStart
+        while i < s.endIndex && s[i] == "`" {
+            fenceLen += 1
+            i = s.index(after: i)
+        }
+        // Walk until we find a line whose first non-space chars are
+        // ``\`\`\`{n}`` with n >= fenceLen.
+        while i < s.endIndex {
+            // Advance to the next line's start.
+            while i < s.endIndex && s[i] != "\n" { i = s.index(after: i) }
+            if i == s.endIndex { return s.endIndex }
+            i = s.index(after: i)  // past the newline
+            // Skip leading spaces (up to 3 per CommonMark, but we're
+            // lenient).
+            var lineStart = i
+            while lineStart < s.endIndex && s[lineStart] == " " {
+                lineStart = s.index(after: lineStart)
+            }
+            var closeCount = 0
+            var j = lineStart
+            while j < s.endIndex && s[j] == "`" {
+                closeCount += 1
+                j = s.index(after: j)
+            }
+            if closeCount >= fenceLen {
+                // Skip the rest of the close line.
+                while j < s.endIndex && s[j] != "\n" { j = s.index(after: j) }
+                if j < s.endIndex { j = s.index(after: j) }
+                return j
+            }
+            i = j
+        }
+        return s.endIndex
+    }
+
+    /// Match a CommonMark inline-code run. ``openStart`` points at
+    /// the first backtick. Returns the index just AFTER the closing
+    /// run of equal length; if no close found, returns the index
+    /// just after the open (so the segmenter doesn't lose ground).
+    private static func endOfInlineCode(_ s: String, openStart: String.Index) -> String.Index {
+        var openLen = 0
+        var i = openStart
+        while i < s.endIndex && s[i] == "`" {
+            openLen += 1
+            i = s.index(after: i)
+        }
+        let bodyStart = i
+        // Walk looking for a run of exactly ``openLen`` backticks.
+        while i < s.endIndex {
+            // Don't span across a paragraph break — CommonMark says
+            // inline code can't contain a blank line.
+            if s[i] == "\n",
+               s.index(after: i) < s.endIndex,
+               s[s.index(after: i)] == "\n" {
+                // Blank line — bail; treat the open as literal.
+                return bodyStart
+            }
+            if s[i] == "`" {
+                var run = 0
+                var j = i
+                while j < s.endIndex && s[j] == "`" {
+                    run += 1
+                    j = s.index(after: j)
+                }
+                if run == openLen {
+                    return j
+                }
+                i = j
+                continue
+            }
+            i = s.index(after: i)
+        }
+        return bodyStart  // unclosed → consume only the open
+    }
+
+    /// Find the closing ``$`` (or ``$$``) for a math run starting
+    /// at ``bodyStart``. Returns ``nil`` if no close found before
+    /// EOF or, for inline math, before the next blank line. Math
+    /// closers preceded by ``\`` are escaped and don't count.
+    private static func findClose(_ s: String, from bodyStart: String.Index, displayMode: Bool) -> String.Index? {
+        var i = bodyStart
+        // Inline math has a paragraph-break terminator — once we
+        // see a blank line (two consecutive newlines) without
+        // finding a close, the run was just a stray ``$`` in
+        // prose and we give up. Display math is more lenient
+        // because models often emit multi-line ``$$ ... $$`` blocks.
+        while i < s.endIndex {
+            let c = s[i]
+            // Escaped dollar — skip.
+            if c == "\\",
+               s.index(after: i) < s.endIndex,
+               s[s.index(after: i)] == "$" {
+                i = s.index(i, offsetBy: 2)
+                continue
+            }
+            // Inline-math line-break guard.
+            if !displayMode && c == "\n" {
+                // Look at the next char for the blank-line break.
+                let next = s.index(after: i)
+                if next == s.endIndex { return nil }
+                if s[next] == "\n" { return nil }
+                // Single newline inside inline math: bail. Inline
+                // math is expected on one line; multi-line should
+                // use ``$$ ... $$``.
+                return nil
+            }
+            if c == "$" {
+                if displayMode {
+                    // Need ``$$`` to close.
+                    let next = s.index(after: i)
+                    if next < s.endIndex && s[next] == "$" {
+                        return i  // body ends here
+                    }
+                    i = s.index(after: i)
+                    continue
+                } else {
+                    return i  // single $ closes
+                }
+            }
+            i = s.index(after: i)
+        }
+        return nil
+    }
+}

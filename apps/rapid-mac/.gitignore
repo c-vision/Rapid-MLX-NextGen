@@ -1,0 +1,33 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode (in case we open the project)
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+DerivedData/
+
+# Build artifacts
+build/
+dist/
+*.app
+*.dmg
+*.zip
+
+# Local notes (not for the repo)
+CLAUDE.md
+.claude/
+
+# macOS
+.DS_Store
+
+# Snapshot diff residue (only the baseline PNGs are versioned)
+Tests/RapidTests/__Snapshots__/*.diff.png
+*.p8
+*.p12
+*.cer
+*.pem
+*.mobileprovision
+*.keychain-db
+*.env

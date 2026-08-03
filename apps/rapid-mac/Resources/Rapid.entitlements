@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    Sidecar bundling (Phase 1 onward): the embedded Python 3.12 + venv
+    at Contents/Resources/rapid-mlx/ ships dynamic libraries (mlx.so,
+    tokenizers.so, etc.) that load their own .dylibs from inside the
+    bundle. Apple's hardened runtime rejects this by default.
+
+    Both keys are flagged informationally (not as errors) in the notary
+    report. Same shape as Anaconda Navigator, Briefcase apps, framework
+    MacPython distributions.
+    -->
+
+    <!--
+    com.apple.security.cs.allow-jit: required by mlx's Metal JIT cache
+    (~/Library/Caches/mlx) which compiles per-model shaders at runtime.
+    Without this entitlement the runtime kills mlx-lm on first model
+    load.
+    -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+
+    <!--
+    com.apple.security.cs.disable-library-validation: required so the
+    bundled python3.12 can load third-party .dylibs (e.g. tokenizers'
+    Rust runtime, mlx's Metal runtime) without each one being signed
+    by Apple or the same Team ID as the host.
+
+    Empirically required — first Phase 2 spike codesign sweep WITHOUT
+    this entitlement broke dlopen for every wheel .so with "different
+    Team IDs" error. Wheel .so's ship TeamIdentifier=not set; hardened
+    runtime enforces library validation by default.
+    -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!--
+    com.apple.security.cs.allow-unsigned-executable-memory: required
+    by mlx's Metal command-buffer scheduler which writes shader code
+    into JIT pages before execution. Discovered empirically during
+    Phase 2 spike — without this, mlx Device(gpu, 0) initialisation
+    succeeds but the first matmul SIGKILLs the runtime.
+
+    Companion to allow-jit: JIT *compiles* the shaders (allow-jit),
+    the executable-memory entitlement lets the result actually run.
+    -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>

@@ -1,0 +1,250 @@
+import Foundation
+
+/// RAM footprint estimator + fit classifier for a rapid-mlx alias on
+/// a given Mac. The picker uses this to push a "Recommended" section
+/// to the top of the menu and grey out anything that won't fit.
+///
+/// We follow whichllm's compatibility model: estimate the model's
+/// weight bytes from its parameter count and quantization, add a
+/// fixed runtime overhead (Python + uvicorn + mlx framework), then
+/// a KV-cache reserve. A model fits when total < usable RAM.
+enum ModelSizing {
+    /// Per-Mac classification of "will this even run?". The picker
+    /// renders ``.recommended`` first, then ``.cached`` second, marks
+    /// ``.borderline`` with a yellow warning, and disables ``.tooBig``.
+    enum Fit: String, Sendable, Equatable {
+        /// Comfortable headroom for KV cache + chat context.
+        case recommended
+        /// Will run but the KV cache budget is tight; flag with a
+        /// yellow icon and tooltip rather than block.
+        case borderline
+        /// Estimated footprint exceeds 80% of RAM — will swap or
+        /// OOM. Picker disables and surfaces "Needs X GB, your Mac
+        /// has Y GB".
+        case tooBig
+    }
+
+    /// Estimate of how many gibibytes the alias needs at run time.
+    /// ``weightsGB`` is the dominant term; the rest is fixed runtime
+    /// floor (rapid-mlx + Python + framework) plus a KV reserve.
+    struct Footprint: Sendable, Equatable {
+        let alias: String
+        /// Parameters in billions parsed from the alias name; ``nil``
+        /// if we couldn't find a number (e.g. an unfamiliar custom
+        /// alias). Treated as "unknown" — picker leaves it ungated.
+        let paramsBillions: Double?
+        /// Effective bits per weight (2, 3, 4, 6, 8, or 16). Default 4
+        /// for any mlx-community alias since they ship 4-bit unless the
+        /// name explicitly says otherwise. Sub-4-bit values cover the
+        /// low-bit / ternary MLX builds (e.g. ``bonsai-1.7b-2bit``),
+        /// which the estimator previously rounded up to 4-bit and so
+        /// over-stated ~2x. #520.
+        let bitsPerWeight: Int
+        /// Estimated weight-tensor footprint at the given bit-width.
+        let weightsGB: Double
+        /// Floor: Python + rapid-mlx + mlx runtime + tokenizer +
+        /// adapters. Roughly constant across aliases.
+        let baseOverheadGB: Double
+        /// Reserve we want left over for KV cache + the prompt the
+        /// user actually wants to send. 8 GB at 4096 ctx for mid-
+        /// size models; we keep this conservative because OOM
+        /// during generation is a worse UX than declining to load.
+        let kvReserveGB: Double
+
+        /// Total RAM needed for a comfortable run.
+        var totalGB: Double {
+            weightsGB + baseOverheadGB + kvReserveGB
+        }
+    }
+
+    // MARK: - Estimate
+
+    /// Compute a footprint estimate from the alias name.
+    ///
+    /// ``alias`` is parsed for two pieces of information:
+    ///   * Parameter count: the largest ``\d+(\.\d+)?B?`` run that
+    ///     looks like a size, e.g. ``qwen3.6-27b`` → 27, ``gemma-4-12b`` → 12.
+    ///   * Quantization: reads an explicit ``16/8/6/4/3/2bit`` (or
+    ///     ``ternary``) tag; defaults to 4-bit if not specified.
+    ///     mlx-community ships overwhelmingly in 4-bit so the default
+    ///     is safe.
+    static func estimate(alias: String) -> Footprint {
+        let params = parseParamsBillions(alias)
+        let bits = parseBitsPerWeight(alias)
+        // Weight tensors: params × bytes-per-weight. Each figure folds in
+        // the mlx group-quant scale/zero-point overhead (a per-group
+        // scale+bias whose relative cost grows as the bit width shrinks).
+        //  16-bit: 2.0  byte/param
+        //   8-bit: 1.05 (1.0  + ~5%)
+        //   6-bit: 0.80 (0.75 + ~7%)
+        //   4-bit: 0.55 (0.5  + ~10%)
+        //   3-bit: 0.42 (0.375 + ~12%)
+        //   2-bit / ternary: 0.28 — measured against bonsai-1.7b-2bit
+        //     (484 MB weights / 1.7 B params). Ternary (1.58-bit) MLX
+        //     builds pack to 2-bit storage, so they land here too.
+        let bytesPerParam: Double
+        switch bits {
+        case 16: bytesPerParam = 2.0
+        case 8: bytesPerParam = 1.05
+        case 6: bytesPerParam = 0.80
+        case 4: bytesPerParam = 0.55
+        case 3: bytesPerParam = 0.42
+        case 2: bytesPerParam = 0.28
+        default: bytesPerParam = 0.55
+        }
+        let weightsGB = (params ?? 0) * bytesPerParam
+        return Footprint(
+            alias: alias,
+            paramsBillions: params,
+            bitsPerWeight: bits,
+            weightsGB: weightsGB,
+            baseOverheadGB: 1.2,
+            kvReserveGB: kvReserve(forParams: params)
+        )
+    }
+
+    /// Pick a KV-reserve target proportional to model size — bigger
+    /// models have bigger per-token cache cost. The picker is mostly
+    /// concerned with order-of-magnitude, not precision.
+    static func kvReserve(forParams params: Double?) -> Double {
+        guard let p = params else { return 2.0 }
+        if p < 4 { return 1.5 }
+        if p < 10 { return 2.5 }
+        if p < 25 { return 4.0 }
+        return 6.0
+    }
+
+    // MARK: - Fit
+
+    /// Classify a footprint against a host's usable RAM pool.
+    ///
+    /// Bands chosen against ``hardware.usableRAMGB`` (80% of total),
+    /// calibrated by the empirical "gemma-4-12b crashes my 18 GB
+    /// MacBook" report:
+    ///   * ≤ 50% of usable → ``.recommended`` (comfortable KV budget)
+    ///   * 50–75% of usable → ``.borderline`` (loads, but tight under
+    ///     long contexts — MLX Metal allocation_limit defaults to 90 %
+    ///     of physical RAM, so the loading-time spike eats into the
+    ///     KV budget hard)
+    ///   * > 75% of usable → ``.tooBig`` (the model + loading spike
+    ///     + Python overhead routinely exceeds the OS jetsam ceiling
+    ///     on smaller Macs)
+    static func classify(_ footprint: Footprint, on hardware: MacHardware) -> Fit {
+        // Unknown params → leave it ungated so a user typing a custom
+        // alias doesn't get a false "won't fit" warning.
+        guard footprint.paramsBillions != nil else { return .borderline }
+        let needed = footprint.totalGB
+        let pool = hardware.usableRAMGB
+        if pool <= 0 { return .borderline }
+        let ratio = needed / pool
+        if ratio <= 0.50 { return .recommended }
+        if ratio <= 0.75 { return .borderline }
+        return .tooBig
+    }
+
+    // MARK: - Lineage ranking
+
+    /// Lineage score borrowed from whichllm's ``MODEL_LINEAGE_VERSIONS``.
+    /// Higher score = newer generation of its family; the picker uses
+    /// this to surface the *newest* fitting model from each family
+    /// first in the Recommended section. Without it, ``qwen2.5`` and
+    /// ``qwen3`` jostle for the same slot at the top.
+    static func lineageScore(_ alias: String) -> Int {
+        let a = alias.lowercased()
+        // Qwen family (most populated alias group in rapid-mlx)
+        if a.contains("qwen3.6") { return 70 }
+        if a.contains("qwen3.5") { return 60 }
+        if a.contains("qwen3-coder-next") { return 60 }
+        if a.contains("qwen3-vl") { return 55 }
+        if a.contains("qwen3") { return 50 }
+        if a.contains("qwq") { return 40 }
+        if a.contains("qwen2.5") { return 30 }
+        if a.contains("qwen2") { return 20 }
+        // Llama family
+        if a.contains("llama-4.5") || a.contains("llama4.5") { return 50 }
+        if a.contains("llama-4") || a.contains("llama4") { return 40 }
+        if a.contains("llama-3.3") || a.contains("llama3.3") { return 35 }
+        if a.contains("llama-3.2") || a.contains("llama3.2") { return 32 }
+        if a.contains("llama-3.1") || a.contains("llama3.1") { return 30 }
+        if a.contains("llama-3") || a.contains("llama3") { return 25 }
+        // Gemma family
+        if a.contains("gemma-4") || a.contains("gemma4") { return 40 }
+        if a.contains("gemma-3n") || a.contains("gemma3n") { return 35 }
+        if a.contains("gemma-3") || a.contains("gemma3") { return 30 }
+        if a.contains("gemma-2") || a.contains("gemma2") { return 20 }
+        // Mistral family
+        if a.contains("mistral-3") { return 30 }
+        if a.contains("mistral") { return 25 }
+        // Other notable families
+        if a.contains("smollm3") { return 30 }
+        if a.contains("hermes-3") || a.contains("hermes3") { return 30 }
+        if a.contains("deepseek-v4") { return 40 }
+        if a.contains("deepseek-v3") { return 35 }
+        if a.contains("glm-5") { return 40 }
+        if a.contains("glm-4.7") || a.contains("glm47") { return 35 }
+        if a.contains("phi-4") { return 35 }
+        if a.contains("phi-3") { return 30 }
+        return 10
+    }
+
+    // MARK: - Alias parsers
+
+    /// Extract the parameter count in billions from an alias.
+    /// Handles ``qwen3.6-27b``, ``llama-3.1-8b-8bit``, ``smollm3-3b``,
+    /// ``gemma-4-12b-qat`` — pulls the largest number followed by ``b``.
+    static func parseParamsBillions(_ alias: String) -> Double? {
+        // Match patterns like "27b", "8.5b", "0.6b", "27B" — case
+        // insensitive. We pick the LARGEST such match because aliases
+        // like ``qwen3-coder-next-80b-a3b`` carry both the full-weight
+        // size (80B — the one that matters for RAM) and the active
+        // params (3B — what the model uses per token).
+        let pattern = #"(\d+(?:\.\d+)?)\s*[bB]\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let nsAlias = alias as NSString
+        let matches = regex.matches(in: alias, range: NSRange(location: 0, length: nsAlias.length))
+        var best: Double? = nil
+        for m in matches {
+            guard m.numberOfRanges >= 2 else { continue }
+            let captured = nsAlias.substring(with: m.range(at: 1))
+            guard let v = Double(captured), v >= 0.1, v <= 1000 else { continue }
+            if best == nil || v > (best ?? 0) { best = v }
+        }
+        return best
+    }
+
+    /// Parse the quantization bit width from an alias. 4 is the
+    /// default for mlx-community models; 8 only when explicitly
+    /// labelled; 16 reserved for hypothetical full-precision aliases;
+    /// 6 / 3 / 2 for the sub-4-bit and ternary MLX builds we now ship
+    /// (e.g. ``bonsai-1.7b-2bit``). Order matters: the wider tags are
+    /// tested first because a narrower substring can appear inside a
+    /// wider one ("16bit" contains "6bit"). #520.
+    static func parseBitsPerWeight(_ alias: String) -> Int {
+        let lower = alias.lowercased()
+        // Full-precision float markers.
+        if lower.contains("bf16") || lower.contains("fp16") { return 16 }
+        // Ternary (1.58-bit) MLX builds pack to 2-bit storage. Match the
+        // word up front so "1.58bit-ternary" resolves to ternary instead
+        // of being read as 8-bit by the embedded "…8bit" run.
+        if lower.contains("ternary") { return 2 }
+        // Explicit "<N>bit" / "<N>-bit" token, delimiter-bounded so a
+        // wider tag can't be read as a narrower substring: plain
+        // ``contains`` parsed "16-bit" as 6-bit ("16-bit" contains
+        // "6-bit") and "1.58bit" as 8-bit. The leading lookbehind
+        // rejects a digit/dot immediately before the width; the trailing
+        // ``\b`` closes the token. #520.
+        let pattern = #"(?<![0-9.])(\d{1,2})-?bit\b"#
+        if let regex = try? NSRegularExpression(pattern: pattern) {
+            let ns = lower as NSString
+            if let match = regex.firstMatch(in: lower, range: NSRange(location: 0, length: ns.length)),
+               match.numberOfRanges >= 2,
+               let width = Int(ns.substring(with: match.range(at: 1))) {
+                switch width {
+                case 2, 3, 4, 6, 8, 16: return width
+                default: return 4  // unrecognised width → safe 4-bit default
+                }
+            }
+        }
+        return 4
+    }
+}

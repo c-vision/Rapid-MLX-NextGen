@@ -1,0 +1,393 @@
+# Signed + notarised release build for the rapid-mac desktop app.
+#
+# This workflow is a scrubbed, monorepo-adapted reconstruction of the
+# private desktop repo's release.yml. It builds apps/rapid-mac/ (the
+# SwiftUI app + its bundled rapid-mlx sidecar), signs it with a Developer
+# ID identity, notarises + staples both the .app and the .dmg, and
+# attaches the DMG to the GitHub Release for the tag.
+#
+# Trigger: pushing a ``rapid-mac-v*`` tag. The ``rapid-mac-v`` prefix keeps
+# app releases from colliding with the engine's own ``v*`` release tags in
+# this same monorepo. A manual workflow_dispatch does the same build but
+# only uploads a workflow artifact (no GitHub Release), so signing can be
+# dry-run without cutting a tag.
+#
+# ── Required GitHub Actions secrets (Settings → Secrets and variables →
+#    Actions → New repository secret). Values are the USER's Apple-account
+#    secrets — this workflow never contains any of them, only their names:
+#
+#   MACOS_DEVID_CERT_P12_BASE64  base64 of the Developer ID Application .p12
+#   MACOS_DEVID_CERT_PASSWORD    the .p12 export password
+#   APPLE_TEAM_ID                10-char Apple Team ID
+#   AC_API_KEY_ID                App Store Connect API key id (notarisation)
+#   AC_API_ISSUER_ID             App Store Connect issuer id
+#   AC_API_KEY_P8_BASE64         base64 of the AuthKey_XXX.p8
+#
+#   Optional — only if the "mirror-dist" job (bottom) is enabled:
+#   CLOUDFLARE_API_TOKEN         token scoped to Workers R2 Storage:Edit on
+#                                the distribution bucket
+#   CLOUDFLARE_ACCOUNT_ID        account id wrangler operates against
+#
+#   Optional — only if the "mirror-dist" job is enabled — as Actions
+#   VARIABLES (not secrets), since they are config, not credentials:
+#   RAPID_MAC_DIST_R2_BUCKET     name of the R2 bucket to mirror the DMG into
+#   RAPID_MAC_DIST_CDN_BASE      public CDN base URL that fronts the bucket
+#
+# NOTE: Sentry has been removed from the monorepo app; there is no
+# SENTRY_DSN secret here (the desktop workflow had one).
+#
+# NOTE: GitHub only reads workflows from ``.github/workflows`` at the
+# REPOSITORY ROOT. The copy under ``apps/rapid-mac/.github/`` is INERT —
+# it is never scheduled. This file (at the repo root) is the only one that
+# runs. Do not edit the app-local copy expecting it to take effect.
+#
+# The temp keychain password is generated at runtime, never stored.
+name: rapid-mac-release
+
+on:
+  push:
+    tags:
+      - "rapid-mac-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # attach the .dmg to the GitHub Release
+
+jobs:
+  build:
+    runs-on: macos-15   # default Xcode 16 → Swift 6.0 (Package.swift tools 6.0)
+    defaults:
+      run:
+        # All script/shell steps run from the app directory so the
+        # in-repo scripts (which resolve $ROOT relative to themselves) and
+        # their ``build/...`` outputs line up. ``uses:`` steps ignore this
+        # and take repo-root-relative paths (see the explicit
+        # ``apps/rapid-mac/`` prefixes below).
+        working-directory: apps/rapid-mac
+    env:
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+      AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+      # Absolute .app size ceiling — enforced by the "Bundle size gate"
+      # step. The bundled sidecar (Contents/Resources/rapid-mlx) dominates.
+      BUNDLE_SIZE_CAP_MB: "500"
+      # Per-release DMG growth ceiling — enforced by the "Bundle size delta
+      # gate" step against the previous rapid-mac release.
+      BUNDLE_SIZE_DELTA_CAP_MB: "50"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          # Full history + tags. scripts/build.sh derives the sidecar
+          # VERSION from the engine's pyproject.toml at the repo root, with
+          # an engine ``v*`` git-tag fallback that needs ancestry to walk.
+          # MONOREPO: NO submodules — the rapid-mlx engine IS this
+          # repository (apps/rapid-mac is a subdirectory of it).
+          fetch-depth: 0
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      # Host python3 is used by scripts/build-sidecar-tarball.sh (only when
+      # the optional bootstrapper tarball is built) and by the optional
+      # BUNDLE_MODEL snapshot path in scripts/build.sh (off by default). The
+      # sidecar's OWN interpreter is a pinned python-build-standalone that
+      # scripts/build-sidecar.sh downloads — this setup-python does not
+      # affect the shipped bundle or its Mach-O signing baseline.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
+
+      - name: Import Developer ID certificate into a temp keychain
+        env:
+          CERT_P12_BASE64: ${{ secrets.MACOS_DEVID_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_DEVID_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+          CERT_PATH="$RUNNER_TEMP/devid.p12"
+
+          # Decode the cert (openssl avoids BSD-vs-GNU base64 flag drift).
+          printf %s "$CERT_P12_BASE64" | openssl base64 -d -A -out "$CERT_PATH"
+
+          # Fresh, isolated keychain — torn down in the always() step.
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_PATH"
+
+          security import "$CERT_PATH" -P "$CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+
+          # Let codesign use the key non-interactively.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN_PATH"
+
+          # Put the temp keychain on the search list (keep user keychains).
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | sed 's/"//g')
+
+          # Resolve the Developer ID Application identity's SHA-1 and hand it
+          # to build.sh / dmg.sh via CODESIGN_IDENTITY.
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | grep 'Developer ID Application' | head -1 | awk '{print $2}')"
+          if [[ -z "$IDENTITY" ]]; then
+            echo "::error::No 'Developer ID Application' identity found in the imported cert"
+            security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
+            exit 1
+          fi
+          echo "CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "Imported identity: $IDENTITY"
+
+      - name: Decode notarisation API key
+        env:
+          AC_API_KEY_P8_BASE64: ${{ secrets.AC_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          printf %s "$AC_API_KEY_P8_BASE64" | openssl base64 -d -A -out "$KEY_PATH"
+          echo "AC_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Extract CHANGELOG section for this tag
+        # Slice the ``## [X.Y.Z]`` block out of CHANGELOG.md so the GitHub
+        # release body is the hand-curated narrative rather than an
+        # auto-generated PR list. Parks it in $RUNNER_TEMP so the "Attach to
+        # GitHub Release" step references the same bytes. Falls back to a
+        # one-line placeholder if the section is missing so the release
+        # still publishes.
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/release-notes.md"
+          TAG="${GITHUB_REF_NAME:-}"
+          # ``rapid-mac-v0.11.0`` → ``0.11.0``. On workflow_dispatch the ref
+          # is a branch, so VERSION is empty and the placeholder branch runs.
+          VERSION="${TAG#rapid-mac-v}"
+          [[ "$VERSION" == "$TAG" ]] && VERSION=""   # ref wasn't a rapid-mac-v tag
+          if [[ -f CHANGELOG.md && -n "$VERSION" ]]; then
+            awk -v needle="## [${VERSION}]" '
+              {
+                if (index($0, needle) == 1) { in_section = 1; print; next }
+                if (in_section && /^## /) { exit }
+                if (in_section) { print }
+              }
+            ' CHANGELOG.md > "$OUT"
+          fi
+          if [[ ! -s "$OUT" ]]; then
+            echo "Release ${TAG:-<dispatch>} (no CHANGELOG.md section found)." > "$OUT"
+          fi
+          echo "RELEASE_NOTES_FILE=$OUT" >> "$GITHUB_ENV"
+          echo "::group::Release notes"
+          cat "$OUT"
+          echo "::endgroup::"
+
+      - name: Build + sign Rapid-MLX Desktop.app
+        # build.sh assembles the .app, builds + signs the bundled sidecar
+        # from the engine at the repo root (RAPID_MLX_SOURCE defaults to
+        # apps/rapid-mac/../.. — the monorepo root), and Developer-ID signs
+        # the bundle with CODESIGN_IDENTITY (exported above).
+        run: bash scripts/build.sh
+
+      - name: Bundle size gate (block if .app exceeds BUNDLE_SIZE_CAP_MB)
+        # Runs BEFORE notarisation so an oversize bundle fails fast without
+        # burning an Apple notary submission.
+        run: |
+          set -euo pipefail
+          APP="build/Rapid-MLX Desktop.app"
+          SIDECAR="$APP/Contents/Resources/rapid-mlx"
+          CAP_MB="${BUNDLE_SIZE_CAP_MB:-500}"
+
+          if [[ ! -d "$APP" ]]; then
+            echo "::error::Expected $APP to exist after build step but it does not."
+            exit 1
+          fi
+
+          APP_MB=$(du -sm "$APP" | awk '{print $1}')
+          if [[ -d "$SIDECAR" ]]; then
+            SIDECAR_MB=$(du -sm "$SIDECAR" | awk '{print $1}')
+          else
+            SIDECAR_MB="0 (sidecar dir missing — investigate)"
+          fi
+          echo "::notice::Rapid-MLX Desktop.app = ${APP_MB} MB (cap ${CAP_MB} MB); sidecar = ${SIDECAR_MB} MB"
+
+          echo "::group::Bundle size breakdown"
+          SITE_PACKAGES="$SIDECAR/site-packages"
+          if [[ -d "$SITE_PACKAGES" ]]; then
+            echo "Top 10 largest dirs under site-packages/:"
+            du -sm "$SITE_PACKAGES"/* 2>/dev/null | sort -rn | head -10 || true
+          fi
+          echo "::endgroup::"
+
+          if [[ "$APP_MB" -gt "$CAP_MB" ]]; then
+            echo "::error::Rapid-MLX Desktop.app is ${APP_MB} MB which exceeds the ${CAP_MB} MB cap (bump BUNDLE_SIZE_CAP_MB if intentional)."
+            exit 1
+          fi
+
+      - name: Notarise + staple Rapid-MLX Desktop.app
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent "build/Rapid-MLX Desktop.app" "build/Rapid-MLX-Desktop.zip"
+          bash scripts/notarize.sh "build/Rapid-MLX-Desktop.zip" "build/Rapid-MLX Desktop.app"
+
+      - name: Build + sign rapid-mlx-desktop.dmg (from the stapled app)
+        run: bash scripts/dmg.sh
+
+      - name: Bundle size delta gate (block if DMG grew > cap vs previous rapid-mac release)
+        # Second-line bloat defence — diffs this DMG against the previous
+        # ``rapid-mac-v*`` release's DMG. Skips cleanly on the first release.
+        # Runs before notarisation so a regression doesn't burn a submission.
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DMG="build/rapid-mlx-desktop.dmg"
+          DELTA_CAP_MB="${BUNDLE_SIZE_DELTA_CAP_MB:-50}"
+          [[ -f "$DMG" ]] || { echo "::error::missing $DMG"; exit 1; }
+          CURRENT_DMG_MB=$(du -sm "$DMG" | awk '{print $1}')
+          CURRENT_TAG="${GITHUB_REF_NAME}"
+
+          # Only compare against OTHER rapid-mac releases (filter out the
+          # engine's own releases in this monorepo, and the current tag).
+          PREV_TAG=$(gh release list --limit 40 --exclude-drafts \
+            --json tagName -q '.[].tagName' \
+            | grep '^rapid-mac-v' \
+            | grep -vxF "$CURRENT_TAG" \
+            | head -1 || true)
+          if [[ -z "$PREV_TAG" ]]; then
+            echo "::notice::no previous rapid-mac release to diff — skipping delta gate (current DMG = ${CURRENT_DMG_MB} MB)"
+            exit 0
+          fi
+
+          CANONICAL_DMG_NAME="rapid-mlx-desktop.dmg"
+          PREV_DMG_BYTES=$(gh release view "$PREV_TAG" --json assets \
+            -q ".assets[] | select(.name == \"${CANONICAL_DMG_NAME}\") | .size" | head -1 || true)
+          if [[ -z "$PREV_DMG_BYTES" ]]; then
+            echo "::notice::previous release ${PREV_TAG} has no '${CANONICAL_DMG_NAME}' asset — skipping delta gate."
+            exit 0
+          fi
+
+          PREV_DMG_MB=$(awk -v b="$PREV_DMG_BYTES" 'BEGIN { printf "%d", (b/1000000) + 0.5 }')
+          DELTA_MB=$(( CURRENT_DMG_MB - PREV_DMG_MB ))
+          echo "::notice::DMG delta vs ${PREV_TAG}: ${CURRENT_DMG_MB} - ${PREV_DMG_MB} = ${DELTA_MB} MB (cap +${DELTA_CAP_MB} MB)"
+          if [[ "$DELTA_MB" -gt "$DELTA_CAP_MB" ]]; then
+            echo "::error::DMG grew by ${DELTA_MB} MB vs ${PREV_TAG}, exceeding +${DELTA_CAP_MB} MB (bump BUNDLE_SIZE_DELTA_CAP_MB if intentional)."
+            exit 1
+          fi
+
+      - name: Validate DMG contents (app bundle + Applications symlink)
+        run: bash scripts/validate-dmg.sh build/rapid-mlx-desktop.dmg
+
+      - name: Notarise + staple rapid-mlx-desktop.dmg
+        run: bash scripts/notarize.sh build/rapid-mlx-desktop.dmg build/rapid-mlx-desktop.dmg
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: rapid-mlx-desktop-dmg
+          # uses: step — path is repo-root-relative (working-directory does
+          # not apply to actions).
+          path: apps/rapid-mac/build/rapid-mlx-desktop.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Attach to GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#rapid-mac-v}"
+          # Prerelease detection on the VERSION part only — the tag itself
+          # always contains hyphens via the ``rapid-mac-v`` prefix, so we
+          # must strip it before looking for a ``-rc`` style suffix.
+          PRERELEASE=""
+          [[ "$VERSION" == *-* ]] && PRERELEASE="--prerelease"
+          NOTES_FILE="${RELEASE_NOTES_FILE:-}"
+          if [[ -z "$NOTES_FILE" || ! -s "$NOTES_FILE" ]]; then
+            echo "::error::RELEASE_NOTES_FILE is unset or empty."
+            exit 1
+          fi
+          # The release object may already exist or not — handle both.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file "$NOTES_FILE" $PRERELEASE
+            gh release upload "$TAG" build/rapid-mlx-desktop.dmg --clobber
+          else
+            gh release create "$TAG" build/rapid-mlx-desktop.dmg \
+              --title "$TAG" --notes-file "$NOTES_FILE" $PRERELEASE
+          fi
+
+      - name: Clean up temp keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
+
+  # ─────────────────────────────────────────────────────────────────────
+  # OPTIONAL: mirror the notarised DMG to a CDN-fronted object store.
+  #
+  # The public GitHub Release (attached above) is the canonical download
+  # and is enough on its own. This job exists only if you ALSO want a
+  # stable, vendor-neutral URL (e.g. for a landing page) that doesn't
+  # change across releases. It is a scrubbed stub of the desktop repo's
+  # Cloudflare R2 mirror + latest.json publish:
+  #
+  #   * No hardcoded bucket name (desktop used a specific private bucket) —
+  #     read from the ``RAPID_MAC_DIST_R2_BUCKET`` Actions VARIABLE.
+  #   * No hardcoded CDN hostname (desktop used dl.rapidmlx.com) — read from
+  #     the ``RAPID_MAC_DIST_CDN_BASE`` Actions VARIABLE.
+  #   * No account attribution and no "repo is private, so
+  #     /releases/latest/download won't work for anonymous users"
+  #     assumption — the monorepo app repo is public, so the GitHub Release
+  #     URL already works unauthenticated; a CDN mirror is purely optional.
+  #   * The in-app auto-update ``latest.json`` manifest is intentionally
+  #     NOT reconstructed here — the minimal app has no in-app updater yet.
+  #     TODO(owner): add latest.json emission if/when the updater lands.
+  #
+  # The whole job no-ops cleanly when its secrets/vars are absent, so it is
+  # safe to leave enabled before the dist infra exists. To hard-disable it,
+  # delete this job or add ``if: false`` below.
+  mirror-dist:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download the notarised DMG artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: rapid-mlx-desktop-dmg
+          path: dist
+
+      - name: Mirror DMG to the distribution bucket (optional)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Config (not credentials) → Actions VARIABLES. TODO(owner): set
+          # these once the dist bucket + CDN exist, or leave unset to skip.
+          R2_BUCKET: ${{ vars.RAPID_MAC_DIST_R2_BUCKET }}
+          CDN_BASE: ${{ vars.RAPID_MAC_DIST_CDN_BASE }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CLOUDFLARE_API_TOKEN:-}" || -z "${CLOUDFLARE_ACCOUNT_ID:-}" || -z "${R2_BUCKET:-}" ]]; then
+            echo "::notice::CLOUDFLARE_* secrets or RAPID_MAC_DIST_R2_BUCKET not configured — skipping the optional CDN mirror. The canonical GitHub Release DMG is unaffected."
+            exit 0
+          fi
+          VERSION="${TAG#rapid-mac-v}"
+          DMG="dist/rapid-mlx-desktop.dmg"
+          [[ -f "$DMG" ]] || { echo "::error::missing $DMG"; exit 1; }
+
+          # Versioned key (immutable) + an unversioned "latest" alias.
+          VERSIONED_KEY="rapid-mac/${VERSION}/rapid-mlx-desktop.dmg"
+          ALIAS_KEY="rapid-mac/rapid-mlx-desktop.dmg"
+
+          npx --yes wrangler@4 r2 object put "${R2_BUCKET}/${VERSIONED_KEY}" \
+            --file "$DMG" --content-type application/x-apple-diskimage --remote
+          npx --yes wrangler@4 r2 object put "${R2_BUCKET}/${ALIAS_KEY}" \
+            --file "$DMG" --content-type application/x-apple-diskimage --remote
+
+          if [[ -n "${CDN_BASE:-}" ]]; then
+            echo "::notice::Mirrored to ${CDN_BASE%/}/${VERSIONED_KEY} and ${CDN_BASE%/}/${ALIAS_KEY}"
+          else
+            echo "::notice::Mirrored to bucket ${R2_BUCKET} keys ${VERSIONED_KEY} and ${ALIAS_KEY} (set RAPID_MAC_DIST_CDN_BASE to print public URLs)."
+          fi
