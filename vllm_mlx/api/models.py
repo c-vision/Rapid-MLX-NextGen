@@ -2450,6 +2450,12 @@ class ModelsResponse(BaseModel):
 
     object: str = "list"
     data: list[ModelInfo]
+    # Codex CLI 0.146+ refreshes provider metadata from the same ``/models``
+    # URL but uses its catalog contract (``{"models": [...]}``) rather than
+    # the OpenAI discovery contract (``{"data": [...]}``). Routes can attach
+    # a local-model catalog alongside the canonical list; OpenAI-compatible
+    # clients ignore the additive field.
+    models: list[dict] = Field(default_factory=list)
 
 
 # =============================================================================

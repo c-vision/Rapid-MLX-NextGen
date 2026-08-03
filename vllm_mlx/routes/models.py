@@ -15,6 +15,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from ..agents.codex_catalog import build_codex_model_info
 from ..api.models import ModelInfo, ModelsResponse
 from ..api.utils import is_mllm_model
 from ..config import get_config
@@ -899,6 +900,17 @@ def _build_model_info(model_id: str) -> ModelInfo:
     )
 
 
+def _build_codex_model_info(info: ModelInfo) -> dict:
+    """Build Codex's additive model-catalog shape for a local model.
+
+    Codex otherwise applies its flagship-model fallback metadata, which can
+    select code-mode-only tools and a very large OpenAI-specific instruction
+    prompt.  Local models are substantially more reliable with the direct
+    ``shell_command`` surface and an explicit act-before-narrating contract.
+    """
+    return build_codex_model_info(info.id, info.context_window)
+
+
 @router.get("/v1/models", dependencies=[Depends(verify_api_key)])
 async def list_models() -> ModelsResponse:
     """List available models (supports multi-model).
@@ -939,7 +951,10 @@ async def list_models() -> ModelsResponse:
     if locked:
         _append(_build_model_info(locked))
 
-    return ModelsResponse(data=models)
+    codex_models = [
+        _build_codex_model_info(info) for info in models if "text" in info.capabilities
+    ]
+    return ModelsResponse(data=models, models=codex_models)
 
 
 @router.get("/v1/models/{model_id:path}", dependencies=[Depends(verify_api_key)])

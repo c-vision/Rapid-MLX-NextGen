@@ -118,6 +118,27 @@ def setup_agent_config(
         config_path = Path(os.path.expanduser(cfg.path))
         config_path.parent.mkdir(parents=True, exist_ok=True)
 
+        if profile.name == "codex" and isinstance(rendered, str):
+            import json
+
+            from .codex_catalog import build_codex_model_info
+
+            catalog_path = config_path.parent / "rapid-mlx-model-catalog.json"
+            rendered = rendered.replace(
+                "{model_catalog_path}", str(catalog_path.resolve())
+            )
+            catalog = {"models": [build_codex_model_info(model_id, context_length)]}
+            try:
+                _atomic_write(
+                    catalog_path,
+                    json.dumps(catalog, indent=2, ensure_ascii=False) + "\n",
+                )
+            except OSError as exc:
+                return (
+                    f"Cannot write Codex model catalog to {catalog_path} "
+                    f"({exc}). Check file permissions."
+                )
+
         try:
             merged_text = _merge_file_config(config_path, rendered, cfg.type)
         except OSError as exc:

@@ -19,6 +19,11 @@ config:
     # `model_provider` and then looks up the matching block below.
     model = "{model_id}"
     model_provider = "rapid-mlx"
+    model_context_window = {context_length}
+    # A startup-local catalog avoids Codex's asynchronous remote-catalog race:
+    # the first turn otherwise uses flagship fallback metadata before the
+    # Rapid-MLX /models request completes.
+    model_catalog_json = "{model_catalog_path}"
 
     [model_providers.rapid-mlx]
     name = "Rapid-MLX (local)"

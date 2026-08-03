@@ -583,6 +583,7 @@ class TestModelsEndpoint:
             ]
         )
         assert resp.object == "list"
+        assert resp.models == []
         assert len(resp.data) == 2
 
 

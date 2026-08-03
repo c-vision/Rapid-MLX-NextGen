@@ -581,6 +581,23 @@ class TestModelsRoutes:
             ids = [m["id"] for m in r.json()["data"]]
             assert "test-model" in ids
             assert "test-alias" in ids
+            codex_models = r.json()["models"]
+            catalog = {m["slug"]: m for m in codex_models}
+            assert catalog["test-model"]["shell_type"] == "shell_command"
+            assert catalog["test-model"]["tool_mode"] == "direct"
+            assert catalog["test-model"]["default_reasoning_level"] == "none"
+            assert [
+                level["effort"]
+                for level in catalog["test-model"]["supported_reasoning_levels"]
+            ] == ["none", "low", "medium", "high"]
+            assert "coding agent" in catalog["test-model"]["base_instructions"]
+            assert (
+                "Do not merely announce" in catalog["test-model"]["base_instructions"]
+            )
+            assert (
+                "Make repository changes with apply_patch"
+                in catalog["test-model"]["base_instructions"]
+            )
         finally:
             self._restore(orig)
 

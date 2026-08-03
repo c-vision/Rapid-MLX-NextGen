@@ -17,6 +17,7 @@ history every turn in ``input``.
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
@@ -114,6 +115,242 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _should_prime_deepseek_codex_exec(
+    responses_request: ResponsesRequest, tool_parser: str | None
+) -> bool:
+    """Return whether an early DeepSeek Codex turn should pin exec_command.
+
+    DeepSeek V4 reliably emits a valid DSML invocation when the tool name is
+    primed, but stochastic ``auto`` selection often stops in hidden output or
+    emits a prose plan before the first repository inspection.  Pin only the
+    bounded early tool phase. After six completed calls, release ``auto`` so
+    the model can either select a non-shell tool or provide its final answer.
+    """
+    if tool_parser != "deepseek_v4_0731":
+        return False
+    if responses_request.tool_choice not in (None, "auto"):
+        return False
+
+    tool_names: set[str] = set()
+    for tool in responses_request.tools or []:
+        data = tool.model_dump() if hasattr(tool, "model_dump") else tool
+        if not isinstance(data, dict):
+            continue
+        function = data.get("function")
+        name = data.get("name") or (
+            function.get("name") if isinstance(function, dict) else None
+        )
+        if isinstance(name, str):
+            tool_names.add(name)
+    # Codex exposes ``apply_patch`` as a custom tool whose wire shape can vary
+    # by client version, while its PTY pair is stable. Requiring both PTY tools
+    # keeps this scoped to a coding-agent surface rather than arbitrary apps
+    # that happen to expose one shell function.
+    if not {"exec_command", "write_stdin"}.issubset(tool_names):
+        return False
+
+    items = responses_request.input
+    if not isinstance(items, list):
+        return True
+    completed_calls = 0
+    for item in items:
+        data = item.model_dump() if hasattr(item, "model_dump") else item
+        if isinstance(data, dict) and data.get("type") == "function_call_output":
+            completed_calls += 1
+    return completed_calls < 6
+
+
+def _is_deepseek_codex_surface(
+    responses_request: ResponsesRequest, tool_parser: str | None
+) -> bool:
+    """Identify the DeepSeek DSML + Codex PTY tool combination."""
+    if tool_parser is None:
+        cfg = get_config()
+        configured = " ".join(
+            str(value or "")
+            for value in (
+                responses_request.model,
+                cfg.model_name,
+                cfg.model_alias,
+                cfg.model_path,
+            )
+        ).lower()
+        if "deepseek-v4-flash-0731" in configured:
+            tool_parser = "deepseek_v4_0731"
+    if tool_parser != "deepseek_v4_0731":
+        return False
+    names: set[str] = set()
+    for tool in responses_request.tools or []:
+        data = tool.model_dump() if hasattr(tool, "model_dump") else tool
+        if not isinstance(data, dict):
+            continue
+        function = data.get("function")
+        name = data.get("name") or (
+            function.get("name") if isinstance(function, dict) else None
+        )
+        if isinstance(name, str):
+            names.add(name)
+    return {"exec_command", "write_stdin"}.issubset(names)
+
+
+def _inject_codex_progress_reminder(
+    messages: list[dict], responses_request: ResponsesRequest
+) -> list[dict]:
+    """Put an action reminder near the generation boundary after exploration."""
+    items = responses_request.input
+    if not isinstance(items, list):
+        return messages
+    completed = 0
+    has_edited = False
+    has_test_passed = False
+    has_test_failed = False
+    calls: dict[str, str] = {}
+    for item in items:
+        data = item.model_dump() if hasattr(item, "model_dump") else item
+        if not isinstance(data, dict):
+            continue
+        if data.get("type") == "function_call_output":
+            completed += 1
+            output = str(data.get("output") or "")
+            command = calls.get(str(data.get("call_id") or ""), "")
+            is_test = any(
+                marker in command
+                for marker in ("pytest", "unittest", "tox", "nox", "ruff", "mypy")
+            )
+            if is_test and re.search(r"(?m)^\s*\d+\s+passed(?:\s|,|$)", output):
+                # Pytest summaries have shapes such as ``21 passed in 1.0s``.
+                has_test_passed = True
+            if is_test and any(
+                marker in output for marker in ("FAILED ", " FAILURES ", " ERROR ")
+            ):
+                has_test_failed = True
+        if data.get("type") == "function_call":
+            arguments = str(data.get("arguments") or "")
+            calls[str(data.get("call_id") or "")] = arguments
+            if "apply_patch" in arguments:
+                has_edited = True
+                has_test_passed = False
+                has_test_failed = False
+    if completed < 5:
+        return messages
+
+    reminder = (
+        "Engineering progress checkpoint: enough repository context has been "
+        "collected. Do not run another search or repeat a file read. "
+    )
+    if has_edited:
+        if has_test_passed and not has_test_failed:
+            reminder += (
+                "Focused tests have passed. Do not rerun the same tests. Compare the "
+                "diff against the original acceptance constraints once, then provide "
+                "the final answer without another search or test command."
+            )
+        else:
+            reminder += (
+                "Before testing, compare the diff against every explicit acceptance "
+                "constraint in the original request. Correct any mismatch first. Continue "
+                "by running focused tests with the repository's supported interpreter/toolchain. "
+                "If a command fails because of the environment, diagnose and change the "
+                "environment or command; do not rerun the same failing test unchanged."
+            )
+    else:
+        reminder += (
+            "First re-check the original request's explicit acceptance constraints. "
+            "The next tool call must make the requested edit satisfying all of them; invoke "
+            "apply_patch through exec_command now."
+        )
+    return [*messages, {"role": "developer", "content": reminder}]
+
+
+def _codex_action_command_prefix(responses_request: ResponsesRequest) -> str | None:
+    """Return a DSML command-value prefix after Codex has explored enough."""
+    items = responses_request.input
+    if not isinstance(items, list):
+        return None
+    completed = 0
+    has_edited = False
+    has_test_edit = False
+    has_unresolved_failure = False
+    has_successful_test = False
+    commands_after_edit: list[str] = []
+    calls: dict[str, str] = {}
+    for item in items:
+        data = item.model_dump() if hasattr(item, "model_dump") else item
+        if not isinstance(data, dict):
+            continue
+        if data.get("type") == "function_call_output":
+            completed += 1
+            if has_edited:
+                output = str(data.get("output") or "")
+                command = calls.get(str(data.get("call_id") or ""), "")
+                is_test = any(
+                    marker in command
+                    for marker in (
+                        "pytest",
+                        "unittest",
+                        "tox",
+                        "nox",
+                        "ruff",
+                        "mypy",
+                    )
+                )
+                if is_test:
+                    failed = any(
+                        marker in output
+                        for marker in (
+                            "FAILED ",
+                            " FAILURES ",
+                            "Traceback (most recent call last)",
+                            " ERROR ",
+                        )
+                    )
+                    passed = bool(re.search(r"(?m)^\s*\d+\s+passed(?:\s|,|$)", output))
+                    if failed:
+                        has_unresolved_failure = True
+                        has_successful_test = False
+                    elif passed:
+                        has_unresolved_failure = False
+                        has_successful_test = True
+        if data.get("type") == "function_call":
+            arguments = str(data.get("arguments") or "")
+            calls[str(data.get("call_id") or "")] = arguments
+            if "apply_patch" in arguments:
+                has_edited = True
+                has_test_edit = has_test_edit or any(
+                    marker in arguments for marker in ("tests/", "test_", "_test.")
+                )
+                has_unresolved_failure = False
+                has_successful_test = False
+                commands_after_edit = []
+            elif has_edited:
+                commands_after_edit.append(arguments)
+    if completed < 5:
+        return None
+    if has_edited:
+        if has_successful_test and not has_unresolved_failure:
+            return None
+        # Give the model room to review its diff, but stop the common semantic
+        # loop where it varies the path/pattern of the same grep indefinitely.
+        # If three post-edit tool turns pass without a regression-test edit,
+        # move it back into the edit phase.  Once tests exist, move it into a
+        # supported Python test invocation (Codex inherits the user's PATH).
+        if len(commands_after_edit) < 3:
+            return None
+        command = (
+            "python -m pytest"
+            if has_test_edit and not has_unresolved_failure
+            else "apply_patch"
+        )
+    else:
+        command = "apply_patch"
+    return (
+        "<｜DSML｜tool_calls>\n"
+        '<｜DSML｜invoke name="exec_command">\n'
+        '<｜DSML｜parameter name="cmd" string="true">'
+        f"{command}"
+    )
+
+
 def _resolve_context_safe_implicit_responses_max_tokens(
     engine: BaseEngine,
     prompt_tokens: int | None,
@@ -142,7 +379,9 @@ def _resolve_context_safe_implicit_responses_max_tokens(
     return min(resolved_max_tokens, remaining_tokens)
 
 
-def _resolved_sampling_kwargs(openai_request: ChatCompletionRequest) -> dict:
+def _resolved_sampling_kwargs(
+    openai_request: ChatCompletionRequest,
+) -> dict:
     """Resolve sampling params through the 4-layer cascade.
 
     Mirrors the helper in routes/anthropic.py so ``/v1/responses`` users
@@ -155,6 +394,29 @@ def _resolved_sampling_kwargs(openai_request: ChatCompletionRequest) -> dict:
         "stop": getattr(openai_request, "stop", None),
     }
     out.update(build_extended_sampling_kwargs(openai_request))
+    return out
+
+
+def _resolved_responses_sampling_kwargs(
+    openai_request: ChatCompletionRequest,
+    responses_request: ResponsesRequest,
+    tool_parser: str | None,
+) -> dict:
+    """Apply Responses/Codex defaults without changing the base helper contract."""
+    out = _resolved_sampling_kwargs(openai_request)
+    if responses_request.temperature is None and _is_deepseek_codex_surface(
+        responses_request, tool_parser
+    ):
+        # The 0731 checkpoint ships temperature=1 in generation_config.
+        # That is useful for chat, but in long Codex tool loops it causes
+        # repeated/degenerate DSML and also opts out of the correctness-gated
+        # greedy DSpark path. Coding-agent requests that did not explicitly
+        # choose a temperature therefore use a low-entropy coding default.
+        # A literal greedy 0.0 currently exposes a reproducible DSpark failure
+        # where the second forced exec call has no ``cmd``; 0.2 stays on the
+        # correctness-gated plain sampler while sharply reducing temperature-1
+        # tool degeneration. Explicit client sampling always wins.
+        out["temperature"] = 0.2
     return out
 
 
@@ -391,6 +653,33 @@ async def create_response(request: Request):
     # detectors, the adapter's input-item builder, and any future tool
     # type-keyed dispatch can read ``tools[i].type`` directly.
     normalize_responses_tool_types(responses_request.tools)
+    cfg_for_priming = get_config()
+    priming_tool_parser = cfg_for_priming.tool_call_parser
+    if priming_tool_parser is None:
+        configured_model = " ".join(
+            str(value or "")
+            for value in (
+                cfg_for_priming.model_name,
+                cfg_for_priming.model_alias,
+                cfg_for_priming.model_path,
+            )
+        ).lower()
+        if "deepseek-v4-flash-0731" in configured_model:
+            # Auto parser selection is materialized later in the request
+            # pipeline and historically did not write the inferred name back
+            # to ServerConfig.  First-turn priming runs before that point, so
+            # recognize this checkpoint directly when the CLI did not receive
+            # an explicit --tool-call-parser value.
+            priming_tool_parser = "deepseek_v4_0731"
+    if _should_prime_deepseek_codex_exec(responses_request, priming_tool_parser):
+        responses_request.tool_choice = {
+            "type": "function",
+            "name": "exec_command",
+        }
+        logger.info(
+            "DeepSeek Codex bounded tool-phase priming: pinning exec_command "
+            "during the first 6 completed tool rounds"
+        )
     validate_responses_tool_types(responses_request.tools)
     # Yuki F6 (0.8.5 dogfood): mirror the chat-completions tool_choice
     # gate so ``required`` / named-function tool_choice REJECTS shapes
@@ -933,6 +1222,9 @@ async def _non_stream(
     created_at = int(time.time())
 
     messages = _prepare_messages_for_engine(engine, openai_request)
+    codex_surface = _is_deepseek_codex_surface(responses_request, cfg.tool_call_parser)
+    if codex_surface:
+        messages = _inject_codex_progress_reminder(messages, responses_request)
 
     # r5-B C-10 / C-11: tool-coupled UI-TARS sysprompt injection. PR
     # #817 wired ``computer_20251022`` → ``computer`` tool translation
@@ -963,10 +1255,21 @@ async def _non_stream(
             openai_request.max_tokens,
             _resolve_enable_thinking(openai_request),
         ),
-        **_resolved_sampling_kwargs(openai_request),
+        **_resolved_responses_sampling_kwargs(
+            openai_request, responses_request, cfg.tool_call_parser
+        ),
     }
     if openai_request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+        from .chat import _compute_forced_tool_prefix
+
+        forced_prefix = _compute_forced_tool_prefix(cfg, openai_request)
+        if codex_surface:
+            forced_prefix = (
+                _codex_action_command_prefix(responses_request) or forced_prefix
+            )
+        if forced_prefix:
+            chat_kwargs["forced_assistant_prefix"] = forced_prefix
 
     resolved_thinking = _resolve_enable_thinking(openai_request)
     if resolved_thinking is not None:
@@ -1877,6 +2180,11 @@ async def _stream_responses(
     )
     try:
         messages = _prepare_messages_for_engine(engine, openai_request)
+        codex_surface = _is_deepseek_codex_surface(
+            responses_request, cfg.tool_call_parser
+        )
+        if codex_surface:
+            messages = _inject_codex_progress_reminder(messages, responses_request)
 
         # r5-B C-10 / C-11: tool-coupled UI-TARS sysprompt injection on
         # the streaming responses lane. Same gate as the non-stream
@@ -1900,10 +2208,21 @@ async def _stream_responses(
                 openai_request.max_tokens,
                 _resolve_enable_thinking(openai_request),
             ),
-            **_resolved_sampling_kwargs(openai_request),
+            **_resolved_responses_sampling_kwargs(
+                openai_request, responses_request, cfg.tool_call_parser
+            ),
         }
         if openai_request.tools:
             chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+            from .chat import _compute_forced_tool_prefix
+
+            forced_prefix = _compute_forced_tool_prefix(cfg, openai_request)
+            if codex_surface:
+                forced_prefix = (
+                    _codex_action_command_prefix(responses_request) or forced_prefix
+                )
+            if forced_prefix:
+                chat_kwargs["forced_assistant_prefix"] = forced_prefix
         resolved_thinking = _resolve_enable_thinking(openai_request)
         if resolved_thinking is not None:
             chat_kwargs["enable_thinking"] = resolved_thinking

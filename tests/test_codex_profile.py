@@ -59,6 +59,8 @@ def test_codex_template_renders_to_valid_toml():
     # Top-level keys Codex reads.
     assert parsed["model"] == "qwen3.6-35b-4bit"
     assert parsed["model_provider"] == "rapid-mlx"
+    assert parsed["model_context_window"] == 32768
+    assert parsed["model_catalog_json"] == "{model_catalog_path}"
     # Provider block.
     providers = parsed["model_providers"]
     assert "rapid-mlx" in providers
@@ -75,6 +77,32 @@ def test_codex_template_renders_to_valid_toml():
         "Inline `api_key` is rejected by `codex --strict-config`. "
         'If you need to ship credentials, use `env_key = "VAR_NAME"`.'
     )
+
+
+def test_codex_setup_writes_startup_static_model_catalog(monkeypatch, tmp_path):
+    import json
+
+    from vllm_mlx.agents.adapter import setup_agent_config
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    profile = get_profile("codex")
+    summary = setup_agent_config(
+        profile,
+        base_url="http://127.0.0.1:8000/v1",
+        model_id="deepseek-v4-flash-0731",
+        context_length=1_048_576,
+    )
+
+    assert "config" in summary.lower()
+    config_path = tmp_path / ".codex" / "config.toml"
+    config = tomllib.loads(config_path.read_text())
+    catalog_path = tmp_path / ".codex" / "rapid-mlx-model-catalog.json"
+    assert config["model_catalog_json"] == str(catalog_path.resolve())
+    catalog = json.loads(catalog_path.read_text())
+    model = catalog["models"][0]
+    assert model["slug"] == "deepseek-v4-flash-0731"
+    assert model["context_window"] == 1_048_576
+    assert model["default_reasoning_level"] == "none"
 
 
 @pytest.mark.parametrize(
