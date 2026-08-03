@@ -173,6 +173,56 @@ def test_bench_command_proceeds_when_mirror_prefetch_is_silent_noop(
     assert load_called == ["mlx-community/Qwen3-1.7B-4bit"]
 
 
+def test_bench_command_loads_weights_on_mlx_step_worker(monkeypatch) -> None:
+    """Freeform ``rapid-mlx bench <alias>`` must load the weights ON the
+    mlx-step worker thread (#170), NOT the main / asyncio thread.
+
+    mlx-lm 0.31.3+ binds the module-level generation stream (and each
+    thread's auto-default stream) to whichever thread first touches MLX.
+    Loading the weights on the main thread and then generating on the
+    engine's worker raises "There is no Stream(gpu, N) in current thread"
+    on the very first batch step, so every request aborts and the run
+    silently reports ``0.00 tok/s`` (the app's "Speed on this Mac" card
+    then shows a confident, wrong zero). Pinning the load onto the
+    ``mlx-step`` worker — the executor AsyncEngineCore then reuses — is
+    the only configuration that survives ThreadLocalStream tagging, and
+    it mirrors the ``--submit`` community path + why ``serve`` works.
+    """
+    import threading
+
+    cli = importlib.import_module("vllm_mlx.cli")
+
+    load_thread: dict[str, str] = {}
+
+    def _fake_load(name: str):
+        load_thread["name"] = threading.current_thread().name
+        # Abort before the engine spins up — this test only pins WHERE the
+        # weights are loaded, not a full generation run.
+        raise ValueError("test-abort — captured load thread")
+
+    monkeypatch.setattr(cli, "_check_disk_space", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_check_memory_capacity", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_ensure_model_downloaded", lambda name: None)
+    monkeypatch.setattr(
+        "vllm_mlx.pflash.resolve_pflash_mode_default",
+        lambda args, *, model_name, is_multimodal=False: "off",
+    )
+    _patch_mlx_lm_load(monkeypatch, _fake_load)
+
+    args = _make_freeform_bench_args("mlx-community/Qwen3-1.7B-4bit")
+
+    with pytest.raises(SystemExit) as exc:
+        cli.bench_command(args)
+    assert exc.value.code == 1
+
+    loaded_on = load_thread.get("name", "")
+    assert loaded_on.startswith("mlx-step"), (
+        f"weights loaded on {loaded_on!r}, not an 'mlx-step' worker — "
+        "freeform bench would hit the cross-thread GPU-stream bug and "
+        "report 0 tok/s"
+    )
+
+
 def _capture_bench_lane_signals(monkeypatch, cli):
     """Wire the bench PFlash default + validation seams to record the
     ``is_multimodal`` / ``is_mllm`` they receive, and abort before the heavy
