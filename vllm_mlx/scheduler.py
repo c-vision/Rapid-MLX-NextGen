@@ -3825,7 +3825,10 @@ class Scheduler:
                 # path — keep boundary entries so later turns with the
                 # same prefix but different suffix still hit.
                 stored = self.memory_aware_cache.store(
-                    prefix_tokens, reconstructed, evict_prefixes=False
+                    prefix_tokens,
+                    reconstructed,
+                    evict_prefixes=False,
+                    message_boundary=True,
                 )
             except Exception as exc:
                 logger.debug(
