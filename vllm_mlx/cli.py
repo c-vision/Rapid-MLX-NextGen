@@ -1700,10 +1700,12 @@ def _add_pflash_args(parser) -> None:
     parser.add_argument(
         "--pflash-keep-ratio",
         type=float,
-        default=0.20,
-        help="Fraction of prompt tokens to keep when compressing "
-        "(default: 0.20 — matches the bench-validated profile in PR #649: "
-        "TTFT 3.87x-8.5x, needle recall 5/5 across tested cells).",
+        default=None,
+        help="Fraction of prompt tokens to keep when compressing. Unset lets "
+        "the engine resolve it: a per-alias ``pflash_keep_ratio`` override if "
+        "the alias pins one (e.g. 0.50 for a ternary arch), else the default "
+        "0.20 (the bench-validated profile in PR #649: TTFT 3.87x-8.5x, needle "
+        "recall 5/5). An explicit value here always wins.",
     )
     parser.add_argument(
         "--pflash-min-keep-tokens",
@@ -2649,8 +2651,7 @@ def serve_command(args):
     # validation path the user-explicit case takes.
     from .api.utils import resolve_serving_lane
     from .pflash import (
-        config_from_args,
-        resolve_pflash_mode_default,
+        resolve_pflash_config,
         validate_model_support,
     )
 
@@ -2666,11 +2667,13 @@ def serve_command(args):
             force_mllm=getattr(args, "mllm", False),
             force_text=getattr(args, "no_mllm", False),
         )
-        args.pflash = resolve_pflash_mode_default(
-            args, model_name=args.model, is_multimodal=_serve_is_mllm
-        )
+        # Resolve BOTH per-alias PFlash defaults (mode + keep_ratio, e.g.
+        # bonsai-27b-2bit → always @ 0.50) and build the config in one shared
+        # helper; an explicit --pflash / --pflash-keep-ratio still wins inside.
         try:
-            pflash_config = config_from_args(args)
+            pflash_config = resolve_pflash_config(
+                args, model_name=args.model, is_multimodal=_serve_is_mllm
+            )
             validate_model_support(
                 pflash_config,
                 model_name=args.model,
@@ -4404,8 +4407,7 @@ def bench_command(args):
     # vendored-arch and tokenizer-fallback routes) and calls
     # ``validate_local_model_file`` internally.
     from .engine_core import AsyncEngineCore, EngineConfig
-    from .pflash import config_from_args as _pflash_config_from_args
-    from .pflash import resolve_pflash_mode_default as _pflash_resolve_default
+    from .pflash import resolve_pflash_config as _pflash_resolve_config
     from .pflash import validate_model_support as _bench_pflash_validate
     from .request import SamplingParams
     from .scheduler import SchedulerConfig
@@ -4463,11 +4465,13 @@ def bench_command(args):
             f"Note: {args.model!r} is a hybrid VLM — benching on the text-only "
             "mlx-lm lane, matching 'serve' auto-downgrade (#352)."
         )
-    args.pflash = _pflash_resolve_default(
-        args, model_name=args.model, is_multimodal=False
-    )
+    # Same shared wiring as serve: resolve mode + per-alias keep_ratio override
+    # and build the config, so bench measures the SAME effective PFlash config
+    # serve would run. is_multimodal=False — bench has no MLLM lane (see above).
     try:
-        bench_pflash_config = _pflash_config_from_args(args)
+        bench_pflash_config = _pflash_resolve_config(
+            args, model_name=args.model, is_multimodal=False
+        )
         _bench_pflash_validate(
             bench_pflash_config,
             model_name=args.model,
