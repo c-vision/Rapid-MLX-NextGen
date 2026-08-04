@@ -27,6 +27,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 INSTALL_SH = REPO / "install.sh"
 APP_TIERS = REPO / "apps/rapid-mac/Sources/Rapid/Server/RAMBucketedDefault.swift"
+README = REPO / "README.md"
 
 
 def _parse_install_sh() -> list[tuple[int, str, list[str]]]:
@@ -241,3 +242,94 @@ def test_small_macs_get_something_that_fits(ram, expected):
             assert alias == expected
             return
     pytest.fail(f"no install.sh tier matched {ram} GB")
+
+
+def _readme_table_tiers() -> list[tuple[int, str, list[str]]]:
+    """``[(floor_gb, alias, one_shot_flags)]`` from the Choose Your Model table.
+
+    Parsed from the tier ROWS, not by scanning the file: the README also
+    names ``qwen3.5-4b-4bit`` as the ``rapid-mlx chat`` default, which is
+    correct and is not a tier recommendation.
+
+    Flags come from the One-shot code span specifically, not from anywhere
+    in the row — a flag sitting in the prose column would satisfy a
+    substring search while the command a reader actually pastes is still
+    incomplete.
+    """
+    out = []
+    for line in README.read_text().splitlines():
+        m = re.match(
+            r"\| \*\*(\d+)(?:[–-]\d+)? GB\+?\*\*[^|]*\| `([a-z0-9.\-]+)` \|[^|]*\| `([^`]+)` \|",
+            line,
+        )
+        if not m:
+            continue
+        floor, alias, oneshot = int(m.group(1)), m.group(2), m.group(3).split()
+        assert oneshot[:2] == ["rapid-mlx", "serve"], f"unexpected command: {oneshot}"
+        assert oneshot[2] == alias, (
+            f"README row recommends {alias} but its command runs {oneshot[2]}"
+        )
+        out.append((floor, alias, oneshot[3:]))
+    return out
+
+
+def _readme_prose_tiers() -> list[tuple[int, str]]:
+    """``[(floor_gb, alias)]`` from the quick-start sentence.
+
+    The README states the map twice. The prose copy is the one a reader
+    hits first, and it can drift on its own — so it gets its own parse
+    rather than being covered by the table's.
+    """
+    text = README.read_text()
+    m = re.search(r"prints a serve command sized to your Mac \(([^)]*)\)", text)
+    assert m, "quick-start tier sentence not found in README.md"
+    return [
+        (int(a), b)
+        for a, b in re.findall(
+            r"(\d+)(?:[–-]\d+)? GB\+? → `([a-z0-9.\-]+)`", m.group(1)
+        )
+    ]
+
+
+def test_readme_table_matches_the_app_tier_for_tier():
+    """Not just the same set of aliases — the same alias at the same RAM.
+
+    Comparing sets would pass if two tiers swapped picks, or if a bucket
+    boundary moved, while still reporting that the tables agree.
+    """
+    app = [(f, a) for f, a, _ in sorted(_parse_app_tiers())]
+    # The app splits 16 and 18; the README covers both with one 16-23 row.
+    app_collapsed = []
+    for floor, alias in app:
+        if app_collapsed and app_collapsed[-1][1] == alias:
+            continue
+        app_collapsed.append((floor, alias))
+    readme = sorted(_readme_table_tiers())
+    assert [(f, a) for f, a, _ in readme] == app_collapsed, (
+        "README.md's tier table does not line up with RAMBucketedDefault.tiers:\n"
+        f"  README: {[(f, a) for f, a, _ in readme]}\n"
+        f"  app:    {app_collapsed}"
+    )
+
+
+def test_readme_prose_matches_the_readme_table():
+    """The README states the map twice; both have to say the same thing."""
+    prose = sorted(_readme_prose_tiers())
+    table = sorted((f, a) for f, a, _ in _readme_table_tiers())
+    assert prose == table, (
+        "the README's quick-start sentence and its tier table disagree:\n"
+        f"  prose: {prose}\n"
+        f"  table: {table}"
+    )
+
+
+def test_readme_one_shot_commands_carry_the_exact_flags():
+    """A README reader pastes the One-shot command verbatim. It must be the
+    command the app runs — same flags, same order, nothing missing."""
+    app = {alias: flags for _, alias, flags in _parse_app_tiers()}
+    for floor, alias, oneshot_flags in _readme_table_tiers():
+        assert alias in app, f"README recommends {alias}, which is not an app pick"
+        assert oneshot_flags == app[alias], (
+            f"README's one-shot command for {alias} has {oneshot_flags}, "
+            f"the app launches it with {app[alias]}"
+        )
