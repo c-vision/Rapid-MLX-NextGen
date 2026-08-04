@@ -209,9 +209,7 @@ class TestResolveHybridCacheEntries:
         ``--enable-prefix-cache`` stored nothing and every agent turn
         re-prefilled the whole context.
         """
-        _patch_resolve_profile(
-            monkeypatch, is_hybrid=False, is_hybrid_explicit=True
-        )
+        _patch_resolve_profile(monkeypatch, is_hybrid=False, is_hybrid_explicit=True)
         result = _resolve_hybrid_cache_entries(
             enable_prefix_cache=True,
             explicit_value=0,
@@ -222,9 +220,7 @@ class TestResolveHybridCacheEntries:
 
     def test_pinned_nonhybrid_recurrent_respects_explicit_zero(self, monkeypatch):
         """Even for a pinned-nonhybrid recurrent model, an explicit 0 wins."""
-        _patch_resolve_profile(
-            monkeypatch, is_hybrid=False, is_hybrid_explicit=True
-        )
+        _patch_resolve_profile(monkeypatch, is_hybrid=False, is_hybrid_explicit=True)
         result = _resolve_hybrid_cache_entries(
             enable_prefix_cache=True,
             explicit_value=0,

@@ -144,18 +144,18 @@ struct ModelPickerBarTests {
         // Pin against the real table, not synthetic picks, so a future
         // edit to the 16 GB tier's numbers has to update this expectation.
         let tier16 = RAMBucketedDefault.tier(forPhysicalRAMGB: 16)
-        // Literal expectations pin the actual curated numbers (86 / 17.1)
+        // Literal expectations pin the actual curated numbers (86 / 17.8)
         // AND the tagline format — a change to either the copy or the
         // table's numbers must update this assertion.
         let taglineP = ModelPickerBar.recommendedTagline(pick: tier16.primary, isPrimary: true)
-        #expect(taglineP == "Best pick for your Mac · 86% capability · ~17 tok/s")
+        #expect(taglineP == "Best pick for your Mac · 86% capability · ~18 tok/s")
 
         #expect(tier16.alt != nil, "16 GB tier carries a faster alternative")
         if let alt = tier16.alt {
             // The fast chat specialist shows its "Chat only" caveat in place
             // of the blended 62 % (which understates conversation quality).
             let taglineA = ModelPickerBar.recommendedTagline(pick: alt, isPrimary: false)
-            #expect(taglineA == "Faster, lighter alternative · ~117 tok/s · Chat only")
+            #expect(taglineA == "Faster, lighter alternative · ~121 tok/s · Chat only")
         }
 
         // A tier with no local tok/s measurement (64 GB → 35b-8bit) omits

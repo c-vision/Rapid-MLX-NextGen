@@ -21,9 +21,8 @@ import Foundation
 ///
 /// A machine with N GB gets the tier whose floor is the largest value
 /// ≤ N — so a 20 GB Mac gets the 18 GB pick (which fits), NOT the 24 GB
-/// pick (which would be borderline). Sub-16 GB Macs clamp to the 16 GB
-/// tier; the app's per-row fit warning still flags anything too big, and
-/// that tier's fast alternative does fit 8 GB.
+/// pick (which would be borderline). Sub-8 GB Macs clamp to the 8 GB
+/// tier; the app's per-row fit warning still flags anything too big.
 ///
 /// A tier only carries a **fast** alt when it beats the smart pick on
 /// speed by a margin worth a second card. The 24 & 32 GB smart picks are
@@ -32,8 +31,9 @@ import Foundation
 ///
 /// | RAM    | 🧠 Smart            | GB   | Cap | tok/s | 🚀 Fast                          |
 /// | ------ | ------------------- | ---- | --- | ----- | -------------------------------- |
-/// | 16 GB  | bonsai-27b-2bit     | 7.6  | 86% | 17.1  | lfm2.5-8b-a1b-4bit · 117 · chat  |
-/// | 18 GB  | bonsai-27b-2bit     | 7.6  | 86% | 17.1  | lfm2.5-8b-a1b-4bit · 117 · chat  |
+/// |  8 GB  | lfm2.5-2.6b-4bit    |  2.7 |  —  | 97.8  | — (only model that fits)         |
+/// | 16 GB  | bonsai-27b-2bit     | 10.7 | 86% | 17.8  | lfm2.5-8b-a1b-4bit · 121 · chat  |
+/// | 18 GB  | bonsai-27b-2bit     | 10.7 | 86% | 17.8  | lfm2.5-8b-a1b-4bit · 121 · chat  |
 /// | 24 GB  | gemma-4-26b-4bit    | 14.6 | 87% | 41.7  | — (smart pick already fast)      |
 /// | 32 GB  | qwen3.6-35b-4bit    | 20.0 | 87% | 60.0  | — (smart pick already fast)      |
 /// | 64 GB  | qwen3.6-35b-8bit    | 37.7 | 87% | —     | qwen3.6-35b-4bit · 87% · 60      |
@@ -44,8 +44,20 @@ import Foundation
 /// "Chat only" instead of its blended 62 % (which understates conversation
 /// and overstates tools/coding). Capability % and tok/s are the
 /// maintainer's measured scores (M2/M3); the 64/96 GB smart rows have no
-/// local tok/s measurement yet (rendered without a speed figure). The
-/// capability column is monotonic non-decreasing by RAM, with ONE
+/// local tok/s measurement yet (rendered without a speed figure).
+///
+/// The three small rows were re-measured together on one M2 Pro
+/// (mlx-lm 0.31.3) rather than carried over, because the GB column had
+/// drifted into meaning *weights on disk* for bonsai while the field is
+/// documented as active memory. Peak resident, 2 K-token prefill:
+/// lfm2.5-2.6b 2.70 GB / 97.8 tok/s, lfm2.5-8b-a1b 5.63 GB / 121.2 tok/s,
+/// bonsai-27b 10.69 GB / 17.8 tok/s. bonsai's old 7.6 GB was its weight
+/// bytes and understated its real footprint by 3.1 GB — on the 16 GB Mac
+/// that is exactly the tier it is recommended for. The column is
+/// display-only (``pickStatsLine``), so this corrects what users read,
+/// not what the app allows them to run.
+///
+/// The capability column is monotonic non-decreasing by RAM, with ONE
 /// deliberate tie documented at the tier: the 64 GB smart 8-bit is floored
 /// at its own faster 4-bit alt's 87 % (an 8-bit quant can't display weaker
 /// than its 4-bit; its edge is fidelity, not bench points). Every alias is
@@ -90,11 +102,32 @@ enum RAMBucketedDefault {
     }
 
     /// The fast/light pick shared by every tier whose smart pick is slow:
-    /// an 8B-A1B MoE at ~117 tok/s. A chat specialist, so it carries a
+    /// an 8B-A1B MoE at ~121 tok/s. A chat specialist, so it carries a
     /// "Chat only" caveat instead of its (misleadingly low) blended score.
     private static let lfm2FastPick = Pick(
-        alias: "lfm2.5-8b-a1b-4bit", footprintGB: 4.8, capabilityPct: 62,
-        tokensPerSec: 117.3, launchFlags: [], caveat: "Chat only")
+        alias: "lfm2.5-8b-a1b-4bit", footprintGB: 5.6, capabilityPct: 62,
+        tokensPerSec: 121.2, launchFlags: [], caveat: "Chat only")
+
+    /// The 8 GB tier's only pick: LFM2.5-2.6B, a 2.6 B dense model whose
+    /// 30 layers are 22 short-convolution blocks and just 8 GQA. Those 8
+    /// attention layers are why it belongs here — the KV cache costs
+    /// ~16 KB/token, so a 32 K conversation adds only ~0.5 GB on top of
+    /// 1.6 GB of weights. Measured on an M2 Pro: 2.70 GB peak,
+    /// 97.8 tok/s decode, 503 tok/s prefill.
+    ///
+    /// It carries a caveat rather than a capability %, and the caveat is
+    /// Liquid's own: they publish this model as "not recommended for
+    /// agentic coding and knowledge-heavy tasks". It is post-trained for
+    /// tool use and instruction following, and on those it beats models
+    /// ~4x its size — but our users drive coding agents, and putting a
+    /// bare "62%" on this card would invite exactly the use Liquid warns
+    /// against. ``capabilityPct`` is never rendered for a caveat pick; the
+    /// 62 below exists only to satisfy the monotonic-by-RAM invariant and
+    /// is deliberately the same band as the other caveat pick in the
+    /// family, not an independently measured score.
+    private static let lfm26Pick = Pick(
+        alias: "lfm2.5-2.6b-4bit", footprintGB: 2.7, capabilityPct: 62,
+        tokensPerSec: 97.8, launchFlags: [], caveat: "Not for coding")
 
     /// The fast/light pick for the big-MoE tiers: the 4-bit Qwen3.6-35B
     /// (same weights as the 32 GB smart pick) — near-equal capability to
@@ -108,9 +141,18 @@ enum RAMBucketedDefault {
     /// the standalone ``scripts/verify-recommendation-tiers.swift`` contract
     /// check against the bundled ``aliases.json``.
     static let tiers: [Tier] = [
+        // 8 GB was a hole, not a tier. These Macs clamped up to the 16 GB
+        // picks, then ``isRecommendedPick``'s floor guard correctly refused
+        // to exempt them from the ``.tooBig`` gate — so launch auto-start
+        // rejected the only thing it was offered and fell through to
+        // ``SafeDefaultFallback``. The user's first run was a model the app
+        // had just told them not to run. Nothing in the catalog fit until
+        // LFM2.5-2.6B: 2.70 GB peak leaves room for macOS on an 8 GB
+        // machine, where the old tier's 5.6 GB "fast" alt did not.
+        Tier(floorGB: 8, primary: lfm26Pick, alt: nil),
         Tier(
             floorGB: 16,
-            primary: Pick(alias: "bonsai-27b-2bit", footprintGB: 7.6, capabilityPct: 86, tokensPerSec: 17.1, launchFlags: []),
+            primary: Pick(alias: "bonsai-27b-2bit", footprintGB: 10.7, capabilityPct: 86, tokensPerSec: 17.8, launchFlags: []),
             alt: lfm2FastPick
         ),
         // 18 GB intentionally MIRRORS the 16 GB tier (bonsai smart + lfm2.5
@@ -123,7 +165,7 @@ enum RAMBucketedDefault {
         // edit. gemma-4-12b remains available in the full "All models" list.
         Tier(
             floorGB: 18,
-            primary: Pick(alias: "bonsai-27b-2bit", footprintGB: 7.6, capabilityPct: 86, tokensPerSec: 17.1, launchFlags: []),
+            primary: Pick(alias: "bonsai-27b-2bit", footprintGB: 10.7, capabilityPct: 86, tokensPerSec: 17.8, launchFlags: []),
             alt: lfm2FastPick
         ),
         // 24 & 32 GB: the smart pick is already MoE-fast (42 / 60 tok/s),

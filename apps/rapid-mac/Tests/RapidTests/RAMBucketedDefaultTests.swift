@@ -10,6 +10,7 @@ import Testing
 /// 24 GB pick. Table (see ``RAMBucketedDefault`` docstring for the full
 /// numbers):
 ///
+///    8 GB  → lfm2.5-2.6b-4bit  (· Not for coding — only model that fits)
 ///   16 GB  → bonsai-27b-2bit   (+ fast lfm2.5-8b-a1b-4bit · Chat only)
 ///   18 GB  → bonsai-27b-2bit   (mirrors 16 GB) (+ fast lfm2.5-8b-a1b-4bit)
 ///   24 GB  → gemma-4-26b-4bit  (--no-mllm --kv-cache-dtype bf16 --cache-memory-mb 512)
@@ -29,7 +30,7 @@ struct RAMBucketedDefaultTests {
 
     @Test("Each RAM lands on the tier whose floor is the largest ≤ its RAM")
     func aliasPerRAM() {
-        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 8) == "bonsai-27b-2bit")     // sub-16 clamps up
+        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 8) == "lfm2.5-2.6b-4bit")   // 8 GB is its own tier now
         #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 16) == "bonsai-27b-2bit")
         #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 17) == "bonsai-27b-2bit")
         #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 18) == "bonsai-27b-2bit")   // 18 mirrors 16
@@ -49,20 +50,26 @@ struct RAMBucketedDefaultTests {
 
     @Test("Pathological zero / negative RAM clamps to the smallest tier, no crash")
     func degenerateRAM() {
-        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 0) == "bonsai-27b-2bit")
-        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: -1) == "bonsai-27b-2bit")
+        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 0) == "lfm2.5-2.6b-4bit")
+        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: -1) == "lfm2.5-2.6b-4bit")
     }
 
     // MARK: - Picks (primary + optional alt)
 
     @Test("Each tier surfaces a smart pick + a fast alt where speed warrants it")
     func smartAndFastPicks() {
+        // 8 GB: one pick, and it carries the publisher's own caveat rather
+        // than a capability % — nothing else in the catalog fits.
+        let smallest = RAMBucketedDefault.picks(forPhysicalRAMGB: 8)
+        #expect(smallest.count == 1)
+        #expect(smallest[0].alias == "lfm2.5-2.6b-4bit")
+        #expect(smallest[0].caveat == "Not for coding")
         // 16/18 GB: slow smart pick → a fast lfm2.5 alt (chat specialist).
-        let smallest = RAMBucketedDefault.picks(forPhysicalRAMGB: 16)
-        #expect(smallest.count == 2)
-        #expect(smallest[0].alias == "bonsai-27b-2bit")
-        #expect(smallest[1].alias == "lfm2.5-8b-a1b-4bit")
-        #expect(smallest[1].caveat == "Chat only")
+        let tier16 = RAMBucketedDefault.picks(forPhysicalRAMGB: 16)
+        #expect(tier16.count == 2)
+        #expect(tier16[0].alias == "bonsai-27b-2bit")
+        #expect(tier16[1].alias == "lfm2.5-8b-a1b-4bit")
+        #expect(tier16[1].caveat == "Chat only")
         // 18 GB mirrors 16 GB (bonsai smart + lfm2.5 fast).
         let tier18 = RAMBucketedDefault.picks(forPhysicalRAMGB: 18)
         #expect(tier18.count == 2)
@@ -101,11 +108,16 @@ struct RAMBucketedDefaultTests {
         #expect(RAMBucketedDefault.isRecommendedPick(alias: "lfm2.5-8b-a1b-4bit", physicalRAMGB: 16))
         #expect(RAMBucketedDefault.isRecommendedPick(alias: "bonsai-27b-2bit", physicalRAMGB: 18))   // 18 mirrors 16
         #expect(!RAMBucketedDefault.isRecommendedPick(alias: "gemma-4-12b-4bit", physicalRAMGB: 18)) // dropped from picks
-        // Floor gate: an 8 GB Mac is SHOWN the 16 GB tier's picks but does
-        // NOT sit in that tier, so the picks stay subject to the .tooBig
-        // gate — bypassing it there would re-open the OOM hole.
+        // An 8 GB Mac now SITS IN a tier, so its own pick is exempt from the
+        // .tooBig gate — that exemption is the whole point of the tier, since
+        // before it every pick offered to an 8 GB Mac was rejected at launch.
+        #expect(RAMBucketedDefault.isRecommendedPick(alias: "lfm2.5-2.6b-4bit", physicalRAMGB: 8))
+        // The bigger models are still NOT exempt there: they are not this
+        // tier's picks, so the OOM hole stays closed.
         #expect(!RAMBucketedDefault.isRecommendedPick(alias: "bonsai-27b-2bit", physicalRAMGB: 8))
         #expect(!RAMBucketedDefault.isRecommendedPick(alias: "lfm2.5-8b-a1b-4bit", physicalRAMGB: 8))
+        // Below the lowest floor there is still no exemption for anything.
+        #expect(!RAMBucketedDefault.isRecommendedPick(alias: "lfm2.5-2.6b-4bit", physicalRAMGB: 4))
         // The fast alt is a recommended pick on its own tiers (64/96 GB),
         // so it also skips the .tooBig gate there.
         #expect(RAMBucketedDefault.isRecommendedPick(alias: "qwen3.6-35b-4bit", physicalRAMGB: 64))
