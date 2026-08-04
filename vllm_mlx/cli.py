@@ -2279,9 +2279,29 @@ def _needs_bounded_trim_free_reuse(model_name: str) -> bool:
     from .utils.deepseek_v4_0731 import is_deepseek_v4_0731
 
     profile = _resolve_alias(model_name)
-    return (profile is not None and profile.is_hybrid) or is_deepseek_v4_0731(
-        model_name
-    )
+    if profile is not None:
+        if profile.is_hybrid:
+            return True
+        # Dense GatedDeltaNet models (Qwen3.5 / Qwen3.6 4B/9B/27B,
+        # Ternary-Bonsai) are deliberately pinned ``is_hybrid=False`` to keep
+        # them OFF the hybrid scheduler — the r6-A R6-C1 metal::malloc (499000)
+        # wedge fires when their dense recurrent weights hit the hybrid
+        # allocation path. But architecturally they DO carry non-trimmable
+        # ArraysCache / GatedDeltaNet recurrent layers, so their state can only
+        # be reused through the bounded snapshot path (``hybrid_cache_entries``),
+        # never the ordinary *trimmable* prefix cache. The
+        # ``is_hybrid_explicit=True`` + ``is_hybrid=False`` pinning uniquely
+        # identifies that "recurrent but routed non-hybrid" set (the explicit
+        # flag is only ever set to suppress the boot-time ArraysCache promotion,
+        # i.e. it implies the model has ArraysCache layers). Without this branch
+        # #1122's auto-default never fires for them, so ``--enable-prefix-cache``
+        # is a silent no-op: every agent turn re-prefills the full accumulated
+        # context (measured turn-2 TTFT ~22s with reuse off vs ~0.85s on for
+        # qwen3.5-9b-4bit). This does NOT touch routing — is_hybrid stays False,
+        # so no throttle, no snapshot path, no wedge.
+        if profile.is_hybrid_explicit and not profile.is_hybrid:
+            return True
+    return is_deepseek_v4_0731(model_name)
 
 
 def _serve_will_run_on_mllm_lane(args) -> bool:

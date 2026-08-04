@@ -199,11 +199,85 @@ class TestResolveHybridCacheEntries:
         )
         assert result == 0
 
+    def test_auto_defaults_for_pinned_nonhybrid_recurrent(self, monkeypatch):
+        """Dense GatedDeltaNet pinned is_hybrid=False + is_hybrid_explicit=True
+        (qwen3.5/3.6 dense, Ternary-Bonsai) → auto-default to 8.
 
-def _patch_resolve_profile(monkeypatch, *, is_hybrid: bool):
-    """Monkeypatch resolve_profile to return a mock alias profile."""
+        These have non-trimmable ArraysCache layers but are deliberately kept
+        off the hybrid scheduler (metal::malloc wedge). Before this fix the
+        #1122 auto-default keyed only on ``is_hybrid`` and skipped them, so
+        ``--enable-prefix-cache`` stored nothing and every agent turn
+        re-prefilled the whole context.
+        """
+        _patch_resolve_profile(
+            monkeypatch, is_hybrid=False, is_hybrid_explicit=True
+        )
+        result = _resolve_hybrid_cache_entries(
+            enable_prefix_cache=True,
+            explicit_value=0,
+            user_set_explicit=False,
+            model_name="qwen3.5-9b-4bit",
+        )
+        assert result == _DEFAULT_HYBRID_CACHE_ENTRIES
+
+    def test_pinned_nonhybrid_recurrent_respects_explicit_zero(self, monkeypatch):
+        """Even for a pinned-nonhybrid recurrent model, an explicit 0 wins."""
+        _patch_resolve_profile(
+            monkeypatch, is_hybrid=False, is_hybrid_explicit=True
+        )
+        result = _resolve_hybrid_cache_entries(
+            enable_prefix_cache=True,
+            explicit_value=0,
+            user_set_explicit=True,
+            model_name="qwen3.5-9b-4bit",
+        )
+        assert result == 0
+
+
+class TestNeedsBoundedTrimFreeReuseRealAliases:
+    """End-to-end against the real alias registry (no mocks) — the #1122 gap.
+
+    These assert the actual shipped aliases.json classification, so they fail
+    on ``main`` (dense recurrent models returned False) and pass with the fix.
+    """
+
+    def test_dense_recurrent_qwen35_9b_needs_bounded_reuse(self):
+        from vllm_mlx.cli import _needs_bounded_trim_free_reuse
+
+        assert _needs_bounded_trim_free_reuse("qwen3.5-9b-4bit") is True
+
+    def test_dense_recurrent_qwen36_27b_needs_bounded_reuse(self):
+        from vllm_mlx.cli import _needs_bounded_trim_free_reuse
+
+        assert _needs_bounded_trim_free_reuse("qwen3.6-27b-4bit") is True
+
+    def test_moe_hybrid_still_needs_bounded_reuse(self):
+        from vllm_mlx.cli import _needs_bounded_trim_free_reuse
+
+        # MoE A3B flagship is is_hybrid=True — unchanged path.
+        assert _needs_bounded_trim_free_reuse("qwen3.6-35b-4bit") is True
+
+    def test_pure_attention_alias_does_not_need_bounded_reuse(self):
+        from vllm_mlx.cli import _needs_bounded_trim_free_reuse
+
+        # A genuine pure-attention alias (no ArraysCache layers, not pinned
+        # is_hybrid_explicit) must stay on the ordinary trimmable prefix cache.
+        assert _needs_bounded_trim_free_reuse("qwen3-coder-30b-4bit") is False
+
+
+def _patch_resolve_profile(
+    monkeypatch, *, is_hybrid: bool, is_hybrid_explicit: bool = False
+):
+    """Monkeypatch resolve_profile to return a mock alias profile.
+
+    ``is_hybrid_explicit`` must be set on the mock (not left as an
+    auto-truthy ``MagicMock`` attribute) because
+    ``_needs_bounded_trim_free_reuse`` now reads it to detect dense
+    recurrent models pinned non-hybrid (#1122 gap for qwen3.5/3.6 dense).
+    """
     mock_profile = MagicMock()
     mock_profile.is_hybrid = is_hybrid
+    mock_profile.is_hybrid_explicit = is_hybrid_explicit
     monkeypatch.setattr(
         "vllm_mlx.model_aliases.resolve_profile", lambda _name: mock_profile
     )
