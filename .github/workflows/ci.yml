@@ -171,6 +171,7 @@ jobs:
             tests/test_music_engine.py \
             tests/test_aliases_contract.py \
             tests/test_alias_subfolder.py \
+            tests/test_ram_tier_recommendations_agree.py \
             -v --tb=short \
             -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache" \
             --cov=vllm_mlx \
