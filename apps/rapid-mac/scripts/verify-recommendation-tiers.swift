@@ -33,19 +33,19 @@ struct Tier: Equatable {
     let alt: Pick?
     var picks: [Pick] { alt.map { [primary, $0] } ?? [primary] }
 }
-let lfm2FastPick = Pick(alias: "lfm2.5-8b-a1b-4bit", footprintGB: 5.6, capabilityPct: 62,
+let lfm2FastPick = Pick(alias: "lfm2.5-8b-a1b-4bit", footprintGB: 5.3, capabilityPct: 62,
                         tokensPerSec: 121.2, launchFlags: [], caveat: "Chat only")
-let lfm26Pick = Pick(alias: "lfm2.5-2.6b-4bit", footprintGB: 2.7, capabilityPct: 62,
+let lfm26Pick = Pick(alias: "lfm2.5-2.6b-4bit", footprintGB: 2.0, capabilityPct: 62,
                      tokensPerSec: 97.8, launchFlags: [], caveat: "Not for coding")
 let qwen35bFastPick = Pick(alias: "qwen3.6-35b-4bit", footprintGB: 20.0, capabilityPct: 87,
                            tokensPerSec: 60.0, launchFlags: [])
 let tiers: [Tier] = [
     Tier(floorGB: 8, primary: lfm26Pick, alt: nil),
     Tier(floorGB: 16,
-         primary: Pick(alias: "bonsai-27b-2bit", footprintGB: 10.7, capabilityPct: 86, tokensPerSec: 17.8, launchFlags: []),
+         primary: Pick(alias: "bonsai-27b-2bit", footprintGB: 8.4, capabilityPct: 86, tokensPerSec: 17.8, launchFlags: []),
          alt: lfm2FastPick),
     Tier(floorGB: 18,  // mirrors 16 GB (bonsai + lfm2.5) — no "more RAM, worse pick" dip
-         primary: Pick(alias: "bonsai-27b-2bit", footprintGB: 10.7, capabilityPct: 86, tokensPerSec: 17.8, launchFlags: []),
+         primary: Pick(alias: "bonsai-27b-2bit", footprintGB: 8.4, capabilityPct: 86, tokensPerSec: 17.8, launchFlags: []),
          alt: lfm2FastPick),
     Tier(floorGB: 24,
          primary: Pick(alias: "gemma-4-26b-4bit", footprintGB: 14.6, capabilityPct: 87, tokensPerSec: 41.7,
@@ -164,19 +164,19 @@ check(!tiers.flatMap(\.picks).contains { $0.alias == "gemma-4-12b-4bit" }, "gemm
 print("Fast chat-specialist shows a 'Chat only' caveat instead of a misleading capability %:")
 let fast16 = picks(forPhysicalRAMGB: 16)[1]
 check(fast16.caveat == "Chat only", "16GB fast (lfm2.5) carries the Chat only caveat")
-check(pickStatsLine(fast16) == "5.6 GB · ~121 tok/s · Chat only", "lfm2.5 stats line drops the % for the caveat")
+check(pickStatsLine(fast16) == "5.3 GB · ~121 tok/s · Chat only", "lfm2.5 stats line drops the % for the caveat")
 // Liquid publishes 2.6B as "not recommended for agentic coding" — our users
 // drive coding agents, so the card must say so instead of showing a bare %.
 let smart8 = picks(forPhysicalRAMGB: 8)[0]
 check(picks(forPhysicalRAMGB: 8).count == 1, "8GB has a single pick (nothing else fits)")
 check(smart8.caveat == "Not for coding", "8GB pick carries the coding caveat")
-check(pickStatsLine(smart8) == "2.7 GB · ~98 tok/s · Not for coding", "8GB stats line drops the % for the caveat")
+check(pickStatsLine(smart8) == "2.0 GB · ~98 tok/s · Not for coding", "8GB stats line drops the % for the caveat")
 check(smart8.footprintGB < 4.0, "8GB pick must leave room for macOS on an 8GB machine")
 let fast96 = picks(forPhysicalRAMGB: 96)[1]
 check(fast96.caveat == nil, "96GB fast (qwen3.6-35b-4bit) is general-purpose — no caveat")
 check(pickStatsLine(fast96) == "20.0 GB · 87% capability · ~60 tok/s", "general-purpose fast pick keeps its capability %")
 let smart16 = picks(forPhysicalRAMGB: 16)[0]
-check(pickStatsLine(smart16) == "10.7 GB · 86% capability · ~18 tok/s", "bonsai renders its measured PEAK, not its weight bytes")
+check(pickStatsLine(smart16) == "8.4 GB · 86% capability · ~18 tok/s", "bonsai renders its served PEAK, not its weight bytes")
 let smart96 = picks(forPhysicalRAMGB: 96)[0]
 check(pickStatsLine(smart96) == "65.0 GB · 88% capability", "no-tok/s smart pick omits the speed figure")
 
