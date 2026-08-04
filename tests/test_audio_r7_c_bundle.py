@@ -429,7 +429,7 @@ class TestSpeechBodyHonored:
         # Skip the misaki gate — we're not testing that path here.
         from vllm_mlx.audio import probe as probe_mod
 
-        monkeypatch.setattr(probe_mod, "require_kokoro_runtime", lambda: None)
+        monkeypatch.setattr(probe_mod, "require_kokoro_runtime", lambda *a, **k: None)
         _install_fake_mlx_audio(monkeypatch)
 
         audio_route._tts_engine = None
@@ -499,7 +499,7 @@ class TestSpeechCatchAllShape:
         monkeypatch.setattr(tts_mod, "TTSEngine", _BoomEngine)
         from vllm_mlx.audio import probe as probe_mod
 
-        monkeypatch.setattr(probe_mod, "require_kokoro_runtime", lambda: None)
+        monkeypatch.setattr(probe_mod, "require_kokoro_runtime", lambda *a, **k: None)
         _install_fake_mlx_audio(monkeypatch)
 
         audio_route._tts_engine = None

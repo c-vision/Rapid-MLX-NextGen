@@ -79,13 +79,15 @@ def _reset_probe_cache() -> None:
     ``mlx_audio`` call this helper in their fixture to force re-probe.
 
     Also clears the per-lane deep-probe status recorded by
-    :func:`deep_probe_audio_lane` and the cached Kokoro espeak
-    readiness verdict so tests don't leak state across cases.
+    :func:`deep_probe_audio_lane` and the cached Kokoro espeak +
+    spaCy-G2P-model readiness verdicts so tests don't leak state
+    across cases.
     """
     _cached_verdict.clear()
     _LANE_STATUS.clear()
     _LANE_REASON.clear()
     _reset_espeak_state()
+    _reset_g2p_model_state()
 
 
 # Sub-modules each route actually needs to load. Split per lane so a
@@ -361,6 +363,13 @@ def _dry_run_tts(model_name: str | None) -> tuple[bool, str | None]:
 
     Catches the F-K-KOKORO-MISAKI shape: Kokoro loads cleanly but
     the misaki G2P pulls in lazily and fails on first generate.
+
+    ``SystemExit`` is caught alongside ``Exception`` (#1254): misaki's
+    spaCy-model download shells out to ``uv pip``, which ``sys.exit()``s
+    under a uv-tool / console-script launcher with no active venv. That is
+    a ``BaseException``, so a bare ``except Exception`` would let it abort
+    server startup when ``RAPID_MLX_AUDIO_DEEP_PROBE`` is enabled — this
+    probe MUST only ever report degraded, never take the process down.
     """
     try:
         from ..audio.tts import DEFAULT_TTS_MODEL, TTSEngine
@@ -374,7 +383,7 @@ def _dry_run_tts(model_name: str | None) -> tuple[bool, str | None]:
         if not hasattr(result, "audio") or len(result.audio) == 0:
             return False, "TTS result is empty (no audio produced)"
         return True, None
-    except Exception as e:  # noqa: BLE001
+    except (Exception, SystemExit) as e:  # noqa: BLE001
         return False, f"TTS dry-run failed: {type(e).__name__}: {e}"
 
 
@@ -608,6 +617,315 @@ def _probe_espeak_readiness() -> tuple[bool, str | None]:
     return False, _ESPEAK_BROKEN_HINT
 
 
+# ---------------------------------------------------------------------------
+# F-K-KOKORO-SPACY (#1254): misaki's English G2P tokenizer needs the spaCy
+# ``en_core_web_sm`` model, which misaki downloads LAZILY on the first
+# ``generate`` via ``spacy.cli.download``. spaCy's installer shells out to
+# ``sys.executable -m pip`` when ``pip`` is importable, else ``uv pip`` (the
+# uv-tool / bundled console-script case). ``uv pip`` aborts with a
+# ``SystemExit`` — "No virtual environment found" — when no venv is active,
+# which the route's ``except Exception`` cannot catch → an opaque HTTP 500 on
+# the FIRST speech request. We pre-resolve the model at the route boundary
+# (offloaded to a worker thread, like the espeak sweep) so a missing model
+# 503s cleanly BEFORE weight load and can never reach misaki's SystemExit-y
+# runtime download. Cached + lock-coalesced: the one-time install runs once
+# per process even under concurrent cold-start requests.
+_KOKORO_G2P_SPACY_MODEL = "en_core_web_sm"
+
+# Per-process readiness cache + single-flight lock. rapid-mlx serves from a
+# SINGLE uvicorn worker (``server.py`` calls ``uvicorn.run(app)`` with no
+# ``workers=``), so a process-local lock fully coalesces the one-time install;
+# a hypothetical multi-worker deployment would need a cross-process lock, but
+# that isn't a supported topology here.
+#
+# SUCCESS is cached for the process lifetime; a FAILURE is cached only for a
+# short cooldown (``_G2P_MODEL_RETRY_COOLDOWN_S``) so a transient index outage
+# or timeout doesn't disable Kokoro until restart — after the window we
+# re-probe, and once the dependency is present we cache success.
+_G2P_MODEL_READY: bool | None = None
+_G2P_MODEL_REASON: str | None = None
+_G2P_MODEL_RETRY_AFTER: float = 0.0
+_G2P_MODEL_RETRY_COOLDOWN_S = 60.0
+_G2P_MODEL_LOCK = threading.Lock()
+
+
+def _g2p_model_install_hint() -> str:
+    """Fixed, operator-facing 503 message.
+
+    Carries NO subprocess output and no interpreter path: raw installer stderr
+    can leak authenticated package-index URLs, internal hostnames, usernames,
+    and filesystem paths, so it is logged server-side and NEVER returned in the
+    HTTP response. The recovery text covers both a normal venv and the uv-tool
+    / no-venv launcher (where a bare ``spacy download`` can't resolve a target)
+    by pointing at a venv reinstall of the audio extras.
+    """
+    return (
+        f"Kokoro TTS needs the spaCy G2P model '{_KOKORO_G2P_SPACY_MODEL}', "
+        "which could not be prepared automatically. Reinstall the audio extras "
+        "with 'pip install \"rapid-mlx[audio]\"' inside a virtual environment "
+        f"(or run 'python -m spacy download {_KOKORO_G2P_SPACY_MODEL}' against "
+        "the server's interpreter), then retry — the server re-checks "
+        "automatically; restart only if it still can't find the model."
+    )
+
+
+def _g2p_installer_env(
+    environ: dict[str, str], prefix: str, prefix_is_venv: bool
+) -> dict[str, str]:
+    """Env for a child spaCy-model install so it targets THIS interpreter.
+
+    spaCy's ``uv pip`` fallback installs into ``$VIRTUAL_ENV``. Two cases:
+
+    * The running interpreter IS a venv (the uv-tool / bundled-sidecar case):
+      force ``VIRTUAL_ENV`` to ``prefix`` — even if one is already set —
+      because an inherited ``VIRTUAL_ENV`` from an outer activated shell can
+      point at a DIFFERENT environment; installing the model there would leave
+      it invisible to the running spaCy and keep misaki's SystemExit-y runtime
+      download reachable.
+    * The running interpreter is NOT a venv (system Python): DROP any inherited
+      ``VIRTUAL_ENV`` rather than let a child ``uv pip`` install into that
+      unrelated outer env. With no venv, ``uv pip`` errors cleanly (→ our
+      caught failure → 503) instead of silently polluting the wrong env.
+
+    Harmless for the ``pip`` path either way (pip installs into
+    ``sys.executable`` regardless of ``VIRTUAL_ENV``). Pure + no FS access →
+    unit-testable.
+    """
+    env = dict(environ)
+    if prefix_is_venv:
+        env["VIRTUAL_ENV"] = prefix
+    else:
+        env.pop("VIRTUAL_ENV", None)
+    return env
+
+
+def _spacy_download_subprocess(
+    cmd: list[str], env: dict[str, str], timeout: int
+) -> None:
+    """Run the spaCy-model install in its OWN process group; kill the WHOLE
+    group on timeout.
+
+    ``subprocess.run(timeout=...)`` SIGKILLs only the direct child, so a pip/uv
+    grandchild would survive a timeout, keep mutating the environment after the
+    single-flight lock is released, and race a later retry. ``start_new_session``
+    makes the child a group leader whose grandchildren inherit the group, so one
+    ``killpg`` reaps the whole tree. Raises ``CalledProcessError`` on non-zero
+    exit (stderr on the exception only) or ``TimeoutExpired`` on timeout — both
+    already handled by the caller, which logs a sanitized shape, never raw text.
+    """
+    import os
+    import signal
+    import subprocess
+
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        _, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()  # fall back to killing at least the direct child
+        # BOUNDED best-effort reap: SIGKILL is uncatchable so this normally
+        # returns at once; cap it so a wedged descendant still holding a pipe
+        # can't hang the worker past the timeout. Close our pipe ends regardless
+        # so we never leak fds; any residual process is reaped by the subprocess
+        # module's own cleanup on the next ``Popen``.
+        try:
+            proc.communicate(timeout=10)
+        except Exception:  # noqa: BLE001 — never mask the timeout re-raised below
+            pass
+        for _pipe in (proc.stdout, proc.stderr, proc.stdin):
+            if _pipe is not None:
+                try:
+                    _pipe.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        raise
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=stderr)
+
+
+def _probe_kokoro_g2p_model() -> tuple[bool, str | None]:
+    """Ensure misaki's spaCy G2P model is importable; install it once if not.
+
+    Returns ``(ready, reason)`` and NEVER raises — its contract is that ANY
+    failure (a spaCy import error, ``spacy.util.is_package`` raising on corrupt
+    metadata, a subprocess or ``SystemExit`` from the installer) becomes a
+    clean 503 verdict, not an exception the route would collapse into the
+    opaque 500 this fix exists to prevent.
+    """
+    try:
+        return _probe_kokoro_g2p_model_impl()
+    except (Exception, SystemExit) as e:  # noqa: BLE001
+        # Log only the exception TYPE — an arbitrary exception's repr can carry
+        # subprocess stderr / index URLs / paths (secret-in-logs), matching the
+        # inner installer-error handler's sanitized contract.
+        logger.error(
+            "Kokoro TTS: spaCy G2P readiness probe failed: %s", type(e).__name__
+        )
+        return False, _g2p_model_install_hint()
+
+
+def _probe_kokoro_g2p_model_impl() -> tuple[bool, str | None]:
+    import importlib
+    import os
+    import subprocess
+    import sys
+
+    try:
+        import spacy.util
+    except Exception as e:  # noqa: BLE001
+        # Reached only for a Kokoro request past the misaki-present gate, and
+        # misaki hard-depends on spaCy — so an unimportable spaCy (absent, torn
+        # submodule, or broken C-ext) is a broken install. Fail closed with a
+        # 503 rather than mask it as ready (which would resurface as the opaque
+        # 500 this fix prevents). Log only the exception TYPE (a broken-C-ext
+        # ImportError repr can carry a dylib path); never return it.
+        logger.error(
+            "Kokoro TTS: spaCy G2P runtime is not importable: %s", type(e).__name__
+        )
+        return False, _g2p_model_install_hint()
+    # ``is_package`` is misaki's OWN download predicate — misaki/en.py does
+    # ``if not spacy.util.is_package(name): spacy.cli.download(name)`` then
+    # ``spacy.load(name)``. Matching that predicate exactly is what makes this
+    # gate sufficient: when it's True, misaki's ``if not is_package`` is False,
+    # so misaki NEVER reaches ``spacy.cli.download`` and the uv-pip SystemExit
+    # cannot fire. (A corrupt-but-installed model would fail later in
+    # ``spacy.load`` as a normal ``OSError`` — a plain Exception the route 500s
+    # cleanly — never the #1254 SystemExit, because misaki gates the download
+    # on presence, not on load success.)
+    if spacy.util.is_package(_KOKORO_G2P_SPACY_MODEL):
+        return True, None
+
+    env = _g2p_installer_env(
+        dict(os.environ),
+        sys.prefix,
+        os.path.exists(os.path.join(sys.prefix, "pyvenv.cfg")),
+    )
+    logger.info(
+        "Kokoro TTS: installing spaCy G2P model %s (first-use bootstrap)…",
+        _KOKORO_G2P_SPACY_MODEL,
+    )
+    try:
+        _spacy_download_subprocess(
+            [sys.executable, "-m", "spacy", "download", _KOKORO_G2P_SPACY_MODEL],
+            env,
+            300,
+        )
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        FileNotFoundError,
+        OSError,
+    ) as e:
+        # Log only the failure SHAPE (exception type + exit status) — never the
+        # raw installer stderr, which can echo authenticated package-index URLs,
+        # credentials, hostnames, and paths (secret-in-logs). The operator
+        # reproduces with the exact command surfaced in the 503 hint.
+        rc = getattr(e, "returncode", None)
+        logger.error(
+            "Kokoro TTS: spaCy G2P model install failed: %s%s",
+            type(e).__name__,
+            f" (exit {rc})" if rc is not None else "",
+        )
+        return False, _g2p_model_install_hint()
+
+    importlib.invalidate_caches()
+    # Verify the model is importable in THIS interpreter. A child ``uv pip``
+    # honouring a mismatched ``VIRTUAL_ENV`` (or any silent no-op) could report
+    # success while the wheel landed elsewhere; without this re-check misaki
+    # would still hit its runtime download. Fail closed → clean 503, never 500.
+    if not spacy.util.is_package(_KOKORO_G2P_SPACY_MODEL):
+        logger.error(
+            "Kokoro TTS: spaCy G2P model install reported success but '%s' is "
+            "still not importable in this interpreter (%s)",
+            _KOKORO_G2P_SPACY_MODEL,
+            sys.prefix,
+        )
+        return False, _g2p_model_install_hint()
+    return True, None
+
+
+def _ensure_kokoro_g2p_model_ready() -> None:
+    """Raise a clean 503 if misaki's spaCy G2P model can't be made available.
+
+    Single-flight, NON-blocking: the first cold request acquires
+    ``_G2P_MODEL_LOCK`` and runs the one-time install (up to the subprocess's
+    300 s timeout); concurrent cold requests do NOT block waiting on the lock.
+    Because the ``/v1/audio/speech`` route offloads this to the shared route
+    thread pool, a first-use burst that all blocked here would tie up worker
+    threads for the whole install window and stall unrelated endpoints — so a
+    request that finds the install already in flight returns a transient 503
+    ("retry shortly") and frees its worker immediately.
+
+    SUCCESS is cached for the process lifetime; a FAILURE is cached only for
+    ``_G2P_MODEL_RETRY_COOLDOWN_S`` so a transient index outage / timeout can
+    recover WITHOUT a server restart (re-probe after the cooldown; cache
+    success once the dependency is present).
+    """
+    global _G2P_MODEL_READY, _G2P_MODEL_REASON, _G2P_MODEL_RETRY_AFTER
+
+    import time
+
+    from fastapi import HTTPException
+
+    if _G2P_MODEL_READY:
+        return  # success is sticky for the process lifetime
+
+    # A recent failure is served from cache until its cooldown expires — don't
+    # re-run the (up to 300 s) install on every request while it's still broken.
+    if _G2P_MODEL_REASON is not None and time.monotonic() < _G2P_MODEL_RETRY_AFTER:
+        raise HTTPException(status_code=503, detail=_G2P_MODEL_REASON)
+
+    if _G2P_MODEL_LOCK.acquire(blocking=False):
+        try:
+            # Re-check under the lock: another request may have just resolved it
+            # or set a fresh cooldown while we were racing to acquire.
+            if not _G2P_MODEL_READY and time.monotonic() >= _G2P_MODEL_RETRY_AFTER:
+                ready, reason = _probe_kokoro_g2p_model()
+                if ready:
+                    _G2P_MODEL_READY, _G2P_MODEL_REASON = True, None
+                else:
+                    _G2P_MODEL_REASON = reason
+                    _G2P_MODEL_RETRY_AFTER = (
+                        time.monotonic() + _G2P_MODEL_RETRY_COOLDOWN_S
+                    )
+        finally:
+            _G2P_MODEL_LOCK.release()
+    else:
+        # Another request holds the lock and is running the install; don't
+        # occupy a worker thread blocked on it. Fail fast + retryable.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Kokoro TTS is preparing its spaCy G2P model "
+                f"('{_KOKORO_G2P_SPACY_MODEL}', one-time first-use setup). "
+                "Retry in a few seconds."
+            ),
+        )
+
+    if _G2P_MODEL_READY:
+        return
+    raise HTTPException(
+        status_code=503, detail=_G2P_MODEL_REASON or _g2p_model_install_hint()
+    )
+
+
+def _reset_g2p_model_state() -> None:
+    """Test hook: forget the cached spaCy-G2P-model readiness verdict."""
+    global _G2P_MODEL_READY, _G2P_MODEL_REASON, _G2P_MODEL_RETRY_AFTER
+    _G2P_MODEL_READY = None
+    _G2P_MODEL_REASON = None
+    _G2P_MODEL_RETRY_AFTER = 0.0
+
+
 def _ensure_kokoro_g2p_ready() -> None:
     """Ensure Kokoro's espeak G2P can initialize; repair or 503 if not.
 
@@ -641,7 +959,31 @@ def _reset_espeak_state() -> None:
     _ESPEAK_REASON = None
 
 
-def require_kokoro_runtime() -> None:
+# Kokoro voice ids encode language in the first letter. These are the KNOWN
+# NON-English prefixes (misaki.ja/zh/es/fr/hi/it/pt), which use their own
+# tokenizers and don't need spaCy ``en_core_web_sm``. English is ``a``
+# (American) / ``b`` (British); anything ELSE — including a custom/unknown id —
+# is treated as English so it can't slip past the gate into the #1254
+# first-request ``SystemExit``.
+_KOKORO_NON_ENGLISH_VOICE_PREFIXES = frozenset("jzefhip")
+
+
+def _kokoro_voice_needs_en_g2p(voice: str | None) -> bool:
+    """True when a Kokoro voice uses misaki's ENGLISH G2P (``misaki.en``) — the
+    only path that needs the spaCy ``en_core_web_sm`` model (#1254).
+
+    FAIL-SAFE: only an explicitly-recognized non-English language prefix
+    (:data:`_KOKORO_NON_ENGLISH_VOICE_PREFIXES`) skips the gate. English
+    (``a``/``b``), an omitted voice, AND any unrecognized/custom id all default
+    to True — the canonical default voice (``af_heart``) is English, and a
+    custom English voice must not bypass the gate.
+    """
+    if not voice:
+        return True
+    return voice[:1].lower() not in _KOKORO_NON_ENGLISH_VOICE_PREFIXES
+
+
+def require_kokoro_runtime(voice: str | None = None) -> None:
     """Raise an HTTP 503 when the Kokoro TTS runtime is incomplete.
 
     F-K-KOKORO-MISAKI: ``mlx_audio.tts.generate.load_model`` succeeds
@@ -653,6 +995,14 @@ def require_kokoro_runtime() -> None:
     BEFORE we load weights, attempt synthesis, or hit the runtime
     ``Kokoro requires the optional 'misaki' package`` error inside
     mlx_audio.
+
+    F-K-KOKORO-SPACY (#1254): misaki's English G2P tokenizer needs the
+    spaCy ``en_core_web_sm`` model, which it downloads lazily on the
+    first ``generate`` in a way that ``SystemExit``s under uv-tool /
+    console-script launchers (an opaque 500). This pre-resolves it here
+    (installed once, in a contained subprocess) so a missing model 503s
+    cleanly instead. Gated on ``voice`` — only ENGLISH voices use
+    ``misaki.en``; Japanese/Mandarin/etc. voices don't need this model.
 
     F-K-KOKORO-ESPEAK: beyond the missing-extra check, this also
     validates that misaki's espeak-ng G2P backend can actually
@@ -674,7 +1024,17 @@ def require_kokoro_runtime() -> None:
             status_code=503,
             detail=f"{_KOKORO_EXTRA_HINT}",
         )
+    # Run the CHEAP espeak readiness check first (a ~1-2 s subprocess self-test)
+    # so a host missing espeak fails fast, BEFORE the spaCy model bootstrap —
+    # which can spend up to 300 s on a network install.
     _ensure_kokoro_g2p_ready()
+    # F-K-KOKORO-SPACY (#1254): misaki's English G2P also needs the spaCy
+    # ``en_core_web_sm`` model, downloaded lazily on first ``generate`` in a
+    # way that SystemExits under uv-tool launchers → opaque 500. Resolve it
+    # here (503 on failure) — but ONLY for English voices; other languages
+    # don't use misaki.en / spaCy.
+    if _kokoro_voice_needs_en_g2p(voice):
+        _ensure_kokoro_g2p_model_ready()
 
 
 def _probe_lane(lane: str) -> _Verdict:

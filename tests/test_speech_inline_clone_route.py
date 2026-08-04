@@ -118,7 +118,7 @@ def _mount(monkeypatch):
     _CloneRecordingEngine._real_to_bytes = tts_mod.TTSEngine.to_bytes
     _install_fake_mlx_audio(monkeypatch)
     monkeypatch.setattr(probe_mod, "require_mlx_audio_tts", lambda: None)
-    monkeypatch.setattr(probe_mod, "require_kokoro_runtime", lambda: None)
+    monkeypatch.setattr(probe_mod, "require_kokoro_runtime", lambda *a, **k: None)
     monkeypatch.setattr(tts_mod, "TTSEngine", _CloneRecordingEngine)
     # Cold-start: force snapshot enumeration empty so the route uses the
     # static per-family voice list (matches a fresh install).

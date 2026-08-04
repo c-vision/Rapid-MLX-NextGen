@@ -206,6 +206,10 @@ def test_require_kokoro_runtime_present_misaki_runs_g2p_check(monkeypatch):
     monkeypatch.setattr(
         probe, "_ensure_kokoro_g2p_ready", lambda: ran.__setitem__("n", ran["n"] + 1)
     )
+    # #1254 inserted the spaCy-G2P-model gate BEFORE the espeak gate; stub it so
+    # this test still isolates the espeak readiness path (the base test env has
+    # no real spaCy, which would otherwise fail closed with a 503 first).
+    monkeypatch.setattr(probe, "_ensure_kokoro_g2p_model_ready", lambda: None)
 
     probe.require_kokoro_runtime()
     assert ran["n"] == 1

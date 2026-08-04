@@ -156,7 +156,7 @@ def _stub_engine(monkeypatch, *, voice_observed=None):
             return real_to_bytes(self, audio, format=format)
 
     monkeypatch.setattr(tts_mod, "TTSEngine", _RecordingEngine)
-    monkeypatch.setattr(probe_mod, "require_kokoro_runtime", lambda: None)
+    monkeypatch.setattr(probe_mod, "require_kokoro_runtime", lambda *a, **k: None)
     _install_fake_mlx_audio(monkeypatch)
     audio_route._tts_engine = None
     return audio_route, observed_models

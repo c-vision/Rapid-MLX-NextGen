@@ -796,6 +796,61 @@ class TestKokoroMisakiGate:
             f"503 envelope should include an install hint. Got: {detail}"
         )
 
+    def test_kokoro_g2p_model_failure_surfaces_as_503_not_500(
+        self, monkeypatch, _reset_audio_probe
+    ):
+        """#1254 route surface: misaki present but its spaCy G2P model can't be
+        resolved → /v1/audio/speech must return the actionable 503, NOT the
+        catch-all 500 the raw misaki ``SystemExit`` would collapse into.
+
+        Drives the REAL create_speech → require_kokoro_runtime →
+        _ensure_kokoro_g2p_model_ready chain through the FastAPI route (only the
+        subprocess-installing probe is stubbed to a deterministic failure), so
+        the test breaks if the route ever stops invoking the gate or downgrades
+        its 503 to a 500.
+        """
+        import importlib.util
+
+        from vllm_mlx.audio import probe as probe_mod
+
+        real_find_spec = importlib.util.find_spec
+
+        def _fake_find_spec(name, *args, **kwargs):
+            if name == "misaki":
+                return object()  # misaki PRESENT → past the extra gate
+            try:
+                return real_find_spec(name, *args, **kwargs)
+            except ValueError:
+                if name == "mlx_audio":
+                    return object()
+                raise
+
+        monkeypatch.setattr(importlib.util, "find_spec", _fake_find_spec)
+        _install_fake_mlx_audio(monkeypatch)
+        # espeak gate passes (it runs first); the spaCy-model probe then fails
+        # deterministically (no real subprocess) — its 503 must reach the client.
+        monkeypatch.setattr(probe_mod, "_ensure_kokoro_g2p_ready", lambda: None)
+        monkeypatch.setattr(
+            probe_mod,
+            "_probe_kokoro_g2p_model",
+            lambda: (False, "Kokoro TTS needs 'en_core_web_sm'; reinstall + retry."),
+        )
+
+        client, restore = _mount_audio_app()
+        try:
+            r = client.post(
+                "/v1/audio/speech",
+                json={"model": "kokoro", "input": "hello", "voice": "af_heart"},
+            )
+        finally:
+            restore()
+
+        assert r.status_code == 503, r.text  # the whole point of #1254: not 500
+        detail = r.json().get("detail", "")
+        if isinstance(detail, dict):
+            detail = detail.get("error", {}).get("message", "")
+        assert "en_core_web_sm" in detail, detail
+
     def test_non_kokoro_tts_does_not_require_misaki(
         self, monkeypatch, _reset_audio_probe
     ):

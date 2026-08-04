@@ -439,6 +439,58 @@ class AudioOutput:
     duration: float
 
 
+def detect_tts_family(model_name: str) -> str:
+    """Module-level SSOT for TTS model-family detection.
+
+    Kept at module scope (not only on ``TTSEngine``) so the audio route can
+    ask the SAME question the engine answers at load time — e.g. whether a
+    model resolves to the Kokoro family (which needs the misaki / espeak /
+    spaCy runtime gate) — without constructing an engine. The
+    ``TTSEngine._detect_family`` method delegates here so the two can never
+    disagree (mirrors the ``is_qwen3_*`` shared classifiers above).
+    """
+    name_lower = model_name.lower()
+    if "kokoro" in name_lower:
+        return "kokoro"
+    elif "chatterbox" in name_lower:
+        return "chatterbox"
+    elif "vibevoice" in name_lower:
+        return "vibevoice"
+    elif "voxcpm" in name_lower:
+        return "voxcpm"
+    elif "csm" in name_lower:
+        return "csm"
+    elif "cosyvoice" in name_lower:
+        return "cosyvoice"
+    elif is_qwen3_tts_model(model_name):
+        # Both CustomVoice and VoiceDesign share the ``qwen3_tts`` family
+        # (same mlx_audio loader + generate() entry). The VoiceDesign vs
+        # CustomVoice split is a per-request generate-arg distinction, not
+        # a separate loader — see ``_is_qwen3_voicedesign``.
+        return "qwen3_tts"
+    elif is_indextts_model(model_name):
+        return "indextts"
+    elif "f5-tts" in name_lower or "f5_tts" in name_lower:
+        return "f5"
+    else:
+        return "kokoro"  # Default
+
+
+def is_kokoro_family_model(model_name: str) -> bool:
+    """True when ``model_name`` should be gated through the Kokoro runtime
+    (misaki + espeak + spaCy G2P model, #1254).
+
+    Uses the SAME classifier the engine loads with (:func:`detect_tts_family`,
+    which :meth:`TTSEngine._detect_family` delegates to). The gate MUST agree
+    with the engine: any model the engine loads/generates as Kokoro — including
+    the name-based fallthrough default (a renamed / HF-path Kokoro repo, or any
+    model the engine runs through the Kokoro generate path) — needs the Kokoro
+    runtime, so it must be gated. Gating on a different (e.g. registry-only)
+    view could skip the check for a model the engine still runs as Kokoro.
+    """
+    return detect_tts_family(model_name) == "kokoro"
+
+
 class TTSEngine:
     """
     Text-to-Speech engine supporting multiple model families.
@@ -486,32 +538,9 @@ class TTSEngine:
         return is_qwen3_voicedesign_model(self.model_name)
 
     def _detect_family(self, model_name: str) -> str:
-        """Detect model family from name."""
-        name_lower = model_name.lower()
-        if "kokoro" in name_lower:
-            return "kokoro"
-        elif "chatterbox" in name_lower:
-            return "chatterbox"
-        elif "vibevoice" in name_lower:
-            return "vibevoice"
-        elif "voxcpm" in name_lower:
-            return "voxcpm"
-        elif "csm" in name_lower:
-            return "csm"
-        elif "cosyvoice" in name_lower:
-            return "cosyvoice"
-        elif is_qwen3_tts_model(model_name):
-            # Both CustomVoice and VoiceDesign share the ``qwen3_tts`` family
-            # (same mlx_audio loader + generate() entry). The VoiceDesign vs
-            # CustomVoice split is a per-request generate-arg distinction, not
-            # a separate loader — see ``_is_qwen3_voicedesign``.
-            return "qwen3_tts"
-        elif is_indextts_model(model_name):
-            return "indextts"
-        elif "f5-tts" in name_lower or "f5_tts" in name_lower:
-            return "f5"
-        else:
-            return "kokoro"  # Default
+        """Detect model family from name (delegates to the module SSOT so the
+        engine and the audio route's Kokoro gate can never disagree)."""
+        return detect_tts_family(model_name)
 
     def load(self) -> None:
         """Load the TTS model."""

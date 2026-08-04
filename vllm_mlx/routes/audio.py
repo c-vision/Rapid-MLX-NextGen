@@ -2563,6 +2563,7 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
         from ..audio.tts import (
             UnsupportedAudioFormatError,
             is_indextts_model,
+            is_kokoro_family_model,
         )
 
         # R7-H3 follow-up: alias resolution lives in a shared helper
@@ -2761,14 +2762,24 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
         # this boundary so the request 503s with a clean envelope
         # BEFORE any weight load (mlx-community/Kokoro-82M-bf16 is
         # ~300 MB) or pipeline construction kicks off.
-        if "kokoro" in model_name.lower():
+        #
+        # Gate on the engine's OWN family classifier, not a bare
+        # ``"kokoro" in name`` substring: ``_detect_family`` DEFAULTS
+        # every otherwise-unrecognized model to Kokoro, so a renamed /
+        # third-party Kokoro repo would bypass a substring gate and hit
+        # misaki's raw crash / uncaught ``SystemExit`` on first generate
+        # (#1254). The classifier covers those too.
+        if is_kokoro_family_model(model_name):
             # F-K-KOKORO-ESPEAK: the espeak readiness probe spawns
             # subprocesses and can block for seconds on a cold worker —
             # offload it so the async event loop stays responsive to other
             # in-flight requests (codex MAJOR).
             from fastapi.concurrency import run_in_threadpool
 
-            await run_in_threadpool(require_kokoro_runtime)
+            # Pass the resolved voice so the spaCy en_core_web_sm gate applies
+            # only to English voices (#1254) — Japanese/Mandarin/etc. Kokoro
+            # voices use their own G2P and must not be forced through it.
+            await run_in_threadpool(require_kokoro_runtime, voice)
 
         # Only forward ``instruct`` when the caller actually sent an
         # ``instructions`` field. Passing ``instruct=None`` is a no-op for

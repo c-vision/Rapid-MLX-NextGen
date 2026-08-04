@@ -296,7 +296,7 @@ def _mount(monkeypatch):
     _RecordingEngine._real_to_bytes = tts_mod.TTSEngine.to_bytes
     _install_fake_mlx_audio(monkeypatch)
     monkeypatch.setattr(probe_mod, "require_mlx_audio_tts", lambda: None)
-    monkeypatch.setattr(probe_mod, "require_kokoro_runtime", lambda: None)
+    monkeypatch.setattr(probe_mod, "require_kokoro_runtime", lambda *a, **k: None)
     monkeypatch.setattr(tts_mod, "TTSEngine", _RecordingEngine)
     # Force snapshot enumeration empty so the route uses the static
     # chatterbox voice list (``["default"]``) — matches a fresh install.
