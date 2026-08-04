@@ -168,6 +168,68 @@ def test_dsml_parser_normalizes_codex_prefix_rule_string_to_array():
     assert arguments == {"cmd": "pwd", "prefix_rule": ["git", "status"]}
 
 
+def test_dsml_parser_accepts_sampled_r_alias_and_drops_empty_enum_placeholder():
+    """Regression for the exact wire shape emitted during a 171K agent soak."""
+    parser = ToolParserManager.get_tool_parser("deepseek_v4_0731")(None)
+    wire = (
+        "inspection\n<｜DSML｜r:tool_calls>\n"
+        '<｜DSML｜r:invoke name="exec_command">\n'
+        '<｜DSML｜r:parameter name="cmd" string="true">pwd</｜DSML｜parameter>\n'
+        '<｜DSML｜r:parameter name="sandbox_permissions" string="false">'
+        "[]</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    )
+
+    result = parser.extract_tool_calls(wire)
+
+    assert result.tools_called is True
+    assert result.content == "inspection"
+    assert result.tool_calls[0]["name"] == "exec_command"
+    assert json.loads(result.tool_calls[0]["arguments"]) == {"cmd": "pwd"}
+
+
+def test_dsml_parser_drops_null_optional_enum_placeholder():
+    parser = ToolParserManager.get_tool_parser("deepseek_v4_0731")(None)
+    wire = (
+        "<｜DSML｜tool_calls>\n"
+        '<｜DSML｜invoke name="exec_command">\n'
+        '<｜DSML｜parameter name="cmd" string="true">pwd</｜DSML｜parameter>\n'
+        '<｜DSML｜parameter name="sandbox_permissions" string="false">'
+        "null</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    )
+
+    result = parser.extract_tool_calls(wire)
+
+    assert result.tools_called is True
+    assert json.loads(result.tool_calls[0]["arguments"]) == {"cmd": "pwd"}
+
+
+def test_dsml_r_alias_streaming_holds_split_opener_and_emits_once():
+    parser = ToolParserManager.get_tool_parser("deepseek_v4_0731")(None)
+    parser.reset()
+    wire = (
+        "checking<｜DSML｜r:tool_calls>\n"
+        '<｜DSML｜r:invoke name="exec_command">\n'
+        '<｜DSML｜r:parameter name="cmd" string="true">pwd'
+        "</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    )
+    previous = ""
+    content: list[str] = []
+    calls: list[dict] = []
+    for char in wire:
+        current = previous + char
+        delta = parser.extract_tool_calls_streaming(previous, current, char)
+        if delta:
+            content.append(delta.get("content", ""))
+            calls.extend(delta.get("tool_calls", []))
+        previous = current
+
+    assert "".join(content) == "checking"
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "exec_command"
+
+
 def test_dsml_parser_restores_escaped_control_literals_in_string_parameter():
     parser = ToolParserManager.get_tool_parser("deepseek_v4_0731")(None)
     escaped = (

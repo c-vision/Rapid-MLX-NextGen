@@ -6,6 +6,11 @@ from vllm_mlx.api.utils import StreamingToolCallFilter
 
 
 class TestStreamingToolCallFilter(unittest.TestCase):
+    def test_suppresses_deepseek_sampled_r_alias(self):
+        f = StreamingToolCallFilter()
+        text = "visible<｜DSML｜r:tool_calls>hidden</｜DSML｜tool_calls>after"
+        assert f.process(text) == "visibleafter"
+
     def test_normal_text_passes_through(self):
         f = StreamingToolCallFilter()
         assert f.process("Hello world") == "Hello world"

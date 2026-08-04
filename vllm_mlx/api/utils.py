@@ -516,6 +516,7 @@ _MAX_TOOL_BUFFER_BYTES = 1_048_576  # 1 MB
 _TOOL_CALL_TAGS: list[tuple[str, str]] = [
     ("<minimax:tool_call>", "</minimax:tool_call>"),
     ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>"),  # DeepSeek V4 0731
+    ("<｜DSML｜r:tool_calls>", "</｜DSML｜tool_calls>"),  # 0731 sampled alias
     ("<tool_call>", "</tool_call>"),  # hermes, qwen3
     ("<function=", "</function>"),
     ("[TOOL_CALL]", "[/TOOL_CALL]"),

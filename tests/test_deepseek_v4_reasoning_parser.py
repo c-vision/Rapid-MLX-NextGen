@@ -142,6 +142,21 @@ def test_dsml_tool_start_implicitly_closes_reasoning() -> None:
     assert parsed.content == "<｜DSML｜tool_calls><｜DSML｜invoke"
 
 
+def test_dsml_sampled_r_tool_start_implicitly_closes_reasoning() -> None:
+    parser = DeepSeekV4ReasoningParser()
+    parser.configure_request(enable_thinking=True)
+
+    parsed = parser.extract_reasoning_streaming(
+        "",
+        "plan<｜DSML｜r:tool_calls><｜DSML｜r:invoke",
+        "plan<｜DSML｜r:tool_calls><｜DSML｜r:invoke",
+    )
+
+    assert parsed is not None
+    assert parsed.reasoning == "plan"
+    assert parsed.content == "<｜DSML｜r:tool_calls><｜DSML｜r:invoke"
+
+
 def test_nonstream_chat_mode_absorbs_control_tokens() -> None:
     parser = DeepSeekV4ReasoningParser()
     reasoning, content = parser.extract_reasoning(

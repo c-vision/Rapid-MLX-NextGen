@@ -13,7 +13,13 @@ from .base import DeltaMessage, ReasoningParser
 _THINK_START = "<think>"
 _THINK_END = "</think>"
 _DSML_TOOL_START = "<｜DSML｜tool_calls>"
-_CONTROL_TOKENS = (_THINK_START, _THINK_END, _DSML_TOOL_START)
+_DSML_TOOL_START_R = "<｜DSML｜r:tool_calls>"
+_CONTROL_TOKENS = (
+    _THINK_START,
+    _THINK_END,
+    _DSML_TOOL_START,
+    _DSML_TOOL_START_R,
+)
 
 
 class DeepSeekV4ReasoningParser(ReasoningParser):
