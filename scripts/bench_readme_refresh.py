@@ -43,6 +43,11 @@ from pathlib import Path
 
 import requests
 
+try:
+    from scripts.bench_metadata import write_bench_json
+except ModuleNotFoundError:  # Direct execution outside the repository root.
+    from bench_metadata import write_bench_json
+
 REPO = Path(__file__).resolve().parent.parent
 RESULTS_DIR = REPO / "reports" / "benchmarks" / "readme-refresh"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -660,29 +665,25 @@ def main():
     out_path = (
         Path(args.output) if args.output else RESULTS_DIR / f"results-{stamp}.json"
     )
-    out_path.write_text(
-        json.dumps(
+    output = {
+        "stamp": stamp,
+        "concurrency": args.concurrency,
+        "rounds": ROUNDS,
+        "max_tokens": MAX_TOKENS,
+        "results": [
             {
-                "stamp": stamp,
-                "concurrency": args.concurrency,
-                "rounds": ROUNDS,
-                "max_tokens": MAX_TOKENS,
-                "results": [
-                    {
-                        "model": r.model,
-                        "engine": r.engine,
-                        "arch_note": r.arch_note,
-                        "median_aggregate_tps": r.median_aggregate_tps(),
-                        "median_decode_tps_per_stream": r.median_decode_tps_per_stream(),
-                        "error": r.error,
-                        "rounds": [asdict(rnd) for rnd in r.rounds],
-                    }
-                    for r in all_results
-                ],
-            },
-            indent=2,
-        )
-    )
+                "model": r.model,
+                "engine": r.engine,
+                "arch_note": r.arch_note,
+                "median_aggregate_tps": r.median_aggregate_tps(),
+                "median_decode_tps_per_stream": r.median_decode_tps_per_stream(),
+                "error": r.error,
+                "rounds": [asdict(rnd) for rnd in r.rounds],
+            }
+            for r in all_results
+        ],
+    }
+    write_bench_json(out_path, output, __file__)
     print(f"\n=== Results saved: {out_path} ===", flush=True)
 
     # Markdown summary

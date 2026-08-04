@@ -31,6 +31,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+try:
+    from scripts.bench_metadata import write_bench_json
+except ModuleNotFoundError:  # Direct execution outside the repository root.
+    from bench_metadata import write_bench_json
+
 DEFAULT_OUTPUT_DIR = Path("reports/benchmarks/ollama-comparison")
 PORT_BIND_ATTEMPTS = 3
 
@@ -558,7 +563,7 @@ def write_outputs(result: dict, output_dir: Path) -> dict[str, Path]:
     stamp = safe_timestamp(result["metadata"]["timestamp"])
     json_path = output_dir / f"{stamp}.json"
     markdown_path = output_dir / f"{stamp}.md"
-    json_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    write_bench_json(json_path, result, __file__)
     markdown_path.write_text(render_markdown(result), encoding="utf-8")
     return {"json": json_path, "markdown": markdown_path}
 

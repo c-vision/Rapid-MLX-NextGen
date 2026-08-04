@@ -47,6 +47,11 @@ from statistics import median
 
 import httpx
 
+try:
+    from scripts.bench_metadata import write_bench_json
+except ModuleNotFoundError:  # Direct execution outside the repository root.
+    from bench_metadata import write_bench_json
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -562,7 +567,7 @@ def main(argv: list[str] | None = None) -> int:
         f"dflash_{args.model.replace('/', '_').lower()}.json"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(summary, indent=2) + "\n")
+    write_bench_json(output, summary, __file__)
 
     logger.info("--- summary ---")
     for k in WORKLOADS:

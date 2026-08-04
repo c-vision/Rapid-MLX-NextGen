@@ -18,6 +18,11 @@ from datetime import datetime
 
 import httpx
 
+try:
+    from scripts.bench_metadata import write_bench_json
+except ModuleNotFoundError:  # Direct execution outside the repository root.
+    from bench_metadata import write_bench_json
+
 BASE_URL = "http://localhost:8000/v1"
 
 
@@ -267,8 +272,7 @@ def main():
     }
     out_path = f"reports/decode_tps_{args.label}.json"
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w") as f:
-        json.dump(output, f, indent=2, default=str)
+    write_bench_json(out_path, output, __file__, default=str)
     print(f"\n  Saved to {out_path}")
 
 

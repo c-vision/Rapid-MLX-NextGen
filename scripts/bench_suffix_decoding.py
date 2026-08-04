@@ -25,7 +25,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import time
 from dataclasses import dataclass, field
 
@@ -33,6 +32,10 @@ import mlx.core as mx
 from mlx_lm import load
 from mlx_lm.models import cache as mlx_cache
 
+try:
+    from scripts.bench_metadata import write_bench_json
+except ModuleNotFoundError:  # Direct execution outside the repository root.
+    from bench_metadata import write_bench_json
 from vllm_mlx.speculative.suffix_decoding import SuffixDecodingDrafter
 
 # ---------- Workloads ------------------------------------------------------
@@ -569,8 +572,7 @@ def main():
                 for mid, results in all_results.items()
             },
         }
-        with open(args.json, "w") as f:
-            json.dump(out, f, indent=2)
+        write_bench_json(args.json, out, __file__)
         print(f"\nWrote raw results: {args.json}")
 
 

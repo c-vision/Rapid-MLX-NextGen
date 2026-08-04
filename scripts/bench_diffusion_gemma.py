@@ -53,6 +53,11 @@ import sys
 import time
 import urllib.request
 
+try:
+    from scripts.bench_metadata import write_bench_json
+except ModuleNotFoundError:  # Direct execution outside the repository root.
+    from bench_metadata import write_bench_json
+
 MODEL = "mlx-community/diffusiongemma-26B-A4B-it-4bit"
 PROMPT = (
     "Explain what a diffusion language model is and how it differs from an "
@@ -172,8 +177,7 @@ def main() -> int:
             f"{int(r['median_tokens'])} |"
         )
     out = {"model": MODEL, "base": base, "runs": args.runs, "sweep": rows}
-    with open("/tmp/diffgemma_bench.json", "w") as f:
-        json.dump(out, f, indent=2)
+    write_bench_json("/tmp/diffgemma_bench.json", out, __file__)
     print("\nRaw JSON: /tmp/diffgemma_bench.json")
     return 0
 

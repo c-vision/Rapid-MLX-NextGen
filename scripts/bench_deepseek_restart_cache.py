@@ -24,6 +24,11 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+try:
+    from scripts.bench_metadata import format_bench_json
+except ModuleNotFoundError:  # Direct execution outside the repository root.
+    from bench_metadata import format_bench_json
+
 
 def _get_json(url: str, timeout: float = 2.0) -> dict:
     with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -245,7 +250,7 @@ def main() -> int:
             "ttft_verified": ttft_verified,
             "work_dir": None if auto_work_dir else str(work),
         }
-        print(json.dumps(summary, indent=2, sort_keys=True))
+        print(format_bench_json(summary, __file__, sort_keys=True))
         return 0 if succeeded else 1
     finally:
         if auto_work_dir:

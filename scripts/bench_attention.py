@@ -31,11 +31,14 @@ ballpark — the achieved/peak ratio is what matters for the conclusion.
 from __future__ import annotations
 
 import argparse
-import json
 import time
 
 import mlx.core as mx
 
+try:
+    from scripts.bench_metadata import write_bench_json
+except ModuleNotFoundError:  # Direct execution outside the repository root.
+    from bench_metadata import write_bench_json
 from vllm_mlx.optimizations import detect_hardware
 
 
@@ -280,25 +283,21 @@ def main():
             )
 
     if args.json:
-        with open(args.json, "w") as f:
-            json.dump(
-                {
-                    "hardware": {
-                        "chip": hw.chip_name,
-                        "gpu_cores": hw.gpu_cores,
-                        "memory_bandwidth_gbs": hw.memory_bandwidth_gbs,
-                        "estimated_peak_tflops": peak_tflops,
-                    },
-                    "config": {
-                        "dtype": args.dtype,
-                        "causal": causal,
-                        "repeats": args.repeats,
-                    },
-                    "results": raw,
-                },
-                f,
-                indent=2,
-            )
+        payload = {
+            "hardware": {
+                "chip": hw.chip_name,
+                "gpu_cores": hw.gpu_cores,
+                "memory_bandwidth_gbs": hw.memory_bandwidth_gbs,
+                "estimated_peak_tflops": peak_tflops,
+            },
+            "config": {
+                "dtype": args.dtype,
+                "causal": causal,
+                "repeats": args.repeats,
+            },
+            "results": raw,
+        }
+        write_bench_json(args.json, payload, __file__)
         print()
         print(f"raw results → {args.json}")
 
