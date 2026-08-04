@@ -6489,6 +6489,12 @@ class Scheduler:
                 output.finish_reason = response.finish_reason
                 if repetition_error is not None:
                     output.error = repetition_error
+                    # Mark this abort as the graceful repetition-guard stop so
+                    # the engine returns the partial output as 200 (finish_reason
+                    # remapped) instead of raising 503 like a genuine runtime
+                    # abort. Other abort sources (Metal/OOM recovery) leave
+                    # error_kind None → they stay on the raise→503 path.
+                    output.error_kind = "repetition"
                 finished_ids.add(request_id)
 
                 if stop_trimmed:

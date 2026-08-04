@@ -113,6 +113,10 @@ def test_scheduler_fails_exact_loop_for_tool_request():
     assert output.finish_reason == "abort"
     assert output.error is not None
     assert "repetition" in output.error.lower()
+    # The scheduler marks the abort KIND so the engine can return the partial
+    # output as 200 (finish_reason remapped) rather than raising 503 like a
+    # genuine runtime abort. Other abort sources leave error_kind None.
+    assert output.error_kind == "repetition"
     assert scheduler.num_repetition_loop_stops == 1
     assert scheduler.get_stats()["num_repetition_loop_stops"] == 1
 

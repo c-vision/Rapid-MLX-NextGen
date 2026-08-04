@@ -1094,14 +1094,31 @@ class EngineCore:
                     # Engine loop sets ``error`` when it aborts a request mid-
                     # flight (e.g. Metal RuntimeError that propagated to Python).
                     # Raise so streaming HTTP handlers can map to 503 instead of
-                    # silently yielding an empty terminal chunk (#353).
+                    # silently yielding an empty terminal chunk (#353) — EXCEPT
+                    # the repetition-guard hard-stop. That is a graceful, terminal
+                    # stop whose partial output (already streamed) is valid, so
+                    # remap its internal "abort" finish_reason to the spec-valid
+                    # "length", clear the error, and fall through to the normal
+                    # terminal-chunk path below (the scheduler already set
+                    # ``output.finished=True``). This delivers a clean
+                    # finish_reason=length chunk instead of a generic
+                    # internal_error SSE frame.
                     if output.error:
-                        from .request import InferenceAbortedError
+                        if output.error_kind == "repetition":
+                            logger.warning(
+                                f"[stream_outputs] {request_id[:12]} "
+                                f"repetition-guard stop; finishing stream with "
+                                f"finish_reason=length ({_token_count} tokens)"
+                            )
+                            output.finish_reason = "length"
+                            output.error = None
+                        else:
+                            from .request import InferenceAbortedError
 
-                        logger.warning(
-                            f"[stream_outputs] {request_id[:12]} engine aborted: {output.error}"
-                        )
-                        raise InferenceAbortedError(output.error)
+                            logger.warning(
+                                f"[stream_outputs] {request_id[:12]} engine aborted: {output.error}"
+                            )
+                            raise InferenceAbortedError(output.error)
 
                     yield output
 
@@ -1195,8 +1212,24 @@ class EngineCore:
 
             # Engine loop sets error= when it aborts the request (e.g. Metal
             # runtime error). Surface as InferenceAbortedError so the HTTP
-            # layer maps to 503 (#353).
+            # layer maps to 503 (#353) — EXCEPT the repetition-guard hard-stop,
+            # which is a deliberate, graceful termination whose partial output
+            # is valid. For that case return the partial as a normal result
+            # (finish_reason remapped from the internal "abort" to the spec-valid
+            # "length" — the same precedent the engine loop uses for forced
+            # terminations) so the agent gets 200 + the truncated text instead
+            # of a 503 that discards it and invites an identical retry → re-loop.
             if final_output.error:
+                if final_output.error_kind == "repetition":
+                    logger.warning(
+                        f"[generate] {request_id[:12]} repetition-guard stop; "
+                        f"returning partial ({final_output.completion_tokens} "
+                        f"tokens) as finish_reason=length instead of 503"
+                    )
+                    final_output.finish_reason = "length"
+                    final_output.error = None
+                    return final_output
+
                 from .request import InferenceAbortedError
 
                 raise InferenceAbortedError(final_output.error)

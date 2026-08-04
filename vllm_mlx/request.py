@@ -323,6 +323,20 @@ class RequestOutput:
     # so positional constructor args for the pre-existing fields keep
     # their indices.
     matched_stop: str | None = None
+    # Distinguishes WHY the request aborted, when ``error`` is set. The engine
+    # raises InferenceAbortedError (→ HTTP 503) for genuine mid-flight failures
+    # (Metal runtime errors, engine-loop crashes) where the partial output may
+    # be corrupt. A repetition-guard hard-stop is different: the scheduler
+    # deliberately terminated a runaway exact-token loop on a has_tools request,
+    # and the partial output up to that point is VALID. Those set
+    # ``error_kind="repetition"`` so the engine returns 200 + partial (with
+    # ``finish_reason`` remapped to a spec-valid value) instead of raising 503 —
+    # which would discard the partial AND invite the agent to blindly retry the
+    # identical prompt straight back into the same loop. ``None`` (or any value
+    # other than ``"repetition"``) keeps the legacy raise→503 path. Appended at
+    # the end of the dataclass so positional constructor args for the pre-existing
+    # fields keep their indices.
+    error_kind: str | None = None
 
     @property
     def usage(self) -> dict[str, int]:
