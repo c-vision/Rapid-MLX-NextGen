@@ -50,6 +50,41 @@ def test_register_vendored_archs_makes_mlx_lm_loader_find_it():
     assert hasattr(mod, "Model")
 
 
+def test_materialize_cache_arrays_flattens_existing_leaf_attributes(monkeypatch):
+    import mlx.core as mx
+
+    from vllm_mlx.models import deepseek_v4
+
+    class Leaf:
+        pass
+
+    class Composite:
+        pass
+
+    first = Leaf()
+    first.keys = mx.array([1])
+    first.metadata = 7
+    second = Leaf()
+    second.pooled = mx.array([2])
+    second.empty = None
+    composite = Composite()
+    composite.caches = (first, second)
+    calls = []
+    monkeypatch.setattr(deepseek_v4.mx, "eval", lambda *arrays: calls.append(arrays))
+
+    assert deepseek_v4._materialize_cache_arrays([composite, None]) == 2
+    assert calls == [(first.keys, second.pooled)]
+
+
+def test_materialize_cache_arrays_skips_empty_cache(monkeypatch):
+    from vllm_mlx.models import deepseek_v4
+
+    eval_calls = []
+    monkeypatch.setattr(deepseek_v4.mx, "eval", lambda *args: eval_calls.append(args))
+    assert deepseek_v4._materialize_cache_arrays(None) == 0
+    assert eval_calls == []
+
+
 def test_register_vendored_archs_is_idempotent():
     from vllm_mlx.utils.tokenizer import _register_vendored_archs
 

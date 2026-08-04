@@ -1351,6 +1351,24 @@ class DeepseekV4Block(nn.Module):
         return hc_expand(x, residual, post, comb)
 
 
+def _materialize_cache_arrays(cache: Optional[Any]) -> int:
+    """Realize existing DeepSeek cache leaf arrays in one MLX evaluation."""
+    if cache is None:
+        return 0
+    arrays: list[mx.array] = []
+    for item in cache:
+        leaves = getattr(item, "caches", None) or (item,)
+        for leaf in leaves:
+            if leaf is None:
+                continue
+            arrays.extend(
+                value for value in vars(leaf).values() if isinstance(value, mx.array)
+            )
+    if arrays:
+        mx.eval(*arrays)
+    return len(arrays)
+
+
 class DeepseekV4Model(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -1403,6 +1421,11 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             global_idx = layer.attn.layer_idx
             if return_dspark_hidden and global_idx in self.args.dspark_target_layer_ids:
                 dspark_hiddens.append(h.mean(axis=2))
+
+        # Functional cache updates otherwise retain prior lazy graphs. During
+        # long decodes that can exhaust Metal's resource-count limit even when
+        # byte memory remains healthy.
+        _materialize_cache_arrays(cache)
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
@@ -1664,6 +1687,7 @@ class Model(nn.Module):
         for block, layer_cache in zip(self.mtp, cache):
             block.attn.update_main(main_x, layer_cache)
         if initial_prefill:
+            _materialize_cache_arrays(cache)
             return None
 
         K = self.args.dspark_block_size
@@ -1703,6 +1727,7 @@ class Model(nn.Module):
                 if draft_sampler is not None
                 else mx.argmax(row, axis=-1)
             )
+        _materialize_cache_arrays(cache)
         return output_ids, draft_logits
 
     @property
