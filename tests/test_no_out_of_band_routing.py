@@ -1320,6 +1320,15 @@ def test_alias_profile_str_fields_are_explicitly_listed():
     ALLOWED_STR_FIELDS: frozenset[str] = frozenset(
         {
             "hf_path",  # HF repo path, open-ended URL-like string
+            # In-repo directory holding this alias's checkpoint, for
+            # publishers who ship one folder per quantization in a single
+            # repo (LiquidAI/LFM2.5-2.6B-MLX). NOT a routing switch: it
+            # never selects a lane or a parser, it only names a path
+            # segment. Its value space is constrained at JSON load —
+            # relative, downward, no glob metacharacters, no drive letter
+            # — and a repo whose declared folder is absent fails loud at
+            # load rather than silently falling back to the repo root.
+            "subfolder",
             "tool_call_parser",  # parser key, see PARSER_REGISTRY
             "reasoning_parser",  # parser key, see PARSER_REGISTRY
             "suffix_decoding_tier",  # one of VALID_SUFFIX_TIERS — non-routing data

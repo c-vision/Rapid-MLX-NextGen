@@ -757,6 +757,107 @@ def _post_load_ubc_evict(model_name: str) -> None:
         logger.debug(f"Defect 4 post-load UBC evict skipped (non-fatal): {e}")
 
 
+def _resolve_subfolder_checkpoint(model_name: str) -> str:
+    """Turn ``org/repo`` into ``…/snapshots/<sha>/<subfolder>`` when the
+    alias for that repo pins one; otherwise return ``model_name`` as-is.
+
+    Only the declared subfolder is fetched — ``allow_patterns`` keeps a
+    ``rapid-mlx serve lfm2.5-2.6b-4bit`` from pulling the repo's other
+    seven quantizations (~20 GB for LFM2.5-2.6B-MLX).
+
+    A local path is passed through untouched — it is already a checkpoint
+    directory, and re-deriving a subfolder from a reverse alias lookup on a
+    local path would be wrong. So is a repo with no declared subfolder.
+
+    Once a subfolder IS declared this must not fall back to the bare repo
+    id. Handing an unresolved remote id to ``mlx_lm.load`` sends it to its
+    own *unfiltered* ``snapshot_download`` — the caller would wait out the
+    full ~20 GB repo and then still fail, because the repo root is not a
+    checkpoint for this publisher. Raise instead: an immediate, named error
+    beats a very expensive one. The offline path is preserved explicitly by
+    retrying against the local cache before giving up.
+    """
+    import os
+
+    if os.path.exists(model_name):
+        return model_name
+    # Registry errors PROPAGATE. Swallowing them and returning the bare
+    # repo id is precisely the outcome this helper exists to prevent: for
+    # a subfolder repo, mlx-lm would then run its own unfiltered
+    # ``snapshot_download`` and pull every quantization before failing.
+    # A malformed aliases.json is a hard error everywhere else too
+    # (``resolve_model`` loads the same registry at CLI startup), so this
+    # is consistent, not a new failure mode.
+    from ..model_aliases import resolve_model, resolve_subfolder
+
+    subfolder = resolve_subfolder(model_name)
+    if not subfolder:
+        return model_name
+    # ``resolve_subfolder`` answers for BOTH spellings — the alias the user
+    # typed and the repo id the CLI resolves it to. The Hub only knows the
+    # latter. ``server.load_model`` is also a public entry point that
+    # programmatic callers reach with a bare alias, skipping the CLI's
+    # pre-resolution, so normalize here instead of assuming someone
+    # upstream already did.
+    repo_id = resolve_model(model_name)
+
+    from huggingface_hub import snapshot_download
+
+    patterns = [f"{subfolder}/*"]
+    try:
+        local = snapshot_download(repo_id, allow_patterns=patterns)
+    except Exception as online_exc:
+        # The Hub call failed. The cause could be anything — no network, a
+        # gated repo, a bad token, a full disk — and we deliberately do NOT
+        # try to tell them apart: the recovery is the same for all of them,
+        # namely "is it already on disk?", and a wrong guess about the cause
+        # is worse than not guessing. So the diagnosis below says what we
+        # observed, not why.
+        try:
+            local = snapshot_download(
+                repo_id, allow_patterns=patterns, local_files_only=True
+            )
+        except Exception:
+            raise RuntimeError(
+                f"Could not fetch the {subfolder!r} subfolder of {repo_id}, "
+                f"and it is not in the local cache. This publisher ships one "
+                f"checkpoint per quantization folder, so the repo root cannot "
+                f"be loaded instead. Original error: {online_exc}"
+            ) from online_exc
+        logger.warning(
+            "Could not reach %s (%s) — falling back to the cached %r subfolder.",
+            repo_id,
+            online_exc,
+            subfolder,
+        )
+
+    resolved = os.path.join(local, subfolder)
+    if not os.path.isdir(resolved):
+        raise RuntimeError(
+            f"{repo_id} declares subfolder {subfolder!r} but {resolved} "
+            "does not exist after download — the publisher has probably "
+            "reorganized the repo. Update the alias rather than loading the "
+            "repo root, which is not a checkpoint."
+        )
+    # A directory is not a checkpoint. An interrupted or disk-full pull
+    # leaves the folder present with its shards missing, and a publisher who
+    # reorganizes the repo can leave a config.json with no weights beside
+    # it. Both reach here on the SUCCESS path too, so the check belongs
+    # after both branches, not only after the offline fallback. Reuse the
+    # download gate's implementation — it already mirrors mlx-lm's own
+    # ``model*.safetensors`` glob and shard-index validation.
+    from .._download_gate import _snapshot_is_complete
+
+    if not _snapshot_is_complete(resolved):
+        raise RuntimeError(
+            f"The {subfolder!r} subfolder of {repo_id} is present but "
+            "incomplete — its weight shards are missing. A previous download "
+            "did not finish, or the publisher reorganized the repo."
+        )
+    logger.info("Loading %s from its %r subfolder", repo_id, subfolder)
+    return resolved
+
+
 def load_model_with_fallback(
     model_name: str,
     tokenizer_config: dict = None,
@@ -773,6 +874,16 @@ def load_model_with_fallback(
     Returns:
         Tuple of (model, tokenizer)
     """
+    # Publishers who ship one repo per model with a folder per quant
+    # (``LiquidAI/LFM2.5-2.6B-MLX`` → ``4bit/``, ``8bit/``, ``bf16/`` …)
+    # need the repo id turned into a concrete directory before mlx-lm
+    # sees it — ``mlx_lm.load`` has no subfolder parameter. This is the
+    # ONLY place that happens: everything upstream (download gate, R2
+    # mirror catalog, ``model_sizes``, telemetry) keeps working with the
+    # bare repo id. No-op for the ~99% of aliases whose repo root is the
+    # checkpoint.
+    model_name = _resolve_subfolder_checkpoint(model_name)
+
     # ``mlx_lm.load`` may import config.json::model_file.  Validate that
     # caller-supplied local path once at this shared boundary before any native
     # or fallback loader runs.  Remote repository ids are intentionally a no-op

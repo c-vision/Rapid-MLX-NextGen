@@ -11,8 +11,11 @@ because the spawned ``serve`` subprocess captured stdout to a logfile,
 the user saw a blank screen and assumed the CLI was hung.
 
 This module is the user-visible safety net. It is intentionally
-self-contained (no rapid-mlx imports) so it stays cheap to import from
-``cli.main()`` on every invocation.
+self-contained at MODULE level (no rapid-mlx imports) so it stays cheap
+to import from ``cli.main()`` on every invocation. The two subfolder
+helpers below reach into ``model_aliases`` through function-local
+imports, which preserves that property — the registry is only read on
+the paths that already touch the filesystem or the Hub.
 
 Public API:
 
@@ -169,6 +172,23 @@ def _model_info_with_timeout(repo_id: str, timeout: float):
     return result.get("info")
 
 
+def _descend_to_checkpoint(snap_dir: str, repo_id: str) -> str:
+    """The directory mlx-lm will actually glob inside ``snap_dir``.
+
+    Identity for the ordinary flat repo. For a subfolder-per-quant repo
+    it appends the declared folder — but only if that folder is really
+    there, so a publisher who reorganises the repo degrades to the
+    (honest) "not cached" answer instead of an exception.
+    """
+    from .model_aliases import checkpoint_prefix
+
+    prefix = checkpoint_prefix(repo_id)
+    if not prefix:
+        return snap_dir
+    candidate = os.path.join(snap_dir, prefix.rstrip("/"))
+    return candidate if os.path.isdir(candidate) else snap_dir
+
+
 def estimate_repo_size_bytes(repo_id: str) -> int | None:
     """Best-effort total size of weight + tokenizer files in ``repo_id``.
 
@@ -176,16 +196,27 @@ def estimate_repo_size_bytes(repo_id: str) -> int | None:
     when available) across files whose extension marks them as weight
     or tokenizer payload. ``None`` on any failure (network down, gated
     repo, HF outage, timeout) — callers should fall through silently.
+
+    For a repo that ships one folder per quantization, only the folder
+    this alias actually downloads is counted. Summing the whole repo
+    told a user that ``serve lfm2.5-2.6b-4bit`` was about to pull
+    18.7 GiB when the real transfer is 1.6 GiB — a confirm prompt that
+    scares people away from a download that would have taken seconds.
     """
     try:
         info = _model_info_with_timeout(repo_id, _HF_API_TIMEOUT_SECONDS)
     except Exception:
         return None
 
+    from .model_aliases import checkpoint_prefix
+
+    prefix = checkpoint_prefix(repo_id)
     siblings = getattr(info, "siblings", None) or []
     total = 0
     for sib in siblings:
         name = getattr(sib, "rfilename", "") or ""
+        if prefix and not name.startswith(prefix):
+            continue
         if not _is_weight_file(name):
             continue
         total += _sibling_size(sib)
@@ -432,6 +463,12 @@ def is_repo_cached(repo_id: str) -> bool:
         snap_dir = os.path.join(snap_root, resolved_sha)
         if not os.path.isdir(snap_dir):
             return False
+        # One repo, one folder per quantization (LiquidAI/LFM2.5-2.6B-MLX):
+        # the checkpoint mlx-lm will glob is the subfolder, not the
+        # snapshot root. Descend before asking "is this complete?" —
+        # otherwise a fully cached 4-bit checkpoint reads as uncached and
+        # the gate re-prompts on every single serve.
+        snap_dir = _descend_to_checkpoint(snap_dir, repo_id)
         return _snapshot_is_complete(snap_dir)
     except Exception:
         pass

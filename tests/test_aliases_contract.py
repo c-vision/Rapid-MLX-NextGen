@@ -45,6 +45,11 @@ from vllm_mlx.tool_parsers import ToolParserManager
 ALLOWED_PROFILE_KEYS: frozenset[str] = frozenset(
     {
         "hf_path",
+        # In-repo directory holding this alias's checkpoint, for
+        # publishers who ship every quantization as a sibling folder of
+        # ONE repo (LiquidAI/LFM2.5-2.6B-MLX). Applied at load and at
+        # download; ``hf_path`` stays a bare repo id everywhere else.
+        "subfolder",
         "modality",
         # State-pin (parallel to ``is_hybrid``): serve a vision-config
         # checkpoint through the text-only mlx-lm lane. Translated to the

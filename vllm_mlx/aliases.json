@@ -1796,10 +1796,18 @@
     "supports_spec_decode": false,
     "is_moe": true
   },
+  "lfm2.5-2.6b-4bit": {
+    "hf_path": "LiquidAI/LFM2.5-2.6B-MLX",
+    "subfolder": "4bit",
+    "tool_call_parser": "lfm",
+    "reasoning_parser": "qwen3",
+    "is_hybrid": false,
+    "supports_spec_decode": false
+  },
   "lfm2.5-8b-a1b-4bit": {
     "hf_path": "mlx-community/LFM2.5-8B-A1B-MLX-4bit",
     "tool_call_parser": "lfm",
-    "reasoning_parser": null,
+    "reasoning_parser": "qwen3",
     "is_hybrid": false,
     "supports_spec_decode": false,
     "is_moe": true

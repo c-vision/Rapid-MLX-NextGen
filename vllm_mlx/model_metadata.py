@@ -209,14 +209,24 @@ def _cached_file(model_name: str, filename: str) -> Path | None:
 
 
 def read_cached_model_metadata(model_name: str) -> ModelMetadata | None:
-    """Read metadata for a cached HF repository, never triggering download."""
-    config_path = _cached_file(model_name, "config.json")
+    """Read metadata for a cached HF repository, never triggering download.
+
+    A publisher like Liquid AI puts eight complete checkpoints in one
+    repo, so ``config.json`` does not exist at the repo root. Without the
+    prefix every read here reports "no config", and the caller routes the
+    model as if its architecture were unknown — which on the serve path
+    is a hard startup failure, not a degraded guess.
+    """
+    from .model_aliases import checkpoint_prefix
+
+    prefix = checkpoint_prefix(model_name)
+    config_path = _cached_file(model_name, f"{prefix}config.json")
     snapshot_dir = config_path.parent if config_path is not None else None
     if snapshot_dir is None:
-        template_path = _cached_file(model_name, "chat_template.jinja")
+        template_path = _cached_file(model_name, f"{prefix}chat_template.jinja")
         snapshot_dir = template_path.parent if template_path is not None else None
     if snapshot_dir is None:
-        tokenizer_path = _cached_file(model_name, "tokenizer_config.json")
+        tokenizer_path = _cached_file(model_name, f"{prefix}tokenizer_config.json")
         snapshot_dir = tokenizer_path.parent if tokenizer_path is not None else None
     if snapshot_dir is None:
         return None

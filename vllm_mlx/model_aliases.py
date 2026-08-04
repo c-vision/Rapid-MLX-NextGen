@@ -121,6 +121,13 @@ def _coerce(alias: str, value: object) -> AliasProfile:
     _ALLOWED_PROFILE_KEYS = frozenset(
         {
             "hf_path",
+            # Directory inside ``hf_path`` holding this alias's checkpoint.
+            # For publishers who ship every quantization as a sibling
+            # folder of ONE repo (LiquidAI/LFM2.5-2.6B-MLX → ``4bit/``,
+            # ``8bit/``, ``bf16/``, …) rather than one repo per quant.
+            # See ModelProfile.subfolder for why this is not folded into
+            # ``hf_path``.
+            "subfolder",
             "modality",
             # State-pin (parallel to ``is_hybrid`` / ``is_moe``): serve
             # this checkpoint through the text mlx-lm lane even though its
@@ -174,6 +181,54 @@ def _coerce(alias: str, value: object) -> AliasProfile:
             f"alias {alias!r}: 'hf_path' must be a non-empty string, "
             f"got {type(hf_path).__name__}={hf_path!r}"
         )
+
+    # ``subfolder`` becomes a path segment joined onto a snapshot
+    # directory, so it is validated as a *relative, downward* path here —
+    # the one place that sees the raw JSON. An absolute path or a ``..``
+    # segment would let an aliases.json edit point the loader at an
+    # arbitrary directory outside the HF cache; a backslash would do the
+    # same on a case-insensitive filesystem that normalises it. Rejecting
+    # at load time keeps every downstream consumer free to treat the value
+    # as a trusted relative path.
+    subfolder = value.get("subfolder")
+    if subfolder is not None:
+        if not isinstance(subfolder, str) or not subfolder:
+            raise ValueError(
+                f"alias {alias!r}: 'subfolder' must be a non-empty string when "
+                f"present, got {type(subfolder).__name__}={subfolder!r}"
+            )
+        # ``os.path.join`` DISCARDS everything to its left when the right
+        # operand is absolute, so an absolute ``subfolder`` silently
+        # relocates the load outside the HF cache instead of erroring.
+        # ``os.path.isabs`` alone is not enough: it is platform-dependent
+        # and returns False for ``C:/x`` on POSIX, so a drive-qualified
+        # path would pass validation on the machine that reviews the JSON
+        # and escape on the machine that loads it. Reject both spellings
+        # everywhere.
+        # The value is BOTH a path segment and the literal prefix of an HF
+        # ``allow_patterns`` glob. Validating it only as a path would let
+        # ``4bit*``, ``[48]bit`` or ``**`` through — each still a legal
+        # relative path, each widening the download past the one directory
+        # the alias declares, which is the entire guarantee this field
+        # exists to make. Reject the metacharacters instead of escaping
+        # them: no real publisher names a folder ``model[0]``, and a
+        # rejected alias is a loud edit-time error.
+        glob_meta = set("*?[]!")
+        drive_qualified = len(subfolder) >= 2 and subfolder[1] == ":"
+        if (
+            subfolder.startswith("/")
+            or os.path.isabs(subfolder)
+            or drive_qualified
+            or "\\" in subfolder
+            or ".." in subfolder.split("/")
+            or subfolder.endswith("/")
+            or glob_meta & set(subfolder)
+        ):
+            raise ValueError(
+                f"alias {alias!r}: 'subfolder' must be a relative path inside "
+                f"the repo with no '..' segment and no trailing slash, got "
+                f"{subfolder!r}"
+            )
     raw_speedup = value.get("suffix_bench_speedup")
     speedup: tuple[tuple[str, float], ...] | None
     if raw_speedup is None:
@@ -399,6 +454,7 @@ def _coerce(alias: str, value: object) -> AliasProfile:
 
     return AliasProfile(
         hf_path=hf_path,
+        subfolder=subfolder,
         modality=modality,
         is_text_only=is_text_only,
         tool_call_parser=value.get("tool_call_parser"),
@@ -429,13 +485,98 @@ def _load() -> dict[str, AliasProfile]:
         path = os.path.join(os.path.dirname(__file__), "aliases.json")
         with open(path) as f:
             raw = json.load(f)
-        _aliases = {alias: _coerce(alias, v) for alias, v in raw.items()}
+        parsed = {alias: _coerce(alias, v) for alias, v in raw.items()}
+        # Validate BEFORE publishing to the module globals. Assigning first
+        # would leave a caught exception with a populated ``_aliases``, and
+        # every later ``_load()`` would take the memoized fast path and use
+        # the registry this check just rejected — failing open exactly once
+        # and then silently forever.
+        _assert_subfolder_is_unambiguous(parsed)
         # Build reverse index in JSON-insertion order so the "first alias
         # wins" rule is deterministic.
-        _hf_to_alias = {}
-        for alias, profile in _aliases.items():
-            _hf_to_alias.setdefault(profile.hf_path, alias)
+        index: dict[str, str] = {}
+        for alias, profile in parsed.items():
+            index.setdefault(profile.hf_path, alias)
+        _aliases, _hf_to_alias = parsed, index
     return _aliases
+
+
+def _assert_subfolder_is_unambiguous(profiles: dict[str, AliasProfile]) -> None:
+    """Reject an aliases.json where ``subfolder`` cannot be recovered.
+
+    ``resolve_subfolder`` reaches the loader through the reverse
+    ``hf_path → first alias`` index, because by the time the text lane
+    loads, the user-typed alias has already been resolved to a bare repo
+    id. "First alias wins" is harmless for every other profile field —
+    two aliases on one repo agree about the parsers and capability gates
+    — but ``subfolder`` is the one field where they would legitimately
+    DISAGREE: ``…-2.6b-4bit`` and ``…-2.6b-8bit`` are the same repo and
+    different directories.
+
+    Rather than silently serve 8-bit weights to someone who asked for
+    4-bit, fail at registry load. Lifting this restriction means
+    threading the alias (not just the resolved path) down to
+    ``load_model_with_fallback`` — a deliberate piece of work, not
+    something to back into by adding a JSON line.
+    """
+    by_path: dict[str, dict[str, str | None]] = {}
+    for alias, profile in profiles.items():
+        by_path.setdefault(profile.hf_path, {})[alias] = profile.subfolder
+    for hf_path, members in by_path.items():
+        if len(set(members.values())) > 1:
+            raise ValueError(
+                f"aliases {sorted(members)} share hf_path {hf_path!r} but "
+                f"declare different 'subfolder' values "
+                f"({ {a: s for a, s in members.items()} }). The loader "
+                "recovers the subfolder by reverse-lookup from the resolved "
+                "hf_path, so it cannot tell them apart. Give each quant its "
+                "own repo, or thread the alias through to "
+                "utils.tokenizer.load_model_with_fallback."
+            )
+
+
+def checkpoint_prefix(name: str) -> str:
+    """``"4bit/"`` when ``name``'s checkpoint lives in a repo subfolder.
+
+    The single implementation shared by every consumer that has to reach
+    a file inside the checkpoint — cache probes (``config.json``),
+    size estimates, and completeness checks. Returns ``""`` for the
+    ordinary flat repo, so callers can prepend it unconditionally.
+
+    Fail-soft: an unreadable registry yields ``""``, i.e. the historical
+    whole-repo behaviour, never an exception. These callers run on the
+    startup path and several of them are explicitly best-effort.
+    """
+    try:
+        subfolder = resolve_subfolder(name)
+    except Exception:
+        return ""
+    return f"{subfolder}/" if subfolder else ""
+
+
+def subfolder_allow_patterns(name: str) -> list[str] | None:
+    """``allow_patterns`` that fetch only ``name``'s checkpoint, or ``None``.
+
+    A repo that ships every quantization side by side is many times larger
+    than the one directory a given alias needs — ``LiquidAI/LFM2.5-2.6B-MLX``
+    is ~20 GB across eight quants, of which ``4bit/`` is 1.6 GB. Every
+    caller that downloads or measures such a repo must pass these
+    patterns, or the user waits for (and stores) seven checkpoints they
+    did not ask for.
+    """
+    subfolder = resolve_subfolder(name)
+    return [f"{subfolder}/*"] if subfolder else None
+
+
+def resolve_subfolder(name: str) -> str | None:
+    """The in-repo directory holding ``name``'s checkpoint, if any.
+
+    Accepts either a user-typed alias or the already-resolved HF repo id
+    (``resolve_profile`` handles both). Returns ``None`` for the ordinary
+    case where the repo root IS the checkpoint.
+    """
+    profile = resolve_profile(name)
+    return profile.subfolder if profile is not None else None
 
 
 def resolve_model(name: str) -> str:

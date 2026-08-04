@@ -931,17 +931,29 @@ def _check_disk_space(model_name: str, force: bool = False) -> None:
     if os.path.exists(model_name):
         return
 
+    # Which directory inside the repo this alias actually needs. Resolved
+    # OUTSIDE the cache probe below: that probe is best-effort and swallows
+    # its own failures, and folding the prefix into it meant one flaky
+    # ``try_to_load_from_cache`` call silently reverted the size estimate to
+    # the whole repo — demanding disk for eight quantizations and refusing a
+    # machine with ample room for the one being fetched.
+    from vllm_mlx.model_aliases import checkpoint_prefix
+
+    _prefix = checkpoint_prefix(model_name)
+
     # Skip if model is already in the HF cache.
     try:
         from huggingface_hub import try_to_load_from_cache
 
-        cached = try_to_load_from_cache(model_name, "config.json")
+        cached = try_to_load_from_cache(model_name, f"{_prefix}config.json")
         if isinstance(cached, str) and os.path.exists(cached):
             return
     except Exception:
         pass
 
     # Query HF for repo size + free space on the actual HF cache filesystem.
+    # Only this alias's checkpoint counts — a subfolder-per-quant repo would
+    # otherwise demand disk for seven quantizations nobody asked for.
     try:
         from huggingface_hub import model_info
         from huggingface_hub.constants import HF_HUB_CACHE
@@ -950,7 +962,7 @@ def _check_disk_space(model_name: str, force: bool = False) -> None:
         model_size_bytes = sum(
             (s.size or 0)
             for s in (getattr(info, "siblings", None) or [])
-            if hasattr(s, "size")
+            if hasattr(s, "size") and (not _prefix or s.rfilename.startswith(_prefix))
         )
         if model_size_bytes == 0:
             return  # Can't determine size — skip rather than guess.
@@ -1281,9 +1293,16 @@ def _check_memory_capacity(model_name: str) -> None:
         else:
             from huggingface_hub import model_info, try_to_load_from_cache
 
-            cached = try_to_load_from_cache(model_name, "config.json")
+            from vllm_mlx.model_aliases import checkpoint_prefix
+
+            # One repo, one folder per quantization: the working set is
+            # this alias's folder, not the eight-checkpoint repo. Sizing
+            # the whole repo made a 1.6 GB model project a 28 GB working
+            # set and fire the kernel-panic warning on a 32 GB Mac.
+            prefix = checkpoint_prefix(model_name)
+            cached = try_to_load_from_cache(model_name, f"{prefix}config.json")
             if isinstance(cached, str) and os.path.exists(cached):
-                # Already-downloaded model: walk the snapshot directory.
+                # Already-downloaded model: walk the checkpoint directory.
                 snapshot_dir = os.path.dirname(cached)
                 for root, _dirs, files in os.walk(snapshot_dir):
                     for f in files:
@@ -1297,6 +1316,7 @@ def _check_memory_capacity(model_name: str) -> None:
                     (s.size or 0)
                     for s in (getattr(info, "siblings", None) or [])
                     if hasattr(s, "size")
+                    and (not prefix or s.rfilename.startswith(prefix))
                 )
     except Exception:
         return  # Network / auth failure — fall through.
@@ -1511,6 +1531,16 @@ def _try_mirror_prefetch(
     bugs in the mirror module surface as real stack traces instead of
     silently routing to ``snapshot_download``.
     """
+    from vllm_mlx.model_aliases import resolve_subfolder
+
+    # The mirror mirrors whole repos; it has no notion of "just this
+    # folder". For a repo that ships one checkpoint per quantization that
+    # would hydrate every quant, so decline and let the HF path run with
+    # ``allow_patterns``. None of these repos is mirrored today — this is
+    # here so that mirroring one later can't silently turn a 1.6 GB pull
+    # into a 20 GB one.
+    if resolve_subfolder(model_name):
+        return False
     try:
         from vllm_mlx._mirror import download_with_mirror_fallback
     except ImportError:
@@ -1584,6 +1614,14 @@ def _ensure_model_downloaded(model_name: str) -> None:
     try:
         from huggingface_hub import model_info, snapshot_download
 
+        from vllm_mlx.model_aliases import subfolder_allow_patterns
+
+        # Repos that ship one folder per quantization: fetch and measure
+        # ONLY this alias's folder. Without the filter a 1.6 GB 4-bit pull
+        # reports and downloads the repo's whole ~20 GB quant matrix.
+        allow_patterns = subfolder_allow_patterns(model_name)
+        _prefix = allow_patterns[0][:-1] if allow_patterns else None
+
         size_gb = 0.0
         try:
             info = model_info(model_name, files_metadata=True)
@@ -1591,6 +1629,7 @@ def _ensure_model_downloaded(model_name: str) -> None:
                 (s.size or 0)
                 for s in (getattr(info, "siblings", None) or [])
                 if hasattr(s, "size")
+                and (_prefix is None or s.rfilename.startswith(_prefix))
             )
             size_gb = size_bytes / (1024**3)
         except Exception:
@@ -1612,7 +1651,10 @@ def _ensure_model_downloaded(model_name: str) -> None:
                 f"fetching {model_name} from HuggingFace ..."
             )
 
-        snapshot_download(model_name)
+        if allow_patterns:
+            snapshot_download(model_name, allow_patterns=allow_patterns)
+        else:
+            snapshot_download(model_name)
         print()
     except SystemExit:
         # _check_disk_space aborts via sys.exit(1) — let it through.
@@ -4976,6 +5018,18 @@ def _snapshot_size_bytes(path) -> int:
 
 def _print_pull_summary(repo_id: str, snapshot_dir, elapsed: float) -> None:
     """Emit the one-line ``Downloaded ... — <size> in <duration>`` summary."""
+    import os as _os
+
+    from vllm_mlx.model_aliases import resolve_subfolder
+
+    # A filtered pull fetched one folder, but the snapshot root may also
+    # hold quant folders left by earlier pulls of a sibling alias. Sizing
+    # the root would report those as part of THIS download.
+    _sub = resolve_subfolder(repo_id)
+    if _sub:
+        _candidate = _os.path.join(str(snapshot_dir), _sub)
+        if _os.path.isdir(_candidate):
+            snapshot_dir = _candidate
     size = _snapshot_size_bytes(snapshot_dir)
     print(
         f"  Downloaded {repo_id} — {_format_bytes(size)} in "
@@ -5024,7 +5078,33 @@ def pull_command(args):
     # error reporting.
     print(f"\n  Pulling {repo_id} from HuggingFace ...")
     try:
-        path = snapshot_download(repo_id)
+        from vllm_mlx.model_aliases import resolve_subfolder
+
+        # A repo that ships one folder per quantization holds many times
+        # more than any one alias needs — unfiltered, this fetches all
+        # eight LFM2.5-2.6B checkpoints (~20 GB) to serve 1.6 GB of them.
+        #
+        # The narrowing applies even when the operator typed the bare repo
+        # id rather than the alias, because every other consumer already
+        # keys on the repo id and reaches inside: the download gate sizes
+        # the subfolder, ``is_repo_cached`` probes the subfolder, and the
+        # loader opens the subfolder. Pulling the whole repo here would
+        # make the gate's "1.5 GiB" quote a lie and leave seven
+        # checkpoints on disk that nothing can serve. It is announced
+        # rather than silent so ``pull <repo-id>`` never quietly does
+        # something narrower than it was asked.
+        _subfolder = resolve_subfolder(repo_id)
+        if _subfolder:
+            print(
+                f"  This repo ships one checkpoint per quantization; "
+                f"fetching only {_subfolder}/ (the folder rapid-mlx serves)."
+            )
+        _allow = [f"{_subfolder}/*"] if _subfolder else None
+        path = (
+            snapshot_download(repo_id, allow_patterns=_allow)
+            if _allow
+            else snapshot_download(repo_id)
+        )
     except HFValidationError:
         # Malformed HF repo id (e.g. ``foo/bar/baz``) — surface the same
         # friendly "unknown model" hint the alias path uses instead of a

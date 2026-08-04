@@ -100,6 +100,21 @@ class ModelProfile:
     """
 
     hf_path: str = ""
+    # Directory INSIDE ``hf_path`` that holds this alias's weights, for
+    # publishers who ship every quantization of one model as sibling
+    # folders of a single repo instead of one repo per quant. Liquid AI
+    # does this: ``LiquidAI/LFM2.5-2.6B-MLX`` carries ``4bit/``, ``6bit/``,
+    # ``8bit/``, ``bf16/``, ``mxfp4/`` … each a complete MLX checkpoint.
+    # ``None`` (the overwhelming majority) means the repo root IS the
+    # checkpoint.
+    #
+    # ``hf_path`` deliberately stays a bare ``org/name`` repo id: the
+    # download gate, the R2 mirror catalog, ``model_sizes`` and telemetry
+    # all key on it, and folding the directory into the id would break
+    # every one of them. The subfolder is applied at exactly one place —
+    # ``utils.tokenizer.load_model_with_fallback`` — where a repo id
+    # becomes a concrete on-disk path.
+    subfolder: str | None = None
 
     # --- Parser defaults ---
     tool_call_parser: str | None = None
