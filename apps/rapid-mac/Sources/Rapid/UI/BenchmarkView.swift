@@ -39,6 +39,9 @@ struct BenchmarkView: View {
         }
         .frame(width: 440, height: 480)
         .background(RapidTheme.canvas)
+        // Closing the card cancels any in-flight bench/submit so it can't
+        // keep burning the GPU in the background after the sheet is gone.
+        .onDisappear { runner.cancelActive() }
     }
 
     private var header: some View {
@@ -86,7 +89,7 @@ struct BenchmarkView: View {
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
             Button {
-                Task { await runner.run(binary: binary ?? URL(fileURLWithPath: "/"), alias: alias, chip: hardware.brandString) }
+                runner.launchRun(binary: binary ?? URL(fileURLWithPath: "/"), alias: alias, chip: hardware.brandString)
             } label: {
                 Label("Benchmark this Mac", systemImage: "play.fill")
                     .frame(maxWidth: .infinity)
@@ -100,14 +103,53 @@ struct BenchmarkView: View {
     }
 
     private var runningState: some View {
-        VStack(spacing: 14) {
-            ProgressView().controlSize(.large).padding(.top, 40)
-            Text("Benchmarking \(displayAlias)…")
-                .font(.callout.weight(.medium))
-            Text("Running a standardized short + long workload. This takes a moment.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+        VStack(spacing: 16) {
+            Image(systemName: "gauge.with.dots.needle.67percent")
+                .font(.system(size: 34))
+                .foregroundStyle(RapidTheme.brandAmber)
+                .padding(.top, 28)
+            Text("Benchmarking \(displayAlias)")
+                .font(.callout.weight(.semibold))
+            benchProgress(
+                runner.progress,
+                fallback: "Running a standardized short + long workload.")
+                .padding(.horizontal, 8)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    /// Live progress used by both the freeform benchmark and the submit
+    /// re-bench: a determinate bar toward the ETA (indeterminate when the
+    /// model size is unknown), the current stage, and an elapsed + ETA
+    /// caption so a multi-minute run never reads as frozen.
+    @ViewBuilder
+    private func benchProgress(_ progress: BenchmarkRunner.Progress?, fallback: String) -> some View {
+        VStack(spacing: 10) {
+            if let p = progress {
+                Group {
+                    if let fraction = p.fraction {
+                        ProgressView(value: fraction)
+                    } else {
+                        ProgressView()
+                    }
+                }
+                .progressViewStyle(.linear)
+                .tint(RapidTheme.amber)
+                Text(p.stageLabel)
+                    .font(.callout.weight(.medium))
+                Text(p.caption)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            } else {
+                ProgressView()
+                    .progressViewStyle(.linear)
+                    .tint(RapidTheme.amber)
+                Text(fallback)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
         }
         .frame(maxWidth: .infinity)
     }
@@ -153,7 +195,7 @@ struct BenchmarkView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(RapidTheme.brand)
                 Button("Run again") {
-                    Task { await runner.run(binary: binary ?? URL(fileURLWithPath: "/"), alias: alias, chip: hardware.brandString) }
+                    runner.launchRun(binary: binary ?? URL(fileURLWithPath: "/"), alias: alias, chip: hardware.brandString)
                 }
                 .buttonStyle(.plain)
                 .font(.callout)
@@ -163,10 +205,8 @@ struct BenchmarkView: View {
                 consentSheet(result)
             }
         case .submitting:
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("Submitting…").font(.callout).foregroundStyle(.secondary)
-            }
+            benchProgress(runner.progress, fallback: "Submitting…")
+                .padding(.top, 4)
         case .submitted:
             VStack(spacing: 8) {
                 Label("On the board", systemImage: "checkmark.seal.fill")
@@ -206,7 +246,7 @@ struct BenchmarkView: View {
                 Spacer()
                 Button("Publish") {
                     showSubmitConsent = false
-                    Task { await runner.submit(binary: binary ?? URL(fileURLWithPath: "/"), alias: alias) }
+                    runner.launchSubmit(binary: binary ?? URL(fileURLWithPath: "/"), alias: alias)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(RapidTheme.brand)
@@ -240,13 +280,11 @@ struct BenchmarkView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             Button("Try again") {
-                Task {
-                    await runner.run(
-                        binary: binary ?? URL(fileURLWithPath: "/"),
-                        alias: alias,
-                        chip: hardware.brandString
-                    )
-                }
+                runner.launchRun(
+                    binary: binary ?? URL(fileURLWithPath: "/"),
+                    alias: alias,
+                    chip: hardware.brandString
+                )
             }
             .buttonStyle(.rapidSecondary)
 
