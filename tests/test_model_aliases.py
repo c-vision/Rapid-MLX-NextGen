@@ -5,12 +5,40 @@ import os
 
 import pytest
 
-from vllm_mlx.model_aliases import list_aliases, resolve_model, suggest_similar
+from vllm_mlx.model_aliases import (
+    RetiredModelAliasError,
+    list_aliases,
+    resolve_model,
+    suggest_similar,
+)
 
 
 def test_known_alias_resolves():
     assert resolve_model("qwen3.5-9b-4bit") == "mlx-community/Qwen3.5-9B-4bit"
     assert resolve_model("llama3-3b-4bit") == "mlx-community/Llama-3.2-3B-Instruct-4bit"
+
+
+def test_broken_ministral_3b_alias_is_rejected_before_loading():
+    """#1367: the default VLM route hangs on its first text completion."""
+    retired = "ministral-3b-4bit"
+    assert retired not in list_aliases()
+    with pytest.raises(RetiredModelAliasError, match="alias was retired"):
+        resolve_model(retired)
+
+
+def test_retired_alias_full_hf_path_remains_available_for_text_only_testing():
+    hf_path = "mlx-community/Ministral-3-3B-Instruct-2512-4bit"
+    assert resolve_model(hf_path) == hf_path
+
+
+def test_local_directory_named_like_retired_alias_keeps_path_precedence(
+    tmp_path, monkeypatch
+):
+    """A real local path is not alias support and keeps the path-first contract."""
+    retired = "ministral-3b-4bit"
+    (tmp_path / retired).mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert resolve_model(retired) == retired
 
 
 def test_full_path_passes_through():
