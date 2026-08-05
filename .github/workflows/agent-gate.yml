@@ -1,11 +1,17 @@
 name: Tier-1 agent gate
 
 # Re-verifies the four Tier-1 (flagship) agents — Claude Code, Codex, Hermes,
-# Aider — end-to-end against a real local model on Apple Silicon. This is the
-# one release check GitHub-hosted runners structurally cannot do (no Metal, no
-# weights, no agent binaries), so it runs on a self-hosted Apple-Silicon runner
-# (the Studio). Mirrors how Apple's own MLX gates its Metal tests on
-# `[self-hosted, macos]`.
+# Aider — end-to-end against a real local model on Apple Silicon, then reuses the
+# same warm serve to run the deep output-coherence golden (#1247) and a
+# decode-throughput perf check. This is the one release check GitHub-hosted
+# runners structurally cannot do (no Metal, no weights, no agent binaries), so it
+# runs on a self-hosted Apple-Silicon runner (the Studio). Mirrors how Apple's own
+# MLX gates its Metal tests on `[self-hosted, macos]`.
+#
+# The coherence + perf extras are driven by RAPID_MLX_RELEASE_GATE=1 (set below)
+# and land in agent_smoke.sh so they share the one 35B load — catching the
+# "agentic path works but the model outputs garbage / regressed in speed" class
+# that agentic checks alone missed (0.11.4).
 #
 # Phase 1: manual (`workflow_dispatch`) only, so we can prove the runner + smoke
 # work before wiring it into the release path. Phase 2 will add this as a
@@ -23,6 +29,9 @@ on:
       model:
         description: "Model alias to verify against (>=8-bit; never 4-bit)"
         default: "qwen3.6-35b-8bit"
+      perf_min_tps:
+        description: "Optional reviewed decode tok/s floor for the perf gate. Blank = advisory (measure + print the number to review, never fails)."
+        default: ""
 
 permissions:
   contents: read
@@ -40,7 +49,12 @@ jobs:
     # every per-command timeout) so the smoke exits on its own, prints its
     # summary, and runs cleanup — instead of GitHub cancelling mid-run. A
     # passing run finishes in ~5-8 min; the tail only matters on regressions.
-    timeout-minutes: 55
+    # Raised from 55: the release path now adds the coherence golden and a
+    # perf measurement on top of the four agents (all on the same warm
+    # serve). Each check is individually bounded, but they stack, and a
+    # run where every check PASSES near its own limit could otherwise be
+    # cancelled by Actions for exceeding the job budget.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - name: Tier-1 agent re-verification
@@ -51,4 +65,11 @@ jobs:
           # Untrusted-ish input passed via env, never interpolated into the
           # script line (matches the repo's auto-release.yml convention).
           MODEL: ${{ inputs.model }}
+          # Turn on the release-gate extras in agent_smoke.sh: after the four
+          # agents pass, reuse the SAME warm serve to run the deep coherence
+          # golden (#1247) and a decode-throughput perf check — no second load.
+          RAPID_MLX_RELEASE_GATE: "1"
+          # Reviewed perf floor (tok/s). Blank → perf runs advisory (prints the
+          # number to review); set it here to enforce. Never a fabricated baseline.
+          RAPID_MLX_PERF_MIN_TPS: ${{ inputs.perf_min_tps }}
         run: bash tests/integrations/agent_smoke.sh "$MODEL"

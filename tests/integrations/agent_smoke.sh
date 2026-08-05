@@ -20,6 +20,13 @@
 # config it touches.
 set -uo pipefail
 
+# Resolved HERE, before anything runs: ``seed_repo``/``verify`` cd into the
+# per-agent scratch dirs and that cwd persists (they are functions, not
+# subshells). Resolving a relative ``$BASH_SOURCE`` later — after the cwd has
+# moved — yields an empty REPO_ROOT, and the release gate would then invoke
+# ``/evals/coherence_gate.py`` and fail a run where every check passed.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
 export PATH="/opt/homebrew/bin:/opt/homebrew/opt/coreutils/libexec/gnubin:$HOME/.local/bin:$PATH"
 VENV="${RAPID_MLX_VENV:-$HOME/rapid-mlx-audit-venv}"
 RMLX="$VENV/bin/rapid-mlx"
@@ -375,4 +382,41 @@ printf "  aider        %s\n" "$R_AIDER"
 for r in "$R_CLAUDE" "$R_CODEX" "$R_HERMES" "$R_AIDER"; do
   [ "$r" = PASS ] || { echo "RESULT: FAIL — a Tier-1 agent regressed; this blocks the release."; exit 1; }
 done
+
+# ---- release-gate extras (opt-in): coherence + perf on the SAME warm serve ----
+# Runs ONLY when RAPID_MLX_RELEASE_GATE=1 (set by agent-gate.yml on the release
+# path). Unset by default, so this block is skipped and the smoke behaves
+# byte-for-byte as before — the local gauntlet and every other caller are
+# unaffected. It reuses the model that is already loaded and warm from the
+# agentic run above (SERVE_PID still listening), so there is NO second model load.
+#
+# This closes the L2 gap where the release gate proved the agentic path but never
+# checked that the flagship model still gives coherent answers or hasn't regressed
+# in speed — the exact class (#1247/#1234) that shipped as garbage in 0.11.4.
+if [ "${RAPID_MLX_RELEASE_GATE:-0}" = "1" ]; then
+  GATE_PY="$VENV/bin/python"
+  echo
+  echo "== release-gate: deep coherence (#1247) + perf on warm $ALIAS serve =="
+
+  # Deep coherence golden (#1247) against the warm flagship model. Fail-closed:
+  # a wrong/incoherent golden answer blocks the release.
+  if ! "$GATE_PY" "$REPO_ROOT/evals/coherence_gate.py" --base-url "$B/v1"; then
+    echo "RESULT: FAIL — $ALIAS coherence gate failed; this blocks the release."
+    exit 1
+  fi
+
+  # Decode-throughput perf gate on the warm serve. Advisory (measure + print)
+  # unless a reviewed floor is set via RAPID_MLX_PERF_MIN_TPS — never a fabricated
+  # baseline. Exit codes: 0 = passed or advisory (INCLUDING a failed measurement
+  # in advisory mode — nothing is being enforced, so a flaky request must not
+  # take the release down); 1 = below the reviewed floor; 2 = a floor IS set but
+  # the run could not be measured, which fails closed because "unable to verify"
+  # is not "verified".
+  if ! "$GATE_PY" "$REPO_ROOT/evals/perf_gate.py" --base-url "$B/v1"; then
+    echo "RESULT: FAIL — $ALIAS perf regressed below the reviewed floor; blocks the release."
+    exit 1
+  fi
+  echo "== release-gate extras PASSED (coherence + perf) =="
+fi
+
 echo "RESULT: PASS — all four Tier-1 agents verified on $ALIAS."

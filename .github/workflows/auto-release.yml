@@ -154,7 +154,11 @@ jobs:
     # untimed up front (hard-bounded to ~10 min) so the healthy path finishes in
     # minutes; 90 min is headroom so a slow-but-passing cold run reaches a verdict
     # instead of being killed. A genuine hang still fails on the per-agent budgets.
-    timeout-minutes: 90
+    # 105, not 90: the coherence golden + perf measurement now run after the
+    # four agents on the same warm serve. They are minutes on a healthy run,
+    # but they stack on top of the ~78 min worst case above, and a run where
+    # every check PASSES near its own budget must not be guillotined.
+    timeout-minutes: 105
     # Serialize with the manual agent-gate.yml so two runs never contend for the
     # single runner / the serve port.
     concurrency:
@@ -170,6 +174,14 @@ jobs:
           # rapid-mlx serve on the shared Studio; the smoke repoints agent
           # configs at it via patch_port.
           RAPID_MLX_PORT: "8188"
+          # Turn on the coherence + perf extras for the REAL release path.
+          # Without this the smoke skips them and this job would re-verify the
+          # four agents while never checking that the flagship model still
+          # answers coherently — the exact gap (#1247) that let 0.11.4 ship as
+          # garbage. Coherence is fail-closed; perf stays advisory because no
+          # floor is set here (RAPID_MLX_PERF_MIN_TPS unset), so it measures and
+          # prints a number to review rather than inventing a baseline.
+          RAPID_MLX_RELEASE_GATE: "1"
         run: |
           set -euo pipefail
           export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
