@@ -333,3 +333,261 @@ def test_readme_one_shot_commands_carry_the_exact_flags():
             f"README's one-shot command for {alias} has {oneshot_flags}, "
             f"the app launches it with {app[alias]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# The Quickstart starter — the RAM-blind first-run pick
+#
+# The tier tables above answer "what should this Mac run". They do NOT
+# cover the alias every brand-new user actually meets first: the
+# Quickstart starter, which is deliberately the same on every Mac.
+#
+# Nothing checked it. The starter shipped as ``bonsai-1.7b-2bit`` on the
+# strength of a tool-call eval (6/6 clean ``tool_calls``), and a community
+# report found it degenerating on an ordinary chat question — reproduced
+# 4/4, terminating 0/4, on plain-chat requests where the repetition guard
+# is inactive by design (it gates on ``request.has_tools``). The eval that
+# justified it measured a real capability that this slot is not judged on.
+#
+# These tests cannot judge output quality. What they can do is pin the
+# mechanical contract that a swap must not break: the alias has to exist,
+# its pinned HF repo has to be the one the registry resolves, and the
+# downloaded and bundled (airgapped) paths must not drift apart — a
+# divergence there means an offline build first-launches a model the
+# online path already rejected.
+
+QUICKSTART = REPO / "apps/rapid-mac/Sources/Rapid/UI/QuickstartView.swift"
+BUNDLED = REPO / "apps/rapid-mac/Sources/Rapid/Server/BundledModel.swift"
+
+
+def _parse_quickstart_default() -> tuple[str, str]:
+    """``(alias, hfRepo)`` from ``QuickstartCoordinator.defaultChoice``."""
+    text = QUICKSTART.read_text()
+    block = re.search(
+        r"static let defaultChoice = QuickstartModelChoice\((.*?)\n    \)",
+        text,
+        re.DOTALL,
+    )
+    assert block, "defaultChoice literal not found in QuickstartView.swift"
+    body = block.group(1)
+    alias = re.search(r'alias:\s*"([^"]+)"', body)
+    repo = re.search(r'hfRepo:\s*"([^"]+)"', body)
+    assert alias, "defaultChoice has no alias literal"
+    assert repo, "defaultChoice must pin hfRepo — it drives the byte-progress monitor"
+    return alias.group(1), repo.group(1)
+
+
+def _parse_bundled() -> tuple[str, str]:
+    """``(bundledAlias, bundledRepoID)`` from ``BundledModel.swift``."""
+    text = BUNDLED.read_text()
+    alias = re.search(r'static let bundledAlias: String = "([^"]+)"', text)
+    repo = re.search(r'static let bundledRepoID: String = "([^"]+)"', text)
+    assert alias and repo, (
+        "bundledAlias / bundledRepoID not found in BundledModel.swift"
+    )
+    return alias.group(1), repo.group(1)
+
+
+def test_quickstart_starter_exists():
+    """An unknown starter alias breaks first run for every new user."""
+    from vllm_mlx.model_aliases import list_aliases
+
+    alias, _ = _parse_quickstart_default()
+    assert alias in list_aliases(), f"Quickstart starter is unknown alias {alias!r}"
+
+
+def test_quickstart_pinned_repo_matches_the_registry():
+    """``hfRepo`` drives the bytes-on-disk progress bar. If it names a
+    different repo than the alias resolves to, the download completes
+    while the bar sits at 0% — the first-impression path, silently wrong."""
+    from vllm_mlx.model_aliases import resolve_model
+
+    alias, repo = _parse_quickstart_default()
+    assert resolve_model(alias) == repo, (
+        f"Quickstart pins hfRepo {repo!r} but {alias!r} resolves to "
+        f"{resolve_model(alias)!r}"
+    )
+
+
+def test_bundled_starter_tracks_the_quickstart_starter():
+    """``BundledModel`` is the airgapped twin of the Quickstart pick. The
+    two are one product decision reached by two paths; letting them drift
+    ships an offline build whose first launch uses the rejected model."""
+    q_alias, q_repo = _parse_quickstart_default()
+    b_alias, b_repo = _parse_bundled()
+    assert b_alias == q_alias, (
+        f"bundledAlias {b_alias!r} != Quickstart starter {q_alias!r}"
+    )
+    assert b_repo == q_repo, f"bundledRepoID {b_repo!r} != Quickstart hfRepo {q_repo!r}"
+
+
+def test_build_script_stages_the_bundled_repo():
+    """``BUNDLE_MODEL=1`` stages weights by repo id in build.sh. A stale
+    default there bundles one model while the app asks for another, and
+    the airgapped first launch falls through to a network pull it cannot
+    make."""
+    build_sh = (REPO / "apps/rapid-mac/scripts/build.sh").read_text()
+    default = re.search(
+        r'BUNDLED_MODEL_REPO="\$\{BUNDLED_MODEL_REPO:-([^}"]+)\}"', build_sh
+    )
+    assert default, "BUNDLED_MODEL_REPO default not found in build.sh"
+    _, b_repo = _parse_bundled()
+    assert default.group(1) == b_repo, (
+        f"build.sh stages {default.group(1)!r} but BundledModel wants {b_repo!r}"
+    )
+
+
+def _parse_retired_starters() -> set[str]:
+    text = QUICKSTART.read_text()
+    block = re.search(
+        r"static let retiredStarters: Set<String> = \[(.*?)\]", text, re.DOTALL
+    )
+    assert block, "retiredStarters literal not found in QuickstartView.swift"
+    return set(re.findall(r'"([^"]+)"', block.group(1)))
+
+
+def test_current_starter_is_not_itself_retired():
+    """``retiredStarters`` re-opens onboarding for anyone whose last-served
+    model is in it. Listing the *current* starter would re-show the wizard
+    to every user who just completed it — an onboarding loop, and the one
+    way this carve-out can strand people instead of rescuing them."""
+    alias, _ = _parse_quickstart_default()
+    assert alias not in _parse_retired_starters(), (
+        f"current starter {alias!r} is listed in retiredStarters — "
+        "every user who onboards onto it would be re-prompted forever"
+    )
+
+
+def test_retired_starters_are_real_aliases():
+    """A typo here silently rescues nobody: the carve-out compares against
+    the persisted ``rapid.serve.lastAlias``, so a misspelled entry just
+    never matches and the stranded cohort stays stranded."""
+    from vllm_mlx.model_aliases import list_aliases
+
+    known = list_aliases()
+    for alias in _parse_retired_starters():
+        assert alias in known, f"retiredStarters names unknown alias {alias!r}"
+
+
+VERIFY_SCRIPT = REPO / "apps/rapid-mac/scripts/verify-recommendation-tiers.swift"
+
+
+def _normalise_swift(body: str) -> str:
+    """Collapse whitespace and drop comments so a copy is compared on
+    behaviour, not formatting."""
+    body = re.sub(r"//[^\n]*", "", body)
+    return re.sub(r"\s+", " ", body).strip()
+
+
+def _extract_func_body(path: Path, signature: str) -> str:
+    """Brace-matched body of the first ``func`` whose declaration starts
+    with ``signature``, comments and whitespace normalised away."""
+    text = path.read_text()
+    start = text.index(signature)
+    depth, i = 0, text.index("{", start)
+    for j in range(i, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return _normalise_swift(text[i : j + 1])
+    raise AssertionError(f"unbalanced {signature!r} body in {path}")
+
+
+def _extract_retired_set(path: Path) -> set[str]:
+    text = path.read_text()
+    block = re.search(r"retiredStarters: Set<String> = \[(.*?)\]", text, re.DOTALL)
+    assert block, f"retiredStarters literal not found in {path}"
+    return set(re.findall(r'"([^"]+)"', block.group(1)))
+
+
+QUICKSTART_PROD = REPO / "apps/rapid-mac/Sources/Rapid/UI/QuickstartView.swift"
+
+
+def test_eligibility_check_script_has_not_drifted_from_production():
+    """``verify-recommendation-tiers.swift`` re-declares the gate rather
+    than importing it — the standalone-script pattern this repo uses
+    because the SPM test target is stripped. That copy is the only thing
+    that EXECUTES the gate, so if production changes and the copy does not,
+    the check passes while testing yesterday's logic.
+
+    The whole decision surface has to be pinned, not just the entry point:
+    ``isEligible`` delegates to ``isStranded``, which reads
+    ``retiredStarters``. Pinning only the first would let a new retired
+    alias — the most likely future edit — land in production while the
+    executable cases keep exercising the old set.
+
+    Bodies are compared whole. An earlier version sliced from the first
+    ``guard`` to skip signature differences, which meant anything inserted
+    *above* that guard — an early return, a new precondition — diverged
+    invisibly. The slice was never needed: ``_extract_func_body`` already
+    returns brace-matched bodies without the signature, so the two sides
+    are directly comparable."""
+    for signature in ("func isEligible(", "func isStranded("):
+        prod = _extract_func_body(QUICKSTART_PROD, signature)
+        copy = _extract_func_body(VERIFY_SCRIPT, signature)
+        assert prod == copy, (
+            f"{signature.strip('func (')} drifted between "
+            "QuickstartView.swift and verify-recommendation-tiers.swift — "
+            "the executable check would be testing stale logic.\n"
+            f"  production: {prod}\n  copy:       {copy}"
+        )
+
+    prod_set = _extract_retired_set(QUICKSTART_PROD)
+    copy_set = _extract_retired_set(VERIFY_SCRIPT)
+    assert prod_set == copy_set, (
+        f"retiredStarters drifted: production {sorted(prod_set)} vs script "
+        f"{sorted(copy_set)} — the rescued cohort differs from the tested one"
+    )
+
+
+def test_auto_start_skips_retired_starters():
+    """Auto-start defaults to ON, so a stranded user's launch would resume
+    the broken model and push ``serverState`` off ``.idle`` — which is
+    exactly what Quickstart's third gate treats as "not a new user". The
+    rescue card would then never render for the cohort it exists for.
+
+    Pinned as source structure because ``AutoStartDecision.decide`` is not
+    reachable from Python; the executable half lives in
+    ``verify-recommendation-tiers.swift``."""
+    decision = (
+        REPO / "apps/rapid-mac/Sources/Rapid/Server/AutoStartDecision.swift"
+    ).read_text()
+    assert "case retiredStarter" in decision, (
+        "AutoStartDecision lost its retiredStarter skip reason"
+    )
+    assert "if isRetiredStarter(alias) {" in decision, (
+        "AutoStartDecision no longer guards against resuming a retired starter"
+    )
+
+    caller = (REPO / "apps/rapid-mac/Sources/Rapid/UI/ContentView.swift").read_text()
+    assert (
+        "!quickstart.done && QuickstartCoordinator.retiredStarters.contains" in caller
+    ), (
+        "the launch hook stopped passing the rescue-gated retired-starter "
+        "predicate. Unconditional leaves a user who dismissed the rescue with "
+        "neither auto-start nor a card; absent, the guard silently no-ops "
+        "because the parameter defaults to 'never retired'"
+    )
+
+    # Presence is not enough: the guard has to come BEFORE the on-disk
+    # check, or a cached retired starter returns .start and is resumed
+    # before anything looks at whether it was retired. Order is what a
+    # refactor moves silently, so pin it in both the production function
+    # and the executable copy that models it.
+    for path, label in (
+        (
+            REPO / "apps/rapid-mac/Sources/Rapid/Server/AutoStartDecision.swift",
+            "AutoStartDecision.decide",
+        ),
+        (VERIFY_SCRIPT, "decideResume (the executable copy)"),
+    ):
+        text = path.read_text()
+        guard_at = text.index("isRetiredStarter(alias)")
+        disk_at = text.index("cachedAliases.contains(alias)")
+        assert guard_at < disk_at, (
+            f"{label}: the retired-starter guard moved after the on-disk "
+            "check — a cached retired starter would be resumed before the "
+            "guard ever runs"
+        )

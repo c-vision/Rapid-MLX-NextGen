@@ -8,8 +8,10 @@ import Foundation
 /// PR #338 swapped the Quickstart default alias from
 /// ``gemma3-1b-qat-4bit`` (~700 MB) to ``qwen3.5-4b-4bit`` (~2.3 GB).
 /// F-LWT-1 then swapped to ``qwen3-0.6b-4bit`` (~400 MB); 2026-07-10
-/// swapped to ``bonsai-1.7b-2bit`` (~0.5 GB ternary) — see
-/// ``QuickstartCoordinator.alias`` for the receipt.
+/// swapped to ``bonsai-1.7b-2bit`` (~0.5 GB ternary); 2026-08-05
+/// swapped to ``lfm2.5-1b-4bit`` (~0.6 GB 4-bit) after Bonsai was found
+/// to degenerate on plain chat — see
+/// ``QuickstartCoordinator.defaultChoice`` for the receipt.
 /// A user with a near-full disk who clicks Get started watches the bar
 /// crawl, then either:
 ///
@@ -51,24 +53,31 @@ enum DiskSpaceProbe {
     /// The free-space threshold the Quickstart pre-flight uses to
     /// decide whether to surface the low-disk banner.
     ///
-    /// Sized for the Quickstart default ``bonsai-1.7b-2bit``
-    /// (~0.5 GB on disk):
+    /// Sized for the Quickstart default ``lfm2.5-1b-4bit``
+    /// (~0.6 GB on disk):
     ///
-    ///   * ~0.5 GB final footprint, AND
+    /// Every operand below is binary (GiB), matching the constant itself
+    /// (``2 * 1024³``) — mixing a decimal download figure into a binary
+    /// budget is how a threshold silently stops covering what it claims.
+    ///
+    ///   * **0.622 GiB** final footprint — measured, ``du -sm`` reported
+    ///     637 MiB for the pulled snapshot, AND
     ///   * ~1.5× transient peak during chunk fetch + dedupe (HF's
     ///     downloader writes an incomplete `.bin` alongside the
     ///     sharded snapshot dir before atomically moving), AND
-    ///   * ~1 GB headroom for the rest of the OS, swap, and Console
+    ///   * 1 GiB headroom for the rest of the OS, swap, and Console
     ///     log churn during a 1-2 minute pull on a slow link.
     ///
-    /// ``0.5 × 1.5 + 1 = 1.75 GB`` rounded up to a clean ``2 GB`` so
-    /// the surfaced "needs ~Y GB" copy is human-readable. The prior
-    /// 0.6B starter (~0.4 GB) derived the same 2 GB; the ternary 1.7B
-    /// at ~0.5 GB stays comfortably inside it.
+    /// ``0.622 × 1.5 + 1 = 1.933 GiB``, inside the ``2 GiB`` threshold,
+    /// which stays put so the surfaced "needs ~Y GB" copy remains a clean
+    /// round number. Earlier starters derived the same 2 GiB from smaller
+    /// footprints, so the slack has narrowed to **~0.067 GiB (~68 MiB)**.
     ///
-    /// If the Quickstart default alias (see ``QuickstartCoordinator.alias``)
-    /// is ever bumped to a meaningfully larger model, the threshold
-    /// here MUST be re-derived from the new on-disk footprint.
+    /// That is thin enough that the next bump probably breaks it: solving
+    /// ``x × 1.5 + 1 = 2`` puts the ceiling at **0.667 GiB (~683 MiB)** on
+    /// disk. If the Quickstart default (see
+    /// ``QuickstartCoordinator.defaultChoice``) moves again, re-derive this
+    /// constant — do not assume 2 GiB still covers it.
     static let quickstartRequiredBytes: Int64 = 2 * 1024 * 1024 * 1024
 
     /// Outcome of ``decide``. Used to drive both the UI banner and a

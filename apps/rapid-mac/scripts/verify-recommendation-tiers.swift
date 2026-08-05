@@ -239,5 +239,112 @@ let withFlag = serveArguments(alias: "gemma-4-26b-4bit", host: "127.0.0.1", port
 check(withFlag.suffix(5) == ["--no-mllm", "--kv-cache-dtype", "bf16", "--cache-memory-mb", "512"], "flags trail the array")
 check(withFlag.firstIndex(of: "--no-mllm")! > withFlag.firstIndex(of: "--cors-origins")!, "--no-mllm comes after --cors-origins (terminates nargs)")
 
+// ---------------------------------------------------------------------------
+// Quickstart eligibility — the retired-starter carve-out
+//
+// Faithful copy of QuickstartCoordinator.isEligible + retiredStarters. The
+// Python contract test pins the *contents* of retiredStarters against the
+// source text; it cannot execute the gate, so inverting the condition or
+// dropping the `done` check would stay green there. These cases are the
+// executable half.
+
+enum FakeServerState { case idle, stopped, ready, starting, crashed, missing }
+
+let retiredStarters: Set<String> = ["bonsai-1.7b-2bit"]
+
+func isStranded(_ lastServedAlias: String?) -> Bool {
+    guard let alias = lastServedAlias else { return false }
+    return retiredStarters.contains(alias)
+}
+
+func isEligible(done: Bool, legacyDone: Bool = false, lastServedAlias: String?, serverState: FakeServerState) -> Bool {
+    guard !done else { return false }
+    let stranded = isStranded(lastServedAlias)
+    guard !(legacyDone && !stranded) else { return false }
+    if lastServedAlias != nil, !stranded {
+        return false
+    }
+    switch serverState {
+    case .idle, .stopped: return true
+    case .ready, .starting, .crashed, .missing: return false
+    }
+}
+
+print("Quickstart eligibility:")
+check(isEligible(done: false, lastServedAlias: nil, serverState: .idle),
+      "brand-new user (no serve yet) sees the card")
+check(isEligible(done: false, lastServedAlias: "bonsai-1.7b-2bit", serverState: .idle),
+      "stranded on the retired starter → card returns (the point of the carve-out)")
+check(!isEligible(done: false, lastServedAlias: "qwen3.5-9b-4bit", serverState: .idle),
+      "traded up to another model → never re-onboarded")
+check(!isEligible(done: false, lastServedAlias: "lfm2.5-1b-4bit", serverState: .idle),
+      "already on the CURRENT starter → not re-onboarded (no onboarding loop)")
+check(!isEligible(done: true, lastServedAlias: "bonsai-1.7b-2bit", serverState: .idle),
+      "done flag still wins over the carve-out — dismissal is permanent")
+check(!isEligible(done: true, lastServedAlias: nil, serverState: .idle),
+      "done flag wins for a new user too")
+check(!isEligible(done: false, legacyDone: true, lastServedAlias: nil, serverState: .idle),
+      "dismissed under v1, never served → the v2 bump must NOT resurrect the card")
+check(!isEligible(done: false, legacyDone: true, lastServedAlias: "qwen3.5-9b-4bit", serverState: .idle),
+      "dismissed under v1 and on another model → still dismissed")
+check(isEligible(done: false, legacyDone: true, lastServedAlias: "bonsai-1.7b-2bit", serverState: .idle),
+      "dismissed under v1 but stranded on the retired starter → rescued anyway")
+for busy in [FakeServerState.ready, .starting, .crashed, .missing] {
+    check(!isEligible(done: false, lastServedAlias: "bonsai-1.7b-2bit", serverState: busy),
+          "server busy (\(busy)) suppresses the card even for the stranded cohort")
+}
+
+// ---------------------------------------------------------------------------
+// Auto-start must not resume a retired starter
+//
+// Auto-start defaults to ON. Without this guard the rescue above is
+// decorative: the stranded user launches, we restart the broken model,
+// serverState leaves .idle, and Quickstart's third gate hides the card.
+// Mirrors the ordering in AutoStartDecision.decide — resolution first, then
+// the retired check, then the on-disk check.
+
+enum FakeDecision: Equatable { case start(String), promptDownload(String), skip(String) }
+
+func isRetiredStarter(_ alias: String) -> Bool { retiredStarters.contains(alias) }
+
+func decideResume(lastServedAlias: String?, cachedAliases: Set<String>,
+                  serverState: FakeServerState, userOptedIn: Bool = true,
+                  quickstartDone: Bool = false) -> FakeDecision {
+    if !userOptedIn { return .skip("userOptedOut") }
+    guard case .idle = serverState else { return .skip("serverNotIdle") }
+    guard let alias = lastServedAlias else { return .skip("noResolvableAlias") }
+    if !quickstartDone && isRetiredStarter(alias) { return .skip("retiredStarter") }
+    return cachedAliases.contains(alias) ? .start(alias) : .promptDownload(alias)
+}
+
+print("Auto-start vs retired starters:")
+check(decideResume(lastServedAlias: "bonsai-1.7b-2bit",
+                   cachedAliases: ["bonsai-1.7b-2bit"], serverState: .idle)
+        == .skip("retiredStarter"),
+      "retired starter on disk is NOT resumed — state stays .idle so the card can show")
+check(decideResume(lastServedAlias: "qwen3.5-9b-4bit",
+                   cachedAliases: ["qwen3.5-9b-4bit"], serverState: .idle)
+        == .start("qwen3.5-9b-4bit"),
+      "a normal model still auto-starts (the guard is not a blanket off-switch)")
+check(decideResume(lastServedAlias: "lfm2.5-1b-4bit",
+                   cachedAliases: ["lfm2.5-1b-4bit"], serverState: .idle)
+        == .start("lfm2.5-1b-4bit"),
+      "the CURRENT starter auto-starts normally")
+
+check(decideResume(lastServedAlias: "bonsai-1.7b-2bit",
+                   cachedAliases: ["bonsai-1.7b-2bit"], serverState: .idle,
+                   quickstartDone: true)
+        == .start("bonsai-1.7b-2bit"),
+      "dismissed the rescue → auto-start comes back (no dead end: neither card nor start)")
+check(!isEligible(done: true, lastServedAlias: "bonsai-1.7b-2bit", serverState: .idle),
+      "…and the card stays down for them, so the two move together")
+
+// The end-to-end property the two halves buy together.
+check(decideResume(lastServedAlias: "bonsai-1.7b-2bit",
+                   cachedAliases: ["bonsai-1.7b-2bit"], serverState: .idle)
+        == .skip("retiredStarter")
+      && isEligible(done: false, lastServedAlias: "bonsai-1.7b-2bit", serverState: .idle),
+      "end-to-end: stranded user launches → no auto-start → card IS shown")
+
 print(fails == 0 ? "\nALL PASS" : "\n\(fails) FAILURE(S)")
 exit(fails == 0 ? 0 : 1)
