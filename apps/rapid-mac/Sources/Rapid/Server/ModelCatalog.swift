@@ -315,6 +315,21 @@ enum ModelCatalog {
             // Model Management, auto-start).
             if line.hasPrefix("Audio models") { continue }
             if line.contains("[audio:") { continue }
+            // Skip engine/server banner lines that can share stdout with
+            // the table.
+            //
+            // The engine prints "Loading model with BatchedEngine: …"
+            // and uvicorn prints "INFO:     Uvicorn running on …". Both
+            // are prose, and the "first whitespace token is the alias"
+            // rule turns them into phantom models — which is exactly how
+            // a selectable model literally named "Loading" reached the
+            // picker, and from there ``recommendedDefault`` put the word
+            // "Loading" in the composer as if the user had chosen it.
+            //
+            // Matching on the banner prefix (rather than blacklisting
+            // the word) keeps a genuine alias that merely starts with
+            // those letters safe.
+            if isBannerLine(line) { continue }
             // First whitespace-delimited token is the alias.
             let token = line.split(maxSplits: 1, whereSeparator: { $0.isWhitespace }).first
             guard let alias = token.map(String.init), !alias.isEmpty else { continue }
@@ -322,6 +337,33 @@ enum ModelCatalog {
             entries.append((alias, nil))
         }
         return entries
+    }
+
+    /// Log/banner lines the engine or its HTTP server can interleave
+    /// with table output. None of these are catalog rows, and every one
+    /// of them would otherwise yield a phantom alias from its first
+    /// token ("Loading", "INFO:", "Uvicorn", …).
+    ///
+    /// Pure + `static` so the set is one list rather than a chain of
+    /// `hasPrefix` calls buried in the parse loop.
+    static func isBannerLine(_ line: String) -> Bool {
+        // Match the full banner grammar, not a bare word. An alias is
+        // ASCII `[A-Za-z0-9._-]` with no spaces or colons (``isSafeAlias``),
+        // so a genuine alias row for a model literally named "Loading",
+        // "Uvicorn", or "Traceback" is `<name><2+ spaces><size>` — which
+        // none of these prefixes match, while the real banners
+        // ("Loading model with …", "Uvicorn running on …", "Traceback
+        // (most recent call last):") all do. `INFO:`/`WARNING:`/`ERROR:`
+        // carry a colon and so can never collide with an alias.
+        let bannerPrefixes = [
+            "Loading model",
+            "INFO:",
+            "WARNING:",
+            "ERROR:",
+            "Uvicorn running",
+            "Traceback (",
+        ]
+        return bannerPrefixes.contains { line.hasPrefix($0) }
     }
 
     /// Parses ``rapid-mlx ls`` output. Each row has the alias in the
@@ -336,6 +378,9 @@ enum ModelCatalog {
             if line.hasPrefix("Cached models") { continue }
             if line.hasPrefix("Alias") { continue }
             if line.allSatisfy({ $0 == "─" || $0 == "-" || $0.isWhitespace }) { continue }
+            // Same banner guard as ``parseAvailable`` — `ls` shares the
+            // engine's stdout too.
+            if isBannerLine(line) { continue }
             // Multi-space splitting: each column is separated by 2+
             // spaces.  ``components(separatedBy: doubleSpaces)`` would
             // need a custom CharacterSet; cheaper to regex.
