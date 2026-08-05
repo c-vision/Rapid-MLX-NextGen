@@ -142,6 +142,96 @@ enum ModelSizing {
         return .tooBig
     }
 
+    // MARK: - Live memory safety (pre-load guard)
+
+    /// Verdict for loading a model RIGHT NOW given live memory use.
+    ///
+    /// Unlike ``classify`` — which bands a footprint against a STATIC
+    /// 80%-of-total estimate and so only knows "does this model fit
+    /// this Mac at all" — this projects the footprint on top of what
+    /// is *actually in use this second*. A model that "fits the Mac"
+    /// is still flagged when other apps (or a model already loaded for
+    /// the benchmark's second copy) have eaten the free RAM. That gap
+    /// is the reported near-crash: gemma-4-12b classifies ``.fits`` on
+    /// a larger Mac, yet loading it with little free RAM pushed unified
+    /// memory past the danger line.
+    ///
+    /// #324: unified memory past ~85% of total can trip the iBoot
+    /// AMCC async-abort firmware path and **kernel-panic the whole
+    /// machine** rather than raise a userspace OOM — so ``.unsafe`` is
+    /// pinned to that ~85% danger line and is a must-confirm block,
+    /// never a silent proceed.
+    enum MemorySafety: String, Sendable, Equatable {
+        /// Projected use < 75% of total — comfortable.
+        case safe
+        /// 75-85% — will load but risks swap / stalls; warn.
+        case tight
+        /// ≥ 85% — at/over the kernel-panic danger line; block + confirm.
+        case unsafe
+    }
+
+    /// Project ``footprint`` onto ``usedBytes`` and bucket the result.
+    /// Returns ``.safe`` when the numbers are unreadable or the param
+    /// count is unknown — never block a load on missing data (the
+    /// loader still surfaces genuine failures downstream).
+    static func memorySafety(
+        footprint: Footprint,
+        usedBytes: UInt64,
+        totalBytes: UInt64
+    ) -> MemorySafety {
+        guard totalBytes > 0, footprint.paramsBillions != nil else { return .safe }
+        let gib = Double(1 << 30)
+        let footprintBytes = footprint.totalGB * gib
+        let projected = (Double(usedBytes) + footprintBytes) / Double(totalBytes)
+        if projected >= 0.85 { return .unsafe }
+        if projected >= 0.75 { return .tight }
+        return .safe
+    }
+
+    /// A pending "this load may exhaust memory" prompt. Held on
+    /// ``ServerManager`` as observable state so any model-start path
+    /// (picker, first message, auto-restart, quickstart) surfaces the
+    /// SAME confirmation without each call site re-implementing it.
+    /// Copy lives here (not in a view) so ``ModelSizingTests`` can pin
+    /// it without a SwiftUI host — same pattern as the tooBig alert.
+    struct MemoryWarning: Equatable, Sendable, Identifiable {
+        var id: String { alias }
+        let alias: String
+        let hfPath: String?
+        let isAutoRespawn: Bool
+        let severity: MemorySafety
+        /// Estimated GB the model needs.
+        let footprintGB: Double
+        /// GB free at the moment the load was attempted.
+        let freeGB: Double
+
+        var title: String {
+            switch severity {
+            case .unsafe:
+                return "\(alias) may crash your Mac right now"
+            case .tight, .safe:
+                return "\(alias) is a tight fit right now"
+            }
+        }
+
+        var message: String {
+            let need = max(1, Int(footprintGB.rounded()))
+            let free = max(0, Int(freeGB.rounded()))
+            let facts = "\(alias) needs about \(need) GB, but only about \(free) GB is free right now — other apps or a running model are using memory."
+            switch severity {
+            case .unsafe:
+                return facts + " Loading it may freeze or crash your Mac. Close some apps, or pick a smaller model."
+            case .tight, .safe:
+                return facts + " It should load but may stall under longer chats. Consider closing some apps or picking a smaller model."
+            }
+        }
+
+        /// The confirm button title — worded to match the risk.
+        var confirmTitle: String {
+            severity == .unsafe ? "Load anyway (risky)" : "Load anyway"
+        }
+    }
+
     // MARK: - Lineage ranking
 
     /// Lineage score borrowed from whichllm's ``MODEL_LINEAGE_VERSIONS``.

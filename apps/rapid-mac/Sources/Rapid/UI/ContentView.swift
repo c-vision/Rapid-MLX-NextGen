@@ -194,6 +194,34 @@ struct ContentView: View {
                 )
             )
         }
+        .alert(
+            server.pendingMemoryWarning?.title ?? "",
+            isPresented: Binding(
+                get: { server.pendingMemoryWarning != nil },
+                // SwiftUI writes `false` here AFTER a button action runs.
+                // Both buttons already resolved the decision and cleared
+                // `pendingMemoryWarning`, so an unconditional cancel would
+                // immediately undo a "Load anyway" the user just picked.
+                // Only treat this as a dismissal when nothing resolved it
+                // (Esc, click-outside).
+                set: {
+                    if !$0, server.pendingMemoryWarning != nil {
+                        server.cancelPendingMemoryLoad()
+                    }
+                }
+            ),
+            presenting: server.pendingMemoryWarning
+        ) { warning in
+            Button("Cancel", role: .cancel) {
+                if let running = runningAlias { alias = running }
+                server.cancelPendingMemoryLoad()
+            }
+            Button(warning.confirmTitle, role: .destructive) {
+                server.confirmPendingMemoryLoad(warning)
+            }
+        } message: { warning in
+            Text(warning.message)
+        }
         .sheet(isPresented: firstRunSheetPresented) {
             firstRunSheet
         }

@@ -160,6 +160,60 @@ struct ModelSizingTests {
         #expect(ModelSizing.lineageScore("llama-3.3-8b") > ModelSizing.lineageScore("llama-3.1-8b"))
     }
 
+    // MARK: - Live memory safety (pre-load guard)
+
+    @Test("memorySafety: a model that fits TOTAL but not FREE is unsafe")
+    func liveGuardCatchesLowFreeMemory() {
+        let g = ModelSizing.estimate(alias: "gemma-4-12b") // ~11.8 GB
+        let gib: UInt64 = 1 << 30
+        // 64 GB Mac with 50 GB already used → ~14 GB free; projected ~96%
+        // → unsafe. This is the reported near-crash: static classify says
+        // "fits a 64 GB Mac", but live free RAM can't take it.
+        #expect(ModelSizing.memorySafety(footprint: g, usedBytes: 50 * gib, totalBytes: 64 * gib) == .unsafe)
+        // Same Mac idle → comfortable.
+        #expect(ModelSizing.memorySafety(footprint: g, usedBytes: 10 * gib, totalBytes: 64 * gib) == .safe)
+        // 32 GB Mac, 14 GB used → ~80% projected → tight (warn, allow).
+        #expect(ModelSizing.memorySafety(footprint: g, usedBytes: 14 * gib, totalBytes: 32 * gib) == .tight)
+    }
+
+    @Test("memorySafety: only >=85% blocks — the 75-85% band still loads")
+    func liveGuardBlocksOnlyAtDangerLine() {
+        let g = ModelSizing.estimate(alias: "gemma-4-12b") // ~11.8 GB
+        let gib: UInt64 = 1 << 30
+        // ServerManager holds a load for confirmation on `.unsafe` ONLY.
+        // 13 GiB used on a 32 GiB Mac projects to ~77.5%: a routine load
+        // on a mid-size Mac. It must classify `.tight`, not `.unsafe` —
+        // prompting here would fire on ordinary loads and train the user
+        // to click through the one prompt that actually matters.
+        #expect(ModelSizing.memorySafety(footprint: g, usedBytes: 13 * gib, totalBytes: 32 * gib) == .tight)
+        // Just over the 85% panic line on the same Mac → blocked.
+        #expect(ModelSizing.memorySafety(footprint: g, usedBytes: 16 * gib, totalBytes: 32 * gib) == .unsafe)
+    }
+
+    @Test("memorySafety: fails open on unknown params or unreadable probe")
+    func liveGuardFailsOpen() {
+        let gib: UInt64 = 1 << 30
+        // Custom alias with no parseable param count → never block.
+        let unknown = ModelSizing.estimate(alias: "some-private-checkpoint")
+        #expect(unknown.paramsBillions == nil)
+        #expect(ModelSizing.memorySafety(footprint: unknown, usedBytes: 60 * gib, totalBytes: 64 * gib) == .safe)
+        // Probe failure (total 0) → safe, so a broken syscall never blocks a load.
+        let g = ModelSizing.estimate(alias: "gemma-4-12b")
+        #expect(ModelSizing.memorySafety(footprint: g, usedBytes: 0, totalBytes: 0) == .safe)
+    }
+
+    @Test("MemoryWarning copy names the model, the GB need, and the free GB")
+    func memoryWarningCopy() {
+        let w = ModelSizing.MemoryWarning(
+            alias: "gemma-4-12b", hfPath: nil, isAutoRespawn: false,
+            severity: .unsafe, footprintGB: 11.8, freeGB: 6.0
+        )
+        #expect(w.title.contains("gemma-4-12b"))
+        #expect(w.message.contains("12")) // rounded need
+        #expect(w.message.contains("6"))  // rounded free
+        #expect(w.confirmTitle.localizedCaseInsensitiveContains("anyway"))
+    }
+
     // MARK: - Helpers
 
     private func mockMac(ramGB: Int) -> MacHardware {

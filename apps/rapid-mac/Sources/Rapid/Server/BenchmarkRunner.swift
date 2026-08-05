@@ -221,6 +221,22 @@ final class BenchmarkRunner {
             phase = .failed("Choose a model first.")
             return
         }
+        // Pre-load memory guard (#324). `rapid-mlx bench` spawns its own
+        // process that loads the full model — a *second* resident copy
+        // if the app's sidecar already has this alias loaded. Projecting
+        // the footprint onto live `usedBytes` (which already includes the
+        // first copy) catches that 2× case, so we refuse to spawn a bench
+        // that would push unified memory past the kernel-panic line.
+        if let snapshot = MemoryProbe.snapshot(),
+           ModelSizing.memorySafety(
+               footprint: ModelSizing.estimate(alias: alias),
+               usedBytes: snapshot.usedBytes,
+               totalBytes: snapshot.totalBytes
+           ) == .unsafe {
+            phase = .failed(
+                "Not enough free memory to benchmark \(alias) right now — it loads a second copy of the model on top of what's already running. Close some apps or restart the model, then try again.")
+            return
+        }
         phase = .running
         beginProgress(gen, kind: .benchmark, alias: alias)
         defer { endProgress(gen) }
@@ -260,6 +276,22 @@ final class BenchmarkRunner {
         guard !Task.isCancelled, runGeneration == gen else { return }
         guard !alias.isEmpty else {
             submitPhase = .failed("Choose a model first.")
+            return
+        }
+        // Same pre-load memory guard as ``run`` (#324). Submitting re-runs
+        // the FULL standardized workload — a cold model reload on top of
+        // whatever the app's sidecar already has resident — so it is the
+        // heavier of the two 2x-load paths, not a lighter one. Leaving it
+        // unguarded would let Publish walk straight into the near-crash
+        // that ``run`` now refuses.
+        if let snapshot = MemoryProbe.snapshot(),
+           ModelSizing.memorySafety(
+               footprint: ModelSizing.estimate(alias: alias),
+               usedBytes: snapshot.usedBytes,
+               totalBytes: snapshot.totalBytes
+           ) == .unsafe {
+            submitPhase = .failed(
+                "Not enough free memory to run the submission benchmark for \(alias) right now — it reloads the model on top of what's already running. Close some apps or restart the model, then try again.")
             return
         }
         submitPhase = .submitting

@@ -49,6 +49,43 @@ final class ServerManager {
     /// Current lifecycle phase. Drives all UI state controls.
     private(set) var state: ServerState
 
+    /// Set when ``start`` declines a load because the model's footprint
+    /// on top of live memory use would risk exhausting RAM (#324). A
+    /// top-level view binds a confirmation alert to this; the user
+    /// either acknowledges the risk (``confirmPendingMemoryLoad``) or
+    /// backs out (``cancelPendingMemoryLoad``). ``nil`` when no load is
+    /// being held for confirmation.
+    var pendingMemoryWarning: ModelSizing.MemoryWarning?
+
+    /// How the user answered the most recent memory prompt. Read by
+    /// ``awaitMemoryDecision`` so ``ensureServing`` can tell "user backed
+    /// out" (an honest startup failure) from "user chose Load anyway"
+    /// (wait for the re-entered launch instead of reporting failure).
+    private var memoryLoadConfirmed: Bool = false
+
+    /// The re-entered launch spawned by "Load anyway". ``ensureServing``
+    /// awaits this instead of polling for a state change: ``start`` can
+    /// legitimately sit in ``awaitDownloadSettlement`` (a background pull
+    /// still fetching the model) with ``state`` still idle for far longer
+    /// than any fixed bound, and timing out there would drop the user's
+    /// message even though the model does come up.
+    private var memoryConfirmTask: Task<Void, Never>?
+
+    /// Confirmed launches still running, by sequence number. Polled by
+    /// ``awaitConfirmedLaunch`` instead of awaiting the task's ``value``:
+    /// awaiting a non-throwing Task is NOT cancellation-aware, so a caller
+    /// that gets cancelled mid-wait (chat Stop, switching conversations)
+    /// would stay suspended until a possibly-stalled download finished.
+    ///
+    /// Keyed per launch rather than a single flag: two confirmations can
+    /// overlap (confirm A while its pull settles, then park and CANCEL B),
+    /// and a shared flag would let B's cancel tell A's waiter that A had
+    /// finished — dropping A's chat turn while A was still coming up.
+    private var memoryConfirmRunning: Set<Int> = []
+
+    /// Monotonic id for the most recent confirmed launch.
+    private var memoryConfirmSeq = 0
+
     /// Alias the child is currently serving once `/healthz` answered 200,
     /// else `nil`. Authoritative source of truth for which model id any
     /// outgoing chat request should put in `model:` — picker bar state
@@ -590,6 +627,23 @@ final class ServerManager {
             await stop()
         }
         await start(alias: trimmed, hfPath: hfPath)
+        // ``start`` also returns without spawning when the pre-load
+        // memory guard parks the load on a confirmation prompt. Reading
+        // ``isServing`` now would report "couldn't start the model"
+        // while the user is still looking at the dialog — and the action
+        // that triggered the load (typically a first chat message) would
+        // be marked failed and then silently dropped the moment the user
+        // picks "Load anyway". Wait for the answer instead.
+        if pendingMemoryWarning != nil {
+            let confirmed = await awaitMemoryDecision()
+            if confirmed {
+                // Wait out the actual re-entered launch — no fixed bound,
+                // because it may legitimately sit on a background download.
+                // Bind to THIS confirmation so an unrelated later cancel
+                // cannot end the wait early.
+                await awaitConfirmedLaunch(memoryConfirmSeq)
+            }
+        }
         // ``start`` returns silently when another caller already owns
         // the launch (``isOperating`` set, or ``child`` non-nil), which
         // leaves us sitting in ``.starting``. Reporting failure there
@@ -618,6 +672,37 @@ final class ServerManager {
     /// genuinely in flight, and 200 ms is far below human perception
     /// against a 15-60 s load. Returns early on cancellation so a
     /// caller that gives up doesn't pin this task.
+    /// Blocks while a load is parked on the memory-confirmation prompt.
+    /// Returns whether the user chose to load anyway. Polls rather than
+    /// awaiting a continuation so a dismissed-without-answer alert (or a
+    /// build with no view bound to ``pendingMemoryWarning``) resolves via
+    /// ``cancelPendingMemoryLoad`` instead of stranding the caller.
+    private func awaitMemoryDecision() async -> Bool {
+        while pendingMemoryWarning != nil {
+            do {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            } catch {
+                return false
+            }
+        }
+        return memoryLoadConfirmed
+    }
+
+
+    /// Waits for a confirmed memory-risky launch to finish. Unbounded (a
+    /// pre-spawn download can take minutes) but cancellation-aware: the
+    /// ``Task.sleep`` throws when the CALLER is cancelled, so we stop waiting
+    /// and leave the launch itself running — the user did ask for it.
+    private func awaitConfirmedLaunch(_ seq: Int) async {
+        while memoryConfirmRunning.contains(seq) {
+            do {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            } catch {
+                return
+            }
+        }
+    }
+
     private func awaitStartupSettled(alias: String) async {
         while true {
             guard case .starting(let current) = state, current == alias else { return }
@@ -684,7 +769,51 @@ final class ServerManager {
     /// transition (the bug Bug A removed), which incidentally also
     /// covered manual restarts. The default is ``false`` to make the
     /// behavior obvious at every public call site.
-    func start(alias: String, hfPath: String? = nil, isAutoRespawn: Bool = false) async {
+    /// The user acknowledged the memory warning and wants to load
+    /// anyway. Takes the ``warning`` by value (not off ``pendingMemory-
+    /// Warning``) because the alert's dismissal clears that property on
+    /// the same run-loop turn the button fires — reading it here would
+    /// race to nil and silently drop the load. Re-enters ``start`` with
+    /// the guard bypassed.
+    func confirmPendingMemoryLoad(_ warning: ModelSizing.MemoryWarning) {
+        memoryLoadConfirmed = true
+        pendingMemoryWarning = nil
+        // Publish the task BEFORE clearing nothing else — both this and the
+        // waiter run on the MainActor, so a waiter that observes
+        // ``pendingMemoryWarning == nil`` is guaranteed to see this task.
+        memoryConfirmSeq += 1
+        let seq = memoryConfirmSeq
+        memoryConfirmRunning.insert(seq)
+        memoryConfirmTask = Task { [weak self] in
+            await self?.start(
+                alias: warning.alias,
+                hfPath: warning.hfPath,
+                isAutoRespawn: warning.isAutoRespawn,
+                bypassMemoryGuard: true
+            )
+            self?.memoryConfirmRunning.remove(seq)
+        }
+    }
+
+    /// The user backed out of a memory-risky load. Just drops the
+    /// held request; ``state`` is untouched (it never left idle/stopped
+    /// because ``start`` returned before spawning).
+    func cancelPendingMemoryLoad() {
+        // Deliberately leaves ``memoryConfirmRunning`` alone: this cancels a
+        // load that was never started, so any launch still in flight belongs
+        // to an EARLIER confirmation and its waiter must not be told it
+        // finished.
+        memoryLoadConfirmed = false
+        memoryConfirmTask = nil
+        pendingMemoryWarning = nil
+    }
+
+    func start(
+        alias: String,
+        hfPath: String? = nil,
+        isAutoRespawn: Bool = false,
+        bypassMemoryGuard: Bool = false
+    ) async {
         // Issue #278: a manual restart is the user taking over the
         // lifecycle — reset the budget at entry so a previously
         // exhausted counter doesn't make a quick post-restart crash
@@ -714,6 +843,65 @@ final class ServerManager {
                 message: "That model name isn't valid. Pick a model from the bar at the top."
             )
             return
+        }
+
+        // Pre-load memory guard (#324). Loading a model whose footprint,
+        // stacked on top of what is ALREADY resident, would push unified
+        // memory past ~85% of total can freeze or kernel-panic the whole
+        // Mac — a far worse outcome than declining to load. This is the
+        // single choke point every start path funnels through (picker,
+        // first message, auto-restart, quickstart), so the check + the
+        // confirmation prompt live here once instead of at each call site.
+        // Unlike the picker's static ``ModelSizing.classify`` (bands vs
+        // 80% of TOTAL), this projects the footprint onto LIVE used memory,
+        // catching the reported near-crash where a "fits the Mac" model
+        // still exhausts the RAM other apps left free. ``bypassMemoryGuard``
+        // is set only by the explicit "Load anyway" path, after the user
+        // acknowledged the risk in the prompt.
+        //
+        // Auto-respawn is exempt (``!isAutoRespawn``): the watchdog re-fires
+        // ``start(isAutoRespawn: true)`` on a fixed schedule, so returning
+        // early here would spin — set-warning → return → watchdog re-fires →
+        // repeat, forever, with a modal stuck on screen and no model serving.
+        // Respawn is also recovering a model that ALREADY fit when it first
+        // started; a genuine free-RAM drop is bounded by the respawn-attempt
+        // budget, and the user's manual restart still routes through the guard.
+        if !bypassMemoryGuard, !isAutoRespawn, let snapshot = MemoryProbe.snapshot() {
+            let footprint = ModelSizing.estimate(alias: trimmedAlias)
+            let safety = ModelSizing.memorySafety(
+                footprint: footprint,
+                usedBytes: snapshot.usedBytes,
+                totalBytes: snapshot.totalBytes
+            )
+            // Only ``.unsafe`` (>= 85%, the panic line) blocks. ``.tight``
+            // is defined as "will load but risks swap / stalls" — holding
+            // it behind a modal would fire on ordinary loads (13 GiB used
+            // on a 32 GiB Mac + an 11.8 GiB model projects to 77.5%) and
+            // train the user to click through the one prompt that matters.
+            // Every mature local-model app draws the same line: refuse
+            // only what is genuinely dangerous, and surface "tight"
+            // passively — the picker's static sizing bands already do.
+            if safety == .unsafe {
+                pendingMemoryWarning = ModelSizing.MemoryWarning(
+                    alias: trimmedAlias,
+                    hfPath: hfPath,
+                    isAutoRespawn: isAutoRespawn,
+                    severity: safety,
+                    footprintGB: footprint.totalGB,
+                    freeGB: Double(snapshot.freeBytes) / Double(1 << 30)
+                )
+                memoryLoadConfirmed = false
+                // The user is now the decision-maker for this alias, so a
+                // queued auto-respawn must not answer for them. Parking a
+                // load leaves ``state`` untouched — still ``.crashed`` when
+                // the user hit Restart after a crash — so
+                // ``runScheduledAutoRespawn``'s state recheck would PASS and
+                // fire ``start(isAutoRespawn: true)``, which bypasses this
+                // guard and loads the very model the user may be about to
+                // decline. Cancel it; a confirm re-enters ``start`` explicitly.
+                cancelAutoRespawn()
+                return
+            }
         }
 
         // Issue #253: if a background ``rapid-mlx pull`` is already
