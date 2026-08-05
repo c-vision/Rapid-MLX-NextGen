@@ -674,4 +674,107 @@ struct ModelPickerVisibilityTests {
                 == .tiny
         )
     }
+
+    // MARK: - known-broken denylist (issue #1367)
+
+    @Test("ministral-3b-4bit is HIDDEN even though 3B clears the size filter — mlx-vlm lane hangs on first chat (#1367)")
+    func brokenMinistralHiddenDespiteSize() {
+        // 3.0B parses well above the 1B floor, so ONLY the denylist
+        // keeps it off the menu. Without the denylist this is the exact
+        // reported footgun: pick it, send "hi", spin forever, 0 tokens.
+        #expect(
+            ModelPickerVisibility.shouldShow(
+                alias: "ministral-3b-4bit",
+                selectedAlias: "",
+                includeAll: false
+            ) == false
+        )
+    }
+
+    @Test("every gemma-4-e2b SKU is HIDDEN — 0/6 incoherent on both lanes, arch-level not quant-level (#1367)")
+    func brokenGemmaE2bFamilyHidden() {
+        for alias in [
+            "gemma-4-e2b-4bit",
+            "gemma-4-e2b-6bit",
+            "gemma-4-e2b-8bit",
+            "gemma-4-e2b-assistant",
+        ] {
+            #expect(
+                ModelPickerVisibility.shouldShow(
+                    alias: alias,
+                    selectedAlias: "",
+                    includeAll: false
+                ) == false,
+                "\(alias) must be hidden"
+            )
+        }
+    }
+
+    @Test("denylist WINS over includeAll — Show small models must not reveal a hanging model")
+    func denylistBeatsIncludeAll() {
+        #expect(
+            ModelPickerVisibility.shouldShow(
+                alias: "ministral-3b-4bit",
+                selectedAlias: "",
+                includeAll: true
+            ) == false
+        )
+    }
+
+    @Test("denylist WINS over the selected-alias exemption — a stale persisted pick of a broken model is not kept on the menu")
+    func denylistBeatsSelected() {
+        #expect(
+            ModelPickerVisibility.shouldShow(
+                alias: "gemma-4-e2b-4bit",
+                selectedAlias: "gemma-4-e2b-4bit",
+                includeAll: false
+            ) == false
+        )
+    }
+
+    @Test("evidence-bounded: untested e4b / 3n nano SKUs are NOT denylisted — hiding a maybe-working model is its own harm")
+    func untestedNanoNotDenylisted() {
+        // These clear both the size filter and the denylist, so they
+        // stay shown. #1367 measured only e2b + Ministral-3; the set
+        // must not creep to models with no failing evidence.
+        for alias in ["gemma-4-e4b-4bit", "gemma-3n-e2b-4bit", "gemma-3n-e4b-4bit"] {
+            #expect(ModelPickerVisibility.isKnownBroken(alias) == false, "\(alias)")
+            #expect(
+                ModelPickerVisibility.shouldShow(
+                    alias: alias,
+                    selectedAlias: "",
+                    includeAll: false
+                ) == true,
+                "\(alias) must stay shown"
+            )
+        }
+    }
+
+    @Test("filter drops denylisted aliases, and hiddenCount does NOT count them (footer copy is about size, not brokenness)")
+    func denylistFilteredAndNotCounted() {
+        let entries = [
+            ModelEntry(alias: "ministral-3b-4bit", hfRepo: nil, sizeOnDisk: nil, cached: true),
+            ModelEntry(alias: "qwen3-0.6b-4bit", hfRepo: nil, sizeOnDisk: nil, cached: true),
+            ModelEntry(alias: "qwen3.5-4b-4bit", hfRepo: nil, sizeOnDisk: nil, cached: true),
+        ]
+        let filtered = ModelPickerVisibility.filter(
+            entries,
+            selectedAlias: "qwen3.5-4b-4bit",
+            includeAll: false
+        )
+        // Broken (ministral) AND size-hidden (0.6b) both drop; only the
+        // 4B survives.
+        #expect(filtered.map(\.alias) == ["qwen3.5-4b-4bit"])
+        // But the footer count reflects ONLY the 1 size-hidden alias —
+        // the denylisted one is excluded so "N small models hidden ·
+        // toggle in Settings" stays truthful (the toggle won't reveal
+        // ministral).
+        #expect(
+            ModelPickerVisibility.hiddenCount(
+                entries,
+                selectedAlias: "qwen3.5-4b-4bit",
+                includeAll: false
+            ) == 1
+        )
+    }
 }

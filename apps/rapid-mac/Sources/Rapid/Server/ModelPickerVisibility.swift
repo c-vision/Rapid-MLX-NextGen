@@ -34,6 +34,50 @@ enum ModelPickerVisibility {
     /// ``AppearanceConfig`` and the sidebar collapsed-section flags.
     static let showAllStorageKey: String = "rapid.picker.show_all_models.v1"
 
+    /// Aliases that are KNOWN-BROKEN for plain text chat on the bundled
+    /// engine and must never be offered as a selectable chat model.
+    ///
+    /// These are small **multimodal-only** checkpoints whose only small
+    /// SKU ships as a VLM. Serving them for text through the bundled
+    /// rapid-mlx routes to the mlx-vlm lane, where they either hang or
+    /// return incoherent output — the exact "switched the picker to X
+    /// and it spun forever with zero tokens" footgun. Evidence (issue
+    /// #1367, reproduced on a real macos-14 M1 runner, rapid-mlx 0.11.4
+    /// / mlx-vlm 0.6.3, and pinned in ``ci.yml``'s L1-smoke comment):
+    ///
+    ///   * ``gemma-4-e2b-*`` (the Gemma nano "effective-2B" MatFormer):
+    ///     **0/6** golden — total incoherence — on BOTH the mlx-vlm lane
+    ///     AND the ``--no-mllm`` text lane. It is not a quant artifact
+    ///     (0/6 is arch-level), so every e2b SKU shares the break:
+    ///     4/6/8-bit and the ``-assistant`` bf16 tune.
+    ///   * ``ministral-3b-4bit`` (Ministral-3-3B-Instruct-2512): the
+    ///     first chat completion **hangs** under the mlx-vlm lane
+    ///     (request times out at 90 s, server goes unreachable). It is
+    ///     usable (5/6, flaky) only via ``--no-mllm``, which the desktop
+    ///     does not wire per-alias — so the picker path always hits the
+    ///     hanging lane.
+    ///
+    /// Scope is deliberately EVIDENCE-BOUNDED to what #1367 measured.
+    /// The ``gemma-4-e4b-*`` / ``gemma-3n-*`` nano SKUs are NOT listed —
+    /// they were not tested, and hiding a model that might work is its
+    /// own harm (mirrors ``shouldShow``'s parse-failure "default to
+    /// shown" bias). Extend this set only when engine testing confirms a
+    /// new alias is broken for text chat.
+    static let knownBrokenForTextChat: Set<String> = [
+        "gemma-4-e2b-4bit",
+        "gemma-4-e2b-6bit",
+        "gemma-4-e2b-8bit",
+        "gemma-4-e2b-assistant",
+        "ministral-3b-4bit",
+    ]
+
+    /// True when ``alias`` is on the known-broken-for-text-chat
+    /// denylist above and must be hidden from the picker regardless of
+    /// size or the ``Show small models`` toggle.
+    static func isKnownBroken(_ alias: String) -> Bool {
+        knownBrokenForTextChat.contains(alias)
+    }
+
     /// Returns true when ``alias`` should be visible in the picker's
     /// "All models" alphabetical list.
     ///
@@ -54,6 +98,16 @@ enum ModelPickerVisibility {
         selectedAlias: String,
         includeAll: Bool
     ) -> Bool {
+        // Known-broken denylist is ABSOLUTE — it wins over both
+        // ``includeAll`` and the currently-selected exemption. Those
+        // two escape hatches are about SIZE ("power user wants the
+        // tinies" / "don't hide what I picked"); brokenness is a
+        // different axis. A model that hangs or garbles on every chat
+        // send is never a legitimate option, so ``Show small models``
+        // must not reveal it and a stale persisted selection must not
+        // keep it on the menu where it can be re-picked. See issue
+        // #1367 and ``knownBrokenForTextChat``.
+        if isKnownBroken(alias) { return false }
         if includeAll { return true }
         if !selectedAlias.isEmpty && alias == selectedAlias { return true }
         guard let params = parseSmallestParamsBillions(alias) else {
@@ -151,11 +205,22 @@ enum ModelPickerVisibility {
         selectedAlias: String,
         includeAll: Bool
     ) -> Int {
-        if includeAll { return 0 }
         return entries.reduce(0) { acc, entry in
-            shouldShow(alias: entry.alias, selectedAlias: selectedAlias, includeAll: includeAll)
-                ? acc
-                : acc + 1
+            // Count ONLY size-hidden aliases: they are what the footer
+            // ("N small (<1B) models hidden · toggle in Settings")
+            // describes and what the toggle actually recovers.
+            // Denylisted aliases are hidden for a different reason, are
+            // NOT toggle-recoverable, and would make the copy lie — so
+            // they are excluded from the count and vanish silently.
+            // (When ``includeAll`` is on, nothing is size-hidden, but a
+            // denylisted alias is still hidden — so it is still excluded
+            // here rather than short-circuiting the whole count to 0.)
+            if isKnownBroken(entry.alias) { return acc }
+            return shouldShow(
+                alias: entry.alias,
+                selectedAlias: selectedAlias,
+                includeAll: includeAll
+            ) ? acc : acc + 1
         }
     }
 
