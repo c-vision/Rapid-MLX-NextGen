@@ -34,6 +34,12 @@ jobs:
     # swift-tools-version and the release workflow's runner. macos-latest still
     # resolves to macos-14 (Swift 5.x) on GitHub-hosted runners.
     runs-on: macos-15
+    # A hung test would otherwise sit on the 6-hour default. The whole
+    # job is ~2 min warm; 20 leaves room for a cold package resolve and
+    # still fails fast. Learned the hard way: a headless-incompatible
+    # dependency deadlocked every @MainActor test and burned 45 minutes
+    # of runner time before anyone noticed.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: apps/rapid-mac
@@ -43,10 +49,28 @@ jobs:
       - name: swift build
         run: swift build
 
-      # The recommendation + Quickstart-eligibility contracts. With the SPM
-      # test target stripped, this dependency-free script is the only thing
-      # that actually EXECUTES that logic — it was runnable but wired to
-      # nothing, so a regression in it would have reached a release.
+      # The suite is back in the manifest (see Package.swift). It had been
+      # excluded, so nothing compiled or ran ~3,100 test functions — which is
+      # how a starter model that degenerates on an ordinary chat question
+      # shipped for months while tests pinning that exact alias sat dormant.
+      # --no-parallel is load-bearing, not a preference. swift-testing
+      # parallelises across a cooperative pool sized to the core count, and
+      # several suites here call `proc.waitUntilExit()` — a synchronous
+      # blocking wait. On this 12-core dev machine there is enough slack to
+      # absorb that; on a GitHub runner there is not, and the pool starves:
+      # the first attempt logged 1,416 tests started, ZERO finished, and sat
+      # there until the job timed out, leaving orphan `head` / `swiftpm-testing`
+      # processes behind. Serialised it is 15s vs 4s locally — cheap insurance.
+      #
+      # The real fix is to stop blocking threads inside async tests; until
+      # then, do not drop this flag.
+      - name: swift test
+        run: swift test --no-parallel
+
+      # Kept alongside `swift test` rather than folded into it: this script
+      # runs without the test target, so it stays usable while bisecting a
+      # manifest problem, and it covers the install.sh <-> app tier contract
+      # that no Swift test can see.
       - name: verify recommendation + eligibility contracts
         run: swift scripts/verify-recommendation-tiers.swift
 

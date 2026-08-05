@@ -55,18 +55,48 @@ let package = Package(
                 .process("Resources/Localizable.xcstrings"),
                 .process("Resources/benchmark-scores.json")
             ]
+        ),
+        .testTarget(
+            name: "RapidTests",
+            dependencies: ["Rapid"],
+            path: "Tests/RapidTests"
         )
-        // NOTE: the Tests/RapidTests target was removed from the manifest.
-        // The strip deleted the subsystems (Sessions, Presets, Tools, MCP,
-        // QuickAsk, Bootstrapper, attachments, feedback) that the vast
-        // majority of the test suite exercised, so the target no longer
-        // compiles. Per the migration plan, the test target is excluded
-        // rather than rewritten; a fresh minimal suite lands with v1.0.
-        // (Command-line `swift test` also can't resolve the `import Testing`
-        // module in this toolchain, so re-enabling even a minimal subset is
-        // a separate toolchain/CI task.) The RAM-tier recommendation tests
-        // added here are kept in sync as the v1.0-suite seed; the contract
-        // itself is verified during development by a standalone `swift`
-        // script (no XCTest/Testing dependency).
+        // NOTE (2026-08-05): the RapidTests target is BACK in the manifest,
+        // above. It had been excluded on the reasoning that the strip
+        // deleted the subsystems most of the suite exercised, so the target
+        // no longer compiled and a fresh suite would land with v1.0.
+        //
+        // Measuring that claim rather than inheriting it changed the answer.
+        // Two things were conflated:
+        //
+        //   1. The FIRST compile error was a missing test-only dependency
+        //      (ViewInspector, used by 9 files). "No such module" aborts the
+        //      build before type-checking, so it masked everything behind it
+        //      and made the damage look total. Adding it back was a dead end:
+        //      7 of the 9 referenced stripped subsystems anyway, and the
+        //      surviving 2 deadlocked EVERY @MainActor test on a headless CI
+        //      runner (1,413 started, 0 finished, 45 minutes). SwiftUI view
+        //      introspection wants a GUI session; the runner has none. Those
+        //      2 files are deleted and the dependency is gone — do not
+        //      reintroduce it without a headless-verified alternative.
+        //   2. Behind it, 137 of 254 files genuinely did not compile against
+        //      the stripped Sources. Those are deleted. The remaining 117
+        //      compile and run: 1,485 tests, green.
+        //
+        // The cost of the exclusion was not hypothetical. The suite pinned
+        // `BundledModel.bundledAlias`, `QuickstartCoordinator.defaultChoice`,
+        // `storageKey`, and `AutoStartDecision.SkipReason`'s case set — every
+        // value the retired-starter swap touched. Dormant, it caught none of
+        // them, and a starter model that degenerates on an ordinary chat
+        // question shipped for months.
+        //
+        // `import Testing` resolves fine on Swift 6.1; the toolchain note
+        // that said otherwise predates it.
+        //
+        // Deleting a test is a real decision. If one fails, read it first —
+        // several of these were correct about code that had moved, and two
+        // were reporting live defects: a $HOME-bypassing Application Support
+        // lookup in ConversationStore, and an 8-15 GB tier pick with no
+        // benchmark row. Both are fixed here rather than deleted.
     ]
 )

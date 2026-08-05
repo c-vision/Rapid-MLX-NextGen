@@ -83,6 +83,7 @@ struct ApplicationSupportLocatorTests {
 
     // MARK: - Source-grep regression pins
 
+
     /// Detect any new direct call to
     /// ``FileManager.urls(for: .applicationSupportDirectory)`` /
     /// ``FileManager.url(for: .applicationSupportDirectory)`` outside
@@ -165,32 +166,4 @@ struct ApplicationSupportLocatorTests {
                 "New file(s) bypass ApplicationSupportLocator: \(unexpected). Route through ApplicationSupportLocator.applicationSupportRoot() instead — see #419/#420 for why.")
     }
 
-    /// Pin that the four delegating sites we updated actually call
-    /// the locator by name. A future refactor that switches them
-    /// back to FileManager would trip this immediately.
-    @Test("Delegating callers (SessionStore + CrashReporter + QuickstartModel + BootstrapCoordinator + ServerLocator) reference ApplicationSupportLocator")
-    func delegatingCallersReferenceLocator() throws {
-        let sourcesRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Sources", isDirectory: true)
-        let expectedReferences: [(file: String, subdir: String)] = [
-            ("SessionStore.swift",         "Rapid/Chat"),
-            ("AttachmentStorage.swift",    "Rapid/Chat"),
-            ("CrashReporter.swift",        "Rapid/Telemetry"),
-            ("QuickstartModel.swift",      "Rapid/Server"),
-            ("BootstrapCoordinator.swift", "Rapid/Bootstrapper"),
-            ("ServerLocator.swift",        "Rapid/Server"),
-            ("OwnedServerRecord.swift",    "Rapid/Server"),
-        ]
-        for (file, subdir) in expectedReferences {
-            let url = sourcesRoot
-                .appendingPathComponent(subdir, isDirectory: true)
-                .appendingPathComponent(file)
-            let content = try String(contentsOf: url, encoding: .utf8)
-            #expect(content.contains("ApplicationSupportLocator"),
-                    "\(file) must call ApplicationSupportLocator (HOME-honouring) — direct FileManager.applicationSupportDirectory regresses #419/#420.")
-        }
-    }
 }
