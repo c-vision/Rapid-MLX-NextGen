@@ -33,7 +33,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import ADAPTERS
+from . import ADAPTERS, cursor
 
 # Where we drop the PID of a ``--start-server`` subprocess. Pulled out
 # so tests can monkeypatch it to a tmp_path and assert the file's
@@ -58,6 +58,7 @@ def _print_list() -> int:
     for name, adapter in ADAPTERS.items():
         status = "detected" if adapter.detect() else "not detected"
         print(f"  {name.ljust(width)}{status}")
+    print("\nNote: cursor requires an explicit public HTTPS --server-url.")
     return 0
 
 
@@ -78,7 +79,7 @@ def _resolve_default_model() -> str:
     return os.environ.get("RAPID_MLX_DEFAULT_MODEL") or "qwen3.5-4b-4bit"
 
 
-def _start_server_background(model: str, port: int) -> int:
+def _start_server_background(model: str, port: int, api_key: str | None = None) -> int:
     """Spawn ``rapid-mlx serve <model> --port <port>`` detached.
 
     Writes the child PID to :data:`PID_FILE` so a later ``kill $(cat
@@ -97,13 +98,17 @@ def _start_server_background(model: str, port: int) -> int:
     # ``start_new_session=True`` is the POSIX-portable replacement for
     # setsid() — detaches the child from the parent's controlling
     # terminal so a Ctrl-C on the parent doesn't propagate.
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    popen_kwargs: dict[str, object] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "start_new_session": True,
+    }
+    if api_key:
+        child_env = os.environ.copy()
+        child_env["RAPID_MLX_API_KEY"] = api_key
+        popen_kwargs["env"] = child_env
+    proc = subprocess.Popen(cmd, **popen_kwargs)
     PID_FILE.write_text(str(proc.pid) + "\n", encoding="utf-8")
     return proc.pid
 
@@ -140,9 +145,30 @@ def launch_command(args: argparse.Namespace) -> None:
         )
         sys.exit(2)
 
+    server_url = args.server_url
+    api_key = os.environ.get("RAPID_MLX_API_KEY")
+    cursor_server_url: str | None = None
+    cursor_reason: str | None = None
+    if args.all or args.client == "cursor":
+        try:
+            cursor_server_url = cursor.canonical_server_url(server_url)
+        except ValueError as exc:
+            cursor_reason = str(exc)
+
     targets: list[str]
     if args.all:
-        targets = [name for name, adapter in ADAPTERS.items() if adapter.detect()]
+        if ADAPTERS["cursor"].detect() and (cursor_reason is not None or not api_key):
+            skip_reason = cursor_reason or (
+                "public endpoints require RAPID_MLX_API_KEY; never expose an "
+                "unauthenticated server"
+            )
+            print(f"  cursor: skipped — {skip_reason}", file=sys.stderr)
+        targets = [
+            name
+            for name, adapter in ADAPTERS.items()
+            if adapter.detect()
+            and (name != "cursor" or (cursor_server_url is not None and bool(api_key)))
+        ]
         if not targets:
             print(
                 "launch: no supported clients detected on this machine. "
@@ -151,6 +177,23 @@ def launch_command(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
     else:
+        if args.client == "cursor":
+            if cursor_reason is not None:
+                print(
+                    f"launch: {cursor_reason}. BYOK requests are routed through "
+                    "Cursor's servers; use a public HTTPS tunnel or choose "
+                    "claude-code, cline, or continue-dev for a local connection.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            if not api_key:
+                print(
+                    "launch: Cursor public endpoints require RAPID_MLX_API_KEY. "
+                    "Start Rapid-MLX with the same key; "
+                    "never expose an unauthenticated server to the internet.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
         if args.client not in ADAPTERS:
             supported = ", ".join(ADAPTERS.keys())
             print(
@@ -170,8 +213,7 @@ def launch_command(args: argparse.Namespace) -> None:
     # Same pattern as ``share_command`` in ``vllm_mlx/share/cli.py``.
     original_alias = getattr(args, "_original_alias", None)
     model = original_alias or args.model or _resolve_default_model()
-    server_url = args.server_url
-
+    effective_cursor_url = cursor_server_url or server_url
     if args.dry_run:
         print(f"[dry-run] model={model} server-url={server_url}")
         for name in targets:
@@ -198,10 +240,13 @@ def launch_command(args: argparse.Namespace) -> None:
             failures.append(name)
             continue
         try:
-            path = adapter.write_or_patch_config(
-                server_url=server_url,
-                model=model,
-            )
+            config_kwargs = {
+                "server_url": effective_cursor_url if name == "cursor" else server_url,
+                "model": model,
+            }
+            if api_key:
+                config_kwargs["api_key"] = api_key
+            path = adapter.write_or_patch_config(**config_kwargs)
         except Exception as exc:
             print(f"  {name}: FAILED — {exc}", file=sys.stderr)
             failures.append(name)
@@ -218,7 +263,7 @@ def launch_command(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
         else:
-            pid = _start_server_background(model, args.port)
+            pid = _start_server_background(model, args.port, api_key=api_key)
             print(f"  Started: rapid-mlx serve {model} --port {args.port} (pid {pid})")
             print(f"  PID file: {PID_FILE}")
 
@@ -253,9 +298,9 @@ def register(subparsers) -> None:
         help="One-shot bootstrap: patch IDE/agent client config to use rapid-mlx",
         description=(
             "Detect an IDE client (Cline, Claude Code, Continue, Cursor) "
-            "and write/patch its local config to route at the local "
+            "and write/patch its config to route at the "
             "rapid-mlx server. Use `rapid-mlx launch list` to see what's "
-            "supported on this machine."
+            "supported. Cursor requires a public HTTPS --server-url."
         ),
     )
     p.add_argument(

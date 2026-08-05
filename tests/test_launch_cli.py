@@ -50,6 +50,8 @@ def fake_home(tmp_path, monkeypatch) -> Path:
     tests. Returns the tmp_path for callers that want to construct
     expected paths.
     """
+    monkeypatch.delenv("RAPID_MLX_API_KEY", raising=False)
+
     # cline: replace the candidate-roots helper so detect/path
     # resolution picks paths under tmp_path.
     fake_root = tmp_path / "vscode-globalStorage"
@@ -62,14 +64,13 @@ def fake_home(tmp_path, monkeypatch) -> Path:
     # continue_dev: replace the config dir.
     monkeypatch.setattr(continue_dev, "_CONFIG_DIR", tmp_path / ".continue")
 
-    # cursor: replace the candidate-dirs helper.
     fake_cursor_dir = tmp_path / "Cursor/User"
     monkeypatch.setattr(cursor, "_candidate_dirs", lambda: [fake_cursor_dir])
     monkeypatch.setattr(cursor, "_CONFIG_DIR_MAC", fake_cursor_dir)
     monkeypatch.setattr(cursor, "_CONFIG_DIR_LINUX", fake_cursor_dir)
 
     # Also redirect which() and mac_app_installed() so detect() doesn't
-    # find the dev machine's real claude / cursor installs.
+    # find the dev machine's real client installs.
     monkeypatch.setattr(_common, "which", lambda _: None)
     monkeypatch.setattr(_common, "mac_app_installed", lambda _: False)
 
@@ -260,7 +261,7 @@ class TestContinueDev:
 
 
 # --------------------------------------------------------------------
-# Cursor adapter
+# Cursor adapter (public HTTPS endpoints only)
 # --------------------------------------------------------------------
 
 
@@ -274,27 +275,65 @@ class TestCursor:
 
     def test_write_sets_dotted_keys(self, fake_home):
         (fake_home / "Cursor/User").mkdir(parents=True)
-        path = cursor.write_or_patch_config("http://127.0.0.1:8000", "qwen3.5-9b-4bit")
+        path = cursor.write_or_patch_config(
+            "https://rapid.example.com",
+            "qwen3.5-9b-4bit",
+            api_key="cursor-secret",
+        )
         data = json.loads(path.read_text())
-        assert data["cursor.aiprovider.openai.baseUrl"] == "http://127.0.0.1:8000/v1"
+        assert data["cursor.aiprovider.openai.baseUrl"] == (
+            "https://rapid.example.com/v1"
+        )
         assert data["cursor.aiprovider.openai.model"] == "qwen3.5-9b-4bit"
-        assert data["cursor.aiprovider.openai.apiKey"] == "sk-noop"
+        assert data["cursor.aiprovider.openai.apiKey"] == "cursor-secret"
 
     def test_preserves_unrelated_settings(self, fake_home):
         (fake_home / "Cursor/User").mkdir(parents=True)
         cfg = cursor.current_config_path()
-        cfg.write_text(
-            json.dumps(
-                {
-                    "editor.fontSize": 14,
-                    "workbench.colorTheme": "Default Dark+",
-                }
-            )
+        cfg.write_text(json.dumps({"editor.fontSize": 14}))
+        cursor.write_or_patch_config(
+            "https://rapid.example.com", "alias", api_key="cursor-secret"
         )
-        cursor.write_or_patch_config("http://127.0.0.1:8000", "alias")
-        data = json.loads(cfg.read_text())
-        assert data["editor.fontSize"] == 14
-        assert data["workbench.colorTheme"] == "Default Dark+"
+        assert json.loads(cfg.read_text())["editor.fontSize"] == 14
+
+    @pytest.mark.parametrize(
+        "server_url",
+        [
+            "http://rapid.example.com",
+            "https://127.0.0.1:8000",
+            "https://rapid.local:8000",
+        ],
+    )
+    def test_direct_write_rejects_non_public_endpoint(self, fake_home, server_url):
+        config_path = fake_home / "Cursor/User/settings.json"
+        with pytest.raises(ValueError):
+            cursor.write_or_patch_config(
+                server_url,
+                "alias",
+                api_key="cursor-secret",
+                config_path=config_path,
+            )
+        assert not config_path.exists()
+
+    def test_direct_write_requires_api_key(self, fake_home):
+        config_path = fake_home / "Cursor/User/settings.json"
+        with pytest.raises(ValueError, match="RAPID_MLX_API_KEY"):
+            cursor.write_or_patch_config(
+                "https://rapid.example.com", "alias", config_path=config_path
+            )
+        assert not config_path.exists()
+
+    @pytest.mark.parametrize(
+        "server_url",
+        [
+            "https://rapid.example.com?token=value",
+            "https://rapid.example.com#settings",
+        ],
+    )
+    def test_rejects_query_and_fragment(self, fake_home, server_url):
+        (fake_home / "Cursor/User").mkdir(parents=True)
+        with pytest.raises(ValueError, match="query string or fragment"):
+            cursor.write_or_patch_config(server_url, "alias")
 
 
 # --------------------------------------------------------------------
@@ -379,6 +418,181 @@ class TestLaunchCommand:
         assert excinfo.value.code == 2
         err = capsys.readouterr().err
         assert "unknown client" in err
+
+    def test_cursor_explains_localhost_is_unsupported(self, fake_home, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            launch_cli.launch_command(_make_args(client="cursor"))
+        assert excinfo.value.code == 2
+        err = capsys.readouterr().err
+        assert "publicly reachable HTTPS" in err
+        assert "Cursor's servers" in err
+
+    @pytest.mark.parametrize(
+        "server_url",
+        [
+            "https://127.0.0.1:8000",
+            "https://192.168.1.20:8000",
+            "https://rapid.local:8000",
+        ],
+    )
+    def test_cursor_rejects_private_https_endpoints(
+        self, fake_home, capsys, server_url
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            launch_cli.launch_command(
+                _make_args(client="cursor", server_url=server_url)
+            )
+        assert excinfo.value.code == 2
+        assert "cannot reach" in capsys.readouterr().err
+
+    def test_cursor_accepts_public_https_endpoint(self, fake_home, capsys, monkeypatch):
+        (fake_home / "Cursor/User").mkdir(parents=True)
+        monkeypatch.setenv("RAPID_MLX_API_KEY", "cursor-secret")
+        launch_cli.launch_command(
+            _make_args(
+                client="cursor",
+                server_url="https://rapid.example.com",
+                dry_run=True,
+            )
+        )
+        out = capsys.readouterr().out
+        assert "[dry-run] cursor: detected=True" in out
+
+    def test_cursor_does_not_infer_backend_routability_from_local_dns(
+        self, fake_home, capsys, monkeypatch
+    ):
+        (fake_home / "Cursor/User").mkdir(parents=True)
+        monkeypatch.setenv("RAPID_MLX_API_KEY", "cursor-secret")
+        with patch("socket.getaddrinfo") as resolver:
+            launch_cli.launch_command(
+                _make_args(
+                    client="cursor",
+                    server_url="https://rapid.example.com",
+                    dry_run=True,
+                )
+            )
+        resolver.assert_not_called()
+
+    def test_cursor_rejects_shorthand_loopback_address(self, fake_home, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            launch_cli.launch_command(
+                _make_args(client="cursor", server_url="https://127.1")
+            )
+        assert excinfo.value.code == 2
+        assert "cannot reach" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("server_url", "error_text"),
+        [
+            ("https://rapid.example.com:0", "non-zero HTTPS port"),
+            ("https://rapid.example.com?token=value", "query string or fragment"),
+            ("https://rapid.example.com#settings", "query string or fragment"),
+        ],
+    )
+    def test_cursor_rejects_malformed_public_url_components(
+        self, fake_home, capsys, server_url, error_text
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            launch_cli.launch_command(
+                _make_args(client="cursor", server_url=server_url)
+            )
+        assert excinfo.value.code == 2
+        assert error_text in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "server_url",
+        [
+            "https://[",
+            "https://127.0.0.1\\@example.com",
+            "https://user:password@example.com",
+            "https://%31%32%37.0.0.1",
+            "https://例子.测试",
+        ],
+    )
+    def test_cursor_rejects_ambiguous_authority_without_traceback(
+        self, fake_home, capsys, server_url
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            launch_cli.launch_command(
+                _make_args(client="cursor", server_url=server_url)
+            )
+        assert excinfo.value.code == 2
+        err = capsys.readouterr().err
+        assert "launch:" in err
+        assert "Traceback" not in err
+
+    def test_cursor_canonicalizes_validated_url(self, fake_home, capsys, monkeypatch):
+        (fake_home / "Cursor/User").mkdir(parents=True)
+        monkeypatch.setenv("RAPID_MLX_API_KEY", "cursor-secret")
+        launch_cli.launch_command(
+            _make_args(
+                client="cursor",
+                server_url="https://EXAMPLE.COM.:443/api/",
+            )
+        )
+        config = json.loads(cursor.current_config_path().read_text())
+        assert config["cursor.aiprovider.openai.baseUrl"] == (
+            "https://example.com:443/api/v1"
+        )
+        assert config["cursor.aiprovider.openai.apiKey"] == "cursor-secret"
+
+    def test_cursor_public_endpoint_requires_api_key(self, fake_home, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            launch_cli.launch_command(
+                _make_args(client="cursor", server_url="https://example.com")
+            )
+        assert excinfo.value.code == 2
+        err = capsys.readouterr().err
+        assert "require RAPID_MLX_API_KEY" in err
+        assert "unauthenticated" in err
+
+    def test_cursor_uses_api_key_from_environment(self, fake_home, capsys, monkeypatch):
+        monkeypatch.setenv("RAPID_MLX_API_KEY", "cursor-env-secret")
+        (fake_home / "Cursor/User").mkdir(parents=True)
+
+        launch_cli.launch_command(
+            _make_args(client="cursor", server_url="https://rapid.example.com")
+        )
+
+        config = json.loads(cursor.current_config_path().read_text())
+        assert config["cursor.aiprovider.openai.apiKey"] == "cursor-env-secret"
+
+    def test_cursor_rejects_multicast_address(self, fake_home, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            launch_cli.launch_command(
+                _make_args(client="cursor", server_url="https://224.0.0.1")
+            )
+        assert excinfo.value.code == 2
+        assert "cannot reach" in capsys.readouterr().err
+
+    def test_cursor_rejects_ipv6_site_local_address(self, fake_home, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            launch_cli.launch_command(
+                _make_args(client="cursor", server_url="https://[fec0::1]")
+            )
+        assert excinfo.value.code == 2
+        assert "cannot reach" in capsys.readouterr().err
+
+    def test_all_skips_cursor_for_default_local_endpoint(self, fake_home, capsys):
+        (fake_home / "Cursor/User").mkdir(parents=True)
+        with pytest.raises(SystemExit) as excinfo:
+            launch_cli.launch_command(_make_args(all=True))
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "cursor: skipped" in err
+        assert "publicly reachable HTTPS" in err
+        assert "no supported clients detected" in err
+
+    def test_all_reports_cursor_skipped_without_api_key(self, fake_home, capsys):
+        (fake_home / "Cursor/User").mkdir(parents=True)
+        with pytest.raises(SystemExit) as excinfo:
+            launch_cli.launch_command(
+                _make_args(all=True, server_url="https://rapid.example.com")
+            )
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "cursor: skipped" in err
+        assert "require RAPID_MLX_API_KEY" in err
 
     def test_missing_client_and_no_all_exit_2(self, fake_home, capsys):
         with pytest.raises(SystemExit) as excinfo:
@@ -467,6 +681,22 @@ class TestLaunchCommand:
         ]
         # PID file written.
         assert launch_cli.PID_FILE.read_text().strip() == "99999"
+
+    def test_api_key_is_passed_to_client_and_started_server(
+        self, fake_home, capsys, monkeypatch
+    ):
+        ext_dir = (
+            fake_home / "vscode-globalStorage" / "saoudrizwan.claude-dev" / "settings"
+        )
+        ext_dir.mkdir(parents=True)
+        fake_proc = MagicMock()
+        fake_proc.pid = 99998
+        monkeypatch.setenv("RAPID_MLX_API_KEY", "shared-secret")
+        with patch.object(subprocess, "Popen", return_value=fake_proc) as popen:
+            launch_cli.launch_command(_make_args(client="cline", start_server=True))
+        config = json.loads((ext_dir / "cline_mcp_settings.json").read_text())
+        assert config["openAiApiKey"] == "shared-secret"
+        assert popen.call_args.kwargs["env"]["RAPID_MLX_API_KEY"] == "shared-secret"
 
     def test_start_server_skipped_when_no_clients_patched(self, fake_home, capsys):
         # cline is NOT detected on this fake_home. --start-server must
@@ -558,3 +788,14 @@ def test_launch_port_accepts_in_range():
     register(sub)
     args = parser.parse_args(["launch", "cline", "--port", "8000"])
     assert args.port == 8000
+
+
+def test_launch_rejects_api_key_on_command_line():
+    """Secrets for launch must travel via RAPID_MLX_API_KEY, never argv."""
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    from vllm_mlx.launch.cli import register
+
+    register(sub)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["launch", "cursor", "--api-key", "leaked-secret"])

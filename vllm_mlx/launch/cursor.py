@@ -1,112 +1,174 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Cursor editor launch adapter.
+"""Cursor editor launch adapter for publicly reachable HTTPS endpoints.
 
-Cursor's "AI Settings" panel for OpenAI-compatible providers is fed via
-the standard VS Code-style ``settings.json``. The relevant keys are
-under the ``cursor.aiprovider.*`` namespace (the same family Cursor
-exposes for the OpenAI base-URL override in its settings UI).
-
-Cursor lives at slightly different paths than vanilla VS Code — its
-support dir is ``~/Library/Application Support/Cursor`` on macOS, NOT
-``Code``. The settings file shape (top-level dotted keys → string
-values) is identical.
+Cursor routes BYOK requests through its own backend, so this adapter cannot
+point Cursor directly at a server bound to the user's localhost. The launch
+adapter enforces that distinction before writing any configuration. A public
+HTTPS ``--server-url`` can point at a tunnel forwarding to Rapid-MLX.
 """
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from . import _common
 
-# Cursor's per-OS user settings dir. We probe both macOS (Apple
-# Silicon-first; the rapid-mlx target platform) and Linux (a small but
-# growing fraction of Cursor users since the official Linux build
-# shipped). Windows isn't supported by rapid-mlx and so isn't probed.
 _CONFIG_DIR_MAC = Path.home() / "Library" / "Application Support" / "Cursor" / "User"
 _CONFIG_DIR_LINUX = Path.home() / ".config" / "Cursor" / "User"
-
 _SETTINGS_FILENAME = "settings.json"
 
 
+def canonical_server_url(server_url: str) -> str:
+    """Validate and serialize a public Cursor URL without ambiguity."""
+    if "\\" in server_url:
+        raise ValueError("Cursor's --server-url cannot contain backslashes")
+    try:
+        parsed = urlsplit(server_url)
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        port = parsed.port
+    except ValueError:
+        raise ValueError(
+            "Cursor requires a valid public hostname and HTTPS port"
+        ) from None
+
+    if parsed.scheme.lower() != "https":
+        raise ValueError("Cursor requires a publicly reachable HTTPS --server-url")
+    if parsed.query or parsed.fragment:
+        raise ValueError(
+            "Cursor's --server-url cannot contain a query string or fragment"
+        )
+    if username is not None or password is not None:
+        raise ValueError("Cursor's --server-url cannot contain user information")
+    if not hostname:
+        raise ValueError("Cursor requires a valid public hostname")
+    if port == 0:
+        raise ValueError("Cursor requires a valid non-zero HTTPS port")
+
+    normalized = hostname.rstrip(".").lower()
+    if normalized == "localhost" or normalized.endswith((".localhost", ".local")):
+        raise ValueError(
+            "Cursor's servers cannot reach localhost or private network hosts"
+        )
+
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        try:
+            address = ipaddress.ip_address(socket.inet_aton(normalized))
+        except OSError:
+            address = None
+    if address is None:
+        labels = normalized.split(".")
+        if (
+            not normalized.isascii()
+            or len(normalized) > 253
+            or any(
+                not label
+                or len(label) > 63
+                or label.startswith("-")
+                or label.endswith("-")
+                or not all(
+                    character.isalnum() or character == "-" for character in label
+                )
+                for label in labels
+            )
+        ):
+            raise ValueError(
+                "Cursor requires an unescaped ASCII hostname (use IDNA/punycode if needed)"
+            )
+    if address is not None and (
+        not address.is_global
+        or address.is_multicast
+        or getattr(address, "is_site_local", False)
+        or address.is_unspecified
+        or address.is_reserved
+    ):
+        raise ValueError(
+            "Cursor's servers cannot reach localhost or private network addresses"
+        )
+
+    # Do not resolve hostnames here. Cursor, not this Mac, makes the provider
+    # request, so split-horizon DNS can produce a different answer from the
+    # backend. Local DNS is neither proof of reachability nor a stable SSRF
+    # boundary; the operator must supply an authenticated HTTPS endpoint that
+    # is public from Cursor's network vantage point.
+
+    try:
+        canonical_address = ipaddress.ip_address(normalized)
+    except ValueError:
+        canonical_host = normalized
+    else:
+        canonical_host = (
+            f"[{normalized}]" if canonical_address.version == 6 else normalized
+        )
+    netloc = canonical_host
+    if parsed.port is not None:
+        netloc += f":{parsed.port}"
+    return urlunsplit(("https", netloc, parsed.path, "", ""))
+
+
+def endpoint_error(server_url: str) -> str | None:
+    """Return the validation error for ``server_url``, if any."""
+    try:
+        canonical_server_url(server_url)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
 def _candidate_dirs() -> list[Path]:
-    """Per-OS Cursor user-settings dirs in priority order."""
+    """Return per-OS Cursor user-settings directories in priority order."""
     return [_CONFIG_DIR_MAC, _CONFIG_DIR_LINUX]
 
 
 def detect() -> bool:
-    """Return True when Cursor appears to be installed.
-
-    Three signals — any one is sufficient:
-
-    * The ``Cursor.app`` bundle exists under ``/Applications`` or
-      ``~/Applications`` (macOS).
-    * The ``cursor`` CLI shim is on PATH (Cursor's "Install 'cursor'
-      command in PATH" action drops a shim that mirrors VS Code's
-      ``code`` command).
-    * The Cursor user-settings dir already exists (the editor has
-      been opened at least once).
-
-    Multi-signal detection avoids false negatives on Linux installs
-    where the ``.app`` bundle check doesn't apply.
-    """
+    """Return whether Cursor appears to be installed."""
     if _common.mac_app_installed("Cursor"):
         return True
     if _common.which("cursor") is not None:
         return True
-    return any(d.exists() for d in _candidate_dirs())
+    return any(directory.exists() for directory in _candidate_dirs())
 
 
 def current_config_path() -> Path | None:
-    """Return Cursor's ``settings.json`` path.
-
-    Picks the macOS path if Cursor's macOS dir is present (or doesn't
-    exist on either OS — in which case the macOS canonical path is the
-    one we mkdir into, matching what Cursor would create on first
-    launch), otherwise falls back to the Linux path.
-    """
-    for d in _candidate_dirs():
-        if d.exists():
-            return d / _SETTINGS_FILENAME
-    # No existing Cursor dir — return the macOS canonical path as the
-    # creation target. detect() returns False in this case so the
-    # dispatcher prints a "Cursor not detected" message before we get
-    # here unless --force is in play (today: never).
+    """Return Cursor's ``settings.json`` path for this platform."""
+    for directory in _candidate_dirs():
+        if directory.exists():
+            return directory / _SETTINGS_FILENAME
     return _CONFIG_DIR_MAC / _SETTINGS_FILENAME
 
 
 def write_or_patch_config(
     server_url: str,
     model: str,
-    api_key: str = "sk-noop",
+    api_key: str | None = None,
     config_path: Path | None = None,
 ) -> Path:
-    """Patch Cursor's ``settings.json`` to point at the local rapid-mlx
-    OpenAI-compatible server.
+    """Point Cursor at a public HTTPS endpoint forwarding to Rapid-MLX.
 
-    Keys we own — Cursor reads dotted top-level keys exactly like VS
-    Code, so we set them as flat string keys (NOT a nested object):
-
-    * ``cursor.aiprovider.openai.baseUrl`` → ``<server_url>/v1``
-    * ``cursor.aiprovider.openai.apiKey`` → ``<api_key>``
-    * ``cursor.aiprovider.openai.model`` → ``<model>``
-
-    These keys mirror what the Cursor "OpenAI API" settings panel
-    writes when the user clicks through the UI. Pasted-in values from
-    that panel and values written here round-trip — Cursor doesn't
-    distinguish.
-
-    All other Cursor settings (theme, keybindings, every other dotted
-    key) round-trip untouched.
+    Local, private, malformed, and unauthenticated endpoints are rejected
+    before any backup or write. All unrelated Cursor settings are preserved.
     """
+    canonical_url = canonical_server_url(server_url)
+    if not api_key:
+        raise ValueError("Cursor public endpoints require RAPID_MLX_API_KEY")
+
+    parsed = urlsplit(canonical_url)
+    path_component = parsed.path.rstrip("/")
+    if not path_component.endswith("/v1"):
+        path_component += "/v1"
+    base_url = urlunsplit((parsed.scheme, parsed.netloc, path_component, "", ""))
+
     path = config_path or current_config_path()
     assert path is not None
 
     existing = _common.load_json_lenient(path)
     _common.backup_existing(path)
-
-    base_url = server_url.rstrip("/")
-    if not base_url.endswith("/v1"):
-        base_url = base_url + "/v1"
 
     existing["cursor.aiprovider.openai.baseUrl"] = base_url
     existing["cursor.aiprovider.openai.apiKey"] = api_key
