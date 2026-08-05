@@ -37,6 +37,13 @@ struct SidebarView: View {
     /// Open a saved conversation (switches the detail pane back to chat).
     var onSelectConversation: (UUID) -> Void
 
+    /// The "now" the date buckets are computed against. Rolled forward by
+    /// ``dayBoundaryTicker`` at each midnight so an open, untouched sidebar
+    /// re-labels yesterday's conversations instead of freezing on the day it
+    /// was first rendered. Injected (rather than reading ``Date()`` inside the
+    /// section builder) so the roll-over is an observable state change.
+    @State private var referenceDate = Date()
+
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             row(
@@ -53,16 +60,19 @@ struct SidebarView: View {
             )
 
             if !chat.conversations.isEmpty {
-                // Label only — grouping, ordering, and persistence are
-                // untouched.
-                SectionHeader("Recents")
-                    .padding(.horizontal, RapidTheme.Space.sm)
-                    .padding(.top, RapidTheme.Space.lg)
-                    .padding(.bottom, RapidTheme.Space.xs)
+                // Date-grouped history (#1470), titled with the shared
+                // SectionHeader so the groups match the refreshed visual
+                // system (#1460) instead of the PR's original inline caption.
                 ScrollView {
                     VStack(alignment: .leading, spacing: 1) {
-                        ForEach(chat.conversations) { conv in
-                            conversationRow(conv)
+                        ForEach(historySections, id: \.title) { section in
+                            SectionHeader(section.title)
+                                .padding(.horizontal, RapidTheme.Space.sm)
+                                .padding(.top, RapidTheme.Space.lg)
+                                .padding(.bottom, RapidTheme.Space.xs)
+                            ForEach(section.conversations) { conv in
+                                conversationRow(conv)
+                            }
                         }
                     }
                 }
@@ -74,6 +84,87 @@ struct SidebarView: View {
         .padding(.horizontal, RapidTheme.Space.sm)
         .padding(.vertical, RapidTheme.Space.md)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .task { await dayBoundaryTicker() }
+    }
+
+    /// The history list split into dated sections, newest first.
+    ///
+    /// Everything used to sit under a hard-coded "Older" heading, so a
+    /// conversation five seconds old was filed as ancient history.
+    private var historySections: [HistorySection] {
+        SidebarView.sections(for: chat.conversations, now: referenceDate)
+    }
+
+    /// Advance ``referenceDate`` at each calendar-day boundary for as long as
+    /// the sidebar is on screen. Sleeps until the next midnight, bumps the
+    /// state (which re-buckets the list), then loops. Cancels with the view.
+    private func dayBoundaryTicker() async {
+        let calendar = Calendar.current
+        while !Task.isCancelled {
+            let next =
+                calendar.nextDate(
+                    after: Date(),
+                    matching: DateComponents(hour: 0, minute: 0, second: 0),
+                    matchingPolicy: .nextTime
+                ) ?? Date().addingTimeInterval(24 * 60 * 60)
+            let delay = next.timeIntervalSinceNow
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            if Task.isCancelled { break }
+            referenceDate = Date()
+        }
+    }
+
+    struct HistorySection {
+        let title: String
+        let conversations: [ChatConversation]
+    }
+
+    /// Bucket conversations by recency. ``now`` is injected rather than read
+    /// inside, matching ``RelativeTimestamp`` — it keeps the function pure so
+    /// the day boundaries can be exercised without waiting for midnight.
+    ///
+    /// Uses `Calendar` (not a fixed 86 400s divisor) because the buckets are
+    /// *calendar* days: something sent at 23:55 belongs to "Yesterday" once
+    /// the clock passes midnight, even though barely any time has elapsed.
+    /// Empty buckets produce no section, so no stray headings appear.
+    static func sections(
+        for conversations: [ChatConversation],
+        now: Date,
+        calendar: Calendar = .current
+    ) -> [HistorySection] {
+        var today: [ChatConversation] = []
+        var yesterday: [ChatConversation] = []
+        var week: [ChatConversation] = []
+        var older: [ChatConversation] = []
+
+        // The 7-day cutoff is anchored to the START of today, not to `now` —
+        // otherwise the boundary would drift through the day and a
+        // conversation could slide between sections while the user watches.
+        let startOfToday = calendar.startOfDay(for: now)
+        let weekCutoff = calendar.date(byAdding: .day, value: -7, to: startOfToday)
+
+        for conv in conversations {
+            if calendar.isDate(conv.updatedAt, inSameDayAs: now) {
+                today.append(conv)
+            } else if calendar.isDateInYesterday(conv.updatedAt) {
+                yesterday.append(conv)
+            } else if let weekCutoff, conv.updatedAt >= weekCutoff {
+                week.append(conv)
+            } else {
+                older.append(conv)
+            }
+        }
+
+        return [
+            ("Today", today),
+            ("Yesterday", yesterday),
+            ("Previous 7 Days", week),
+            ("Older", older),
+        ]
+        .filter { !$0.1.isEmpty }
+        .map { HistorySection(title: $0.0, conversations: $0.1) }
     }
 
     /// One history row — the conversation's derived title, amber-selected
