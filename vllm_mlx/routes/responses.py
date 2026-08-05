@@ -485,6 +485,92 @@ def _attach_deepseek_no_think_suppression(
     )
 
 
+def _attach_deepseek_codex_reasoning_budget(
+    engine: BaseEngine,
+    cfg,
+    openai_request: ChatCompletionRequest,
+    resolved_thinking: bool | None,
+    codex_surface: bool,
+    chat_kwargs: dict,
+) -> None:
+    """Enforce the Codex reasoning tier while generation is still in ``think``.
+
+    The generic chat builder conservatively skips requests with tools because an
+    ungated grammar may already be inside a tool envelope when a budget fires.
+    DeepSeek V4's Codex/DSML path has a token-delimited ``</think>`` boundary and
+    parses tools only after that boundary, so forcing the boundary is safe here.
+    Without this coupling, Responses only trims hidden reasoning after decode;
+    long agent turns can therefore spend thousands of invisible tokens without
+    ever reaching the next action even though ``reasoning_max_tokens`` is set.
+
+    Once a request qualifies, missing boundary metadata is a server invariant
+    violation rather than an opt-out: silently retaining the post-hoc trim would
+    re-open the unbounded-decode failure this path exists to prevent. Streaming
+    converts this error into ``response.failed``; non-streaming returns the
+    route's normal server-error envelope.
+    """
+    if (
+        not codex_surface
+        or not openai_request.tools
+        or not _uses_deepseek_v4_reasoning(cfg)
+    ):
+        return
+
+    if (
+        _effective_enable_thinking(resolved_thinking, cfg.model_path or cfg.model_name)
+        is not True
+        or getattr(openai_request, "reasoning_max_tokens", None) is None
+    ):
+        return
+
+    from ..api.reasoning_budget import ReasoningBudgetLogitsProcessor
+    from .chat import _engine_output_vocab_size
+
+    # This checkpoint's assistant turn is structurally in the reasoning lane:
+    # depending on the vendored tokenizer/template, the opening marker is either
+    # prefilled or is the first generated token. Treating it as seeded also avoids
+    # losing that first marker when mlx-lm establishes the processor's cumulative
+    # token baseline on its first callback.
+    cache_attr = "_rapid_mlx_deepseek_codex_reasoning_boundary"
+    boundary = getattr(engine, cache_attr, None)
+    if not (
+        isinstance(boundary, tuple)
+        and len(boundary) == 2
+        and all(isinstance(value, int) for value in boundary)
+    ):
+        tokenizer = getattr(engine, "tokenizer", None)
+        try:
+            end_id = tokenizer.get_vocab().get("</think>")
+        except Exception as exc:
+            raise RuntimeError(
+                "DeepSeek Codex reasoning budget unavailable: tokenizer cannot "
+                "resolve the </think> boundary"
+            ) from exc
+        vocab_size = _engine_output_vocab_size(engine)
+        if (
+            not isinstance(end_id, int)
+            or vocab_size is None
+            or not 0 <= end_id < vocab_size
+        ):
+            raise RuntimeError(
+                "DeepSeek Codex reasoning budget unavailable: </think> is "
+                "missing or outside the model output vocabulary"
+            )
+        boundary = (end_id, vocab_size)
+        try:
+            setattr(engine, cache_attr, boundary)
+        except (AttributeError, TypeError):
+            # Slot-only engine facades still get the enforced processor; they
+            # merely pay the one-token lookup again on their next request.
+            pass
+    end_id, _vocab_size = boundary
+    chat_kwargs["reasoning_budget_logits_processor"] = ReasoningBudgetLogitsProcessor(
+        end_id,
+        getattr(openai_request, "reasoning_max_tokens", None),
+        seeded_thinking=True,
+    )
+
+
 def _should_start_in_thinking(chat_template: str, enable_thinking: bool | None) -> bool:
     """Thin wrapper over the shared
     ``service.helpers._should_start_in_thinking`` predicate.
@@ -1360,6 +1446,14 @@ async def _non_stream(
         cfg,
         responses_request.model,
         explicit_no_thinking,
+        chat_kwargs,
+    )
+    _attach_deepseek_codex_reasoning_budget(
+        engine,
+        cfg,
+        openai_request,
+        resolved_thinking,
+        codex_surface,
         chat_kwargs,
     )
 
@@ -2320,6 +2414,14 @@ async def _stream_responses(
             cfg,
             responses_request.model,
             explicit_no_thinking,
+            chat_kwargs,
+        )
+        _attach_deepseek_codex_reasoning_budget(
+            engine,
+            cfg,
+            openai_request,
+            resolved_thinking,
+            codex_surface,
             chat_kwargs,
         )
         # C-01: thread the request_id holder so disconnect_guard can
