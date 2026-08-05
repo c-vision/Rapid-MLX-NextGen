@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "_comment": "Reviewed decode-throughput floors (tok/s) per model alias for evals/perf_gate.py, consumed by release-check-m3's G8b gate. A floor is a REVIEWED HUMAN DECISION captured on real hardware — NEVER invented or auto-generated (mirrors release_baselines.py: 'refreshing a baseline remains a reviewed human decision'). To add/refresh one: boot `rapid-mlx serve <alias> --port 8000 --no-thinking`, run `python evals/perf_gate.py`, take the advisory 'decode only' tok/s, set the floor conservatively (~85% of the observed rate, lower if measured on slower hardware than the release machine) and commit it under 'floors' keyed by the exact serve alias. With a floor present the G8b gate ENFORCES it (a decode regression blocks the release); with no entry the gate stays advisory. Keys are serve aliases (e.g. 'qwen3.5-9b-4bit'), NOT HF repo ids.",
+  "_provenance": {
+    "qwen3.5-9b-4bit": "Measured 35.6-35.9 tok/s decode-only (3 runs, stable) on a Mac mini M2 Pro 32GB, 2026-08-05, rapid-mlx serve --no-thinking. Floor set to 30.0 (~85% of the observed minimum) to absorb run-to-run variance. The release machine (Mac Studio M3) is faster, so it clears this with wide margin — this is a deliberately CONSERVATIVE floor that trips only on a gross (~40%+ on M3) decode regression, not a tight per-machine target. Re-measure on the M3 release box to tighten."
+  },
+  "floors": {
+    "qwen3.5-9b-4bit": 30.0
+  }
+}

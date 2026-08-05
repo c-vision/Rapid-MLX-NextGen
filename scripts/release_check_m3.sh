@@ -592,6 +592,30 @@ echo "  G8 — parser microbench (extract_tool_calls × 10000)"
 line
 "$PY" scripts/microbench_parsers.py
 
+#-------------------- G8b decode-throughput perf gate -------------
+# The end-to-end perf regression gate (docs/development/releasing.md row
+# G8b): measures the served model's steady-state decode tokens/sec on the
+# STILL-WARM gauntlet server and — when a reviewed floor exists for MODEL in
+# harness/perf_floors.json — FAILS the release if decode regressed. This is
+# the gate that catches KV-cache / hot-path throughput regressions (the very
+# class of change in a bump PR full of MTP / prefix-cache / speculative-decode
+# edits) that every correctness gate above sails past.
+#
+# It runs HERE, before the G12 cleanup tears the server down, so it reuses the
+# same warm serve (no second model load). perf_gate.py boots nothing; it reads
+# RAPID_MLX_BASE_URL (exported at the top) to reach 127.0.0.1:$PORT.
+#
+# Floor provenance: perf_floors.json is a REVIEWED HUMAN DECISION, never
+# invented (same rule as release_baselines.py). With no committed floor for
+# MODEL the gate stays ADVISORY — it prints the decode tok/s and passes — so a
+# fresh model doesn't hard-fail before anyone has reviewed a number; commit the
+# floor (see the file's _comment) to turn enforcement on. A one-off run can
+# override with RAPID_MLX_PERF_MIN_TPS=<n> or --min-tps.
+line
+echo "  G8b — decode-throughput perf gate (enforces harness/perf_floors.json[$MODEL] when set)"
+line
+"$PY" evals/perf_gate.py --alias "$MODEL" --floors-file harness/perf_floors.json
+
 #-------------------- G12 random-coverage -------------------------
 # Randomized sweep across small/medium aliases × harnesses × rounds.
 # Catches model-specific regressions that the fixed gauntlet (one
