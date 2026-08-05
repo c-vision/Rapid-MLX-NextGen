@@ -9,9 +9,12 @@ and the attestation check.
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
+import tomllib
+from packaging.requirements import Requirement
 
 # Load the script directly (scripts/ is not an importable package).
 _SPEC = importlib.util.spec_from_file_location(
@@ -20,6 +23,8 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 guard = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(guard)
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 _CORE = """\
@@ -105,6 +110,26 @@ class TestExtractMlxBounds:
         assert {SpecifierSet(s) for s in bounds["mlx-lm"]} == {
             SpecifierSet(">=0.31.3,<0.32")
         }
+
+
+def test_desktop_sidecar_uses_validated_mlx_vlm_bound():
+    """The signed Desktop bundle must not bypass the coherence-gated cap."""
+    pyproject = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())
+    vision_specs = [
+        Requirement(spec)
+        for spec in pyproject["project"]["optional-dependencies"]["vision"]
+        if Requirement(spec).name == "mlx-vlm"
+    ]
+    assert len(vision_specs) == 1
+
+    sidecar = (
+        _REPO_ROOT / "apps" / "rapid-mac" / "scripts" / "build-sidecar.sh"
+    ).read_text()
+    matches = re.findall(r"['\"](mlx-vlm[^'\"]*)['\"]", sidecar)
+    assert len(matches) == 1, "expected exactly one mlx-vlm sidecar requirement"
+
+    desktop_spec = Requirement(matches[0])
+    assert desktop_spec.specifier == vision_specs[0].specifier
 
 
 class TestStrictMode:

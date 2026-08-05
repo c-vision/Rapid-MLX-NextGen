@@ -270,7 +270,7 @@ fi
 # path. All other eager deps (transformers, requests, huggingface_hub,
 # safetensors, numpy, mlx) are already bundled by rapid-mlx's own
 # install above, so Pillow is the only additional dep we need.
-# We pin to the same ``>=0.6.3,!=0.6.4`` range that rapid-mlx's
+# We pin to the same ``>=0.6.3,!=0.6.4,<0.7`` range that rapid-mlx's
 # pyproject.toml [vision] extras pin so the bundled mlx-vlm tracks the
 # DiffusionGemma + gemma4_unified architecture support the loader needs.
 # (0.6.4 excluded: garbage vision output — rapid-mlx 0.11.1 serves Bonsai
@@ -283,7 +283,7 @@ echo "==> bundling mlx-vlm --no-deps + Pillow (gemma-4 + DiffusionGemma loader p
     --no-compile \
     --no-deps \
     --upgrade \
-    'mlx-vlm>=0.6.3,!=0.6.4' \
+    'mlx-vlm>=0.6.3,!=0.6.4,<0.7' \
     'Pillow>=10.0'
 
 # ----- step 3: strip dev / unused artifacts ----------------------------
