@@ -1207,7 +1207,7 @@ class _CacheEntry:
         )
 
 
-def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
+def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any] | None:
     """Create shallow copies of KVCache/QuantizedKVCache layers with offset reduced.
 
     This is used when returning a cached KV state to the scheduler so that
@@ -1215,7 +1215,8 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     next forward pass (preventing duplicate KV entries).
 
     Supports both KVCache (keys/values are arrays) and QuantizedKVCache
-    (keys/values are 3-tuples of arrays).
+    (keys/values are 3-tuples of arrays). Returns ``None`` when a DeepSeek V4
+    wrapper's nested pooling state cannot rewind by exactly ``trim_by`` tokens.
     """
     from mlx_lm.models.cache import KVCache
 
@@ -1223,6 +1224,46 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
         from mlx_lm.models.cache import QuantizedKVCache
     except ImportError:
         QuantizedKVCache = None  # noqa: N806
+
+    def has_deepseek_pooling(layer: Any) -> bool:
+        if type(layer).__module__ == "vllm_mlx.models.deepseek_v4_cache":
+            return type(layer).__name__ in {
+                "PoolingCache",
+                "BatchPoolingCache",
+                "DeepseekV4PoolingCache",
+                "BatchDeepseekV4PoolingCache",
+            }
+        return any(
+            has_deepseek_pooling(child)
+            for child in (getattr(layer, "caches", None) or ())
+        )
+
+    def trim_wrapper_exact(layer: Any) -> Any:
+        """Copy and trim a wrapper only when every nested cache can rewind.
+
+        ``CacheList.is_trimmable()`` only promises that its children can trim
+        *some* amount.  DeepSeek V4's pooling caches may retain rollback state
+        for just the latest decode window, so treating that boolean as
+        permission to rewind an arbitrary LCP distance leaks the divergent
+        suffix into the next request.
+        """
+        children = getattr(layer, "caches", None)
+        if children is not None:
+            tc = copy.copy(layer)
+            trimmed_children = []
+            for child in children:
+                trimmed_child = trim_wrapper_exact(child)
+                if trimmed_child is None:
+                    return None
+                trimmed_children.append(trimmed_child)
+            tc.caches = type(children)(trimmed_children)
+            return tc
+
+        tc = copy.deepcopy(layer)
+        trim = getattr(tc, "trim", None)
+        if not callable(trim):
+            return None
+        return tc if trim(trim_by) == trim_by else None
 
     trimmed: list[Any] = []
     for layer_cache in cache:
@@ -1253,9 +1294,16 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
             tc.offset = max(layer_cache.offset - trim_by, 0)
             trimmed.append(tc)
         else:
-            # Deep copy unknown/wrapper layers (e.g. CacheList) to prevent
-            # aliasing the stored cache entry — generation mutates in-place.
-            trimmed.append(copy.deepcopy(layer_cache))
+            if has_deepseek_pooling(layer_cache):
+                # DeepSeek pooling state must rewind with the local KV state;
+                # otherwise a divergent suffix crosses request boundaries.
+                tc = trim_wrapper_exact(layer_cache)
+                if tc is None:
+                    return None
+                trimmed.append(tc)
+            else:
+                # Preserve the established path for all other wrappers.
+                trimmed.append(copy.deepcopy(layer_cache))
     return trimmed
 
 
@@ -1929,12 +1977,20 @@ class MemoryAwarePrefixCache:
                 )
             elif excess > 0:
                 trimmed_cache = _trim_cache_offset(best_super.cache, excess)
-                self._entries.move_to_end(best_super.tokens)
-                self._stats.hits += 1
-                self._stats.tokens_saved += n_requested
-                self._last_match_type = "supersequence"
-                trimmed_cache = self._decompress_cache(trimmed_cache)
-                return trimmed_cache, []
+                if trimmed_cache is None:
+                    logger.info(
+                        "[cache_fetch] supersequence match skipped: cache "
+                        "could not rewind exactly by %d tokens",
+                        excess,
+                    )
+                    best_super = None
+                else:
+                    self._entries.move_to_end(best_super.tokens)
+                    self._stats.hits += 1
+                    self._stats.tokens_saved += n_requested
+                    self._last_match_type = "supersequence"
+                    trimmed_cache = self._decompress_cache(trimmed_cache)
+                    return trimmed_cache, []
             else:
                 self._entries.move_to_end(best_super.tokens)
                 self._stats.hits += 1
@@ -2005,26 +2061,34 @@ class MemoryAwarePrefixCache:
 
             if not has_non_trimmable:
                 trimmed_cache = _trim_cache_offset(best_lcp_entry.cache, excess)
-                self._entries.move_to_end(best_lcp_entry.tokens)
-                self._stats.hits += 1
-                self._stats.tokens_saved += best_lcp_length
-                remaining = tokens[best_lcp_length:]
-                logger.debug(
-                    f"[cache_fetch] LCP hit: shared={best_lcp_length} "
-                    f"trimmed={excess} remaining={len(remaining)}"
+                if trimmed_cache is not None:
+                    self._entries.move_to_end(best_lcp_entry.tokens)
+                    self._stats.hits += 1
+                    self._stats.tokens_saved += best_lcp_length
+                    remaining = tokens[best_lcp_length:]
+                    logger.debug(
+                        f"[cache_fetch] LCP hit: shared={best_lcp_length} "
+                        f"trimmed={excess} remaining={len(remaining)}"
+                    )
+                    self._last_match_type = "lcp"
+                    trimmed_cache = self._decompress_cache(trimmed_cache)
+                    return trimmed_cache, remaining
+                logger.info(
+                    "[cache_fetch] LCP unavailable: shared=%d entry_len=%d "
+                    "cache could not rewind exactly by %d tokens",
+                    best_lcp_length,
+                    len(best_lcp_entry.tokens),
+                    excess,
                 )
-                self._last_match_type = "lcp"
-                trimmed_cache = self._decompress_cache(trimmed_cache)
-                return trimmed_cache, remaining
 
-            logger.info(
-                "[cache_fetch] LCP unavailable: shared=%d entry_len=%d "
-                "requested_len=%d non_trimmable=%s",
-                best_lcp_length,
-                len(best_lcp_entry.tokens),
-                len(tokens),
-                has_non_trimmable,
-            )
+            if has_non_trimmable:
+                logger.info(
+                    "[cache_fetch] LCP unavailable: shared=%d entry_len=%d "
+                    "requested_len=%d non_trimmable=True",
+                    best_lcp_length,
+                    len(best_lcp_entry.tokens),
+                    len(tokens),
+                )
 
         self._stats.misses += 1
         self._last_match_type = "miss"

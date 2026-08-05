@@ -532,6 +532,71 @@ class TestCacheListTrimmability:
         assert result is None
         assert remaining == requested
 
+    @pytest.mark.skipif(not _has_mlx_lm, reason="mlx_lm not available (Linux CI)")
+    def test_deepseek_pooling_cache_rejects_unreachable_bos_lcp(self, cache):
+        """A tiny shared BOS must not reuse an unrewindable DeepSeek suffix."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import CacheList, RotatingKVCache
+
+        from vllm_mlx.models.deepseek_v4_cache import PoolingCache
+
+        rotating = RotatingKVCache(max_size=128)
+        kv = mx.zeros((1, 1, 8, 4))
+        rotating.update_and_fetch(kv, kv)
+
+        pooling = PoolingCache(ratio=4)
+        pooled_kv, _, _ = pooling.accumulate_windows(
+            mx.zeros((1, 7, 4)), mx.zeros((1, 7, 2)), 0
+        )
+        pooling.update_and_fetch(pooled_kv)
+        assert pooling.remainder == 3
+        assert pooling.is_trimmable()
+        original_buf = pooling.buf_kv
+
+        # The wrapper advertises trimmability because three recent tokens can
+        # be rewound, but the divergent suffix is seven tokens long.
+        cache.store([1, 2, 3, 4, 5, 6, 7, 8], [CacheList(rotating, pooling)])
+        result, remaining = cache.fetch([1, 20, 21])
+
+        assert result is None
+        assert remaining == [1, 20, 21]
+        assert cache.get_stats()["hits"] == 0
+        assert pooling.remainder == 3
+        assert pooling.buf_kv is original_buf
+
+    @pytest.mark.skipif(not _has_mlx_lm, reason="mlx_lm not available (Linux CI)")
+    def test_deepseek_pooling_exact_rewind_does_not_mutate_stored_entry(self, cache):
+        import mlx.core as mx
+        from mlx_lm.models.cache import CacheList, RotatingKVCache
+
+        from vllm_mlx.models.deepseek_v4_cache import PoolingCache
+
+        rotating = RotatingKVCache(max_size=128)
+        kv = mx.zeros((1, 1, 8, 4))
+        rotating.update_and_fetch(kv, kv)
+        pooling = PoolingCache(ratio=4)
+        pooled_kv, _, _ = pooling.accumulate_windows(
+            mx.zeros((1, 7, 4)), mx.zeros((1, 7, 2)), 0
+        )
+        pooling.update_and_fetch(pooled_kv)
+        cache.store([1, 2, 3, 4, 5, 6, 7, 8], [CacheList(rotating, pooling)])
+        stored_wrapper = next(iter(cache._entries.values())).cache[0]
+        stored_wrapper.caches = list(stored_wrapper.caches)
+        stored_rotating = stored_wrapper.caches[0]
+        stored_pooling = stored_wrapper.caches[1]
+        stored_rotating_offset = stored_rotating.offset
+        stored_buf = stored_pooling.buf_kv
+
+        result, remaining = cache.fetch([1, 2, 3, 4, 5, 6, 20])
+
+        assert remaining == [20]
+        assert isinstance(result[0].caches, list)
+        assert result[0].caches[0].offset == 6
+        assert result[0].caches[1].remainder == 1
+        assert stored_rotating.offset == stored_rotating_offset
+        assert stored_pooling.remainder == 3
+        assert stored_pooling.buf_kv is stored_buf
+
 
 class TestGetAvailableMemory:
     """Tests for _get_available_memory helper."""
