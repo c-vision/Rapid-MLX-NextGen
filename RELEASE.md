@@ -8,12 +8,42 @@ automated.
 ## TL;DR — cut a release
 
 1. Bump `version` in `pyproject.toml` to `X.Y.Z`.
-2. Open a PR whose commit subject is exactly `chore: bump version to X.Y.Z`
+2. In the same PR, `git mv docs/release-notes/unreleased.md
+   docs/release-notes/vX.Y.Z.md` (optional — see "Release notes" below).
+3. Open a PR whose commit subject is exactly `chore: bump version to X.Y.Z`
    (GitHub's `(#N)` squash suffix is fine), and merge it to `main`.
-3. That's it. The pipeline below tags `vX.Y.Z`, publishes a GitHub Release,
+4. That's it. The pipeline below tags `vX.Y.Z`, publishes a GitHub Release,
    PyPI, and Homebrew — **after** the Tier-1 agent gate passes.
 
 Nothing else is manual. There is no separate "publish" button.
+
+## Release notes
+
+`scripts/build_release_notes.sh` builds the GitHub Release body. It reads
+**`docs/release-notes/vX.Y.Z.md` out of the commit being tagged**; if that file
+exists it becomes the top of the notes verbatim (prose, `## Highlights`,
+benchmark tables, caveats) and the auto commit list is appended below it under a
+collapsed `<details>`. If it's absent the release publishes exactly as before —
+a flat commit list. **A release is never blocked on prose.**
+
+Write the prose as you land the work, in `docs/release-notes/unreleased.md`, and
+rename it in the version-bump PR. Full guidance and a template:
+`docs/release-notes/README.md`.
+
+Two invariants the workflow enforces, so notes can never describe a tree other
+than the one being tagged:
+
+- The release commit is resolved **once** (from `github.sha`, asserted equal to
+  the checked-out `HEAD`) and that one SHA is used for the notes, the ancestry
+  assert, and `--target`.
+- The baseline is the nearest **ancestor** tag (`git describe`), not the highest
+  version string in the repo — those differ whenever a newer tag exists that the
+  release commit does not descend from.
+- If the tag already exists at a *different* commit, the job **fails loudly**
+  rather than publishing: `gh release create` reuses an existing tag and
+  silently ignores `--target`.
+
+Run the offline tests with `./tests/release/test_build_release_notes.sh`.
 
 ## The pipeline
 
@@ -122,6 +152,9 @@ it sparingly — it ships a version whose agent integrations were *not* verified
 
 ## Related docs
 
+- `docs/release-notes/README.md` — how curated release notes are written.
+- `scripts/build_release_notes.sh` + `tests/release/test_build_release_notes.sh`
+  — the notes builder and its offline tests.
 - `tests/integrations/agent_smoke.sh` — the gate script (canonical).
 - `tests/integrations/README.md` — the full agent × model integration matrix.
 - `landing/runbooks/agent-release-verification.md` (rapidmlx.com repo) — the

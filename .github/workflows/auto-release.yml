@@ -16,6 +16,11 @@ name: Auto-release on version bump
 # ``force_version`` set — that BYPASSES the gate and releases anyway. It is
 # audited (actor + reason are logged and stamped into the release notes). See
 # RELEASE.md § "Studio down / emergency release".
+#
+# RELEASE NOTES: built by ``scripts/build_release_notes.sh`` (extracted so it can
+# be tested offline — ``tests/release/test_build_release_notes.sh``). It prepends
+# ``docs/release-notes/vX.Y.Z.md`` from the release commit when that file exists,
+# and otherwise emits the plain commit list. See ``docs/release-notes/README.md``.
 
 on:
   push:
@@ -202,7 +207,7 @@ jobs:
           # the previous tag, not only the version-bump commit.
           fetch-depth: 0
 
-      - name: Build CHANGELOG body
+      - name: Build release notes
         id: changelog
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -210,67 +215,35 @@ jobs:
           FORCE: ${{ needs.detect.outputs.force }}
           ACTOR: ${{ github.actor }}
           REASON: ${{ github.event.inputs.reason }}
+          EVENT_SHA: ${{ github.sha }}
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
         run: |
-          # Find the last release tag to enumerate merged PRs since then.
-          PREV_TAG=$(git tag --list 'v*' --sort=-v:refname | head -1 || true)
+          set -euo pipefail
 
-          if [ -n "$PREV_TAG" ]; then
-            echo "Generating notes since $PREV_TAG"
-            COMMITS=$(git log "$PREV_TAG..HEAD" --pretty='- %s (%h)' || true)
-          else
-            COMMITS=$(git log -50 --pretty='- %s (%h)')
+          # Resolve the commit being released ONCE, here. This SHA is what the
+          # notes are generated from, what the ancestry assert checks against,
+          # and (via the step output below) what the tag is created at. Nothing
+          # downstream re-reads a bare ``HEAD``: two independent reads of "the
+          # current commit" is exactly how notes and tag drift apart.
+          RELEASE_SHA=$(git rev-parse --verify "${EVENT_SHA}^{commit}")
+          HEAD_SHA=$(git rev-parse --verify 'HEAD^{commit}')
+          if [ "$RELEASE_SHA" != "$HEAD_SHA" ]; then
+            echo "❌ checkout is at $HEAD_SHA but the release targets $RELEASE_SHA" >&2
+            echo "   (the notes would describe a different tree than the tag)" >&2
+            exit 1
           fi
 
-          # Credit every merged PR author other than the repository owner.
-          OWNER="${GITHUB_REPOSITORY%%/*}"
-          PR_NUMBERS=$(
-            {
-              git log "${PREV_TAG:+$PREV_TAG..}HEAD" --pretty='%s' |
-                sed -nE 's/.*\(#([0-9]+)\)$/\1/p'
-              git log "${PREV_TAG:+$PREV_TAG..}HEAD" --pretty='%s' |
-                sed -nE 's/^Merge pull request #([0-9]+).*/\1/p'
-            } | sort -nu
-          )
-          CONTRIBUTIONS=()
-          while IFS= read -r PR_NUMBER; do
-            [ -n "$PR_NUMBER" ] || continue
-            PR_JSON=$(gh pr view "$PR_NUMBER" \
-              --repo "$GITHUB_REPOSITORY" \
-              --json author,title,url 2>/dev/null) || continue
-            AUTHOR=$(jq -r '.author.login // empty' <<<"$PR_JSON")
-            if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "$OWNER" ]; then
-              continue
-            fi
-            CONTRIBUTIONS+=("$(
-              jq -r '"- [@\(.author.login)](https://github.com/\(.author.login)) — [\(.title)](\(.url))"' \
-                <<<"$PR_JSON"
-            )")
-          done <<<"$PR_NUMBERS"
+          # The body goes to a file, not to $GITHUB_OUTPUT. The old heredoc
+          # (``body<<__EOF__``) could be escaped by any line equal to the
+          # delimiter — now reachable from human-authored highlights as well as
+          # commit subjects. A file has no delimiter to escape and never passes
+          # through ``${{ }}``.
+          RELEASE_SHA="$RELEASE_SHA" bash scripts/build_release_notes.sh > "$NOTES_FILE"
 
-          {
-            echo 'body<<__EOF__'
-            echo "## What's new in v$VERSION"
-            echo
-            if [ "$FORCE" = "true" ]; then
-              echo "> ⚠️ **Emergency release** — the Tier-1 agent gate was bypassed"
-              echo "> (forced by @$ACTOR). Reason: ${REASON:-<none given>}."
-              echo
-            fi
-            if [ -n "$COMMITS" ]; then
-              echo "$COMMITS"
-            else
-              echo "_(no changes recorded)_"
-            fi
-            echo
-            if [ "${#CONTRIBUTIONS[@]}" -gt 0 ]; then
-              echo "## Community contributors"
-              echo
-              printf '%s\n' "${CONTRIBUTIONS[@]}"
-              echo
-            fi
-            echo "Install: \`brew upgrade rapid-mlx\` or \`pip install -U rapid-mlx==$VERSION\` (or just \`rapid-mlx upgrade\`)."
-            echo '__EOF__'
-          } >> "$GITHUB_OUTPUT"
+          echo "release_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "notes_file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+          echo "--- release notes ---"
+          cat "$NOTES_FILE"
 
       - name: Create tag and release
         env:
@@ -281,25 +254,94 @@ jobs:
           # PyPI/Homebrew. Falls back to ``GITHUB_TOKEN`` if the secret is absent
           # so forks don't break — the release just won't auto-publish.
           GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-          # Pass untrusted strings (commit subjects from git log) via env, never
-          # via ``${{ }}`` interpolation into a ``run:`` block — otherwise a
-          # commit subject containing ``$(...)`` would execute on the runner with
-          # ``contents: write``.
           TAG: v${{ needs.detect.outputs.version }}
-          NOTES: ${{ steps.changelog.outputs.body }}
-          TARGET_SHA: ${{ github.sha }}
+          # Resolved once by the step above. The notes describe exactly this
+          # commit, so the tag must be created at exactly this commit.
+          RELEASE_SHA: ${{ steps.changelog.outputs.release_sha }}
+          # The body lives in a file on disk; it is never interpolated into this
+          # ``run:`` block, so a commit subject containing ``$(...)`` cannot
+          # execute on a runner holding ``contents: write``.
+          NOTES_FILE: ${{ steps.changelog.outputs.notes_file }}
         run: |
-          # Idempotency: re-check at create time too.
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists — done"
+          set -euo pipefail
+
+          # Idempotency: re-check at create time too. An existing Release is
+          # only "already done" if it points at the commit these notes
+          # describe — a retry that resolved a different RELEASE_SHA must not
+          # report success over a release that documents another tree.
+          if EXISTING_REL=$(gh release view "$TAG" --json targetCommitish,tagName -q .targetCommitish 2>/dev/null); then
+            # targetCommitish can be a branch name for pre-existing releases;
+            # resolve through the tag, which is what actually ships.
+            if REL_SHA=$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}" 2>/dev/null); then
+              :
+            else
+              REL_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" -q .object.sha 2>/dev/null || echo "")
+            fi
+            if [ -n "$REL_SHA" ] && [ "$REL_SHA" != "$RELEASE_SHA" ]; then
+              echo "❌ Release $TAG already exists at $REL_SHA, but these notes describe $RELEASE_SHA." >&2
+              echo "   Refusing to report success over a release that documents a different tree." >&2
+              exit 1
+            fi
+            echo "Release $TAG already exists at the release commit ($EXISTING_REL) — done"
             exit 0
           fi
 
-          # ``--notes-file -`` reads from stdin so the body is never expanded by
-          # the shell, even if it contains backticks or ``$(...)``.
-          printf '%s' "$NOTES" | gh release create "$TAG" \
-            --title "$TAG" \
-            --notes-file - \
-            --target "$TARGET_SHA"
+          # A tag can exist WITHOUT a Release object: a prior run that died
+          # between tag and release, a hand-pushed tag, a deleted release. The
+          # check above only sees Releases, so we would fall through to
+          # ``gh release create`` — and GitHub REUSES an existing tag and
+          # silently IGNORES ``--target``. The result is a published release
+          # whose notes describe $RELEASE_SHA attached to a tag pointing
+          # somewhere else. That is the one way this job can ship a release that
+          # lies about its own contents, so fail loudly instead of guessing.
+          # ``git fetch <tag>`` fails both when the tag is absent (fine) and
+          # when the network/auth broke (NOT fine), and swallowing that with
+          # ``|| true`` would read a failed check as "no tag exists" — then
+          # ``gh release create`` reuses the remote tag, ignores --target, and
+          # the post-condition only catches it AFTER downstream workflows fired.
+          # ``ls-remote`` separates the two: exit 0 + empty means genuinely
+          # absent, non-zero means we could not check and must not guess.
+          if ! REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/$TAG"); then
+            echo "❌ could not query origin for refs/tags/$TAG — refusing to guess." >&2
+            exit 1
+          fi
+          if [ -n "$REMOTE_TAG" ]; then
+            git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG"
+            # ls-remote already proved the tag EXISTS, so a peel that fails
+            # here is not "no tag" — it is a tag we cannot reason about (an
+            # annotated tag can legally point at a tree or blob). Falling
+            # through would hand it to ``gh release create``, which reuses the
+            # tag and ignores --target, and the post-condition would only
+            # notice after the release published and triggered downstream.
+            if ! EXISTING=$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}"); then
+              echo "❌ Tag $TAG exists on origin but does not peel to a commit." >&2
+              echo "   Refusing to publish against a tag whose target cannot be verified." >&2
+              exit 1
+            fi
+          fi
+          if [ -n "${EXISTING:-}" ]; then
+            if [ "$EXISTING" != "$RELEASE_SHA" ]; then
+              echo "❌ Tag $TAG already exists at $EXISTING, but these notes describe $RELEASE_SHA." >&2
+              echo "   GitHub ignores --target when the tag already exists, so publishing now" >&2
+              echo "   would attach these notes to a different tree." >&2
+              echo "   Fix by hand: delete the stale tag, or bump to a fresh version." >&2
+              exit 1
+            fi
+            echo "Tag $TAG already exists and points at the release commit — reusing it."
+          fi
 
-          echo "✓ Released $TAG — publish.yml will now publish to PyPI"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file "$NOTES_FILE" \
+            --target "$RELEASE_SHA"
+
+          # Post-condition: the tag that actually got published must be the
+          # commit these notes were generated from.
+          git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          PUBLISHED=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
+          if [ "$PUBLISHED" != "$RELEASE_SHA" ]; then
+            echo "❌ published tag $TAG points at $PUBLISHED, expected $RELEASE_SHA" >&2
+            exit 1
+          fi
+
+          echo "✓ Released $TAG at $RELEASE_SHA — publish.yml will now publish to PyPI"

@@ -53,7 +53,12 @@ The full path from "I want to release" to "users on `brew upgrade` see the new v
 
    The commit subject **must** match `chore: bump version to X.Y.Z` exactly — `auto-release.yml` parses it.
 
-3. **`auto-release.yml` fires** (~30s) — verifies the commit, checks the tag doesn't already exist, builds a CHANGELOG from `git log <prev-tag>..HEAD`, adds a linked **Community contributors** entry for every merged PR author other than the repository owner, and creates the GitHub Release.
+   While you're in this PR, also roll the release notes:
+   `git mv docs/release-notes/unreleased.md docs/release-notes/vX.Y.Z.md`,
+   tidy the prose, and recreate an empty `unreleased.md`. Optional — skipping
+   it just gives you a plain commit list. See `docs/release-notes/README.md`.
+
+3. **`auto-release.yml` fires** (~30s) — verifies the commit, checks the tag doesn't already exist, builds the release notes via `scripts/build_release_notes.sh` (curated `docs/release-notes/vX.Y.Z.md` if present, plus the commit list for `<nearest ancestor tag>..<release commit>`), adds a linked **Community contributors** entry for every merged PR author other than the repository owner, and creates the GitHub Release **at that same commit**.
 
 4. **`publish.yml` fires on `release: published`** (~3min) — builds sdist + wheel, uploads to PyPI (via the `pypi` deployment environment).
 
