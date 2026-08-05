@@ -63,7 +63,15 @@ from ..service.helpers import (
     count_prompt_tokens,
     enforce_context_length_for_messages,
     get_engine,
+    maybe_auto_disable_thinking_for_casual_chat,
+    maybe_auto_disable_thinking_for_tools,
 )
+
+
+def _apply_anthropic_thinking_defaults(openai_request: ChatCompletionRequest) -> None:
+    """Apply the shared chat/responses thinking defaults after adaptation."""
+    maybe_auto_disable_thinking_for_tools(openai_request)
+    maybe_auto_disable_thinking_for_casual_chat(openai_request)
 
 
 def _resolved_sampling_kwargs(openai_request) -> dict:
@@ -668,6 +676,7 @@ async def create_anthropic_message(
             openai_request = anthropic_to_openai(anthropic_request)
         except AnthropicOutputConfigError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        _apply_anthropic_thinking_defaults(openai_request)
 
         # D-ANTHRO-TOOL-USAGE F3 (codex r3 BLOCKING #1+#2): suffix
         # injection MUST happen BEFORE the context-length DoS gate and
@@ -1266,6 +1275,7 @@ async def count_anthropic_tokens(request: Request):
         openai_request = anthropic_to_openai(anthropic_request)
     except AnthropicOutputConfigError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    _apply_anthropic_thinking_defaults(openai_request)
     # Codex r2 BLOCKING #2: ``preserve_native_tool_format`` is an
     # optional attribute on the engine contract — guard with
     # ``getattr`` so test stubs without it (or any future engine

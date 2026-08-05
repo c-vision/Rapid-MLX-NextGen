@@ -399,9 +399,14 @@ class AnthropicRequest(BaseModel):
     # the pre-existing free-form-text + no-cap path so existing SDK
     # callers see no behavior change.
     output_config: AnthropicOutputConfig | None = None
-    # Legacy Anthropic ``thinking`` field (v0.20+) — mirrors the same
-    # idea but as a ``{"type": "enabled", "budget_tokens": N}`` shape.
-    # The adapter consults ``thinking.budget_tokens`` only when
+    # Rapid-MLX compatibility controls accepted by the OpenAI surfaces too.
+    # Declaring them here is load-bearing: Pydantic otherwise drops these
+    # extension fields before the Anthropic adapter can preserve them.
+    enable_thinking: bool | None = None
+    chat_template_kwargs: dict | None = None
+    # Native Anthropic ``thinking`` field (v0.20+) — mirrors the same
+    # idea as a ``{"type": "enabled", "budget_tokens": N}`` shape.
+    # The adapter translates both ``type`` and ``budget_tokens`` when
     # ``output_config.effort`` is unset (newer surface wins).
     thinking: dict | None = None
 

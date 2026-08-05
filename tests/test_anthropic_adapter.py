@@ -396,6 +396,46 @@ class TestAnthropicToOpenai:
         result = anthropic_to_openai(req)
         assert result.stream is True
 
+    @pytest.mark.parametrize(
+        ("kwargs", "expected"),
+        [
+            ({"enable_thinking": False}, False),
+            ({"chat_template_kwargs": {"enable_thinking": False}}, False),
+            ({"thinking": {"type": "disabled"}}, False),
+            (
+                {
+                    "enable_thinking": True,
+                    "chat_template_kwargs": {"enable_thinking": True},
+                    "thinking": {"type": "disabled"},
+                },
+                False,
+            ),
+            (
+                {
+                    "thinking": {"type": "enabled", "budget_tokens": 16},
+                },
+                True,
+            ),
+        ],
+    )
+    def test_thinking_controls_are_forwarded(self, kwargs, expected):
+        result = anthropic_to_openai(self._make_request(**kwargs))
+        ctk = result.chat_template_kwargs
+        actual = (
+            ctk.get("enable_thinking")
+            if isinstance(ctk, dict) and "enable_thinking" in ctk
+            else result.enable_thinking
+        )
+        assert actual is expected
+
+    def test_thinking_budget_still_forwards_with_enabled_type(self):
+        result = anthropic_to_openai(
+            self._make_request(
+                thinking={"type": "enabled", "budget_tokens": 16},
+            )
+        )
+        assert result.reasoning_max_tokens == 16
+
     def test_tools_conversion(self):
         req = self._make_request(
             tools=[

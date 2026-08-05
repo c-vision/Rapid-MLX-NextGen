@@ -47,6 +47,19 @@ def _make_client(engine: _StreamingEngine) -> TestClient:
     return TestClient(app)
 
 
+def _make_reasoning_client(engine: _StreamingEngine) -> TestClient:
+    cfg = reset_config()
+    cfg.engine = engine
+    cfg.model_name = "test-model"
+    cfg.no_thinking = False
+    cfg.reasoning_parser_name = "qwen3"
+    cfg.model_registry = None
+
+    app = FastAPI()
+    app.include_router(router)
+    return TestClient(app)
+
+
 def _parse_sse_data(response_text: str) -> list[dict]:
     events = []
     for raw_event in response_text.split("\n\n"):
@@ -79,7 +92,7 @@ def test_anthropic_stream_route_no_thinking_template_answers_as_text():
         "/v1/messages",
         json={
             "model": "test-model",
-            "max_tokens": 32,
+            "max_tokens": 2048,
             "stream": True,
             "messages": [{"role": "user", "content": "answer directly"}],
         },
@@ -182,9 +195,102 @@ def test_anthropic_stream_route_reasoning_parser_with_no_thinking_answers_as_tex
     assert thinking_deltas == []
 
 
-def test_anthropic_stream_route_reasoning_parser_with_thinking_default_still_works():
-    """Inverse guard: when enable_thinking is NOT explicitly False (i.e.
-    default thinking-on for a reasoning model), the reasoning parser
+@pytest.mark.parametrize(
+    "request_extension",
+    [
+        {},
+        {"enable_thinking": False},
+        {"chat_template_kwargs": {"enable_thinking": False}},
+        {"thinking": {"type": "disabled"}},
+    ],
+    ids=["casual-default", "top-level", "template-kwargs", "native"],
+)
+def test_anthropic_stream_route_disables_thinking(request_extension):
+    """Every supported opt-out reaches the engine, including shared defaults."""
+    engine = _StreamingEngine(["Direct answer"])
+    client = _make_reasoning_client(engine)
+    payload = {
+        "model": "test-model",
+        "max_tokens": 32,
+        "stream": True,
+        "messages": [{"role": "user", "content": "answer directly"}],
+    }
+    payload.update(request_extension)
+
+    response = client.post("/v1/messages", json=payload)
+
+    assert response.status_code == 200, response.text
+    assert engine.calls[0]["kwargs"]["enable_thinking"] is False
+    events = _parse_sse_data(response.text)
+    assert not any(
+        event.get("delta", {}).get("type") == "thinking_delta" for event in events
+    )
+
+
+def test_anthropic_stream_route_tools_default_disables_thinking(monkeypatch):
+    """The tools policy reaches the engine independently of casual-chat logic."""
+    monkeypatch.setattr(
+        "vllm_mlx.routes.anthropic.maybe_auto_disable_thinking_for_casual_chat",
+        lambda request: False,
+    )
+    engine = _StreamingEngine(["Direct answer"])
+    client = _make_reasoning_client(engine)
+
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 32,
+            "stream": True,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Inspect the scheduler and correlate cache misses.",
+                }
+            ],
+            "tools": [
+                {
+                    "name": "lookup",
+                    "description": "Look something up",
+                    "input_schema": {"type": "object"},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert engine.calls[0]["kwargs"]["enable_thinking"] is False
+
+
+@pytest.mark.parametrize("with_tools", [False, True], ids=["casual", "tools"])
+def test_anthropic_stream_route_effort_preserves_thinking_intent(with_tools):
+    """Anthropic output_config.effort must override both auto-disable policies."""
+    engine = _StreamingEngine(["<think>scratch</think>", "answer"])
+    client = _make_reasoning_client(engine)
+    payload = {
+        "model": "test-model",
+        "max_tokens": 2048,
+        "stream": True,
+        "output_config": {"effort": "low"},
+        "messages": [{"role": "user", "content": "answer directly"}],
+    }
+    if with_tools:
+        payload["tools"] = [
+            {
+                "name": "lookup",
+                "description": "Look something up",
+                "input_schema": {"type": "object"},
+            }
+        ]
+
+    response = client.post("/v1/messages", json=payload)
+
+    assert response.status_code == 200, response.text
+    assert engine.calls[0]["kwargs"]["enable_thinking"] is True
+
+
+def test_anthropic_stream_route_reasoning_parser_with_explicit_thinking_still_works():
+    """Inverse guard: when thinking is explicitly enabled, the reasoning parser
     must still be exercised so the existing #185 fix isn't regressed.
     The model emits a <think>…</think> block followed by the answer;
     the parser splits them, and the route emits thinking_delta then
@@ -211,13 +317,13 @@ def test_anthropic_stream_route_reasoning_parser_with_thinking_default_still_wor
             "model": "test-model",
             "max_tokens": 32,
             "stream": True,
+            "thinking": {"type": "enabled", "budget_tokens": 16},
             "messages": [{"role": "user", "content": "what is 6*7"}],
         },
     )
 
     assert response.status_code == 200
-    # No enable_thinking override on the request → kwargs absent or None.
-    assert engine.calls[0]["kwargs"].get("enable_thinking") is not False
+    assert engine.calls[0]["kwargs"].get("enable_thinking") is True
 
     events = _parse_sse_data(response.text)
 

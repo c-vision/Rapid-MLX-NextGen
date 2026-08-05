@@ -340,6 +340,7 @@ def test_c08_vibethinker_preamble_length_truncation_no_duplicate_emit():
             "model": "test-model",
             "max_tokens": 4,
             "stream": True,
+            "enable_thinking": True,
             "messages": [{"role": "user", "content": "ignored"}],
         },
     )
@@ -410,6 +411,7 @@ def test_c08_implicit_think_length_truncation_no_duplicate_emit():
             "model": "test-model",
             "max_tokens": 8,
             "stream": True,
+            "enable_thinking": True,
             "messages": [{"role": "user", "content": "count 1 2"}],
         },
     )
@@ -475,6 +477,7 @@ def test_c08_special_tokens_in_thinking_dont_break_duplicate_detection():
             "model": "test-model",
             "max_tokens": 3,
             "stream": True,
+            "enable_thinking": True,
             "messages": [{"role": "user", "content": "hi"}],
         },
     )
@@ -524,6 +527,7 @@ def test_c08_no_phantom_text_block_on_thinking_max_tokens_truncation():
             "model": "test-model",
             "max_tokens": 3,
             "stream": True,
+            "enable_thinking": True,
             "messages": [{"role": "user", "content": "Recite A B C..."}],
         },
     )

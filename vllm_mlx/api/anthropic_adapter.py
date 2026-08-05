@@ -198,6 +198,34 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
     # ``AnthropicOutputConfigError``; the route converts that to HTTP 400.
     response_format = _convert_output_config(request.output_config)
 
+    # Preserve the same thinking controls accepted by the OpenAI-compatible
+    # routes. Anthropic's native controls are authoritative over compatibility
+    # extensions; the newer ``output_config.effort`` in turn wins over legacy
+    # ``thinking.type`` when both are supplied. Put the translated value in
+    # chat_template_kwargs, the highest-precedence per-request source used by
+    # service.helpers._resolve_enable_thinking.
+    chat_template_kwargs = dict(request.chat_template_kwargs or {})
+    has_output_effort = (
+        request.output_config is not None and request.output_config.effort is not None
+    )
+    if has_output_effort:
+        chat_template_kwargs["enable_thinking"] = True
+    if isinstance(request.thinking, dict) and not has_output_effort:
+        thinking_type = request.thinking.get("type")
+        if thinking_type == "disabled":
+            chat_template_kwargs["enable_thinking"] = False
+        elif thinking_type in ("enabled", "adaptive"):
+            chat_template_kwargs["enable_thinking"] = True
+        elif (
+            thinking_type is None
+            and isinstance(request.thinking.get("budget_tokens"), int)
+            and not isinstance(request.thinking.get("budget_tokens"), bool)
+            and request.thinking["budget_tokens"] >= 1
+        ):
+            # Preserve the pre-type Anthropic extension: a positive budget is
+            # itself an explicit request to think, not merely a cap.
+            chat_template_kwargs["enable_thinking"] = True
+
     return ChatCompletionRequest(
         model=request.model,
         messages=messages,
@@ -215,6 +243,8 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
         tools=tools,
         tool_choice=tool_choice,
         response_format=response_format,
+        enable_thinking=request.enable_thinking,
+        chat_template_kwargs=chat_template_kwargs or None,
         # Pick 1 (this PR) — upstream vLLM PR #20859 + #42396 backport.
         # Translates ``output_config.effort`` (or legacy
         # ``thinking.budget_tokens``) into a per-request reasoning cap
@@ -245,8 +275,14 @@ def _resolve_reasoning_max_tokens(request: AnthropicRequest) -> int | None:
             request.output_config.effort
         )
     if isinstance(request.thinking, dict):
+        thinking_type = request.thinking.get("type")
         budget = request.thinking.get("budget_tokens")
-        if isinstance(budget, int) and budget >= 1:
+        if (
+            thinking_type not in ("disabled", "adaptive")
+            and isinstance(budget, int)
+            and not isinstance(budget, bool)
+            and budget >= 1
+        ):
             return budget
     return None
 

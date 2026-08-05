@@ -251,9 +251,9 @@ class TestAnthropicToOpenaiOutputConfig:
         """Pick 1 has now landed. ``effort`` is translated through
         ``ANTHROPIC_EFFORT_TO_REASONING_MAX_TOKENS`` into a per-request
         ``reasoning_max_tokens`` on the OpenAI side. Every other OpenAI
-        field stays identical to the baseline request — only
-        ``reasoning_max_tokens`` changes, so the cap path is the single
-        wire effect.
+        field stays identical to the baseline request except for the
+        explicit thinking enablement that prevents shared default-off
+        policies from erasing the caller's reasoning intent.
 
         See ``tests/test_per_request_thinking_budget.py`` for the full
         effort-mapping test matrix; this case pins coexistence with
@@ -267,10 +267,11 @@ class TestAnthropicToOpenaiOutputConfig:
         # ``high`` → 8192 per the canonical Anthropic mapping.
         assert baseline.reasoning_max_tokens is None
         assert with_effort.reasoning_max_tokens == 8192
-        # Everything else must be identical so Pick 1 doesn't sneak in
-        # a side effect on the OpenAI surface.
-        baseline_dump = baseline.model_dump(exclude={"reasoning_max_tokens"})
-        with_effort_dump = with_effort.model_dump(exclude={"reasoning_max_tokens"})
+        assert with_effort.chat_template_kwargs == {"enable_thinking": True}
+        # Everything else must remain identical.
+        excluded = {"reasoning_max_tokens", "chat_template_kwargs"}
+        baseline_dump = baseline.model_dump(exclude=excluded)
+        with_effort_dump = with_effort.model_dump(exclude=excluded)
         assert baseline_dump == with_effort_dump
 
     def test_unsupported_format_raises(self):
