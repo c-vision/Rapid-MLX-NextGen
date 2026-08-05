@@ -322,6 +322,12 @@ final class ServerManager {
     /// True while we are deliberately stopping the child. The
     /// `terminationHandler` checks this to decide whether to surface the
     /// exit as `.stopped` (expected) or `.crashed` (unexpected).
+    /// Latches once the terminal SIGTERM has been delivered so a second
+    /// ``beginShutdown`` (the reap phase calls it again) cannot re-signal a
+    /// child that is already shutting down gracefully. Reset when a new
+    /// child is spawned so a restart is not permanently un-signallable.
+    private var didSignalShutdown = false
+
     private var expectedStop: Bool = false
 
     /// Issue #270: the current spawn cycle observed at least one
@@ -969,6 +975,7 @@ final class ServerManager {
         //     is false here; ``stop()`` can preempt by terminating
         //     ``child`` and the polling loop notices ``child == nil``
         //     and returns.
+        didSignalShutdown = false
         isOperating = true
 
         // Clear the log tail from any previous run so the user only
@@ -1012,7 +1019,43 @@ final class ServerManager {
         // common when the user runs vite / jupyter / fastapi on the
         // same machine. ``PortAllocator`` walks 8000..8009 and picks
         // the first port not held by a foreign process.
-        guard let resolvedPort = PortAllocator.allocate() else {
+        //
+        // Run OFF the main actor. ``allocate()`` is blocking work by
+        // nature: per candidate port it forks ``lsof`` (+ one ``ps``
+        // per pid it finds) and, when it finds a rapid-owned orphan,
+        // waits out a SIGTERM grace before probing the bind. Calling
+        // that synchronously from this @MainActor method froze the UI
+        // for the whole walk — with several occupied candidates the
+        // freeze ran into multiple seconds of unresponsive window and
+        // spinning beachball, right at the moment the user clicked a
+        // model. ``PortAllocator``/``PortSweep`` are plain nonisolated
+        // enums over process + socket syscalls with no shared mutable
+        // state, so hopping them onto a detached task is safe.
+        //
+        // The surrounding ``isOperating = true`` (set above, cleared
+        // on every exit path below) is what makes this new suspension
+        // point safe against ``start``'s documented reentrancy: a
+        // second call landing on the actor while we're parked here
+        // bails at the ``guard !isOperating`` at the top rather than
+        // racing a second spawn onto a different port.
+        // Wait out the opportunistic launch sweep before allocating. It runs
+        // detached so launch is not blocked, but it reaps anything on the
+        // candidate port that LOOKS like rapid-mlx — including a server this
+        // launch just spawned, if an auto-start beat the sweep's `lsof` to the
+        // port. Awaiting it here keeps launch responsive while making a spawn
+        // and a sweep mutually exclusive.
+        await PortSweep.awaitLaunchSweep()
+        let allocated = await Task.detached(priority: .userInitiated) {
+            PortAllocator.allocate()
+        }.value
+        // A quit can land while we were parked on the allocator above. Spawning
+        // now would put a child on the far side of `beginShutdown`, so nothing
+        // ever reaps it — an orphan holding the port for the next launch.
+        if didSignalShutdown {
+            isOperating = false
+            return
+        }
+        guard let resolvedPort = allocated else {
             isOperating = false
             state = .crashed(
                 alias: trimmedAlias,
@@ -1388,17 +1431,54 @@ final class ServerManager {
     /// returning control to the OS. We send SIGTERM, wait a short
     /// blocking window, then SIGKILL — same pattern as `stop()` but
     /// without the async hops.
-    func shutdownSync() {
+    ///
+    /// Split into ``beginShutdown`` (signal, non-blocking) and this
+    /// reaping half so ``AppDelegate.runTerminationSequence`` can
+    /// signal BOTH this child and the download children before any
+    /// grace window starts, letting the two waits overlap instead of
+    /// summing. The grace budget itself is unchanged.
+    ///
+    /// Returns immediately when there is nothing to reap so the quit
+    /// path costs nothing in the common "server never started" case.
+    func beginShutdown() {
         // Issue #270: app is quitting. Even if no child is currently
         // alive, a pending auto-respawn task could fire AFTER
         // ``applicationWillTerminate`` returned to AppKit but BEFORE
         // the process actually exits, spawning a child that gets
         // orphaned. Cancel unconditionally here, before the child guard.
         cancelAutoRespawn()
+        // Actually idempotent, not merely "cheap to call twice".
+        // ``shutdownSync`` calls this again at the start of the reap
+        // phase, so without this latch the child receives a SECOND
+        // SIGTERM part-way through its first graceful shutdown —
+        // uvicorn reads that as "stop waiting, exit now" and abandons
+        // the prefix-cache serialisation that the 5 s grace below exists
+        // to protect, leaving the partial ``prefix_cache/<rev>.new/``
+        // this teardown is specifically written to avoid.
+        guard !didSignalShutdown else { return }
         guard let process = child else { return }
         guard process.isRunning || process.isProcessGroupAlive else { return }
+        didSignalShutdown = true
         expectedStop = true
         process.signalProcessGroup(SIGTERM)
+    }
+
+    func shutdownSync() {
+        // ``beginShutdown`` is idempotent and cheap, so calling it here
+        // keeps this method correct as a standalone teardown even
+        // though the production quit path calls it separately first.
+        beginShutdown()
+        guard let process = child else { return }
+        guard process.isRunning || process.isProcessGroupAlive else { return }
+        // NOTE: the 5 s SIGTERM grace is deliberate and load-bearing,
+        // not slack to be trimmed — rapid-mlx's FastAPI shutdown hook
+        // serialises the in-memory prefix cache to disk here, and
+        // SIGKILLing mid-write leaves a partial ``prefix_cache/<rev>.new/``
+        // that forces a full re-prefill on the next launch. See the
+        // ``sigtermGracePeriod`` doc comment for the full rationale.
+        // What this path DOES avoid is burning the grace when the
+        // child is already gone: the poll below exits as soon as the
+        // process group dies.
         let deadline = Date().addingTimeInterval(5.0)
         while Date() < deadline && process.isProcessGroupAlive {
             Thread.sleep(forTimeInterval: 0.1)
