@@ -317,13 +317,13 @@ def _compute_forced_tool_prefix(cfg, request) -> str | None:
     """
     if not (request.tools and getattr(request, "tool_choice", None) is not None):
         return None
+    normalized = _normalize_tool_choice_for_grammar(request.tool_choice)
     _forced_name: str | None = None
-    if (
-        isinstance(request.tool_choice, dict)
-        and request.tool_choice.get("type") == "function"
+    if normalized and normalized.get("mode") == "named":
+        _forced_name = normalized.get("name")
+    elif (
+        normalized and normalized.get("mode") == "required" and len(request.tools) == 1
     ):
-        _forced_name = (request.tool_choice.get("function") or {}).get("name")
-    elif request.tool_choice == "required" and len(request.tools) == 1:
         # OpenAI spec: ``required`` with a single tool is unambiguous — same
         # forcing semantics as a named choice.
         _forced_name = request.tools[0].function.get("name")
@@ -362,6 +362,19 @@ def _normalize_tool_choice_for_grammar(tool_choice) -> dict | None:
     drops ``request.tools``). A malformed object form (no usable name) also
     degrades to ``None`` — free-form, rather than fabricating a constraint.
     """
+    # Pydantic currently preserves this field as a raw dict, but callers and a
+    # future stricter request schema may supply a model instance. Normalize that
+    # representation once so every forced-choice consumer sees the same shape.
+    if not isinstance(tool_choice, dict):
+        model_dump = getattr(tool_choice, "model_dump", None)
+        if callable(model_dump):
+            try:
+                dumped = model_dump(exclude_none=True)
+            except (TypeError, ValueError):
+                dumped = None
+            if isinstance(dumped, dict):
+                tool_choice = dumped
+
     # Object form is the ONLY place a tool name appears: a named choice.
     if isinstance(tool_choice, dict):
         if tool_choice.get("type") == "function":
@@ -5578,9 +5591,10 @@ async def _create_chat_completion_impl(
     # model ignores ``tool_choice="required"`` and emits ordinary
     # prose. Scrub only when the visible text contains STRUCTURAL
     # parser-wire residue, not merely a literal token mention.
-    _is_forced_choice = request.tool_choice == "required" or (
-        isinstance(request.tool_choice, dict)
-        and request.tool_choice.get("type") == "function"
+    _normalized_tool_choice = _normalize_tool_choice_for_grammar(request.tool_choice)
+    _is_forced_choice = bool(
+        _normalized_tool_choice
+        and _normalized_tool_choice.get("mode") in ("required", "named")
     )
     _raw_text_for_reasoning = output.raw_text or output.text
     _raw_has_structural_wire = _contains_structural_tool_wire_leak(
@@ -6017,6 +6031,25 @@ async def stream_chat_completion(
             escaped = json.dumps(_sanitize(text))
             return f'{_sse_prefix}"{field}":{escaped}{_sse_suffix}'
 
+        def _content_sse_chunk(
+            text: str, chunk_logprobs: ChoiceLogProbs | None = None
+        ) -> str:
+            """Serialize one content delta, preserving requested logprobs."""
+            if not want_logprobs:
+                return _fast_sse_chunk(text, "content")
+            chunk = ChatCompletionChunk(
+                id=response_id,
+                created=_sse_created,
+                model=_resolve_model_name(request.model),
+                choices=[
+                    ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(content=text),
+                        logprobs=chunk_logprobs,
+                    )
+                ],
+            )
+            return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
         # First chunk with role
         _first_sse = f'{_sse_prefix}"role":"assistant"{_sse_suffix}'
         if logger.isEnabledFor(logging.INFO):
@@ -6087,6 +6120,65 @@ async def stream_chat_completion(
         # the swallow-buffer state machine. No-op when the prefix is
         # absent.
         processor.seed_forced_assistant_prefix(kwargs.get("forced_assistant_prefix"))
+
+        # Forced-choice content needs a small streaming quarantine: a parser can
+        # surface raw ``<tool_call>{...}</tool_call>`` bytes as content before
+        # terminal synthesis/schema validation refuses the call (#1508). Hold
+        # only marker-like content, while safe prose, reasoning, and parsed tool
+        # calls retain normal streaming latency.
+        _stream_tool_choice = _normalize_tool_choice_for_grammar(request.tool_choice)
+        _buffer_forced_content = bool(
+            request.tools
+            and _stream_tool_choice
+            and _stream_tool_choice.get("mode") in ("required", "named")
+        )
+        _forced_content_pending: list[tuple[str, ChoiceLogProbs | None]] = []
+        _forced_wire_quarantine = False
+        _forced_quarantine_tail = ""
+        _wire_prefixes = (
+            "<tool_call>",
+            "</tool_call>",
+            "<function=",
+            "<function>",
+            "</function>",
+            "<parameter=",
+            "</parameter>",
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁call▁begin｜>",
+            "<｜tool▁sep｜>",
+            "<arg_key>",
+            "</arg_value>",
+            "<minimax:tool_call>",
+            "<invoke",
+            "</invoke>",
+            "<|python_tag|>",
+            "<|tool_calls_section_begin|>",
+            "[TOOL_CALLS]",
+            "[/TOOL_CALLS]",
+        )
+        _wire_closers = (
+            "</tool_call>",
+            "</function>",
+            "<｜tool▁calls▁end｜>",
+            "<｜tool▁call▁end｜>",
+            "</arg_value>",
+            "</minimax:tool_call>",
+            "</invoke>",
+            "<|tool_calls_section_end|>",
+            "[/TOOL_CALLS]",
+        )
+
+        def _may_be_tool_wire(text: str) -> bool:
+            if _contains_tool_wire_literal(text):
+                return True
+            starts = [i for i in (text.rfind("<"), text.rfind("[")) if i >= 0]
+            if not starts:
+                return False
+            suffix = text[max(starts) :]
+            return any(
+                marker.startswith(suffix) or suffix.startswith(marker)
+                for marker in _wire_prefixes
+            )
 
         # Track token counts for usage reporting
         prompt_tokens = 0
@@ -6166,34 +6258,78 @@ async def stream_chat_completion(
                 # Telemetry: stamp TTFT on the first real output token
                 # (content / reasoning / tool_call). Cheap monotonic read
                 # gated to fire once; never touches the wire.
-                if first_token_ts is None and event.type in (
-                    "content",
-                    "reasoning",
-                    "tool_call",
+                if (
+                    first_token_ts is None
+                    and event.type
+                    in (
+                        "content",
+                        "reasoning",
+                        "tool_call",
+                    )
+                    and not _buffer_forced_content
                 ):
                     first_token_ts = time.perf_counter()
                 if event.type == "content":
-                    if not want_logprobs:
-                        _sse = _fast_sse_chunk(event.content, "content")
-                        if _sse:
-                            yield _sse
-                    else:
-                        chunk = ChatCompletionChunk(
-                            id=response_id,
-                            created=_sse_created,
-                            model=_resolve_model_name(request.model),
-                            choices=[
-                                ChatCompletionChunkChoice(
-                                    delta=ChatCompletionChunkDelta(
-                                        content=event.content,
-                                    ),
-                                    logprobs=_build_chunk_logprobs(output),
+                    _event_logprobs = (
+                        _build_chunk_logprobs(output) if want_logprobs else None
+                    )
+                    if _buffer_forced_content:
+                        if _forced_wire_quarantine:
+                            # A channel boundary bisected marker-shaped content.
+                            # Discard content until its closer arrives; otherwise
+                            # dropping only the opener would leak the following
+                            # JSON payload as plain assistant text.
+                            _forced_quarantine_tail = (
+                                _forced_quarantine_tail + event.content
+                            )[-256:]
+                            if any(
+                                closer in _forced_quarantine_tail
+                                for closer in _wire_closers
+                            ):
+                                _forced_wire_quarantine = False
+                                _forced_quarantine_tail = ""
+                            continue
+                        if _forced_content_pending or _may_be_tool_wire(event.content):
+                            _forced_content_pending.append(
+                                (event.content, _event_logprobs)
+                            )
+                            _pending_raw = "".join(
+                                text for text, _ in _forced_content_pending
+                            )
+                            if _contains_structural_tool_wire_leak(_pending_raw):
+                                _clean_pending = _scrub_visible_tool_wire_leaks(
+                                    _pending_raw
                                 )
-                            ],
-                        )
-                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                                _forced_content_pending.clear()
+                                if _clean_pending:
+                                    if first_token_ts is None:
+                                        first_token_ts = time.perf_counter()
+                                    yield _content_sse_chunk(_clean_pending, None)
+                            elif not _may_be_tool_wire(_pending_raw):
+                                # A partial candidate diverged into ordinary
+                                # prose (e.g. ``<funx``): replay every held byte.
+                                for _text, _logprobs in _forced_content_pending:
+                                    if _text:
+                                        if first_token_ts is None:
+                                            first_token_ts = time.perf_counter()
+                                        yield _content_sse_chunk(_text, _logprobs)
+                                _forced_content_pending.clear()
+                        else:
+                            if first_token_ts is None:
+                                first_token_ts = time.perf_counter()
+                            yield _content_sse_chunk(event.content, _event_logprobs)
+                    else:
+                        yield _content_sse_chunk(event.content, _event_logprobs)
 
                 elif event.type == "reasoning":
+                    if _forced_content_pending:
+                        # A channel boundary makes later content non-contiguous.
+                        # Fail closed on the ambiguous marker-shaped fragment so
+                        # it cannot be spliced around this reasoning event.
+                        _forced_content_pending.clear()
+                        _forced_wire_quarantine = True
+                    if first_token_ts is None:
+                        first_token_ts = time.perf_counter()
                     yield _fast_sse_chunk(event.reasoning, "reasoning_content")
 
                 elif event.type == "tool_call":
@@ -6260,6 +6396,14 @@ async def stream_chat_completion(
                     # double-emit the turn end.
                     if event.finish_reason is not None:
                         inline_terminal_finish_emitted = True
+                    if _forced_content_pending:
+                        # A parsed tool call confirms the held marker-like bytes
+                        # were transport, not assistant prose.
+                        _forced_content_pending.clear()
+                    _forced_wire_quarantine = False
+                    _forced_quarantine_tail = ""
+                    if first_token_ts is None:
+                        first_token_ts = time.perf_counter()
                     yield _tc_sse
 
                 elif event.type == "finish":
@@ -6350,11 +6494,8 @@ async def stream_chat_completion(
             and request.tool_choice is not None
         ):
             _synth_target: str | None = None
-            if (
-                isinstance(request.tool_choice, dict)
-                and request.tool_choice.get("type") == "function"
-            ):
-                _pinned = (request.tool_choice.get("function") or {}).get("name")
+            if _stream_tool_choice and _stream_tool_choice.get("mode") == "named":
+                _pinned = _stream_tool_choice.get("name")
                 _submitted = {
                     t.function.get("name")
                     for t in request.tools
@@ -6362,7 +6503,11 @@ async def stream_chat_completion(
                 }
                 if _pinned and _pinned in _submitted:
                     _synth_target = _pinned
-            elif request.tool_choice == "required" and len(request.tools) == 1:
+            elif (
+                _stream_tool_choice
+                and _stream_tool_choice.get("mode") == "required"
+                and len(request.tools) == 1
+            ):
                 _synth_target = request.tools[0].function.get("name")
             if _synth_target:
                 _raw_text = (
@@ -6426,6 +6571,42 @@ async def stream_chat_completion(
                         _synth_target,
                     )
 
+        # Finish/finalize content is the last contiguous content segment. Join
+        # it to any quarantined marker prefix so a wire span split at stream end
+        # is inspected as one logical content stream, then consume it here to
+        # avoid a second copy in the terminal chunk.
+        _forced_terminal_content_consumed = False
+        if _buffer_forced_content:
+            _finish_held = ""
+            if buffered_finish is not None:
+                _finish_held = buffered_finish[0].content or ""
+            _terminal_held = _finish_held + finalize_content
+            if _forced_wire_quarantine:
+                # The stream ended inside a quarantined wire fragment. Its
+                # remaining bytes are transport residue, never visible content.
+                _forced_terminal_content_consumed = bool(_terminal_held)
+                _forced_content_pending.clear()
+            elif _forced_content_pending or _may_be_tool_wire(_terminal_held):
+                _forced_terminal_content_consumed = True
+                _forced_content_pending.append((_terminal_held, None))
+                _pending_raw = "".join(text for text, _ in _forced_content_pending)
+                if _contains_structural_tool_wire_leak(_pending_raw):
+                    _final_content = _scrub_visible_tool_wire_leaks(_pending_raw)
+                    if _final_content:
+                        if first_token_ts is None:
+                            first_token_ts = time.perf_counter()
+                        yield _content_sse_chunk(_final_content, None)
+                else:
+                    # No payload-bearing structure materialized by stream end:
+                    # preserve literal marker documentation and partial prose.
+                    for _text, _logprobs in _forced_content_pending:
+                        if not _text:
+                            continue
+                        if first_token_ts is None:
+                            first_token_ts = time.perf_counter()
+                        yield _content_sse_chunk(_text, _logprobs)
+                _forced_content_pending.clear()
+
         # Emit the terminal chunk. Three cases:
         #   (a) Streaming parser already emitted tool_calls during the
         #       loop → buffered_finish has finish_reason="tool_calls"
@@ -6448,7 +6629,11 @@ async def stream_chat_completion(
             # finish_event.content path is normally None for non-tool
             # plain-text streams (deltas already drained content during
             # the loop), so this typically just adds the held suffix.
-            terminal_content = (finish_event.content or "") + finalize_content
+            terminal_content = (
+                ""
+                if _forced_terminal_content_consumed
+                else (finish_event.content or "") + finalize_content
+            )
 
             # Issue #569 streaming rescue: if NOTHING was streamed as
             # ``content`` across the whole turn AND no ``tool_calls``
@@ -6757,7 +6942,11 @@ async def stream_chat_completion(
                 choices=[
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
-                            content=finalize_content or None,
+                            content=(
+                                None
+                                if _forced_terminal_content_consumed
+                                else finalize_content or None
+                            ),
                             reasoning_content=None,
                             tool_calls=fallback_tool_calls or None,
                         ),

@@ -267,6 +267,21 @@ def test_normalize_named_object_form():
     }
 
 
+def test_normalize_named_pydantic_shape():
+    """A stricter request model must not bypass named-choice consumers."""
+    from vllm_mlx.routes.chat import _normalize_tool_choice_for_grammar
+
+    class _NamedChoice:
+        def model_dump(self, *, exclude_none=False):
+            assert exclude_none is True
+            return {"type": "function", "function": {"name": "get_time"}}
+
+    assert _normalize_tool_choice_for_grammar(_NamedChoice()) == {
+        "mode": "named",
+        "name": "get_time",
+    }
+
+
 def test_normalize_bare_tool_name_string_is_never_named():
     # Deferred codex #2: a bare string that happens to equal a tool name is
     # an INVALID tool_choice enum, not a named selection. It must NOT be read
