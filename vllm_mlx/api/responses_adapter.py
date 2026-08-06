@@ -569,8 +569,19 @@ def _to_text(value):
     return ""
 
 
-def _merge_system_messages(messages: list[Message]) -> list[Message]:
+def _merge_system_messages(
+    messages: list[Message], *, relocate_mid_conversation: bool = False
+) -> list[Message]:
     """Collapse all system messages into one at index 0.
+
+    ``relocate_mid_conversation`` opts into keeping MID-CONVERSATION
+    system messages at their original position (folded into the next
+    user turn) instead of hoisting them, which is what preserves the
+    prefix cache. It is OFF by default and enabled only on the Anthropic
+    lane. See :func:`_relocate_mid_conversation_systems` for why the two
+    lanes differ: Codex sends ``developer`` items as durable instructions
+    that must keep system authority, while Anthropic's mid-conversation
+    system messages are ephemeral reminders by design.
 
     Codex 0.136.0 sends BOTH ``instructions`` (the big system prompt)
     AND ``developer``-role items interleaved with user turns. After role
@@ -607,7 +618,7 @@ def _merge_system_messages(messages: list[Message]) -> list[Message]:
     )
     only_leading = not any(m.role == "system" for m in messages[first_body:])
 
-    if not only_leading:
+    if relocate_mid_conversation and not only_leading:
         messages = _relocate_mid_conversation_systems(messages, first_body)
 
     system_texts = [
@@ -661,14 +672,43 @@ def _relocate_mid_conversation_systems(
     request and stays cached. The trailing user turn is new on this
     request anyway, so nothing that was cacheable is disturbed.
 
-    Falls back to the historical hoist when there is no following user
-    turn (nothing to fold into) — better an extra leading system block
-    than silently dropping an instruction.
+    ALL-OR-NOTHING (codex r1 BLOCKING). If ANY mid-conversation system
+    message has no following user turn to fold into, this returns
+    ``messages`` untouched so the caller hoists every one of them, the
+    historical way. Mixing the two strategies in one request inverts
+    instruction order::
+
+        system: base
+        user:   ...
+        system: enter plan mode      -> folded into the next user turn
+        user:   plan this
+        system: exit plan mode       -> no following user turn, hoisted
+
+    The hoisted "exit plan mode" would land at the FRONT, ahead of the
+    folded "enter plan mode" that came before it — the newest
+    instruction rendered as the oldest, so the model could stay in plan
+    mode after being told to leave. Losing the cache benefit on that
+    request is the cheaper failure.
+
+    CONTENT SHAPE IS PRESERVED (codex r1 BLOCKING). The target user
+    message is rebuilt with ``model_copy`` and, when its content is a
+    list of blocks, the reminder is inserted as a leading text part
+    rather than flattening the list — otherwise an ``input_image`` /
+    video / audio block on that turn would be silently dropped and an
+    MLLM would answer without the image it was given.
     """
+    # Refuse to mix relocation and hoisting — see ALL-OR-NOTHING above.
+    tail = messages[first_body:]
+    for i, msg in enumerate(tail):
+        if msg.role != "system":
+            continue
+        if not any(m.role == "user" for m in tail[i + 1 :]):
+            return messages
+
     out: list[Message] = list(messages[:first_body])
     pending: list[str] = []
 
-    for msg in messages[first_body:]:
+    for msg in tail:
         if msg.role == "system":
             text = _to_text(msg.content)
             if text:
@@ -678,22 +718,31 @@ def _relocate_mid_conversation_systems(
             reminder = "\n".join(
                 f"{_MID_SYSTEM_OPEN}\n{t}\n{_MID_SYSTEM_CLOSE}" for t in pending
             )
-            body = _to_text(msg.content)
-            out.append(
-                Message(
-                    role="user", content=f"{reminder}\n\n{body}" if body else reminder
-                )
-            )
+            out.append(_prepend_text_to_message(msg, reminder))
             pending = []
             continue
         out.append(msg)
 
-    # No user turn followed the trailing nudges — keep them as system
-    # messages so the caller's merge still hoists them rather than
-    # dropping the instruction on the floor.
-    for text in pending:
-        out.append(Message(role="system", content=text))
     return out
+
+
+def _prepend_text_to_message(msg: Message, prefix: str) -> Message:
+    """Return a copy of ``msg`` with ``prefix`` inserted before its content.
+
+    Preserves the content SHAPE: a string stays a string, a list of
+    content blocks stays a list with one extra text block at the front,
+    and every other field on the message is carried over via
+    ``model_copy`` rather than reconstructed.
+    """
+    content = msg.content
+    if isinstance(content, list):
+        return msg.model_copy(
+            update={"content": [{"type": "text", "text": prefix}, *content]}
+        )
+    body = _to_text(content)
+    return msg.model_copy(
+        update={"content": f"{prefix}\n\n{body}" if body else prefix}
+    )
 
 
 def openai_to_responses(
