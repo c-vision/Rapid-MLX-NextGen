@@ -6,12 +6,19 @@ contract on the miss path. When it reports ``tools_called=False`` it has
 decided the text was NOT a tool call, so it has no licence to have
 rewritten that text — the caller will surface it to the user verbatim.
 
-``qwen3_coder_xml`` violated this: its candidate scanner matches
-``<function=(.*)$`` to end-of-string, so any answer merely *mentioning*
-``<function=`` was cut at that point even though the candidate was then
-rejected and ``tools_called`` came back ``False``. It is the parser for
-22 aliases including ``qwen3.6-35b-4bit`` and every Qwen3-Coder build,
-so that is the default path for local coding agents.
+``qwen3_coder_xml`` violated this, and worse: it FABRICATED calls out
+of prose. Its candidate scanner matches ``<function=`` spans whether or
+not the model meant them as wire, so an answer merely *mentioning* the
+markup produced a structured ``tool_call`` and a truncated ``content``.
+It is the parser for 22 aliases including ``qwen3.6-35b-4bit`` and every
+Qwen3-Coder build, so that is the default path for local coding agents.
+
+The discriminator is NOT whether the span is closed —
+``<function=read_file></function>`` is well-formed either way — but
+whether the CALLER declared that tool. A name the request never offered
+can never be executed, so promoting it only breaks the agent loop. That
+also preserves recovery of a genuine call truncated by ``max_tokens``
+before ``</function>``, which a closed-only rule would have thrown away.
 
 The tool-extraction path also runs when the request declared no tools at
 all (``vllm_mlx/service/helpers.py`` does not gate on ``request.tools``),
@@ -121,3 +128,73 @@ def test_qwen3coder_still_parses_a_real_call():
     result = parser.extract_tool_calls(wire, {"tools": tools})
     assert result.tools_called is True
     assert result.tool_calls[0]["name"] == "read_file"
+
+
+DECLARED_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    }
+]
+
+
+def _qwen3coder():
+    return ToolParserManager.get_tool_parser("qwen3_coder_xml")(None)
+
+
+class TestOnlyDeclaredToolsBecomeCalls:
+    """A name the request never offered can never be executed."""
+
+    def test_balanced_prose_with_no_tools_declared(self):
+        """codex r1 BLOCKING: closed spans in prose were still promoted."""
+        text = "Docs: write <function=read_file></function> to show an empty call."
+        result = _qwen3coder().extract_tool_calls(text, None)
+        assert result.tools_called is False
+        assert result.content == text
+
+    def test_balanced_prose_naming_an_undeclared_tool(self):
+        text = "Docs: write <function=read_file></function> to show an empty call."
+        result = _qwen3coder().extract_tool_calls(text, {"tools": DECLARED_TOOLS})
+        assert result.tools_called is False
+        assert result.content == text
+
+    def test_unclosed_prose_with_no_tools_declared(self):
+        text = "Docs mention </tool_call> and <function=name> together."
+        result = _qwen3coder().extract_tool_calls(text, None)
+        assert result.tools_called is False
+        assert result.content == text
+
+
+class TestTruncatedCallsStillRecover:
+    """codex r1 MAJOR: a closed-only rule threw these away."""
+
+    def test_call_truncated_by_max_tokens_before_the_closer(self):
+        wire = (
+            "<tool_call>\n<function=write_file>\n"
+            "<parameter=path>\na.md\n</parameter>\n"
+            "<parameter=content>\nhi\n</parameter>"
+        )
+        result = _qwen3coder().extract_tool_calls(wire, {"tools": DECLARED_TOOLS})
+        assert result.tools_called is True
+        assert result.tool_calls[0]["name"] == "write_file"
+
+    def test_complete_call_is_unaffected(self):
+        wire = (
+            "<tool_call>\n<function=write_file>\n"
+            "<parameter=path>\na.md\n</parameter>\n"
+            "<parameter=content>\nhi\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        result = _qwen3coder().extract_tool_calls(wire, {"tools": DECLARED_TOOLS})
+        assert result.tools_called is True
+        assert result.tool_calls[0]["name"] == "write_file"

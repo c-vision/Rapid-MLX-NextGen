@@ -223,29 +223,18 @@ class Qwen3CoderToolParser(ToolParser):
         self.tool_call_regex = re.compile(
             r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL
         )
+        # Deliberately TOLERANT of an unterminated ``<function=`` running
+        # to end-of-string: a genuine call cut off by ``max_tokens``
+        # before ``</function>`` must still be recovered, and the
+        # streaming state machine relies on the same shape.
+        #
+        # What separates a call from prose about calls is NOT whether the
+        # span is closed — ``<function=read_file></function>`` is
+        # well-formed either way — but whether the caller declared that
+        # tool. See ``_declared_tool_names``; the membership check in
+        # ``extract_tool_calls`` is the gate.
         self.tool_call_function_regex = re.compile(
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
-        )
-        # Finalize-path counterpart: CLOSED spans only. The tolerant
-        # regex above accepts an unterminated ``<function=`` all the way
-        # to end-of-string, which is right while tokens are still
-        # arriving and wrong once generation has stopped — at that point
-        # "no closer" means "not a call".
-        #
-        # Mirrors the existing ``tool_call_complete_regex`` /
-        # ``tool_call_regex`` pair for the ``<tool_call>`` wrapper.
-        #
-        # Using the tolerant regex on the finalize path did not merely
-        # truncate content, it FABRICATED calls out of prose. Measured
-        # with ``request=None`` — no tools declared at all:
-        #   'Docs mention </tool_call> and <function=name> together.'
-        #   -> tools_called=True, tool_calls=[{'name': 'name',
-        #                                      'arguments': '{}'}]
-        #      content='Docs mention </tool_call> and '
-        # An agent receiving that tries to execute a tool called
-        # ``name`` and its loop breaks.
-        self.tool_call_function_complete_regex = re.compile(
-            r"<function=(.*?)</function>", re.DOTALL
         )
         self.tool_call_parameter_regex = re.compile(
             r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
@@ -355,10 +344,6 @@ class Qwen3CoderToolParser(ToolParser):
         }
 
     def _get_function_calls(self, model_output: str) -> list[str]:
-        """Candidate ``<function=...>...</function>`` spans, finalize path.
-
-        Only CLOSED spans count — see ``tool_call_function_complete_regex``.
-        """
         matched_ranges = self.tool_call_regex.findall(model_output)
         raw_tool_calls = [m[0] if m[0] else m[1] for m in matched_ranges]
         if not raw_tool_calls:
@@ -366,10 +351,33 @@ class Qwen3CoderToolParser(ToolParser):
 
         raw_function_calls = []
         for tc in raw_tool_calls:
-            raw_function_calls.extend(
-                self.tool_call_function_complete_regex.findall(tc)
-            )
-        return raw_function_calls
+            raw_function_calls.extend(self.tool_call_function_regex.findall(tc))
+        return [m[0] if m[0] else m[1] for m in raw_function_calls]
+
+    @staticmethod
+    def _declared_tool_names(tools) -> set[str]:
+        """Names the CALLER offered on this request.
+
+        The wire framing alone cannot tell a call from prose about calls:
+        ``<function=read_file></function>`` is a well-formed span whether
+        the model meant it or was documenting the protocol. What settles
+        it is whether the caller actually offered that tool — a name the
+        request never declared can never be executed, so promoting it to
+        a structured ``tool_call`` only breaks the agent loop.
+        """
+        names: set[str] = set()
+        for tool in tools or []:
+            fn = tool.get("function") if isinstance(tool, dict) else None
+            if fn is None and isinstance(tool, dict):
+                fn = tool
+            name = None
+            if isinstance(fn, dict):
+                name = fn.get("name")
+            elif fn is not None:
+                name = getattr(fn, "name", None)
+            if isinstance(name, str) and name:
+                names.add(name)
+        return names
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -390,11 +398,21 @@ class Qwen3CoderToolParser(ToolParser):
             if request and isinstance(request, dict):
                 tools = request.get("tools")
 
+            declared = self._declared_tool_names(tools)
+
             tool_calls = []
             for fc_str in function_calls:
                 tc = self._parse_xml_function_call(fc_str, tools)
-                if tc:
-                    tool_calls.append(tc)
+                if not tc:
+                    continue
+                if tc.get("name") not in declared:
+                    # Not something this request can execute — prose about
+                    # the protocol, or a hallucinated name. Dropping it
+                    # here is what keeps documentation from becoming a
+                    # bogus call; with no tools declared at all nothing
+                    # can match, so a plain chat turn never produces one.
+                    continue
+                tool_calls.append(tc)
 
             if not tool_calls:
                 # Every candidate span failed to parse into a call, so
