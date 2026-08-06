@@ -800,6 +800,211 @@ def test_the_nemotron_parser_gates_calls_too():
     assert [c["name"] for c in result.tool_calls] == [_NAME]
 
 
+def test_the_nemotron_gate_survives_streaming():
+    """The gate has to hold on the path agents actually use.
+
+    ``extract_tool_calls_streaming`` re-parses the accumulated text once the
+    close tag arrives, and that re-parse called ``extract_tool_calls`` with
+    no ``request`` — so the declared-name check above ran against ``None``
+    and admitted everything. The same bytes were correctly refused when the
+    caller buffered them, which is why the non-streaming test passed while
+    the hole stayed open.
+
+    ``request`` was already a parameter of the enclosing method and
+    ``service/postprocessor.py`` already passes it; only the forwarding was
+    missing. Mutation: drop the argument at that call and this fails with
+    ``['delete_everything']``.
+    """
+    parser = ToolParserManager.get_tool_parser("nemotron")(None)
+    hostile = _render_xml_body("delete_everything", _KEY, "x")
+
+    emitted: list[dict] = []
+    previous = ""
+    for i in range(len(hostile)):
+        current = hostile[: i + 1]
+        delta = parser.extract_tool_calls_streaming(
+            previous, current, hostile[i], request=_REQUEST
+        )
+        previous = current
+        emitted.extend((delta or {}).get("tool_calls") or [])
+
+    assert emitted == [], f"streaming admitted an undeclared call: {emitted}"
+
+
+def test_a_streamed_refusal_still_reaches_the_user_as_text():
+    """Refusing a call must not swallow the answer.
+
+    Non-streaming answers a refused block with ``content=model_output`` —
+    text the caller never authorised as a tool is still the model's reply.
+    Streaming had no equivalent: every delta of the block was withheld
+    (``None``), and the postprocessor drops its suppression buffer the moment
+    the parser "makes progress" on a closing tag. Its #1359 release is
+    byte-budget driven, so a short refused call never tripped it and the user
+    got an EMPTY response.
+
+    Mutation: delete the release branch and ``content`` comes back ``''``.
+    """
+    parser = ToolParserManager.get_tool_parser("nemotron")(None)
+    hostile = _render_xml_body("delete_everything", _KEY, "x")
+
+    content, previous = "", ""
+    for i in range(len(hostile)):
+        current = hostile[: i + 1]
+        delta = parser.extract_tool_calls_streaming(
+            previous, current, hostile[i], request=_REQUEST
+        )
+        previous = current
+        content += (delta or {}).get("content") or ""
+
+    assert "delete_everything" in content, (
+        f"the refused block vanished instead of reaching the user: {content!r}"
+    )
+    # Released once, not once per closing tag.
+    assert content.count("<function=delete_everything>") == 1, content
+
+
+def test_every_refused_block_reaches_the_user_and_none_twice():
+    """One release per BLOCK, not one per turn — and no duplication.
+
+    A boolean "already released" flag drops every refused block after the
+    first; a watermark that ignores the prose passed through between them
+    re-sends that prose. Both were live in earlier revisions of this fix.
+    """
+    parser = ToolParserManager.get_tool_parser("nemotron")(None)
+    first = _render_xml_body("delete_everything", _KEY, "x")
+    second = _render_xml_body("also_undeclared", _KEY, "y")
+    text = first + " BETWEEN " + second
+
+    content, previous = "", ""
+    for i in range(len(text)):
+        current = text[: i + 1]
+        delta = parser.extract_tool_calls_streaming(
+            previous, current, text[i], request=_REQUEST
+        )
+        previous = current
+        content += (delta or {}).get("content") or ""
+
+    assert content == text, (
+        "every byte of every refused block and the prose between them must "
+        f"reach the wire exactly once: {content!r}"
+    )
+
+
+def test_reset_clears_the_content_watermark():
+    """A reused instance must not carry a turn's watermark into the next.
+
+    ``reset()`` is the caller's contract; relying on the ``not previous_text``
+    branch alone is not enough, because the postprocessor can forward a new
+    turn's opening prose through its own fast path before this parser sees a
+    delta.
+    """
+    parser = ToolParserManager.get_tool_parser("nemotron")(None)
+    hostile = _render_xml_body("delete_everything", _KEY, "a much longer first turn")
+
+    def _turn(text):
+        out, previous = "", ""
+        for i in range(len(text)):
+            current = text[: i + 1]
+            delta = parser.extract_tool_calls_streaming(
+                previous, current, text[i], request=_REQUEST
+            )
+            previous = current
+            out += (delta or {}).get("content") or ""
+        return out
+
+    _turn(hostile)
+    parser.reset()
+    # Model the real fast path: the postprocessor already forwarded this
+    # prefix without invoking the parser, so the first post-reset parser call
+    # starts with non-empty previous_text.
+    prefix = "already visible: "
+    second = _render_xml_body("also_undeclared", _KEY, "x")
+    current = prefix + second
+    delta = parser.extract_tool_calls_streaming(
+        prefix, current, second, request=_REQUEST
+    )
+    content = (delta or {}).get("content") or ""
+    assert "also_undeclared" in content, "stale state swallowed the second turn"
+    assert "already visible" not in content, "the fast-path prefix was replayed"
+
+
+def test_refused_block_before_valid_call_in_one_delta_is_not_swallowed():
+    """A later valid call must not advance across earlier refused prose.
+
+    Streaming parsers receive tokenizer-sized deltas in production, including
+    a delta large enough to complete more than one block. The valid call still
+    executes, while the undeclared block retains non-streaming parity as text.
+    """
+    parser = ToolParserManager.get_tool_parser("nemotron")(None)
+    refused = _render_xml_body("delete_everything", _KEY, "x")
+    valid = _render_xml_body(_NAME, _KEY, "ok")
+    text = refused + valid
+
+    delta = parser.extract_tool_calls_streaming("", text, text, request=_REQUEST)
+
+    calls = (delta or {}).get("tool_calls") or []
+    assert [call["function"]["name"] for call in calls] == [_NAME]
+    content = (delta or {}).get("content") or ""
+    assert "delete_everything" in content, content
+    assert f"<function={_NAME}>" not in content, content
+
+
+def test_plain_less_than_after_call_is_not_mistaken_for_partial_markup():
+    """Ordinary same-delta prose containing ``<`` must survive stream end."""
+    parser = ToolParserManager.get_tool_parser("nemotron")(None)
+    valid = _render_xml_body(_NAME, _KEY, "ok")
+    text = valid + " Result: 2 < 3"
+
+    delta = parser.extract_tool_calls_streaming("", text, text, request=_REQUEST)
+
+    calls = (delta or {}).get("tool_calls") or []
+    assert [call["function"]["name"] for call in calls] == [_NAME]
+    assert (delta or {}).get("content") == " Result: 2 < 3"
+
+
+def test_disambiguated_partial_opener_releases_every_withheld_byte():
+    """A marker-like suffix that becomes prose must be released in full."""
+    parser = ToolParserManager.get_tool_parser("nemotron")(None)
+    valid = _render_xml_body(_NAME, _KEY, "ok")
+    parser.extract_tool_calls_streaming("", valid, valid, request=_REQUEST)
+
+    previous = valid
+    emitted = ""
+    for char in "<funx":
+        current = previous + char
+        delta = parser.extract_tool_calls_streaming(
+            previous, current, char, request=_REQUEST
+        )
+        previous = current
+        emitted += (delta or {}).get("content") or ""
+
+    assert emitted == "<funx"
+
+
+def test_wrapper_close_is_accounted_before_following_prose():
+    """A decorative close must not leak after an already-emitted call."""
+    parser = ToolParserManager.get_tool_parser("nemotron")(None)
+    function = (
+        f"<tool_call><function={_NAME}><parameter={_KEY}>ok</parameter></function>"
+    )
+    first = parser.extract_tool_calls_streaming(
+        "", function, function, request=_REQUEST
+    )
+    assert len((first or {}).get("tool_calls") or []) == 1
+
+    wrapped = function + "</tool_call>"
+    close = parser.extract_tool_calls_streaming(
+        function, wrapped, "</tool_call>", request=_REQUEST
+    )
+    assert not (close or {}).get("content")
+
+    complete = wrapped + " after"
+    prose = parser.extract_tool_calls_streaming(
+        wrapped, complete, " after", request=_REQUEST
+    )
+    assert (prose or {}).get("content") == " after"
+
+
 def test_gating_is_off_when_the_request_declares_no_tools():
     """A request with no tools keeps the position-only behaviour.
 

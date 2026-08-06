@@ -53,6 +53,17 @@ class NemotronToolParser(ToolParser):
 
     EXPECTED_WIRE_FORMATS = ("tool_call_xml_body",)
 
+    # How much of ``current_text`` this turn has already been accounted for on
+    # the wire — forwarded as prose, consumed into an emitted call, or released
+    # after a refusal. The refusal release below sends only what lies past it.
+    #
+    # A watermark rather than a "released once" boolean: a turn can hold more
+    # than one refused block, and a boolean drops every block after the first.
+    # Class-level default so an instance used without a preceding ``reset()``
+    # still has the attribute.
+    _content_upto = 0
+    _stream_started = False
+
     # Pattern for Nemotron-style with parameters.
     #
     # The load-bearing signature of a call is ``<function=NAME>...</function>``;
@@ -78,6 +89,117 @@ class NemotronToolParser(ToolParser):
         r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>",
         re.DOTALL,
     )
+
+    def reset(self) -> None:
+        """Clear per-request state.
+
+        The base reset owns the tool-id counters; the content watermark is
+        just as per-request. Relying on the ``not previous_text`` branch alone
+        is not enough — the postprocessor can forward a new turn's opening
+        prose through its own fast path before this parser sees a delta, so
+        the first call can arrive with ``previous_text`` already non-empty and
+        a stale watermark from the turn before.
+        """
+        super().reset()
+        self._content_upto = 0
+        self._stream_started = False
+
+    def _visible_content_between(
+        self,
+        text: str,
+        start: int,
+        end: int,
+        request: dict[str, Any] | None,
+    ) -> str:
+        """Project a raw range onto the non-tool content stream.
+
+        Valid function spans are executable calls and must stay off the content
+        channel. Refused spans are deliberately retained as prose. When at
+        least one valid call exists, the decorative outer wrappers are removed
+        too, matching :meth:`extract_tool_calls`.
+
+        Keeping source offsets here is important: a single model delta can
+        finish a refused block and a later valid call. A plain byte watermark
+        advanced for the valid call used to swallow the refused range.
+        """
+        if end <= start:
+            return ""
+
+        valid_spans = [
+            (span_start, span_end)
+            for _name, _body, span_start, span_end in split_marked_calls(
+                text,
+                r"<function=([^>]+)>",
+                "</function>",
+                valid_names=_declared_tool_names(request),
+            )
+        ]
+        removed = list(valid_spans)
+        if valid_spans:
+            removed.extend(
+                (match.start(), match.end())
+                for match in self.RESIDUAL_WRAPPER_PATTERN.finditer(text)
+            )
+        removed.sort()
+
+        parts: list[str] = []
+        cursor = start
+        removed_before = False
+        for span_start, span_end in removed:
+            if span_end <= start or span_start >= end:
+                continue
+            clipped_start = max(start, span_start)
+            clipped_end = min(end, span_end)
+            if cursor < clipped_start:
+                gap = text[cursor:clipped_start]
+                # Pretty-printed wire uses newlines between the decorative
+                # wrapper and function body. If both neighboring spans are
+                # removed, that formatting is markup too, not assistant text.
+                if not (removed_before and gap.isspace()):
+                    parts.append(gap)
+            cursor = max(cursor, clipped_end)
+            removed_before = True
+        if cursor < end:
+            parts.append(text[cursor:end])
+        return "".join(parts)
+
+    @staticmethod
+    def _pending_markup_index(text: str) -> int | None:
+        """Return where recognized complete/partial markup begins, if any.
+
+        A bare ``<`` in assistant prose (for example ``2 < 3``) is content,
+        not sufficient evidence of a tool-call opener. Only suppress a suffix
+        that is already a known marker or can still grow into one.
+        """
+        markers = ("<function=", "<tool_call>", "</function>", "</tool_call>")
+        candidates: list[int] = []
+        for marker in markers:
+            full = text.find(marker)
+            if full != -1:
+                candidates.append(full)
+            for prefix_len in range(1, len(marker)):
+                if text.endswith(marker[:prefix_len]):
+                    candidates.append(len(text) - prefix_len)
+        return min(candidates) if candidates else None
+
+    @staticmethod
+    def _safe_accounting_boundary(text: str) -> int:
+        """Return the raw offset safe to account after a close event.
+
+        Plain trailing text is safe through the end. If another markup opener
+        has started, stop at the latest complete close so its partial bytes can
+        still be released or parsed on a later delta.
+        """
+        latest_close = 0
+        for tag in ("</function>", "</tool_call>"):
+            idx = text.rfind(tag)
+            if idx != -1:
+                latest_close = max(latest_close, idx + len(tag))
+        if latest_close == 0:
+            return 0
+        tail = text[latest_close:]
+        pending = NemotronToolParser._pending_markup_index(tail)
+        return len(text) if pending is None else latest_close + pending
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -240,7 +362,8 @@ class NemotronToolParser(ToolParser):
             # No close tag yet → we are still inside the (first) call's markup.
             return None
         tail = current_text[end:]
-        return None if "<" in tail else tail
+        pending = NemotronToolParser._pending_markup_index(tail)
+        return None if pending is not None else tail
 
     def extract_tool_calls_streaming(
         self,
@@ -255,7 +378,19 @@ class NemotronToolParser(ToolParser):
         """
         Extract tool calls from streaming Nemotron model output.
         """
+        if not self._stream_started or not previous_text:
+            # The postprocessor's plain-text fast path can forward an opening
+            # prefix without invoking this parser. On the first parser call of
+            # a reset turn, that prefix is therefore already on the wire and
+            # ``previous_text`` is non-empty. Start the watermark there rather
+            # than replaying it. ``not previous_text`` also covers callers that
+            # reuse an instance without honoring reset().
+            self._content_upto = len(previous_text)
+            self._stream_started = True
         if "<tool_call>" not in current_text and "<function=" not in current_text:
+            # Ordinary prose, forwarded verbatim — already on the wire, so a
+            # later refusal must not send it again.
+            self._content_upto = len(current_text)
             return {"content": delta_text}
 
         # Trigger from the COMPLETION STATE of current_text, NOT from a close
@@ -279,14 +414,18 @@ class NemotronToolParser(ToolParser):
         # arrive in separate deltas (each bumps the count → one re-parse each,
         # but the second finds nothing new to emit).
         if self._close_tag_count(current_text) > self._close_tag_count(previous_text):
-            result = self.extract_tool_calls(current_text)
-            # Trailing assistant text that arrived in THIS SAME delta, after the
-            # close tag (e.g. the tokenizer emits "</function> done" as one
-            # chunk). It is new (everything past the just-closed tag) and, being
-            # content-safe per _clean_trailing_content, must not be dropped — we
-            # ride it out on the same delta via the combined content+tool_calls
-            # return the postprocessor already supports.
-            tail = self._clean_trailing_content(current_text)
+            # ``request`` matters here, not just to the non-streaming caller:
+            # ``extract_tool_calls`` derives its declared-name gate from it, so
+            # omitting it let a name the caller never offered through on the
+            # streaming path while the same text was correctly refused when
+            # buffered. Agents stream, so the gate was off where it counts.
+            result = self.extract_tool_calls(current_text, request)
+            safe_end = self._safe_accounting_boundary(current_text)
+            unsent_content = self._visible_content_between(
+                current_text, self._content_upto, safe_end, request
+            )
+            # The source-offset projection includes safe trailing assistant
+            # text from this same delta while excluding executable spans.
             if result.tools_called:
                 already_emitted = self.current_tool_id + 1
                 total = len(result.tool_calls)
@@ -307,14 +446,43 @@ class NemotronToolParser(ToolParser):
                             for i, tc in enumerate(new_calls)
                         ]
                     }
-                    if tail:
-                        out["content"] = tail
+                    if unsent_content:
+                        out["content"] = unsent_content
+                    # Account only through the latest complete/safe boundary.
+                    # A partial following opener still belongs to a future
+                    # block and must remain releasable.
+                    self._content_upto = safe_end
                     return out
+            elif safe_end > self._content_upto:
+                # The block CLOSED and is not a call — the declared-name gate
+                # refused it. Non-streaming answers that with
+                # ``content=model_output``: text the caller never authorised as
+                # a tool is still the model's answer and belongs on the wire.
+                #
+                # Streaming had no equivalent. Every delta of the block was
+                # withheld (``None``), and the postprocessor buffers those only
+                # until a closing tag arrives — at which point it drops the
+                # buffer unemitted (``_tool_suppressed_buffer = ""``) because
+                # the parser "made progress". Its #1359 release is byte-budget
+                # driven, so a short refused call never trips it and the user
+                # gets an EMPTY response instead of the prose.
+                #
+                # Returning the accumulated text hands the postprocessor the
+                # content it is about to discard, so nothing is duplicated.
+                # Once per turn: ``</function>`` and ``</tool_call>`` each bump
+                # the close count, and the second must not re-send it.
+                self._content_upto = safe_end
+                if unsent_content:
+                    return {"content": unsent_content}
             # Close tag but no NEW call to emit (e.g. the second of </function>
             # + </tool_call> for a call already streamed). Still surface any
             # trailing content that rode in on this delta.
-            if tail:
-                return {"content": tail}
+            if safe_end > self._content_upto:
+                # The projection is a view of the raw range after the watermark,
+                # so a refusal released above cannot be sent twice.
+                self._content_upto = safe_end
+                if unsent_content:
+                    return {"content": unsent_content}
             return None
 
         # No new call closed in this delta. If we are past all tool-call markup
@@ -323,9 +491,21 @@ class NemotronToolParser(ToolParser):
         # silently dropped. _clean_trailing_content being non-None guarantees no
         # partial or complete tag can leak, so we never emit "<function=",
         # "</function>", or a fragment like "</fun" as user-visible content. We
-        # emit only delta_text (the new chars), never the whole tail, so
-        # already-streamed trailing content is not re-sent.
+        # Emit only the source range after the watermark, so already-streamed
+        # trailing content is not re-sent while previously withheld partial
+        # opener bytes can be recovered when they become ordinary prose.
         if self._clean_trailing_content(current_text) is not None:
-            return {"content": delta_text}
+            # Release the whole unaccounted visible range, not only this delta.
+            # A prior suffix such as ``<fun`` may have been withheld while it
+            # could still become ``<function=``; once a later byte turns it
+            # into ordinary prose (``<funx``), those earlier bytes belong on
+            # the wire too.
+            # Everything after the watermark is already known to be outside
+            # completed tool spans on this no-new-close path. Slice directly
+            # instead of reparsing the full accumulated response for every
+            # prose delta (which would make long streams quadratic).
+            content = current_text[self._content_upto :]
+            self._content_upto = len(current_text)
+            return {"content": content} if content else None
 
         return None
