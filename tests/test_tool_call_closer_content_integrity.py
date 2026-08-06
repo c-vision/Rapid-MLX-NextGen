@@ -144,3 +144,103 @@ class TestAssistantMessageEnvelope:
 
         msg = AssistantMessage(content="answer<|im_end|>")
         assert msg.content == "answer"
+
+
+class TestAnthropicThinkingBlockStillStrips:
+    """The `thinking` block is the reasoning channel on /v1/messages.
+
+    Splitting the sanitizers left `_sanitize_reasoning_channel` calling
+    the now content-only `sanitize_output`, so a bare `</tool_call>`
+    started surviving into `thinking`. Caught in review; pinned here.
+    """
+
+    def test_thinking_block_strips_the_closer(self):
+        from vllm_mlx.api.anthropic_adapter import _thinking_block_content
+
+        assert _thinking_block_content("x</tool_call>y", "answer") == "xy"
+
+    def test_thinking_block_keeps_ordinary_prose(self):
+        from vllm_mlx.api.anthropic_adapter import _thinking_block_content
+
+        assert (
+            _thinking_block_content("weighing the options", "answer")
+            == "weighing the options"
+        )
+
+
+class TestStreamingSanitizerHelpersKeepTheCloser:
+    """The per-delta helpers, asserted on the CLOSER specifically.
+
+    The pre-existing #1508 branch only checks that the OPENER survives, so
+    routing streamed content back through the reasoning sanitizer would
+    still have passed there.
+
+    NOTE these exercise the HELPERS, not `routes/chat.py::_fast_sse_chunk`
+    itself — that closure is defined inside the streaming generator and is
+    not reachable from a unit test. Its dispatch is a one-line
+    `field == "reasoning_content"` branch; an HTTP-level streaming test
+    would be needed to pin it end to end.
+    """
+
+    def test_content_stream_helper_keeps_the_closer(self):
+        assert sanitize_content_for_stream(AGENT_LINE) == AGENT_LINE
+        # ...while the reasoning half of the same helper pair does strip.
+        assert "</tool_call>" not in sanitize_reasoning_for_stream(AGENT_LINE)
+
+    def test_content_delta_and_reasoning_delta_diverge(self):
+        """Both fields, one envelope — the dispatch must not collapse."""
+        delta = ChatCompletionChunkDelta(
+            content=AGENT_LINE, reasoning_content=AGENT_LINE
+        )
+        assert delta.content == AGENT_LINE
+        assert "</tool_call>" not in (delta.reasoning_content or "")
+
+
+class TestRescuePrefixBranchAlsoStrips:
+    """The length-cut rescue branch is the OTHER call site that moved.
+
+    Review MINOR, twice: my first attempt at this test passed neither
+    ``finish_reason="length"`` nor rescue-shaped content, so it ran the
+    ORDINARY path and would have stayed green with the rescue line
+    reverted. Reviewer mutated that line in memory and confirmed it.
+
+    Entering the branch needs all three at once:
+
+    * ``finish_reason == "length"``
+    * ``text`` that satisfies ``is_rescue_payload`` (the cutoff sentinel)
+    * a reasoning trace LONGER than ``RESCUE_TAIL_LENGTH``, so a
+      non-empty prefix survives the tail slice
+
+    The assertion below is on the PREFIX, so the closer under test must
+    sit in the first ``len(reasoning) - RESCUE_TAIL_LENGTH`` characters.
+    """
+
+    def test_length_cut_rescue_prefix_strips_the_closer(self):
+        from vllm_mlx.api.anthropic_adapter import _thinking_block_content
+        from vllm_mlx.api.constants import (
+            REASONING_CUTOFF_SENTINEL,
+            RESCUE_TAIL_LENGTH,
+        )
+
+        # Closer up front, then enough filler that the prefix survives
+        # the tail slice.
+        reasoning = "planning </tool_call> the next step. " + (
+            "x" * RESCUE_TAIL_LENGTH * 2
+        )
+        rescue_text = f"{REASONING_CUTOFF_SENTINEL}\n\nsome tail"
+
+        out = _thinking_block_content(reasoning, rescue_text, "length")
+
+        assert out, "expected a non-empty thinking prefix from the rescue branch"
+        assert "planning" in out, (
+            f"did not enter the rescue-prefix branch; got {out[:80]!r}"
+        )
+        assert "</tool_call>" not in out, (
+            f"closer leaked through the rescue prefix: {out[:120]!r}"
+        )
+
+    def test_ordinary_path_still_strips_the_closer(self):
+        """The non-rescue path, for contrast — both must hold."""
+        from vllm_mlx.api.anthropic_adapter import _thinking_block_content
+
+        assert _thinking_block_content("x</tool_call>y", "answer") == "xy"

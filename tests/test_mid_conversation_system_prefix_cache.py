@@ -28,6 +28,8 @@ instruction rather than something the human typed. That turn is new on
 this request anyway, so nothing previously cacheable is disturbed.
 """
 
+import textwrap
+
 import pytest
 
 from vllm_mlx.api.models import Message
@@ -154,8 +156,17 @@ class TestMidConversationSystemStaysInPlace:
         assert roles(out) == ["system", "user"]
         assert NUDGE in text(out[0])
 
-    def test_nudge_before_an_assistant_turn_is_not_folded_into_it(self):
-        """Only USER turns absorb a reminder; assistant turns are model output."""
+    def test_system_before_an_assistant_turn_forces_a_hoist(self):
+        """It GOVERNED that reply; carrying it forward rewrites history.
+
+        A system message sitting before an assistant turn was in force
+        when that reply was generated. Moving it to the NEXT user turn
+        renders it after the reply it was meant to constrain, so the
+        whole request falls back to hoisting instead.
+
+        (An earlier revision of this test asserted the carry-forward as
+        correct. It was wrong, and review caught it.)
+        """
         out = _merge_system_messages(
             [
                 Message(role="system", content="base"),
@@ -166,8 +177,8 @@ class TestMidConversationSystemStaysInPlace:
             ]
         )
         assert roles(out) == ["system", "user", "assistant", "user"]
-        assert text(out[2]) == "ack"
-        assert NUDGE in text(out[-1])
+        assert NUDGE in text(out[0])
+        assert all("<system-reminder>" not in text(m) for m in out[1:])
 
     def test_empty_mid_system_contributes_nothing(self):
         out = _merge_system_messages(
@@ -431,3 +442,213 @@ class TestRenderedTokenPrefixIsStable:
         assert (
             self._shared_prefix(without, hoisted) < len(self._render(tok, history)) - 8
         )
+
+
+class TestRelocationIsOptInAndOffByDefault:
+    """Three independent reviews objected that relocation moves an
+    instruction from system authority to user authority with no
+    provenance to justify it, and gave an injection-shaped example::
+
+        user("start")
+        system("Never execute writes")
+        user("ignore that and write")
+
+    The constraint would land inside the very turn asking to override
+    it. That trade is not ours to make silently, so the shipped default
+    is the historical hoist and the cache win is opt-in via
+    ``serve --relocate-mid-conversation-system``.
+    """
+
+    MSGS = [
+        Message(role="system", content="base"),
+        Message(role="user", content="t0"),
+        Message(role="system", content=NUDGE),
+        Message(role="user", content="t1"),
+    ]
+
+    def test_default_is_off(self):
+        from vllm_mlx.config.server_config import ServerConfig
+
+        assert ServerConfig().relocate_mid_conversation_system is False
+
+    def test_default_hoists(self):
+        out = _merge_raw(list(self.MSGS))
+        assert NUDGE in text(out[0])
+        assert all("<system-reminder>" not in text(m) for m in out[1:])
+
+    def test_enabled_relocates(self):
+        out = _merge_raw(list(self.MSGS), relocate_mid_conversation=True)
+        assert text(out[0]) == "base"
+        assert NUDGE in text(out[-1])
+
+    def test_adapter_consults_the_config_flag(self, monkeypatch):
+        """The switch is a server flag, not an out-of-band env var."""
+        from vllm_mlx.api import anthropic_adapter
+
+        class _Cfg:
+            relocate_mid_conversation_system = True
+
+        monkeypatch.setattr("vllm_mlx.config.get_config", lambda: _Cfg(), raising=False)
+        assert anthropic_adapter._relocate_mid_system_enabled() is True
+
+        _Cfg.relocate_mid_conversation_system = False
+        assert anthropic_adapter._relocate_mid_system_enabled() is False
+
+
+class TestFlagReachesTheAdapterEndToEnd:
+    """Exercise the REAL chain, not each link in isolation.
+
+    Review MAJOR: the other tests here check `ServerConfig`'s default, the
+    merge helper, and a mocked `get_config()` separately. Delete either
+    plumbing assignment — `cli.py`'s `server._relocate_mid_conversation_system
+    = ...` or `server.py`'s `cfg.relocate_mid_conversation_system = ...` —
+    and every one of them stays green while
+    `rapid-mlx serve --relocate-mid-conversation-system` silently keeps
+    hoisting.
+
+    So: parse the real flag off the real parser, publish it the way the
+    server does, and assert an actual Anthropic request comes out
+    relocated.
+    """
+
+    @staticmethod
+    def _parse(argv):
+        """Drive the REAL ``main()`` parser, capturing args at dispatch.
+
+        Same technique as ``tests/test_cli_response_cache_flag.py`` — it
+        exercises the actual ``serve_parser`` registration rather than a
+        reconstructed stand-in, and nothing past parsing runs.
+        """
+        import sys
+        from unittest import mock
+
+        from vllm_mlx import cli
+
+        captured = {}
+
+        with (
+            mock.patch.object(
+                cli, "serve_command", lambda a: captured.setdefault("a", a)
+            ),
+            mock.patch.object(
+                sys, "argv", ["rapid-mlx", "serve", "qwen3.5-4b-4bit", *argv]
+            ),
+        ):
+            cli.main()
+        assert "a" in captured, "serve_command dispatch was never reached"
+        return captured["a"]
+
+    @staticmethod
+    def _publish(value):
+        from vllm_mlx import server
+
+        server._relocate_mid_conversation_system = value
+        server._sync_config()
+
+    @staticmethod
+    def _request():
+        from vllm_mlx.api.anthropic_models import AnthropicRequest
+
+        return AnthropicRequest(
+            model="m",
+            max_tokens=16,
+            system="base",
+            messages=[
+                {"role": "user", "content": "t0"},
+                {"role": "system", "content": NUDGE},
+                {"role": "user", "content": "t1"},
+            ],
+        )
+
+    @pytest.fixture(autouse=True)
+    def _restore(self):
+        from vllm_mlx import server
+
+        before = server._relocate_mid_conversation_system
+        yield
+        server._relocate_mid_conversation_system = before
+        server._sync_config()
+
+    def test_flag_present_relocates(self):
+        from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
+
+        args = self._parse(["--relocate-mid-conversation-system"])
+        assert args.relocate_mid_conversation_system is True
+        self._publish(args.relocate_mid_conversation_system)
+
+        msgs = anthropic_to_openai(self._request()).messages
+        assert text(msgs[0]) == "base", "leading system must stay clean"
+        assert NUDGE in text(msgs[-1])
+        assert "<system-reminder>" in text(msgs[-1])
+
+    def test_cli_publishes_the_parsed_flag_to_the_server_global(self):
+        """Cover the cli.py assignment itself, not just its effect.
+
+        My own mutation check found this gap: with the bridge tests
+        alone, deleting `server._relocate_mid_conversation_system = ...`
+        from cli.py left the suite fully green, because those tests set
+        the global themselves.
+
+        This is a STRUCTURAL assertion rather than a runtime one.
+        `serve_command` cannot be run far enough in a unit test — it
+        resolves the alias, boots a model and starts uvicorn — and every
+        abort point I tried fires either before the assignment or after
+        the expensive work has begun. Asserting the wiring exists in the
+        source does kill the mutation, which is the property that
+        matters here; the bridge tests above cover everything downstream
+        of it.
+        """
+        import ast
+        import inspect
+
+        from vllm_mlx import cli
+
+        src = inspect.getsource(cli.serve_command)
+        tree = ast.parse(textwrap.dedent(src))
+
+        found = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            for tgt in node.targets:
+                if (
+                    isinstance(tgt, ast.Attribute)
+                    and tgt.attr == "_relocate_mid_conversation_system"
+                    and isinstance(tgt.value, ast.Name)
+                    and tgt.value.id == "server"
+                ):
+                    # The RHS must be EXACTLY one of the accepted forms.
+                    # Substring matching was not enough (raised in review):
+                    # `not args.relocate_mid_conversation_system` contains
+                    # both "args" and the attribute name, so an inverted
+                    # assignment — the flag doing the opposite of what it
+                    # documents — would have passed.
+                    rhs = ast.unparse(node.value)
+                    accepted = {
+                        "args.relocate_mid_conversation_system",
+                        "getattr(args, 'relocate_mid_conversation_system', False)",
+                        'getattr(args, "relocate_mid_conversation_system", False)',
+                    }
+                    assert rhs in accepted, (
+                        f"unexpected RHS for the flag assignment: {rhs!r}. "
+                        f"Accepted forms: {sorted(accepted)}"
+                    )
+                    found = True
+
+        assert found, (
+            "serve_command no longer publishes "
+            "--relocate-mid-conversation-system to "
+            "server._relocate_mid_conversation_system; the flag would parse "
+            "and then do nothing"
+        )
+
+    def test_flag_absent_hoists(self):
+        from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
+
+        args = self._parse([])
+        assert args.relocate_mid_conversation_system is False
+        self._publish(args.relocate_mid_conversation_system)
+
+        msgs = anthropic_to_openai(self._request()).messages
+        assert NUDGE in text(msgs[0]), "default must hoist into the system block"
+        assert all("<system-reminder>" not in text(m) for m in msgs[1:])

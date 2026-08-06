@@ -11,6 +11,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+# A real runtime import, deliberately. It used to drag the whole engine in
+# — ``vllm_mlx.engine`` eagerly imported ``engine_core``, which does
+# ``import mlx.core`` at module scope — so naming ``BaseEngine`` here made
+# ``vllm_mlx.config`` unimportable anywhere MLX is absent, and a wire
+# adapter that consults ``get_config()`` died on Linux CI.
+#
+# The fix is in ``vllm_mlx/engine/__init__.py``, which now imports only the
+# stdlib-pure ``base`` eagerly and defers the MLX-dependent members to PEP
+# 562. Hiding this behind ``TYPE_CHECKING`` instead would have left
+# ``typing.get_type_hints(ServerConfig)`` unable to resolve the name, and a
+# runtime stand-in would have made it answer with the wrong type; keeping
+# the import real and cheap is correct for the runtime and the type checker
+# at once.
 from ..engine.base import BaseEngine
 
 
@@ -172,6 +185,12 @@ class ServerConfig:
     no_thinking: bool = False
     pin_system_prompt: bool = False
     pinned_system_prompt_hash: str | None = None
+
+    # Keep a mid-conversation ``role="system"`` message at its original
+    # position (folded into the following user turn) instead of hoisting
+    # it into the leading system block. OFF by default — see
+    # ``anthropic_adapter._relocate_mid_system_enabled`` for the trade.
+    relocate_mid_conversation_system: bool = False
 
     # --- Audio lane (task #292) ---
     # Operator opt-in for ``/v1/audio/*`` routes on a TEXT-only server.
