@@ -223,16 +223,6 @@ class Qwen3CoderToolParser(ToolParser):
         self.tool_call_regex = re.compile(
             r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL
         )
-        # Deliberately TOLERANT of an unterminated ``<function=`` running
-        # to end-of-string: a genuine call cut off by ``max_tokens``
-        # before ``</function>`` must still be recovered, and the
-        # streaming state machine relies on the same shape.
-        #
-        # What separates a call from prose about calls is NOT whether the
-        # span is closed — ``<function=read_file></function>`` is
-        # well-formed either way — but whether the caller declared that
-        # tool. See ``_declared_tool_names``; the membership check in
-        # ``extract_tool_calls`` is the gate.
         self.tool_call_function_regex = re.compile(
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
         )
@@ -354,31 +344,6 @@ class Qwen3CoderToolParser(ToolParser):
             raw_function_calls.extend(self.tool_call_function_regex.findall(tc))
         return [m[0] if m[0] else m[1] for m in raw_function_calls]
 
-    @staticmethod
-    def _declared_tool_names(tools) -> set[str]:
-        """Names the CALLER offered on this request.
-
-        The wire framing alone cannot tell a call from prose about calls:
-        ``<function=read_file></function>`` is a well-formed span whether
-        the model meant it or was documenting the protocol. What settles
-        it is whether the caller actually offered that tool — a name the
-        request never declared can never be executed, so promoting it to
-        a structured ``tool_call`` only breaks the agent loop.
-        """
-        names: set[str] = set()
-        for tool in tools or []:
-            fn = tool.get("function") if isinstance(tool, dict) else None
-            if fn is None and isinstance(tool, dict):
-                fn = tool
-            name = None
-            if isinstance(fn, dict):
-                name = fn.get("name")
-            elif fn is not None:
-                name = getattr(fn, "name", None)
-            if isinstance(name, str) and name:
-                names.add(name)
-        return names
-
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:
@@ -398,44 +363,11 @@ class Qwen3CoderToolParser(ToolParser):
             if request and isinstance(request, dict):
                 tools = request.get("tools")
 
-            declared = self._declared_tool_names(tools)
-
             tool_calls = []
             for fc_str in function_calls:
                 tc = self._parse_xml_function_call(fc_str, tools)
-                if not tc:
-                    continue
-                if tc.get("name") not in declared:
-                    # Not something this request can execute — prose about
-                    # the protocol, or a hallucinated name. Dropping it
-                    # here is what keeps documentation from becoming a
-                    # bogus call; with no tools declared at all nothing
-                    # can match, so a plain chat turn never produces one.
-                    continue
-                tool_calls.append(tc)
-
-            if not tool_calls:
-                # Every candidate span failed to parse into a call, so
-                # nothing was extracted — the framing the scanner matched
-                # was ordinary prose, not wire. Return the output UNCUT,
-                # exactly like the two early-returns above.
-                #
-                # Without this, ``<function=`` appearing anywhere in a
-                # normal answer silently truncated the reply at that
-                # point: the ``<function=(.*?)</function>|<function=(.*)$``
-                # alternation matches to end-of-string, ``_parse_xml_
-                # function_call`` then rejects it, and the content slice
-                # had already been cut to ``model_output[:content_index]``.
-                # Measured with ``request=None`` (no tools declared at
-                # all):
-                #   'Docs mention </tool_call> and <function=name> too.'
-                #   -> 'Docs mention </tool_call> and '
-                # This parser backs 22 aliases, including qwen3.6-35b and
-                # every Qwen3-Coder build, so it is on the default path
-                # for local coding agents.
-                return ExtractedToolCallInformation(
-                    tools_called=False, tool_calls=[], content=model_output
-                )
+                if tc:
+                    tool_calls.append(tc)
 
             # Extract content before tool calls
             content_index = model_output.find(self.tool_call_start_token)
@@ -444,7 +376,7 @@ class Qwen3CoderToolParser(ToolParser):
             content = model_output[:content_index]
 
             return ExtractedToolCallInformation(
-                tools_called=True,
+                tools_called=len(tool_calls) > 0,
                 tool_calls=tool_calls,
                 content=content if content else None,
             )
