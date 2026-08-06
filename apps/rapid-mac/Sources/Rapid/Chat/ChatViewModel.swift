@@ -46,6 +46,31 @@ final class ChatViewModel {
     /// inject a real URLSession or thread a mock through both layers.
     private var client: ChatStreamClient
 
+    /// Tool runner. An ``EmptyToolRegistry`` short-circuits the tool-call
+    /// request shape (we send no ``tools:`` field and the server emits plain
+    /// content), which is what unit tests and the no-tools build get.
+    let tools: any ToolRegistry
+
+    /// Hard cap on tool-call rounds within a single user turn — stops a
+    /// runaway model that just keeps asking for the same tool.
+    private let maxToolRounds: Int = 10
+
+    /// Per-tool on/off flags, persisted in ``UserDefaults`` under keys of the
+    /// form ``rapid.tools.enabled.<name>``. Reads fall through to ``true``
+    /// (every tool is enabled by default) so a fresh install picks up tools we
+    /// ship without the user opting in. ``enabledDefinitions`` filters disabled
+    /// tools out before they reach the model, and the loop also gates dispatch
+    /// so a model that invents a disabled name gets a clean refusal instead.
+    private(set) var disabledTools: Set<String>
+
+    /// ``UserDefaults`` suite the tool flags live in. Injectable so tests can
+    /// use a fresh in-memory suite per case.
+    private let toolDefaults: UserDefaults
+
+    private static func toolEnabledKey(_ name: String) -> String {
+        "rapid.tools.enabled.\(name)"
+    }
+
     /// Set while a stream is in flight. UI reads this to show the stop
     /// button instead of send.
     private(set) var isStreaming: Bool = false {
@@ -103,19 +128,53 @@ final class ChatViewModel {
 
     init(
         client: ChatStreamClient = ChatStreamClient(),
+        tools: any ToolRegistry = EmptyToolRegistry(),
+        toolDefaults: UserDefaults = .standard,
         sampling: SamplingConfig? = nil,
         server: ServerManager? = nil,
         persistsConversations: Bool = true,
         conversationStoreURL: URL? = nil
     ) {
         self.client = client
+        self.tools = tools
+        self.toolDefaults = toolDefaults
         self.sampling = sampling
         self.server = server
         self.persistsConversations = persistsConversations
         self.conversationStoreURL = conversationStoreURL
+        // Seed disabledTools from the persistent store. Anything explicitly set
+        // to ``false`` in UserDefaults goes in; unknown keys default to enabled.
+        var disabled = Set<String>()
+        for def in tools.definitions {
+            // ``object(forKey:)`` so we can distinguish "absent" (default to
+            // enabled) from "explicitly false".
+            if let raw = toolDefaults.object(forKey: Self.toolEnabledKey(def.function.name)) as? Bool,
+               raw == false {
+                disabled.insert(def.function.name)
+            }
+        }
+        self.disabledTools = disabled
         self.conversations = persistsConversations
             ? ConversationStore.load(from: conversationStoreURL)
             : []
+    }
+
+    /// Toggle a tool from the UI. Persists to ``UserDefaults`` so the choice
+    /// survives an app restart.
+    func setToolEnabled(_ name: String, _ enabled: Bool) {
+        toolDefaults.set(enabled, forKey: Self.toolEnabledKey(name))
+        if enabled {
+            disabledTools.remove(name)
+        } else {
+            disabledTools.insert(name)
+        }
+    }
+
+    /// Active tool definitions — the registry minus anything the user has
+    /// toggled off. Computed every send so a mid-session toggle takes effect on
+    /// the next turn without re-initialising the chat loop.
+    var enabledDefinitions: [ToolDefinition] {
+        tools.definitions.filter { !disabledTools.contains($0.function.name) }
     }
 
     // MARK: - Conversation history (M3)
@@ -337,9 +396,9 @@ final class ChatViewModel {
                 client.baseURL = ChatStreamClient.loopbackURL(port: server.activePort)
             }
 
-            await self.runSingleStream(
+            await self.runToolLoop(
                 alias: alias,
-                placeholderIndex: placeholderIndex,
+                initialPlaceholder: placeholderIndex,
                 epoch: epoch
             )
         }
@@ -904,18 +963,25 @@ final class ChatViewModel {
         regenerateLast(alias: trimmed)
     }
 
-    // MARK: - Single-stream driver
+    // MARK: - Tool round-trip loop
 
-    /// Stream one assistant turn into the placeholder at
-    /// ``placeholderIndex``. The minimal menu-bar app is a plain
-    /// streaming chat — no tools, no tool-call round-trip — so a single
-    /// stream is the whole turn. The KEEP-path wire hygiene is preserved:
-    /// empty-prose and forward-incompatible ``.unknown`` rows are stripped
-    /// from the wire body, and the transcript is silently context-window
-    /// trimmed (ChatGPT / Claude desktop behaviour).
-    private func runSingleStream(
+    /// Drive one user turn to completion.
+    ///
+    /// Each iteration streams one assistant turn into the placeholder at
+    /// ``currentPlaceholder``. When the model finishes with
+    /// ``finish_reason: "tool_calls"`` we run the referenced tools, append the
+    /// results as ``role: "tool"`` rows, open a fresh assistant placeholder,
+    /// and loop. Any other finish reason (or a transport failure, or Stop)
+    /// ends the turn. Bounded by ``maxToolRounds`` so a misbehaving model
+    /// can't pin the loop forever.
+    ///
+    /// The KEEP-path wire hygiene is preserved on every round: empty-prose
+    /// and forward-incompatible ``.unknown`` rows are stripped from the wire
+    /// body, and the transcript is silently context-window trimmed (ChatGPT /
+    /// Claude desktop behaviour).
+    private func runToolLoop(
         alias: String,
-        placeholderIndex: Int,
+        initialPlaceholder: Int,
         epoch: Int
     ) async {
         defer {
@@ -927,64 +993,280 @@ final class ChatViewModel {
                 inflight = nil
             }
         }
-        // History for this request: everything BEFORE the streaming
-        // placeholder. The placeholder itself is excluded because the
-        // assistant hasn't said anything yet.
-        var history = Array(messages.prefix(placeholderIndex))
-        // v0.4.35: strip empty-prose assistant turns from the wire body.
-        // The UI still shows them — this is wire-only — but sending
-        // ``{"role":"assistant","content":""}`` into a chat template is a
-        // documented foot-gun (several templates treat an empty assistant
-        // slot as "the model already finished" and immediately EOS).
-        history = ChatViewModel.filterEmptyAssistantsForWire(history)
-        // Issue #477: drop any forward-incompatible ``.unknown``-role rows
-        // so a serialised ``{"role":"unknown"}`` never 400s the send.
-        history = ChatViewModel.filterUnknownRolesForWire(history)
-        // v0.5.1: outgoing ``model:`` is the alias the server is ACTUALLY
-        // serving right now, falling back to the caller-supplied alias
-        // until the server reports ``.ready``.
-        let wireAlias = server?.servingAlias ?? alias
-        // v0.5.11 / issue #363: silent context-window trim against the
-        // engine-reported window (captured on the last profile fetch),
-        // falling back to the per-family heuristic in ``ModelInfoCatalog``.
-        let ctxWindow = ModelInfoCatalog
-            .info(
-                for: wireAlias,
-                hfRepo: nil,
-                serverContextWindow: sampling?.activeContextWindow
+        var currentPlaceholder = initialPlaceholder
+        var roundsLeft = maxToolRounds
+        while roundsLeft > 0 {
+            roundsLeft -= 1
+            // History for this request: everything BEFORE the streaming
+            // placeholder. The placeholder itself is excluded because the
+            // assistant hasn't said anything yet.
+            var history = Array(messages.prefix(currentPlaceholder))
+            // v0.4.35: strip empty-prose assistant turns from the wire body.
+            // The UI still shows them — this is wire-only — but sending
+            // ``{"role":"assistant","content":""}`` into a chat template is a
+            // documented foot-gun (several templates treat an empty assistant
+            // slot as "the model already finished" and immediately EOS).
+            // Tool-call assistants (empty prose but ``tool_calls`` populated)
+            // stay — they're load-bearing for the tool loop.
+            history = ChatViewModel.filterEmptyAssistantsForWire(history)
+            // Issue #477: drop any forward-incompatible ``.unknown``-role rows
+            // so a serialised ``{"role":"unknown"}`` never 400s the send.
+            history = ChatViewModel.filterUnknownRolesForWire(history)
+            // v0.5.1: outgoing ``model:`` is the alias the server is ACTUALLY
+            // serving right now, falling back to the caller-supplied alias
+            // until the server reports ``.ready``. Resolved BEFORE the tool
+            // definitions so the broken-tool-caller strip runs against the
+            // model that will actually answer this round.
+            let wireAlias = server?.servingAlias ?? alias
+            let definitions = ChatViewModel.wireDefinitions(
+                forAlias: wireAlias,
+                enabled: enabledDefinitions
             )
-            .contextWindow
-        history = ChatViewModel.trimMessagesForContextWindow(
-            history,
-            contextWindow: ctxWindow
-        )
-        let request: ChatStreamClient.Request
-        if let s = sampling {
-            let resolved = s.resolved(toolsEnabled: false)
-            request = ChatStreamClient.Request(
-                alias: wireAlias,
-                messages: history,
-                temperature: resolved.temperature,
-                topP: resolved.topP,
-                maxTokens: resolved.maxTokens,
-                repetitionPenalty: resolved.repetitionPenalty,
-                enableThinking: resolved.enableThinking
+            let allowedToolNames = Set(definitions.map { $0.function.name })
+            let knownToolNames = Set(tools.definitions.map { $0.function.name })
+            // Ambient anti-confabulation guidance, prepended for the wire body
+            // only (never appended to the transcript) so the user's history
+            // stays prose-only. Skipped when the transcript already opens with
+            // a system row, and when no tools are advertised.
+            history.insert(
+                contentsOf: ChatViewModel.ambientSystemMessages(
+                    historyOpensWithSystem: history.first?.role == .system,
+                    toolsAdvertised: !definitions.isEmpty
+                ),
+                at: 0
             )
-        } else {
-            request = ChatStreamClient.Request(
-                alias: wireAlias,
-                messages: history,
-                enableThinking: false
+            // v0.5.11 / issue #363: silent context-window trim against the
+            // engine-reported window (captured on the last profile fetch),
+            // falling back to the per-family heuristic in ``ModelInfoCatalog``.
+            let ctxWindow = ModelInfoCatalog
+                .info(
+                    for: wireAlias,
+                    hfRepo: nil,
+                    serverContextWindow: sampling?.activeContextWindow
+                )
+                .contextWindow
+            history = ChatViewModel.trimMessagesForContextWindow(
+                history,
+                contextWindow: ctxWindow
             )
+            let request: ChatStreamClient.Request
+            if let s = sampling {
+                let resolved = s.resolved(toolsEnabled: !definitions.isEmpty)
+                request = ChatStreamClient.Request(
+                    alias: wireAlias,
+                    messages: history,
+                    temperature: resolved.temperature,
+                    topP: resolved.topP,
+                    maxTokens: resolved.maxTokens,
+                    repetitionPenalty: resolved.repetitionPenalty,
+                    tools: definitions.isEmpty ? nil : definitions,
+                    enableThinking: resolved.enableThinking
+                )
+            } else {
+                request = ChatStreamClient.Request(
+                    alias: wireAlias,
+                    messages: history,
+                    tools: definitions.isEmpty ? nil : definitions,
+                    enableThinking: false
+                )
+            }
+            let outcome = await runOneStream(
+                placeholderIndex: currentPlaceholder,
+                request: request,
+                epoch: epoch
+            )
+            switch outcome {
+            case .terminal:
+                return
+            case .toolCallsPending(let calls):
+                // The user can press Stop in the gap between the stream
+                // returning .toolCallsPending and the loop below dispatching
+                // the first tool. Honour cancellation here, and after each
+                // tool, clearing the staged tool_calls on the assistant row so
+                // the next wire body doesn't ship a half-finished tool round
+                // with no matching results (most chat templates 400 on that).
+                if Task.isCancelled {
+                    finaliseCancelledPlaceholder(at: currentPlaceholder, epoch: epoch)
+                    return
+                }
+                // On the last allowed round, executing the requested tools is
+                // wasted work — there is no follow-up round left to consume
+                // the results. Bail before the side-effects fire.
+                if roundsLeft == 0 {
+                    failWithToolRoundCap(at: currentPlaceholder, epoch: epoch)
+                    return
+                }
+                // Run each tool sequentially. Parallel execution via TaskGroup
+                // trips Swift 6's region-based isolation analyzer on
+                // @MainActor protocols; the tools here are network calls the
+                // model rarely emits more than two of at once.
+                var results: [ToolCallResult] = []
+                for call in calls {
+                    if Task.isCancelled {
+                        finaliseCancelledPlaceholder(at: currentPlaceholder, epoch: epoch)
+                        return
+                    }
+                    // Refuse rather than dispatch when the tool was not
+                    // advertised this round — a malformed model can emit a
+                    // tool_call for a tool we never offered, and ``tools.run``
+                    // would happily execute it. The refusal goes back as an
+                    // error result so the model can recover in prose.
+                    if let refusal = ChatViewModel.toolRefusalMessage(
+                        name: call.function.name,
+                        allowed: allowedToolNames,
+                        known: knownToolNames
+                    ) {
+                        results.append(ToolCallResult(
+                            toolCallID: call.id,
+                            content: refusal,
+                            isError: true,
+                            failureKind: .toolFailed
+                        ))
+                        continue
+                    }
+                    let r = await tools.run(call)
+                    results.append(r)
+                    // A Stop pressed AFTER the tool resolved but BEFORE we
+                    // append the result rows must still win. Exit BEFORE the
+                    // append so the placeholder gets the standard cancel
+                    // finalisation instead of a dangling tool_calls row.
+                    if Task.isCancelled {
+                        finaliseCancelledPlaceholder(at: currentPlaceholder, epoch: epoch)
+                        return
+                    }
+                }
+                guard epoch == conversationEpoch else { return }
+                // Append role:"tool" messages for each result.
+                for r in results {
+                    let failureKind = r.failureKind ?? FailureDiagnoser.toolFailureKind(
+                        toolName: calls.first(where: { $0.id == r.toolCallID })?.function.name ?? "",
+                        content: r.content,
+                        isError: r.isError
+                    )
+                    let msg = ChatMessage(
+                        role: .tool,
+                        content: r.content,
+                        status: (r.isError || failureKind != nil) ? .failed : .complete,
+                        errorMessage: failureKind.map { FailureDiagnoser.diagnosis(for: $0).message },
+                        failureKind: failureKind,
+                        toolCallID: r.toolCallID
+                    )
+                    _ = appendMessage(msg)
+                }
+                // Open the next assistant placeholder and loop.
+                currentPlaceholder = appendMessage(ChatMessage(role: .assistant, status: .streaming))
+            }
         }
-        _ = await runOneStream(
-            placeholderIndex: placeholderIndex,
-            request: request,
-            epoch: epoch
-        )
     }
 
-    // MARK: - Legacy tool round-trip loop (removed)
+    /// Finalise the streaming placeholder through the shared cancel contract.
+    /// Used by the tool loop's several cancellation checkpoints.
+    private func finaliseCancelledPlaceholder(at index: Int, epoch: Int) {
+        guard epoch == conversationEpoch else { return }
+        guard var stale = currentMessage(index: index) else { return }
+        ChatViewModel.finaliseCancellation(message: &stale)
+        updateMessage(at: index, with: stale)
+    }
+
+    /// The model kept asking for tools until ``maxToolRounds`` ran out. Surface
+    /// it as a failed row + banner rather than leaving the user staring at a
+    /// half-finished transcript.
+    private func failWithToolRoundCap(at index: Int, epoch: Int) {
+        guard epoch == conversationEpoch else { return }
+        let message = ChatViewModel.toolRoundCapMessage(cap: maxToolRounds)
+        if var capped = currentMessage(index: index) {
+            capped.status = .failed
+            capped.failureKind = .toolFailed
+            capped.errorMessage = message
+            capped.toolCalls = nil
+            updateMessage(at: index, with: capped)
+        }
+        lastFailureKind = .toolFailed
+        lastError = message
+    }
+
+    /// Copy for the round-cap failure. Static so a test can pin it without
+    /// driving a full loop.
+    static func toolRoundCapMessage(cap: Int) -> String {
+        "The model kept calling tools without answering (\(cap) rounds). Try rephrasing, or turn a tool off."
+    }
+
+    /// Wire-side filter — what actually ends up in the request body's ``tools``
+    /// array. When ``alias`` is marked broken in ``ToolUseCapability``, returns
+    /// ``[]`` so the model never sees tools it has been empirically proven to
+    /// silently ignore or schema-leak. Static + pure so the strip can be
+    /// pinned without spinning up a ``ChatViewModel``.
+    nonisolated static func wireDefinitions(
+        forAlias alias: String,
+        enabled: [ToolDefinition]
+    ) -> [ToolDefinition] {
+        if ToolUseCapability.shouldDisableToolsChip(alias: alias) {
+            return []
+        }
+        return enabled
+    }
+
+    /// Decide whether a model-emitted tool call should be REFUSED (never
+    /// dispatched to ``tools.run``) rather than executed, and with what
+    /// model-facing explainer. Returns nil when the call is allowed to run.
+    ///
+    /// Omitting a tool from the request body does NOT stop a malformed model
+    /// emitting a call for it, so this is the load-bearing gate — not the
+    /// wire filter. Refusing (rather than hard-discarding) lets the model
+    /// answer in prose on the next round; the round cap backstops a model that
+    /// keeps trying.
+    nonisolated static func toolRefusalMessage(
+        name: String,
+        allowed: Set<String>,
+        known: Set<String>
+    ) -> String? {
+        // Only a tool advertised (and enabled) THIS round may run. Everything
+        // else is refused before dispatch — a disabled-but-shipped tool and a
+        // name the model invented outright both get a recoverable prose nudge
+        // rather than reaching ``tools.run``.
+        if allowed.contains(name) { return nil }
+        if known.contains(name) {
+            return "tool '\(name)' isn't available in this conversation — answer directly, or ask the user to enable it in Settings."
+        }
+        let list = allowed.sorted().joined(separator: ", ")
+        return "unknown tool '\(name)'\(list.isEmpty ? "" : " — available: \(list)"). Answer directly instead."
+    }
+
+    /// Ambient anti-confabulation guidance — prepended to the wire body
+    /// whenever at least one tool is advertised.
+    ///
+    /// Small models routinely fire a tool, get faithful snippets back, then
+    /// fabricate the rest of the list from training-data priors. The preamble
+    /// is the cheapest mitigation and costs nothing when no tool is offered.
+    /// Returns an empty array when the transcript already opens with a
+    /// ``role: "system"`` row so we never ship competing system messages.
+    static func ambientSystemMessages(
+        historyOpensWithSystem: Bool,
+        toolsAdvertised: Bool
+    ) -> [ChatMessage] {
+        guard !historyOpensWithSystem, toolsAdvertised else { return [] }
+        return [ChatMessage(role: .system, content: toolGuidancePreamble, status: .complete)]
+    }
+
+    static let toolGuidancePreamble: String = """
+You have access to tools that fetch real-time information. When you use one of these tools, follow these rules — they OVERRIDE your training data:
+
+1. Your ONLY source of truth for this turn is the tool result text. If a fact is not in the tool result, you DO NOT KNOW IT for the purposes of this answer. Your training data on this topic is OUT OF DATE and MUST NOT be used.
+
+2. NEVER enumerate a list (teams, products, countries, dates, scores, names) from memory. If the user asks for a list and the tool result does NOT name the specific items, say so plainly. Do not produce any items from training data.
+
+3. Forbidden phrases — they always signal you are reaching past the snippet: "based on common knowledge", "as is widely reported", "the following are typically considered", "generally speaking".
+
+4. If only one or two items appear in the tool result, list ONLY those — do not extrapolate the rest of the bracket / list / table. State explicitly that this is partial coverage.
+
+5. When the user's question is ambiguous about which subject the tool result covers, ask a clarifying question before answering.
+
+6. If you find yourself wanting to write a long enumerated list, STOP. The tool result likely doesn't contain that list. Issue another tool call with a more specific query instead.
+
+These rules apply to every tool, not just web search.
+"""
+
+    // MARK: - Single-stream driver
 
     /// Outcome of one streamed assistant turn.
     private enum StreamOutcome {

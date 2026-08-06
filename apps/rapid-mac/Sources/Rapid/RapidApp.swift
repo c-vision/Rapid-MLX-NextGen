@@ -51,6 +51,11 @@ struct RapidApp: App {
     @State private var dockPromptStore: DockVisibilityPromptStore
     /// View → Keep Window on Top toggle (session state, not persisted).
     @State private var keepWindowOnTop: Bool = false
+    /// Web-search backend + API key, shared by the tool runner and Settings.
+    @State private var webSearch: WebSearchConfig
+    /// Per-fetch approval gate for the ``browse`` tool, shared by the tool
+    /// runner (which suspends on it) and the SwiftUI approval sheet.
+    @State private var browseApproval: BrowseApprovalStore
 
     /// AppKit delegate — installs the menu-bar tray + tears down the
     /// subprocess before the process image dies.
@@ -96,7 +101,18 @@ struct RapidApp: App {
         // Apply the persisted theme override before the first window
         // renders so the user doesn't see a flash of the wrong mode.
         appearanceConfig.apply()
-        let chat = ChatViewModel(sampling: samplingConfig, server: manager)
+        // Built-in tools. The registry owns the two stores the tools consult
+        // at dispatch time, and the app re-publishes them into the environment
+        // so Settings + the approval sheet bind to the same instances.
+        let webSearchConfig = WebSearchConfig()
+        let browseApprovalStore = BrowseApprovalStore()
+        let toolRegistry = BuiltinToolRegistry(
+            browseApproval: browseApprovalStore,
+            webSearch: webSearchConfig
+        )
+        _webSearch = State(initialValue: webSearchConfig)
+        _browseApproval = State(initialValue: browseApprovalStore)
+        let chat = ChatViewModel(tools: toolRegistry, sampling: samplingConfig, server: manager)
         let updateChecker = UpdateChecker()
         let installerInstance = Installer()
         let downloadsInstance = DownloadManager(binaryPath: manager.binaryPath)
@@ -144,6 +160,8 @@ struct RapidApp: App {
                 .environment(installTracker)
                 .environment(quickstart)
                 .environment(dockPromptStore)
+                .environment(webSearch)
+                .environment(browseApproval)
                 .task {
                     // DEV-ONLY: render real screens to PNG when
                     // RAPID_DEV_SNAPSHOT_DIR is set, then quit. Inert
@@ -252,6 +270,8 @@ struct RapidApp: App {
                 .environment(updater)
                 .environment(installer)
                 .environment(dockPromptStore)
+                .environment(webSearch)
+                .environment(browseApproval)
         }
         .windowResizability(.contentMinSize)
         .defaultSize(width: 900, height: 720)

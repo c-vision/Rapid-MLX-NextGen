@@ -291,41 +291,69 @@ struct ChatView: View {
     /// ``ScrollView`` content to zero height).
     @ViewBuilder
     var transcriptRows: some View {
+        // Tool results are rendered INSIDE the assistant row that dispatched
+        // them (as an expandable chip), never as standalone transcript rows —
+        // a raw JSON blob in the scroll reads as debug output.
+        let toolResults = ChatView.toolResultsByCallID(messages)
         LazyVStack(alignment: .leading, spacing: RapidTheme.Space.lg) {
             ForEach(messages) { message in
-                MessageRow(
-                    message: message,
-                    isStreaming: viewModel.isStreaming,
-                    onEdit: { newContent in
-                        // Edit and Retry re-enter ``send`` inside the view
-                        // model, so they answer to the same readiness gate
-                        // the composer does. Without this, a message action
-                        // could kick off a turn the Send button is refusing
-                        // to allow one row below.
-                        guard acknowledgeIfNotReady() else { return false }
-                        return viewModel.editUserMessage(
-                            id: message.id,
-                            newContent: newContent,
-                            alias: alias
-                        )
-                    },
-                    onRetry: {
-                        guard acknowledgeIfNotReady() else { return false }
-                        return viewModel.retryAssistantMessage(
-                            id: message.id,
-                            alias: alias
-                        )
-                    }
-                )
-                .frame(maxWidth: contentMaxWidth, alignment: .leading)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .id(message.id)
+                if message.role != .tool {
+                    MessageRow(
+                        message: message,
+                        isStreaming: viewModel.isStreaming,
+                        toolResults: toolResults,
+                        onEdit: { newContent in
+                            // Edit and Retry re-enter ``send`` inside the view
+                            // model, so they answer to the same readiness gate
+                            // the composer does. Without this, a message action
+                            // could kick off a turn the Send button is refusing
+                            // to allow one row below.
+                            guard acknowledgeIfNotReady() else { return false }
+                            return viewModel.editUserMessage(
+                                id: message.id,
+                                newContent: newContent,
+                                alias: alias
+                            )
+                        },
+                        onRetry: {
+                            guard acknowledgeIfNotReady() else { return false }
+                            return viewModel.retryAssistantMessage(
+                                id: message.id,
+                                alias: alias
+                            )
+                        },
+                        // Retry re-enters ``send``, so it answers to the same
+                        // lifecycle gate — and must LOOK like it does. It used
+                        // to render at full weight in every state and then do
+                        // nothing at all when the model wasn't running: the
+                        // gate fired, the banner flashed 400pt away at the
+                        // bottom of the window, and the button the user
+                        // actually pressed gave no feedback whatsoever. It now
+                        // dims and carries the Send tooltip's sentence, which
+                        // is the pattern ``sendOrStopButton`` already uses.
+                        retryEnabled: readiness.sendAllowed,
+                        retryTooltip: readiness.sendTooltip
+                    )
+                    .frame(maxWidth: contentMaxWidth, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .id(message.id)
+                }
             }
             Color.clear
                 .frame(height: 1)
         }
         .padding(.horizontal, RapidTheme.Space.xl)
         .padding(.vertical, RapidTheme.Space.xl)
+    }
+
+    /// Index every ``role: .tool`` row by the ``toolCallID`` it answers, so an
+    /// assistant row can pair each of its ``toolCalls`` with its result.
+    static func toolResultsByCallID(_ messages: [ChatMessage]) -> [String: ChatMessage] {
+        var out: [String: ChatMessage] = [:]
+        for m in messages where m.role == .tool {
+            if let id = m.toolCallID { out[id] = m }
+        }
+        return out
     }
 
     private var emptyState: some View {
@@ -622,8 +650,18 @@ struct ChatView: View {
 private struct MessageRow: View {
     let message: ChatMessage
     let isStreaming: Bool
+    /// Tool-result rows keyed by the ``ToolCall.id`` they answer. Used to
+    /// pair each dispatched call with its outcome inside this row.
+    var toolResults: [String: ChatMessage] = [:]
     var onEdit: (String) -> Bool = { _ in false }
     var onRetry: () -> Bool = { false }
+    /// Whether Retry can actually start a turn right now. Mirrors the
+    /// composer's Send gate so a dead button is never shown at full
+    /// weight — see the call site in ``ChatView.transcriptRows``.
+    var retryEnabled: Bool = true
+    /// The one sentence explaining a disabled Retry. Same string the
+    /// Send button uses, so both channels say the same thing.
+    var retryTooltip: String = "Retry response"
 
     @State private var reasoningExpanded: Bool = false
     @State private var isEditing: Bool = false
@@ -766,11 +804,35 @@ private struct MessageRow: View {
             if !message.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 reasoningDisclosure
             }
-            if !message.content.isEmpty {
+            if message.toolCallArtifactSuppressed {
+                // The model tried to call a tool and the parser couldn't read
+                // the request. Show the quiet explainer instead of dumping the
+                // raw envelope syntax at the user.
+                Text(ChatMessage.toolCallArtifactSuppressedCaptionCopy)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else if !message.content.isEmpty {
                 LaTeXMarkdownView(content: message.content)
                     .textSelection(.enabled)
+            } else if let caption = toolDispatchCaption {
+                Text(caption)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             } else if showTypingIndicator {
                 typingIndicator
+            }
+            if let calls = message.toolCalls, !calls.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(calls) { call in
+                        ToolCallChip(call: call, result: toolResults[call.id])
+                    }
+                }
+            }
+            if message.toolNotCalledFlagged {
+                Text(ChatMessage.toolNotCalledCaptionCopy)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(ChatMessage.toolNotCalledCaptionAccessibilityLabel)
             }
             if message.status == .failed {
                 failureCaption
@@ -789,9 +851,24 @@ private struct MessageRow: View {
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
-            assistantActions
+            if showsAssistantActions {
+                assistantActions
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// "Calling web_search…" filler for the window between a tool_calls
+    /// envelope landing with no preamble prose and the result coming back.
+    /// Clears itself once every dispatched call has a result — the chips then
+    /// tell the whole story.
+    private var toolDispatchCaption: String? {
+        ChatMessage.toolDispatchPlaceholderCaption(
+            content: message.content,
+            reasoning: message.reasoning,
+            toolCalls: message.toolCalls,
+            settledToolCallIDs: Set(toolResults.keys)
+        )
     }
 
     private var assistantActions: some View {
@@ -800,12 +877,36 @@ private struct MessageRow: View {
             QuietIconButton(
                 symbol: "arrow.clockwise",
                 label: "Retry response",
+                help: retryEnabled ? "Retry response" : retryTooltip,
                 size: RapidTheme.ControlHeight.mini
             ) {
                 _ = onRetry()
             }
-            .disabled(isStreaming)
+            .disabled(isStreaming || !retryEnabled)
+            .accessibilityHint(retryEnabled ? "" : retryTooltip)
         }
+    }
+
+    /// Whether this assistant row is a finished ANSWER the user can copy
+    /// or regenerate — as opposed to a mid-turn tool dispatch.
+    ///
+    /// A tool round-trip writes two assistant rows into the transcript:
+    /// the one that requested the tool (prose empty, ``toolCalls``
+    /// populated, and the chips rendered under it), then the one that
+    /// reads the results and actually answers. Rendering the action row
+    /// under BOTH put a stray copy/retry pair between the weather chip
+    /// and the sentence it produced — pointing at nothing the user
+    /// thinks of as a response, since the visible answer is the row
+    /// below. Copy would have yielded the empty string, and Retry would
+    /// have rewound the same user turn the second row's Retry already
+    /// covers.
+    ///
+    /// Keyed on the tool-dispatch shape rather than "is the last row" so
+    /// it holds for every round of a multi-round turn, and for a row
+    /// still streaming its follow-up prose.
+    private var showsAssistantActions: Bool {
+        guard let calls = message.toolCalls, !calls.isEmpty else { return true }
+        return !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var assistantCopyText: String {
@@ -878,6 +979,123 @@ private struct MessageRow: View {
             .font(.footnote)
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .center)
+    }
+}
+
+/// One dispatched tool call, with its arguments and (once it lands) its
+/// result behind a disclosure. Expanded while the tool is still running so
+/// the user sees what is happening; auto-collapses on success so a long
+/// transcript stays skimmable, and stays expanded on failure because the
+/// error detail is the useful part.
+private struct ToolCallChip: View {
+    let call: ToolCall
+    let result: ChatMessage?
+
+    /// Manual override. Tracks the user's last toggle so a click always wins
+    /// over the auto-collapse-on-success rule; without it, expanding a
+    /// completed chip would be silently re-collapsed on the next body pass.
+    @State private var userToggled: Bool = false
+    @State private var manualExpanded: Bool = false
+
+    private var expanded: Bool {
+        if userToggled { return manualExpanded }
+        guard let result else { return true }
+        return result.status == .failed
+    }
+
+    /// Pretty-printed if the model emitted real JSON, sanitised raw string if
+    /// not — smaller models occasionally drop unparseable junk in here.
+    private var prettyArguments: String {
+        let raw = call.function.arguments
+        guard !raw.isEmpty else { return "(no arguments)" }
+        guard let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data),
+              let pretty = try? JSONSerialization.data(
+                withJSONObject: obj,
+                options: [.prettyPrinted, .sortedKeys]
+              ),
+              let str = String(data: pretty, encoding: .utf8) else {
+            return ChatTextSanitizer.sanitizeForDisplay(raw)
+        }
+        return ChatTextSanitizer.sanitizeForDisplay(str)
+    }
+
+    /// A failed result renders its stable diagnosis, never the raw tool
+    /// payload — that stays in the model's context, not on screen.
+    private var resultBody: String? {
+        guard let result else { return nil }
+        if result.status == .failed {
+            return result.toolFailureDiagnosis(toolName: call.function.name).message
+        }
+        return ChatTextSanitizer.sanitizeForDisplay(result.content)
+    }
+
+    private var statusIcon: String {
+        guard let result else { return "ellipsis.circle" }
+        return result.status == .failed ? "exclamationmark.octagon.fill" : "checkmark.circle.fill"
+    }
+
+    private var statusColor: Color {
+        guard let result else { return .secondary }
+        return result.status == .failed ? RapidTheme.statusError : .green
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                userToggled = true
+                manualExpanded = !expanded
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "wrench.and.screwdriver.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(RapidTheme.brand)
+                    Text(ChatTextSanitizer.sanitizeForDisplay(call.function.name))
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    Spacer(minLength: 0)
+                    Image(systemName: statusIcon)
+                        .font(.system(size: 11))
+                        .foregroundStyle(statusColor)
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.vertical, 6)
+                .padding(.horizontal, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Tool call \(call.function.name)")
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 6) {
+                    Divider()
+                    Text(prettyArguments)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if let body = resultBody {
+                        Divider()
+                        Text(body)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(result?.status == .failed ? RapidTheme.statusError : .secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: RapidTheme.Radius.input, style: .continuous)
+                .fill(RapidTheme.surfaceRaised)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: RapidTheme.Radius.input, style: .continuous)
+                .strokeBorder(RapidTheme.hairline, lineWidth: 1)
+        )
     }
 }
 

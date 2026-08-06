@@ -18,6 +18,7 @@ struct ContentView: View {
     @Environment(SamplingConfig.self) private var sampling
     @Environment(UpdateChecker.self) private var updater
     @Environment(QuickstartCoordinator.self) private var quickstart
+    @Environment(BrowseApprovalStore.self) private var browseApproval
 
     @State private var alias: String = ""
     /// Which detail surface the sidebar shows (chat vs the Launch page).
@@ -251,6 +252,10 @@ struct ContentView: View {
         .sheet(isPresented: quickstartSheetPresented) {
             quickstartSheet
         }
+        // Per-fetch approval for the ``browse`` tool. Skipped entirely when
+        // the user has turned on auto-approve in Settings (resolved before a
+        // request is ever published), so it only appears on a real prompt.
+        .modifier(BrowseApprovalDialog(store: browseApproval))
         .task { await runLaunchAutoStart() }
         // Keyed exactly as the picker's own catalog task: re-fetch when
         // the engine binary appears and whenever the set of models on
@@ -783,6 +788,79 @@ struct ContentView: View {
         case .ready, .starting, .idle, .stopped, .crashed:
             return .chat
         }
+    }
+}
+
+/// Approval dialog for the ``browse`` tool: present while a request is
+/// pending, deny on external dismiss (Esc / click-outside) so a suspended
+/// tool can never hang waiting on a sheet the user has closed. There is no
+/// per-URL "always allow" — URLs vary each call; unattended users flip
+/// **Auto-approve browsing** in Settings → Tools.
+private struct BrowseApprovalDialog: ViewModifier {
+    let store: BrowseApprovalStore
+
+    func body(content: Content) -> some View {
+        content.sheet(isPresented: Binding(
+            get: { store.pendingRequest != nil },
+            set: { if !$0 && store.pendingRequest != nil { store.answer(.deny) } }
+        )) {
+            if let req = store.pendingRequest {
+                BrowseApprovalSheet(request: req, store: store)
+            }
+        }
+    }
+}
+
+/// URL approval sheet for ``browse``. The complete URL is shown display-safe
+/// (so a model can't hide the real destination behind bidi / zero-width
+/// scalars past the one-line preview) and the host is called out so the user
+/// judges *where* the request goes. It is only a read-only GET whose body
+/// returns to the model — but the model picks the URL, so approving the exact
+/// destination is what stops silent exfiltration to an attacker-controlled
+/// host.
+private struct BrowseApprovalSheet: View {
+    let request: BrowseApprovalStore.PendingApproval
+    let store: BrowseApprovalStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Fetch this web page?")
+                .font(.headline)
+            Text("The model wants to fetch content from:")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            Text(BrowseApprovalStore.displaySafe(request.host))
+                .font(.system(.body, design: .monospaced).weight(.semibold))
+                .textSelection(.enabled)
+
+            ScrollView {
+                Text(BrowseApprovalStore.displaySafe(request.fullURL))
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+            }
+            .frame(minHeight: 44, maxHeight: 140)
+            .background(Color(nsColor: .textBackgroundColor))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(.quaternary))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            Text("The page's text is sent back to the model. Only http/https "
+                + "public addresses are allowed — private and local addresses are blocked.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                Button("Don't allow") { store.answer(.deny) }
+                    .keyboardShortcut(.cancelAction)
+                Button("Allow once") { store.answer(.allowOnce) }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
     }
 }
 

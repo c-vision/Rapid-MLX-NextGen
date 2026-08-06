@@ -68,6 +68,9 @@ struct SettingsView: View {
         /// Issue #210 — file-manager-style cache inspector (what's on
         /// disk, what to delete or download).
         case modelManagement
+        /// Built-in tools the model can call: on/off per tool, the
+        /// web-search backend + key, and the browse approval mode.
+        case tools
         case appearance
         case privacy
         /// Rapid-MLX Desktop app updates. The .app self-update is the
@@ -79,6 +82,7 @@ struct SettingsView: View {
             switch self {
             case .models: return "Models"
             case .modelManagement: return "Model Management"
+            case .tools: return "Tools"
             case .appearance: return "Appearance"
             case .privacy: return "Privacy"
             case .app: return "App"
@@ -88,6 +92,7 @@ struct SettingsView: View {
             switch self {
             case .models: return "cylinder.split.1x2.fill"
             case .modelManagement: return "externaldrive.fill"
+            case .tools: return "wrench.and.screwdriver.fill"
             case .appearance: return "paintpalette.fill"
             case .privacy: return "lock.shield.fill"
             case .app: return "app.badge.fill"
@@ -321,6 +326,8 @@ struct SettingsView: View {
             SettingsModelsPanel()
         case .modelManagement:
             SettingsModelManagementPanel()
+        case .tools:
+            SettingsToolsPanel()
         case .appearance:
             appearancePanel
         case .privacy:
