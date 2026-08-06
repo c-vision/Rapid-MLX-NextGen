@@ -549,6 +549,26 @@ def responses_to_openai(
     )
 
 
+def _to_text(value):
+    """Coerce a ``Message.content`` of any supported shape to plain text.
+
+    Defensive coercion: today every system message reaches the callers
+    with string content (``_message_item_to_chat`` joins structured
+    content parts), but a future path or a hand-crafted
+    ``ChatCompletionRequest`` mutation could leave a list / dict there,
+    and ``"\\n\\n".join([list, list])`` would raise ``TypeError``.
+    """
+    if isinstance(value, str):
+        return value
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(exclude_none=True)
+    if isinstance(value, dict):
+        return value.get("text") or ""
+    if isinstance(value, list):
+        return "\n".join(_to_text(v) for v in value)
+    return ""
+
+
 def _merge_system_messages(messages: list[Message]) -> list[Message]:
     """Collapse all system messages into one at index 0.
 
@@ -569,17 +589,6 @@ def _merge_system_messages(messages: list[Message]) -> list[Message]:
     found`` mid-conversion.
     """
 
-    def _to_text(value):
-        if isinstance(value, str):
-            return value
-        if hasattr(value, "model_dump"):
-            value = value.model_dump(exclude_none=True)
-        if isinstance(value, dict):
-            return value.get("text") or ""
-        if isinstance(value, list):
-            return "\n".join(_to_text(v) for v in value)
-        return ""
-
     # Branch on role presence, not on whether the merged text is truthy.
     # An empty / unsupported-shape `developer` item still appears as a
     # system-role message after `_message_item_to_chat`, so leaving the
@@ -589,6 +598,18 @@ def _merge_system_messages(messages: list[Message]) -> list[Message]:
     has_system = any(m.role == "system" for m in messages)
     if not has_system:
         return messages
+
+    # Index of the first non-system message. Everything at or before it is
+    # "leading" and keeps the historical treatment; anything after it is a
+    # MID-CONVERSATION system message and is handled below.
+    first_body = next(
+        (i for i, m in enumerate(messages) if m.role != "system"), len(messages)
+    )
+    only_leading = not any(m.role == "system" for m in messages[first_body:])
+
+    if not only_leading:
+        messages = _relocate_mid_conversation_systems(messages, first_body)
+
     system_texts = [
         t for t in (_to_text(m.content) for m in messages if m.role == "system") if t
     ]
@@ -600,6 +621,79 @@ def _merge_system_messages(messages: list[Message]) -> list[Message]:
         return non_system
     merged = Message(role="system", content="\n\n".join(system_texts))
     return [merged] + non_system
+
+
+#: Wrapper for a relocated mid-conversation system message. Claude Code uses
+#: this exact tag for the reminders it injects into user turns upstream, so
+#: models already read it as "an instruction, not something the human typed".
+_MID_SYSTEM_OPEN = "<system-reminder>"
+_MID_SYSTEM_CLOSE = "</system-reminder>"
+
+
+def _relocate_mid_conversation_systems(
+    messages: list[Message], first_body: int
+) -> list[Message]:
+    """Fold mid-conversation system messages into the NEXT user turn.
+
+    Hoisting them into the leading system block (the historical
+    behaviour) destroys the prefix cache. Measured on qwen3.6-35b, three
+    renderings differing only in WHERE one nudge sits::
+
+        A  no nudge                  input_tokens = 775
+        B  nudge mid-array           input_tokens = 803
+        C  nudge appended to system  input_tokens = 803   <- B == C
+
+    B and C render identically, i.e. the mid-array message really was
+    hoisted to the front. The front of the prompt therefore GROWS every
+    time one arrives and everything behind it shifts, so the cache is
+    invalidated at the system/first-user boundary. Measured cost: a warm
+    prefix of 760 reused tokens dropped to 0 after a single injected
+    system message, and stayed at 0 for every subsequent turn.
+
+    This is not a rare shape. Claude Code injects a ``role: "system"``
+    message into ``messages`` routinely — the "task tools haven't been
+    used recently" nudge, the "date has changed" notice, and entering or
+    leaving plan mode — always at the END of the array, right before the
+    new user turn. Every one of those was a full re-prefill.
+
+    Folding into the FOLLOWING user turn keeps the text at its true
+    position, so everything before it is byte-identical to the previous
+    request and stays cached. The trailing user turn is new on this
+    request anyway, so nothing that was cacheable is disturbed.
+
+    Falls back to the historical hoist when there is no following user
+    turn (nothing to fold into) — better an extra leading system block
+    than silently dropping an instruction.
+    """
+    out: list[Message] = list(messages[:first_body])
+    pending: list[str] = []
+
+    for msg in messages[first_body:]:
+        if msg.role == "system":
+            text = _to_text(msg.content)
+            if text:
+                pending.append(text)
+            continue
+        if pending and msg.role == "user":
+            reminder = "\n".join(
+                f"{_MID_SYSTEM_OPEN}\n{t}\n{_MID_SYSTEM_CLOSE}" for t in pending
+            )
+            body = _to_text(msg.content)
+            out.append(
+                Message(
+                    role="user", content=f"{reminder}\n\n{body}" if body else reminder
+                )
+            )
+            pending = []
+            continue
+        out.append(msg)
+
+    # No user turn followed the trailing nudges — keep them as system
+    # messages so the caller's merge still hoists them rather than
+    # dropping the instruction on the floor.
+    for text in pending:
+        out.append(Message(role="system", content=text))
+    return out
 
 
 def openai_to_responses(
