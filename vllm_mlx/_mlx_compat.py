@@ -131,3 +131,103 @@ def install() -> None:
     mx.new_thread_local_stream = patched_new_thread_local_stream
     mx._rapid_mlx_compat_installed = True
     logger.debug("MLX compat shim installed (#404 M5 single-stream guard).")
+
+
+def install_batch_slot_guard() -> None:
+    """Stop mlx-lm writing ``None`` into a batch's ``logits_processors``.
+
+    Separate from ``install()`` and separately idempotent: that shim must
+    run BEFORE ``mlx_lm.generate`` is imported (it patches a symbol that
+    module captures at import time), whereas this one patches a class
+    inside it and therefore must run AFTER. Callers import
+    ``mlx_lm.generate`` and then call this.
+
+    ``PromptProcessingBatch.extend`` normalizes "this batch has no logits
+    processors" to ``None`` slots::
+
+        if not any(self.logits_processors):
+            self.logits_processors = [None] * len(self.uids)
+        logits_processors = (
+            batch.logits_processors
+            if any(batch.logits_processors)
+            else [None] * len(batch.uids)
+        )
+
+    ``any()`` is a whole-list question but the slots are per-sequence, so
+    merging a no-processor batch into one that HAS a processor yields
+    ``[None, None, [proc]]``. From then on ``any(...)`` is True, so
+    ``filter`` keeps every slot verbatim and ``GenerationBatch._step``
+    reaches ``for processor in self.logits_processors[e]`` on a ``None``::
+
+        TypeError: 'NoneType' object is not iterable
+
+    which kills the engine loop and 503s every in-flight request. Only the
+    MIXED batch is affected — all-empty takes the ``else`` branch and
+    becomes ``[[]] * n``, all-present is iterable throughout. That is
+    exactly "plain chat concurrent with a tool call", i.e. every agent we
+    support, and it needs a split/merge to reshuffle the batch, which is
+    why it is intermittent: 3 of 5 consecutive stress runs on main.
+
+    ``[]`` is the correct normalization at both sites — it keeps ``any()``
+    False for the all-empty case, so the fast path still skips the whole
+    processing loop, and it stays iterable when mixed. We wrap rather than
+    reimplement ``extend`` so upstream stays authoritative for everything
+    else it does; we only clean up after it.
+
+    Upstream tracking: rapid-mlx #1525. Remove when a released mlx-lm
+    writes ``[]`` instead of ``None``.
+    """
+    try:
+        # ``import_module``, NOT ``from mlx_lm import generate``: mlx_lm's
+        # package namespace binds a top-level ``generate()`` FUNCTION that
+        # shadows the submodule of the same name, so the ``from`` form
+        # hands back a callable and every attribute lookup below silently
+        # misses.
+        from importlib import import_module
+
+        _generate = import_module("mlx_lm.generate")
+    except ImportError as exc:
+        # "mlx_lm isn't here" is the expected case off Apple Silicon and
+        # stays quiet. "mlx_lm is here but importing it blew up on one of
+        # its dependencies" is a broken install that would otherwise leave
+        # the guard silently disabled in production (raised in review).
+        missing = getattr(exc, "name", None) or ""
+        if missing == "mlx_lm" or missing.startswith("mlx_lm.") or missing == "mlx":
+            return  # Linux CI / no MLX
+        logger.warning(
+            "rapid-mlx compat: could not import mlx_lm.generate (%s) — the "
+            "#1525 logits_processors slot guard is NOT installed. Mixed "
+            "chat+tool-call traffic may 503. Check the mlx-lm install.",
+            exc,
+        )
+        return
+
+    batch_cls = getattr(_generate, "PromptProcessingBatch", None)
+    original = getattr(batch_cls, "extend", None)
+    if original is None:
+        # Renamed or restructured upstream. A shim that silently patches
+        # the wrong thing is worse than one that declines — but declining
+        # quietly is how a crash-prevention guard disappears across an
+        # unattended dependency bump, so say so (raised in review).
+        logger.warning(
+            "rapid-mlx compat: mlx_lm.generate has no "
+            "PromptProcessingBatch.extend to guard (mlx-lm %s) — the #1525 "
+            "slot guard is NOT installed. Either upstream fixed it (then "
+            "drop this shim) or it moved (then retarget it).",
+            getattr(import_module("mlx_lm"), "__version__", "unknown"),
+        )
+        return
+    if getattr(batch_cls, "_rapid_mlx_slot_guard", False):
+        return
+
+    def extend(self, batch):
+        original(self, batch)
+        slots = getattr(self, "logits_processors", None)
+        if slots is not None and any(slot is None for slot in slots):
+            self.logits_processors = [[] if s is None else s for s in slots]
+
+    extend.__doc__ = original.__doc__
+    extend.__name__ = original.__name__
+    batch_cls.extend = extend
+    batch_cls._rapid_mlx_slot_guard = True
+    logger.debug("MLX compat shim installed (#1525 logits_processors slot guard).")
