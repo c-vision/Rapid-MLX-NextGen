@@ -197,7 +197,15 @@ struct ContentView: View {
         .alert(
             server.pendingMemoryWarning?.title ?? "",
             isPresented: Binding(
-                get: { server.pendingMemoryWarning != nil },
+                // #1503: when the Quickstart sheet is up it renders its OWN
+                // in-sheet copy of this decision (this alert is anchored on
+                // the parent, behind the full-window sheet, and cannot
+                // present over it). Suppress here so we don't double-present
+                // on macOS builds where an alert DOES stack above a sheet —
+                // gated on the exact predicate QuickstartView presents on.
+                get: {
+                    server.pendingMemoryWarning != nil && !memoryWarningHandledByQuickstart
+                },
                 // SwiftUI writes `false` here AFTER a button action runs.
                 // Both buttons already resolved the decision and cleared
                 // `pendingMemoryWarning`, so an unconditional cancel would
@@ -334,6 +342,21 @@ struct ContentView: View {
         case .idle, .ready:
             return false
         }
+    }
+
+    /// True when the Quickstart sheet is up AND owns the pending
+    /// memory-warning decision (#1503) — it renders its own in-sheet copy,
+    /// so this parent-anchored (and sheet-covered) alert must stand down to
+    /// avoid a double presentation. Keyed on the exact predicate
+    /// ``QuickstartView`` presents on, so the two surfaces can never
+    /// disagree about who owns the decision.
+    private var memoryWarningHandledByQuickstart: Bool {
+        quickstartVisible
+            && QuickstartView.memoryWarningToPresent(
+                phase: quickstart.phase,
+                pending: server.pendingMemoryWarning,
+                selectionAlias: quickstart.selection.alias
+            ) != nil
     }
 
     /// Alias the server is actively serving, or ``nil`` if no live state.
