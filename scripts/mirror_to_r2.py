@@ -156,6 +156,92 @@ def _hf_files(repo_id: str) -> list[FileMeta]:
     return files
 
 
+# Files that live at the repo root and belong with EVERY quantisation
+# subfolder. A subfolder holds weights and tokenizer; provenance and terms
+# sit at the top level, and a mirror that drops them hands users a copy of
+# the weights with no statement of what they may do with them.
+#
+# Matched by STEM, case-insensitively, so a repo shipping ``NOTICE.md``,
+# ``LICENSE-MODEL`` or ``license.txt`` keeps its terms too. An exact-name
+# set silently dropped those while still reporting a successful mirror,
+# which is the worst possible way to get redistribution wrong (review
+# MINOR).
+_ROOT_KEEP_STEMS = ("license", "notice", "readme", "copying")
+
+
+def _is_root_keep(relpath: str) -> bool:
+    """True for a repo-root file that ships with every quantisation."""
+    lowered = relpath.lower()
+    return any(
+        lowered == stem
+        or lowered.startswith(stem + ".")
+        or lowered.startswith(stem + "-")
+        for stem in _ROOT_KEEP_STEMS
+    )
+
+
+# A quantisation subfolder must actually contain a loadable checkpoint.
+# Without this, ``--subfolder docs`` uploads a documentation directory,
+# verifies the objects it just wrote, and reports success — reproducing
+# the "mirror completed but pull still 404s" failure this flag exists to
+# prevent (review MAJOR).
+_WEIGHT_SUFFIXES = (".safetensors", ".npz", ".bin", ".gguf")
+
+
+def _select_subfolder(files: list[FileMeta], subfolder: str) -> list[FileMeta]:
+    """Narrow ``files`` to one quantisation subfolder plus repo-root metadata.
+
+    Some upstreams now ship every quantisation of a model in ONE repo, as
+    sibling directories::
+
+        LiquidAI/LFM2.5-2.6B-MLX/
+          LICENSE  README.md  .gitattributes
+          4bit/  5bit/  6bit/  8bit/  bf16/  mxfp4/  mxfp8/  nvfp4/
+
+    Mirroring such a repo wholesale copies ~20 GB to serve the 1.6 GB anyone
+    actually pulls. Every other repo we mirror is one-quantisation-per-repo,
+    where "the repo" and "what we serve" are the same thing — which is why
+    this selector did not exist until the first subfolder repo showed up.
+
+    Keys keep their full in-repo path (``…-MLX/4bit/config.json``), so the
+    object layout on R2 stays a faithful copy of the source tree and the
+    alias resolver can point at the subfolder directly.
+    """
+    stripped = subfolder.strip("/")
+    if not stripped:
+        raise ValueError(
+            f"--subfolder {subfolder!r} is empty. Pass a real subfolder name, "
+            "or omit the flag entirely to mirror the whole repo."
+        )
+
+    prefix = stripped + "/"
+    selected = [f for f in files if f.relpath.startswith(prefix)]
+    available = sorted({f.relpath.split("/")[0] for f in files if "/" in f.relpath})
+    if not selected:
+        raise ValueError(
+            f"--subfolder {subfolder!r} matched no files. "
+            f"Available subfolders: {available or '(none — flat repo)'}"
+        )
+
+    # A directory that exists is not necessarily a checkpoint. Require the
+    # two things a loader cannot start without, as DIRECT children of the
+    # subfolder: a config and at least one weight shard.
+    direct = {f.relpath[len(prefix) :] for f in selected}
+    direct = {name for name in direct if "/" not in name}
+    if "config.json" not in direct or not any(
+        name.endswith(_WEIGHT_SUFFIXES) for name in direct
+    ):
+        raise ValueError(
+            f"--subfolder {subfolder!r} does not look like a checkpoint: "
+            f"expected config.json and a weight file ({', '.join(_WEIGHT_SUFFIXES)}) "
+            f"directly inside it, found {sorted(direct)[:8]}. "
+            f"Available subfolders: {available or '(none — flat repo)'}"
+        )
+
+    roots = [f for f in files if "/" not in f.relpath and _is_root_keep(f.relpath)]
+    return roots + selected
+
+
 def _r2_client(endpoint_url: str, profile: str) -> Any:
     """Build a boto3 S3 client bound to the R2 endpoint / profile.
 
@@ -397,8 +483,15 @@ def mirror_repo(
     dry_run: bool = False,
     verify_only: bool = False,
     tmp_dir: Path | None = None,
+    subfolder: str | None = None,
 ) -> int:
-    """Mirror one HF repo to R2. Return process exit code (0 = ok)."""
+    """Mirror one HF repo to R2. Return process exit code (0 = ok).
+
+    ``subfolder`` narrows a multi-quantisation repo to one variant; see
+    ``_select_subfolder``. Omitted, the whole repo is mirrored, which is
+    correct for the one-quantisation-per-repo layout every other upstream
+    we mirror uses.
+    """
     started = time.monotonic()
     print(f"== mirror {repo_id} → r2://{bucket}/{repo_id}/ ==", flush=True)
     print(f"   endpoint: {endpoint_url}", flush=True)
@@ -409,6 +502,20 @@ def mirror_repo(
         print("   MODE:     verify-only (no uploads)", flush=True)
 
     files = _hf_files(repo_id)
+    # ``is not None``, not truthiness: ``--subfolder ""`` (an unset shell
+    # variable expanding to nothing) is a caller mistake, and treating it
+    # as "no filter" silently mirrors the full 20 GB repo the flag exists
+    # to avoid. _select_subfolder rejects it (review MAJOR).
+    if subfolder is not None:
+        before = len(files)
+        before_bytes = sum((f.size or 0) for f in files)
+        files = _select_subfolder(files, subfolder)
+        kept_bytes = sum((f.size or 0) for f in files)
+        print(
+            f"   subfolder: {subfolder!r} — {len(files)}/{before} files, "
+            f"{kept_bytes / 1e9:.3f} of {before_bytes / 1e9:.3f} GB",
+            flush=True,
+        )
     # HF sometimes doesn't expose sizes for a subset of siblings; treat
     # those as 0 for the aggregate banner (the actual bytes-uploaded
     # counter tracks the ground truth below).
@@ -624,6 +731,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip upload; only run the verification pass.",
     )
     p.add_argument(
+        "--subfolder",
+        default=None,
+        help=(
+            "Mirror only this quantisation subfolder (e.g. '4bit') from a "
+            "repo that ships several. Repo-root LICENSE/NOTICE/README are "
+            "always included. Default: mirror the whole repo."
+        ),
+    )
+    p.add_argument(
         "--tmp-dir",
         default=None,
         help="Scratch dir for per-file downloads (default: /tmp/mirror-<pid>)",
@@ -636,6 +752,7 @@ def main(argv: list[str] | None = None) -> int:
     tmp = Path(args.tmp_dir) if args.tmp_dir else None
     return mirror_repo(
         args.repo_id,
+        subfolder=args.subfolder,
         endpoint_url=args.endpoint_url,
         bucket=args.bucket,
         profile=args.profile,
