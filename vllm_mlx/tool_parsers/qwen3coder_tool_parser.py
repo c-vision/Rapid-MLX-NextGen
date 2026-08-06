@@ -226,6 +226,27 @@ class Qwen3CoderToolParser(ToolParser):
         self.tool_call_function_regex = re.compile(
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
         )
+        # Finalize-path counterpart: CLOSED spans only. The tolerant
+        # regex above accepts an unterminated ``<function=`` all the way
+        # to end-of-string, which is right while tokens are still
+        # arriving and wrong once generation has stopped — at that point
+        # "no closer" means "not a call".
+        #
+        # Mirrors the existing ``tool_call_complete_regex`` /
+        # ``tool_call_regex`` pair for the ``<tool_call>`` wrapper.
+        #
+        # Using the tolerant regex on the finalize path did not merely
+        # truncate content, it FABRICATED calls out of prose. Measured
+        # with ``request=None`` — no tools declared at all:
+        #   'Docs mention </tool_call> and <function=name> together.'
+        #   -> tools_called=True, tool_calls=[{'name': 'name',
+        #                                      'arguments': '{}'}]
+        #      content='Docs mention </tool_call> and '
+        # An agent receiving that tries to execute a tool called
+        # ``name`` and its loop breaks.
+        self.tool_call_function_complete_regex = re.compile(
+            r"<function=(.*?)</function>", re.DOTALL
+        )
         self.tool_call_parameter_regex = re.compile(
             r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
             re.DOTALL,
@@ -334,6 +355,10 @@ class Qwen3CoderToolParser(ToolParser):
         }
 
     def _get_function_calls(self, model_output: str) -> list[str]:
+        """Candidate ``<function=...>...</function>`` spans, finalize path.
+
+        Only CLOSED spans count — see ``tool_call_function_complete_regex``.
+        """
         matched_ranges = self.tool_call_regex.findall(model_output)
         raw_tool_calls = [m[0] if m[0] else m[1] for m in matched_ranges]
         if not raw_tool_calls:
@@ -341,8 +366,10 @@ class Qwen3CoderToolParser(ToolParser):
 
         raw_function_calls = []
         for tc in raw_tool_calls:
-            raw_function_calls.extend(self.tool_call_function_regex.findall(tc))
-        return [m[0] if m[0] else m[1] for m in raw_function_calls]
+            raw_function_calls.extend(
+                self.tool_call_function_complete_regex.findall(tc)
+            )
+        return raw_function_calls
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -369,6 +396,29 @@ class Qwen3CoderToolParser(ToolParser):
                 if tc:
                     tool_calls.append(tc)
 
+            if not tool_calls:
+                # Every candidate span failed to parse into a call, so
+                # nothing was extracted — the framing the scanner matched
+                # was ordinary prose, not wire. Return the output UNCUT,
+                # exactly like the two early-returns above.
+                #
+                # Without this, ``<function=`` appearing anywhere in a
+                # normal answer silently truncated the reply at that
+                # point: the ``<function=(.*?)</function>|<function=(.*)$``
+                # alternation matches to end-of-string, ``_parse_xml_
+                # function_call`` then rejects it, and the content slice
+                # had already been cut to ``model_output[:content_index]``.
+                # Measured with ``request=None`` (no tools declared at
+                # all):
+                #   'Docs mention </tool_call> and <function=name> too.'
+                #   -> 'Docs mention </tool_call> and '
+                # This parser backs 22 aliases, including qwen3.6-35b and
+                # every Qwen3-Coder build, so it is on the default path
+                # for local coding agents.
+                return ExtractedToolCallInformation(
+                    tools_called=False, tool_calls=[], content=model_output
+                )
+
             # Extract content before tool calls
             content_index = model_output.find(self.tool_call_start_token)
             idx = model_output.find(self.tool_call_prefix)
@@ -376,7 +426,7 @@ class Qwen3CoderToolParser(ToolParser):
             content = model_output[:content_index]
 
             return ExtractedToolCallInformation(
-                tools_called=len(tool_calls) > 0,
+                tools_called=True,
                 tool_calls=tool_calls,
                 content=content if content else None,
             )
