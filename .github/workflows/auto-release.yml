@@ -56,6 +56,10 @@ jobs:
         env:
           # Pass untrusted-ish dispatch inputs via env, never ``${{ }}`` into the
           # run block.
+          # Read-only auth for the ``gh release view`` idempotency check below
+          # (auto-auth works, but the repo's other release jobs set this
+          # explicitly — keep the pattern).
+          GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           FORCE_VERSION: ${{ github.event.inputs.force_version }}
           REASON: ${{ github.event.inputs.reason }}
@@ -87,9 +91,22 @@ jobs:
               exit 1
             fi
             if git ls-remote --tags origin "refs/tags/v$VERSION" | grep -q "v$VERSION"; then
-              echo "Tag v$VERSION already exists — nothing to do (idempotent)"
-              echo "should_release=false" >> "$GITHUB_OUTPUT"
-              echo "force=false" >> "$GITHUB_OUTPUT"
+              # The tag may already exist WITHOUT a Release (a prior run died
+              # between tag and Release, or the Release was deleted). detect
+              # must stay 'true' so the release job can recover it — only a
+              # Release that already exists stops us.
+              RELEASE_DRAFT=$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" \
+                --json isDraft -q .isDraft 2>/dev/null || echo "missing")
+              if [ "$RELEASE_DRAFT" = "false" ]; then
+                echo "Release v$VERSION already exists — nothing to do (idempotent)"
+                echo "should_release=false" >> "$GITHUB_OUTPUT"
+                echo "force=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "Tag v$VERSION exists without a published Release — will recover"
+              echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+              echo "force=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -120,16 +137,22 @@ jobs:
             exit 1
           fi
 
-          # Idempotency: if the tag already exists there is nothing to do.
-          if git ls-remote --tags origin "refs/tags/v$VERSION" | grep -q "v$VERSION"; then
-            echo "Tag v$VERSION already exists — skipping (idempotent)"
+          # Idempotency: if the Release already exists there is nothing to do.
+          # A tag alone does NOT stop us — it may be a tag with no Release (a
+          # prior run that died between tag and Release, a hand-pushed tag, a
+          # deleted Release). We must stay should_release=true so the release
+          # job can recover it. Only a Release that already exists is done.
+          RELEASE_DRAFT=$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft -q .isDraft 2>/dev/null || echo "missing")
+          if [ "$RELEASE_DRAFT" = "false" ]; then
+            echo "Release v$VERSION already exists — skipping (idempotent)"
             echo "should_release=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "should_release=true" >> "$GITHUB_OUTPUT"
-          echo "✓ Detected version bump → v$VERSION (pyproject matches, tag is new)"
+          echo "✓ Detected version bump → v$VERSION (pyproject matches, release missing)"
 
   # 2) The gate. Runs on the self-hosted Apple-Silicon runner (the Studio) —
   #    GitHub-hosted runners have no Metal, no weights, no agent binaries, so
@@ -276,84 +299,7 @@ jobs:
           NOTES_FILE: ${{ steps.changelog.outputs.notes_file }}
         run: |
           set -euo pipefail
-
-          # Idempotency: re-check at create time too. An existing Release is
-          # only "already done" if it points at the commit these notes
-          # describe — a retry that resolved a different RELEASE_SHA must not
-          # report success over a release that documents another tree.
-          if EXISTING_REL=$(gh release view "$TAG" --json targetCommitish,tagName -q .targetCommitish 2>/dev/null); then
-            # targetCommitish can be a branch name for pre-existing releases;
-            # resolve through the tag, which is what actually ships.
-            if REL_SHA=$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}" 2>/dev/null); then
-              :
-            else
-              REL_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" -q .object.sha 2>/dev/null || echo "")
-            fi
-            if [ -n "$REL_SHA" ] && [ "$REL_SHA" != "$RELEASE_SHA" ]; then
-              echo "❌ Release $TAG already exists at $REL_SHA, but these notes describe $RELEASE_SHA." >&2
-              echo "   Refusing to report success over a release that documents a different tree." >&2
-              exit 1
-            fi
-            echo "Release $TAG already exists at the release commit ($EXISTING_REL) — done"
-            exit 0
-          fi
-
-          # A tag can exist WITHOUT a Release object: a prior run that died
-          # between tag and release, a hand-pushed tag, a deleted release. The
-          # check above only sees Releases, so we would fall through to
-          # ``gh release create`` — and GitHub REUSES an existing tag and
-          # silently IGNORES ``--target``. The result is a published release
-          # whose notes describe $RELEASE_SHA attached to a tag pointing
-          # somewhere else. That is the one way this job can ship a release that
-          # lies about its own contents, so fail loudly instead of guessing.
-          # ``git fetch <tag>`` fails both when the tag is absent (fine) and
-          # when the network/auth broke (NOT fine), and swallowing that with
-          # ``|| true`` would read a failed check as "no tag exists" — then
-          # ``gh release create`` reuses the remote tag, ignores --target, and
-          # the post-condition only catches it AFTER downstream workflows fired.
-          # ``ls-remote`` separates the two: exit 0 + empty means genuinely
-          # absent, non-zero means we could not check and must not guess.
-          if ! REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/$TAG"); then
-            echo "❌ could not query origin for refs/tags/$TAG — refusing to guess." >&2
-            exit 1
-          fi
-          if [ -n "$REMOTE_TAG" ]; then
-            git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG"
-            # ls-remote already proved the tag EXISTS, so a peel that fails
-            # here is not "no tag" — it is a tag we cannot reason about (an
-            # annotated tag can legally point at a tree or blob). Falling
-            # through would hand it to ``gh release create``, which reuses the
-            # tag and ignores --target, and the post-condition would only
-            # notice after the release published and triggered downstream.
-            if ! EXISTING=$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}"); then
-              echo "❌ Tag $TAG exists on origin but does not peel to a commit." >&2
-              echo "   Refusing to publish against a tag whose target cannot be verified." >&2
-              exit 1
-            fi
-          fi
-          if [ -n "${EXISTING:-}" ]; then
-            if [ "$EXISTING" != "$RELEASE_SHA" ]; then
-              echo "❌ Tag $TAG already exists at $EXISTING, but these notes describe $RELEASE_SHA." >&2
-              echo "   GitHub ignores --target when the tag already exists, so publishing now" >&2
-              echo "   would attach these notes to a different tree." >&2
-              echo "   Fix by hand: delete the stale tag, or bump to a fresh version." >&2
-              exit 1
-            fi
-            echo "Tag $TAG already exists and points at the release commit — reusing it."
-          fi
-
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --notes-file "$NOTES_FILE" \
-            --target "$RELEASE_SHA"
-
-          # Post-condition: the tag that actually got published must be the
-          # commit these notes were generated from.
-          git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG"
-          PUBLISHED=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
-          if [ "$PUBLISHED" != "$RELEASE_SHA" ]; then
-            echo "❌ published tag $TAG points at $PUBLISHED, expected $RELEASE_SHA" >&2
-            exit 1
-          fi
-
-          echo "✓ Released $TAG at $RELEASE_SHA — publish.yml will now publish to PyPI"
+          # Atomic tag claim + tag-without-Release recovery (issue #1462).
+          # Extracted to scripts/create_release.sh so the TOCTOU and recovery
+          # paths are testable offline against a mock ``gh``.
+          bash scripts/create_release.sh
