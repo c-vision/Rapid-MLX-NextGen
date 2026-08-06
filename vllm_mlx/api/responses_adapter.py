@@ -740,9 +740,7 @@ def _prepend_text_to_message(msg: Message, prefix: str) -> Message:
             update={"content": [{"type": "text", "text": prefix}, *content]}
         )
     body = _to_text(content)
-    return msg.model_copy(
-        update={"content": f"{prefix}\n\n{body}" if body else prefix}
-    )
+    return msg.model_copy(update={"content": f"{prefix}\n\n{body}" if body else prefix})
 
 
 def openai_to_responses(
