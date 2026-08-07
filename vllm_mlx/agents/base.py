@@ -11,7 +11,7 @@ breaking the old one.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 
 @dataclass
@@ -22,6 +22,16 @@ class AgentConfigSpec:
     path: str | None = None  # config file path (for yaml/json/toml)
     template: str | None = None  # config file template with {base_url}, {model_id}
     env_vars: dict[str, str] | None = None  # env vars for "env" type
+    # Name of the environment variable the agent's own CLI uses to relocate
+    # its config directory (codex: CODEX_HOME, hermes: HERMES_HOME). When it
+    # is set, ``--setup`` writes there instead of the operator's real config.
+    #
+    # This is what makes the gate non-destructive. Without it, a harness that
+    # wants an isolated config has only backup-then-restore, which loses on
+    # SIGKILL and — worse — silently re-saves damage: a config clobbered once
+    # is faithfully backed up and restored by every later run, so the break
+    # looks permanent and self-inflicted by each run in turn.
+    home_env: str | None = None
 
 
 @dataclass
@@ -105,6 +115,21 @@ class AgentProfile:
             for vs in self.versions:
                 if _version_matches(agent_version, vs.version_range):
                     if vs.config:
+                        # A version block is a *complete* replacement, so it can
+                        # silently omit ``home_env`` and send ``--setup`` back to
+                        # the operator's real config even when the caller set
+                        # CODEX_HOME/HERMES_HOME. The redirect is a safety
+                        # property of the agent, not a per-version formatting
+                        # detail, so inherit it whenever the override is silent.
+                        #
+                        # A version that genuinely relocates declares its own
+                        # ``home_env`` and that declaration wins — inheritance
+                        # only fills a hole. There is deliberately no way to
+                        # spell "this version honours no variable at all",
+                        # because that means "always write the operator's real
+                        # file", which is the bug this exists to remove.
+                        if vs.config.home_env is None:
+                            return replace(vs.config, home_env=self.config.home_env)
                         return vs.config
         return self.config
 

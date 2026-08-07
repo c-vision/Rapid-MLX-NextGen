@@ -44,8 +44,77 @@ WORK="$HOME/agent-smoke-work"
 LOG="$HOME/agent-smoke-serve.log"
 SERVE_PID=""
 
-CODEX_CFG="$HOME/.codex/config.toml"
-HERMES_CFG="$HOME/.hermes/config.yaml"
+# Throwaway config homes. codex and hermes both relocate their entire config
+# directory via these variables, and `agents <x> --setup` honours them, so this
+# gate never reads or writes the operator's real ~/.codex or ~/.hermes.
+#
+# This replaces backup-then-restore as the PRIMARY protection. That approach
+# has two failure modes we actually hit: the restore never runs if the script
+# is SIGKILLed, and — the one that did real damage — once a config has been
+# clobbered by any run, every later run faithfully backs it up and restores
+# the *damaged* file. The operator's codex stayed pointed at a local rapid-mlx
+# server for weeks that way, with each run's restore looking like it worked.
+#
+# Exported so `agents --setup`, the agent CLIs, and anything they spawn all
+# agree on the same location.
+#
+# Fail CLOSED. This script has no `set -e`, so a failed `mktemp -d` (full or
+# unwritable temp volume) would export an empty value, and an empty or
+# whitespace-only home is treated as *unset* on the Python side — sending
+# `--setup` straight back to the operator's real ~/.codex / ~/.hermes, which
+# is precisely the damage this redirect exists to prevent.
+#
+# The blankness test is delegated to Python on purpose. The shell and Python do
+# not agree on what whitespace is: BSD `tr -d '[:space:]'` keeps U+0085 while
+# `str.strip()` removes it, so a shell-side check passes a value that Python
+# then treats as unset — the guard reports safe and the real config is written
+# anyway. One definition, owned by the side that actually makes the decision.
+export CODEX_HOME="${CODEX_HOME_OVERRIDE:-$(mktemp -d)}"
+export HERMES_HOME="${HERMES_HOME_OVERRIDE:-$(mktemp -d)}"
+for _home_var in CODEX_HOME HERMES_HOME; do
+  eval "_home_val=\${$_home_var}"
+  # Resolve it EXACTLY as _resolve_config_path will (strip, then expanduser)
+  # and re-export the result, so the value this script validates, backs up and
+  # cleans up is byte-for-byte the one setup writes to. Validating the raw
+  # value instead lets the two diverge: a real directory named "$HOME/.codex "
+  # (trailing space) passes an is-a-directory check here while Python strips
+  # the space and writes the operator's real ~/.codex/config.toml — which the
+  # backup and restore then miss, because they are looking at the other path.
+  # ...and CANONICALIZE, because the comparison below is only as good as the
+  # spelling. `$HOME/.codex/`, `$HOME/.codex/.`, a `..` path and a symlink all
+  # resolve to the protected directory while comparing unequal as strings. A
+  # relative value would also break the run outright, since `seed_repo` changes
+  # cwd before the agent reads the re-exported home.
+  _home_val="$(python3 -c 'import os, sys
+v = sys.argv[1].strip()
+sys.stdout.write(os.path.realpath(os.path.expanduser(v)) if v else "")' \
+    "${_home_val}" 2>/dev/null)"
+  if [ -z "${_home_val}" ]; then
+    echo "SMOKE-ABORT: $_home_var is blank once resolved — refusing to run, as" >&2
+    echo "             \`agents --setup\` would then write the operator's real config." >&2
+    exit 3
+  fi
+  [ -d "${_home_val}" ] || { echo "SMOKE-ABORT: $_home_var=${_home_val} is not a directory" >&2; exit 3; }
+  # Belt and braces: refuse to run against the operator's REAL config dir, no
+  # matter how the value spelled its way here. Agreeing with Python is not the
+  # same as being safe — "$HOME/.codex " resolves to exactly the directory this
+  # redirect exists to protect, and it is a real directory, so every check
+  # above passes. There is no legitimate reason for this gate to write there.
+  case "$_home_var" in
+    CODEX_HOME)  _home_real="$(python3 -c 'import os,sys; sys.stdout.write(os.path.realpath(os.path.expanduser("~/.codex")))')" ;;
+    HERMES_HOME) _home_real="$(python3 -c 'import os,sys; sys.stdout.write(os.path.realpath(os.path.expanduser("~/.hermes")))')" ;;
+    *)           _home_real="" ;;
+  esac
+  if [ -n "$_home_real" ] && [ "${_home_val}" = "$_home_real" ]; then
+    echo "SMOKE-ABORT: $_home_var resolves to the operator's real config dir" >&2
+    echo "             ($_home_real). Refusing — this gate must never write there." >&2
+    exit 3
+  fi
+  export "$_home_var=${_home_val}"
+done
+unset _home_var _home_val _home_real
+CODEX_CFG="$CODEX_HOME/config.toml"
+HERMES_CFG="$HERMES_HOME/config.yaml"
 
 # Portable timeout: coreutils `timeout`, or `gtimeout`, else a bash fallback
 # (background the command, hard-kill after N seconds). macOS ships neither
@@ -93,6 +162,10 @@ cleanup() {
   fi
   restore_cfg "$CODEX_CFG"
   restore_cfg "$HERMES_CFG"
+  # Both live under throwaway homes now, so this is just tidying temp files —
+  # the operator's real ~/.codex and ~/.hermes were never touched.
+  [ -n "${CODEX_HOME_OVERRIDE:-}" ] || rm -rf "$CODEX_HOME"
+  [ -n "${HERMES_HOME_OVERRIDE:-}" ] || rm -rf "$HERMES_HOME"
   rm -rf "$WORK" "$LOG"
 }
 trap cleanup EXIT
@@ -344,12 +417,36 @@ run_aider() {
 # (qwen3.6-35b-8bit → 262144) when it can reach the running server to detect it;
 # without --base-url it falls back to the 32768 default and Hermes refuses to
 # start every time.
+# Assert the invariant directly instead of enumerating the ways it can break.
+# Every guard above stops a *spelling* — a resolved path, a blank value, the
+# protected directory. None of them can see a `home_env` the profile renamed:
+# a user profile in ~/.rapid-mlx/agents/ may legitimately declare
+# `home_env: MY_CODEX_HOME`, and if that variable is unset, `--setup` resolves
+# back to the operator's real config no matter what this script exported.
+# Fingerprinting the real files and checking them afterwards catches that, and
+# anything else nobody has thought of yet.
+_real_fingerprint() {
+  for f in "$HOME/.codex/config.toml" "$HOME/.hermes/config.yaml"; do
+    if [ -f "$f" ]; then shasum -a 256 "$f" 2>/dev/null; else echo "absent $f"; fi
+  done
+}
+_REAL_BEFORE="$(_real_fingerprint)"
+
 save_cfg "$CODEX_CFG"
 "$RMLX" agents codex --setup --base-url "$B/v1" >/dev/null 2>&1
 patch_port "$CODEX_CFG"
 save_cfg "$HERMES_CFG"
 "$RMLX" agents hermes --setup --base-url "$B/v1" >/dev/null 2>&1
 patch_port "$HERMES_CFG"
+
+if [ "$(_real_fingerprint)" != "$_REAL_BEFORE" ]; then
+  echo "SMOKE-ABORT: \`agents --setup\` modified the operator's REAL config despite" >&2
+  echo "             the redirect. Refusing to continue. Before / after:" >&2
+  printf '%s\n' "$_REAL_BEFORE" | sed 's/^/               was  /' >&2
+  _real_fingerprint | sed 's/^/               now  /' >&2
+  echo "             A renamed home_env in ~/.rapid-mlx/agents/ is the usual cause." >&2
+  exit 3
+fi
 
 echo "running 4 Tier-1 agents serially (budget ${AGENT_TO}s, hermes ${HERMES_TO}s)…"
 # Serial, NOT backgrounded: overlapping them oversubscribes the single GPU and
