@@ -62,8 +62,11 @@ struct SidebarConversationDeleteConfirmationTests {
         // The context-menu destructive button must set pendingDeletion, never
         // call the model's delete directly. This literal shape is exactly what
         // the old immediate-delete build lacked, so it fails against a revert.
+        // The item is spelled with a trailing `label:` closure so it carries a
+        // trash icon like its siblings, so the guard matches the action body
+        // rather than the title.
         #expect(
-            stripped.contains(#"Button("Delete",role:.destructive){pendingDeletion=conv}"#),
+            stripped.contains(#"Button(role:.destructive){pendingDeletion=conv}"#),
             "SidebarView's context-menu Delete must stage `pendingDeletion = conv`, not delete on the spot."
         )
         // And the pre-fix immediate shape must be gone from the context menu.

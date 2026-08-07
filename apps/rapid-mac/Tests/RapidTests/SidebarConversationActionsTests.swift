@@ -164,6 +164,23 @@ struct SidebarConversationActionsTests {
         #expect(SidebarView.archived(for: [archived, active]).map(\.id) == [archived.id])
     }
 
+    /// ``archived(for:)`` sorts rather than inheriting the caller's order.
+    /// Archiving does not touch ``updatedAt`` or a row's slot in
+    /// ``ChatViewModel.conversations``, so the input can hand the archived
+    /// rows over in any order — the group still has to read newest-first.
+    @Test("Archived rows are ordered newest-updated first")
+    func archivedRowsAreSortedByRecency() {
+        let now = Date()
+        let stale = conversation(
+            title: "Filed long ago",
+            updatedAt: now.addingTimeInterval(-60 * 60 * 24 * 30),
+            isArchived: true
+        )
+        let recent = conversation(title: "Filed today", updatedAt: now, isArchived: true)
+
+        #expect(SidebarView.archived(for: [stale, recent]).map(\.id) == [recent.id, stale.id])
+    }
+
     // MARK: - Backward compatibility
 
     /// A history file written before pin/archive shipped must still decode.

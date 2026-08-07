@@ -262,8 +262,17 @@ struct SidebarView: View {
 
     /// Archived rows, newest-updated first. Kept out of ``sections`` so the
     /// main list can never accidentally render one.
+    ///
+    /// The sort is done here rather than trusted from the caller: the main
+    /// list's order is maintained incrementally by ``ConversationOrdering``,
+    /// which deliberately leaves a row's position alone for non-activity edits
+    /// — and archiving is one of those. So an archived row keeps whatever slot
+    /// it held in the live list, which says nothing about its rank among the
+    /// other archived ones.
     static func archived(for conversations: [ChatConversation]) -> [ChatConversation] {
-        conversations.filter { $0.isArchived }
+        conversations
+            .filter { $0.isArchived }
+            .sorted { $0.updatedAt > $1.updatedAt }
     }
 
     private var archivedConversations: [ChatConversation] {
@@ -405,47 +414,75 @@ struct SidebarView: View {
     /// and with it the focus observer that would have cancelled the edit — off
     /// screen; so the edit is resolved up front rather than left to a blur that
     /// may never be observed. Delete is the documented exception (see below).
+    ///
+    /// The whole set is wrapped in a `Group` carrying ``tint(nil)`` — a
+    /// `Group`'s modifiers apply to each child, and inside a `Menu` the
+    /// children are flattened back out into sibling `NSMenuItem`s, so this
+    /// does not nest them into a submenu.
+    ///
+    /// Why the tint has to be cleared: the scene applies
+    /// ``.tint(RapidTheme.brandAmber)`` app-wide (``RapidApp``), which reaches
+    /// this menu's content and makes SwiftUI hand AppKit *coloured*
+    /// (`isTemplate == false`) menu-item images. AppKit only recolours
+    /// TEMPLATE images to `selectedMenuItemTextColor` when a row highlights,
+    /// so the amber glyphs stayed amber while their text flipped to white —
+    /// the icon and its label disagreeing under the pointer. Dropping the
+    /// tint restores template rendering, so each glyph tracks its own row's
+    /// text colour at rest and on hover alike.
     @ViewBuilder
     private func rowMenuItems(_ conv: ChatConversation) -> some View {
-        Button {
-            // Tear down any rename already in flight FIRST. Rename → Rename is
-            // one continuous edit as far as ``renameFieldFocused`` is
-            // concerned: leaving it `true` would rob the new editor of the
-            // `false → true` transition its focus gate watches for, and its own
-            // eventual blur would then be ignored. Ending the previous cycle
-            // outright is what guarantees the transition happens.
-            endRename()
-            renameDraft = conv.title
-            renamingID = conv.id
-            renameSession &+= 1
-        } label: {
-            Label("Rename", systemImage: "pencil")
+        Group {
+            Button {
+                // Tear down any rename already in flight FIRST. Rename → Rename is
+                // one continuous edit as far as ``renameFieldFocused`` is
+                // concerned: leaving it `true` would rob the new editor of the
+                // `false → true` transition its focus gate watches for, and its own
+                // eventual blur would then be ignored. Ending the previous cycle
+                // outright is what guarantees the transition happens.
+                endRename()
+                renameDraft = conv.title
+                renamingID = conv.id
+                renameSession &+= 1
+            } label: {
+                Label("Rename", systemImage: "pencil")
+            }
+            Divider()
+            Button {
+                cancelRename()
+                chat.setConversationPinned(conv.id, !conv.isPinned)
+            } label: {
+                Label(
+                    conv.isPinned ? "Unpin" : "Pin",
+                    systemImage: conv.isPinned ? "pin.slash" : "pin"
+                )
+            }
+            Button {
+                cancelRename()
+                chat.setConversationArchived(conv.id, !conv.isArchived)
+            } label: {
+                Label(
+                    conv.isArchived ? "Unarchive" : "Archive",
+                    systemImage: conv.isArchived ? "tray.and.arrow.up" : "archivebox"
+                )
+            }
+            Divider()
+            // Delete is the one item that does NOT need an explicit cancel: it only
+            // stages a confirmation, and presenting that dialog takes keyboard
+            // focus, which the editor's blur handler resolves. Keeping the action
+            // body a bare `pendingDeletion = conv` is also what the #1568
+            // delete-gate guard pins.
+            //
+            // Spelled with a trailing `label:` closure rather than the shorter
+            // `Button("Delete", …)` so the destructive item carries an icon like
+            // every other entry above it — a title-only button renders with a
+            // blank icon gutter beside four icon-bearing siblings and looks broken.
+            Button(role: .destructive) {
+                pendingDeletion = conv
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
         }
-        Divider()
-        Button {
-            cancelRename()
-            chat.setConversationPinned(conv.id, !conv.isPinned)
-        } label: {
-            Label(conv.isPinned ? "Unpin" : "Pin", systemImage: conv.isPinned ? "pin.slash" : "pin")
-        }
-        Button {
-            cancelRename()
-            chat.setConversationArchived(conv.id, !conv.isArchived)
-        } label: {
-            Label(
-                conv.isArchived ? "Unarchive" : "Archive",
-                systemImage: conv.isArchived ? "tray.and.arrow.up" : "archivebox"
-            )
-        }
-        Divider()
-        // Delete is the one item that does NOT need an explicit cancel: it only
-        // stages a confirmation, and presenting that dialog takes keyboard
-        // focus, which the editor's blur handler resolves. Keeping this body a
-        // bare `pendingDeletion = conv` is also what the #1568 delete-gate
-        // guard pins.
-        Button("Delete", role: .destructive) {
-            pendingDeletion = conv
-        }
+        .tint(nil)
     }
 
     /// Inline rename editor, occupying the row it replaces.
