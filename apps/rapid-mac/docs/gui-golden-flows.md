@@ -171,6 +171,63 @@ Set `RAPID_GUI_SOURCE_APP` to test a release candidate bundle and
 `RAPID_GUI_GOLDEN_OUT` to choose the artifact directory. Each run records AX
 trees, actions, fake-sidecar events, logs, and a top-level `result.json`.
 
+## AX structural baselines
+
+Ten settled states across the five journeys are also fingerprinted as
+**structural baselines**, committed under
+`Tests/GUIGoldenFlows/__Snapshots__/<flow>.<state>.txt`. `scripts/ax-baseline.py`
+normalises a raw AX dump into an indented tree and the suite fails on any
+difference, so a PR that removes a button, reparents a control, renames an
+identifier, drops an icon or flips an enabled state produces a reviewable diff
+instead of passing silently.
+
+**This is the cheap layer of appearance testing and it is structural only.** It
+cannot see colour, spacing, typography or anything else that never reaches the
+accessibility layer; the PNG snapshots in `Tests/RapidTests/__Snapshots__` stay
+the pixel-level check.
+
+The normaliser keeps hierarchy, role, subrole, `accessibilityIdentifier`,
+`AXTitle`/`AXDescription`/`AXHelp`, enabled state, sibling order below the
+window level, and the *kind* of each value (`bool:true`, `bool:false`,
+`number`, `text`, `empty`). It drops or rewrites everything that is legitimately
+volatile: screen coordinates and sizes, pids, top-level window z-order, value
+contents, and version numbers, byte sizes, token rates, durations, dates, clock
+times, UUIDs, `/Users/<name>` paths and the fake model alias wherever they
+appear in text. `Settings.App.UpToDate` carries the release version and a
+conversation row identifier carries a fresh UUID — recording those verbatim
+would make the baselines flap every release and every run.
+
+Two further things are dropped because they flap without any product change,
+both found by comparing real recorded baselines rather than by reasoning:
+
+- **Everything below a window-control button.** The traffic lights are AppKit's,
+  and their anonymous `AXGroup` descendants are realized lazily: two dumps taken
+  seconds apart in the *same* run recorded one group under `AXZoomButton` in
+  `settings-root` and two in `models-idle`. The buttons themselves stay, so a
+  missing close box is still a diff; their private innards do not.
+- **Relative day headings.** A transcript is filed under `Today` — until a run
+  straddles local midnight, at which point the identical UI says `Yesterday`
+  and every baseline holding one goes red at 00:00 for no reason.
+
+An intended UI change is a deliberate commit:
+
+```bash
+./scripts/gui-golden-flows.sh --update-baselines
+git diff apps/rapid-mac/Tests/GUIGoldenFlows/__Snapshots__
+```
+
+Recording is **only** ever done by `--update-baselines`. A missing baseline is a
+failure, not a free pass: recording on absence would mean a typo'd snapshot name,
+or one somebody forgot to `git add`, sails through CI green while comparing
+against nothing. (This deliberately diverges from the PNG convention in
+`Tests/RapidTests/SnapshotHelpers.swift`.)
+
+Inspect a single normalised tree without running a journey:
+
+```bash
+python3 scripts/ax-baseline.py normalize --scrub fake-alias /tmp/…/steady.json
+```
+
 ## Why this is not coordinate automation
 
 The checked-in `rapid-ax.swift` helper talks directly to macOS Accessibility.
@@ -193,3 +250,28 @@ observable user state rather than sleeps or pixels. Keep model behavior behind
 the fake sidecar unless the purpose of the flow is real inference quality. A
 real-model dogfood pass remains a separate, explicitly memory-budgeted release
 stage.
+
+Fingerprint only *settled* states. Baselines taken mid-transition flap: the
+crash-recovery tree captured while the sidecar was still restarting contained a
+transient "Starting …" banner in one run and not the next. `wait_send_idle`
+exists for this — `ChatView.SendOrStopButton` publishes `AXHelp` only while the
+readiness gate is closed, so the absence of that attribute is a
+copy-independent "ready and not streaming" signal. If a new state turns out to
+be irreducibly unstable, exclude it and say why rather than loosening the
+comparison.
+
+**Never assert that text appears *somewhere* in the tree when a specific place
+is what you mean.** `chat-restore` failed roughly one run in two for a reason
+worth repeating. `start_model` gated on `SendOrStopButton.description ==
+"Send message"`, which is the button's label for the whole startup — its hint
+still read "… is still starting." So the flow pressed Send into a closed
+readiness gate, the press was dropped, and the draft stayed in the composer.
+`assert_tree_text "golden restore marker"` then *found* the prompt — in the
+composer — and reported success for a message that was never sent. The run only
+failed later, on the reply that never came, which is why it looked like a
+flake rather than a broken assertion.
+
+Both halves are now fixed: `start_model` waits on `wait_send_idle`, and
+`send_prompt` requires the composer to actually drain. The general rule: an
+assertion that a string is present anywhere is satisfied by the input field,
+the placeholder, the tooltip and the sidebar. Say *which element*.
