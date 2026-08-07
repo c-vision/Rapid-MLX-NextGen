@@ -8,6 +8,7 @@ Verifies that:
 3. Metal memory stats are reported in get_stats()
 """
 
+import time
 from unittest.mock import MagicMock, patch
 
 from vllm_mlx.request import SamplingParams
@@ -228,6 +229,20 @@ class TestIncrementalCacheEval:
         mock_request.output_token_ids = [100]
         mock_request.num_output_tokens = 1
         mock_request.num_prompt_tokens = 3
+        # Real floats for the timing fields _process_batch_responses reads:
+        # it computes prefill_s / generation_s and gates each on ``> 0``,
+        # which a bare auto-created MagicMock cannot satisfy (MagicMock
+        # supports arithmetic magic methods but not comparison ones, so
+        # ``MagicMock() > 0`` raises TypeError). Leaving these as mocks is
+        # what made this test go stale; the subject under test — no eager
+        # mx.eval in the extraction path — is unaffected by the values.
+        # Offsets follow the real request lifecycle (arrival → prefill
+        # start → first token, all in the past) so both the prefill and
+        # generation durations come out positive.
+        now = time.time()
+        mock_request.arrival_time = now - 2.0
+        mock_request._prefill_started_at = now - 1.5
+        mock_request.first_token_time = now - 1.0
         scheduler.running["req-1"] = mock_request
         scheduler.uid_to_request_id[42] = "req-1"
 
