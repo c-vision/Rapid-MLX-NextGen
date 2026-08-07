@@ -308,4 +308,296 @@ struct ModelSurfaceRedesignTests {
         #expect(!ModelFavorites.isFavorite("qwen3.6-35b-4bit", defaults: defaults))
         #expect(ModelFavorites.load(defaults: defaults).isEmpty)
     }
+
+    // MARK: - Recommended card geometry
+
+    /// The reported defect: the best-pick card's primary call to action
+    /// rendered as "Dow…". Nothing truncated the label directly — the
+    /// slot it sat in was pinned to 92pt and its contents did not fit,
+    /// so AppKit ellipsised the title. Widening the window did not help
+    /// because the clamp was on the card, not the window.
+    ///
+    /// This measures the real thing: AppKit's own metrics for the small
+    /// system font, plus the button's chrome, against the width the card
+    /// gives that slot. Any future label, control size or padding change
+    /// that reintroduces the squeeze fails here.
+    @Test("recommended card: every action label fits the slot it renders in")
+    func recommendedActionLabelsFitTheirColumn() {
+        for title in RecommendedCardLayout.actionButtonTitles {
+            let needed = RecommendedCardLayout.buttonWidth(title: title)
+            #expect(
+                needed <= RecommendedCardLayout.actionColumnWidth,
+                "\"\(title)\" needs \(needed)pt but the action column offers \(RecommendedCardLayout.actionColumnWidth)pt"
+            )
+        }
+        for text in RecommendedCardLayout.actionPillTitles {
+            let needed = RecommendedCardLayout.pillWidth(text: text)
+            #expect(
+                needed <= RecommendedCardLayout.actionColumnWidth,
+                "\"\(text)\" needs \(needed)pt but the action column offers \(RecommendedCardLayout.actionColumnWidth)pt"
+            )
+        }
+    }
+
+    /// The sweep above can only mean something if the two arrays really
+    /// are the labels the card renders — they are hand-maintained, and a
+    /// width derived from them would otherwise be self-certifying.
+    ///
+    /// So: grep the source. Every `Text("…")` inside the card's
+    /// ``actionButton`` and inside ``statusBadgeView``'s pill calls must
+    /// appear in one of the two arrays. Adding "Download again" to the
+    /// button without widening the column trips here rather than shipping
+    /// another ellipsis. Same pattern as
+    /// ``ToolUseCapabilitySourceGuardTests``.
+    @Test("recommended card: the measured label set matches the source")
+    func actionLabelArraysMatchTheSource() throws {
+        let source = try Self.loadPanelSource()
+        let known = Set(
+            RecommendedCardLayout.actionButtonTitles
+                + RecommendedCardLayout.actionPillTitles
+        )
+
+        let buttonBody = try Self.body(
+            of: "private func actionButton(for entry: ModelEntry, badge: ModelCacheActions.StatusBadge) -> some View {",
+            in: source
+        )
+        for label in Self.textLiterals(in: buttonBody) {
+            #expect(
+                known.contains(label),
+                """
+                actionButton renders Text("\(label)") but RecommendedCardLayout \
+                does not measure it, so the card's action column width was \
+                derived without it. Add it to actionButtonTitles.
+                """
+            )
+        }
+
+        let badgeBody = try Self.body(
+            of: "private func statusBadgeView(_ badge: ModelCacheActions.StatusBadge) -> some View {",
+            in: source
+        )
+        // The pills the CARD can reach. ``statusBadgeView`` is shared with
+        // states the card never routes to it, so only these two are
+        // required to be measured.
+        for label in ["On disk", "In use"] {
+            #expect(
+                badgeBody.contains("\"\(label)\""),
+                "statusBadgeView no longer renders the \"\(label)\" pill the card's width was measured against"
+            )
+            #expect(known.contains(label))
+        }
+    }
+
+    /// Panel source, located from ``#filePath`` so the test runs from any
+    /// working directory.
+    private static func loadPanelSource() throws -> String {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // RapidTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // apps/rapid-mac
+        return try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/Rapid/UI/SettingsModelManagementPanel.swift"
+            ),
+            encoding: .utf8
+        )
+    }
+
+    /// One function's body, scoped by matching the braces after its
+    /// signature. A "up to the next MARK" heuristic silently swallowed
+    /// the following functions, which would have made this guard pass on
+    /// labels it never actually saw.
+    private static func body(of signature: String, in source: String) throws -> String {
+        struct MissingDeclaration: Error { let signature: String }
+        guard let start = source.range(of: signature) else {
+            throw MissingDeclaration(signature: signature)
+        }
+        // ``signature`` ends with the opening brace, so start at depth 1.
+        var depth = 1
+        var end = start.upperBound
+        while end < source.endIndex, depth > 0 {
+            switch source[end] {
+            case "{": depth += 1
+            case "}": depth -= 1
+            default: break
+            }
+            if depth > 0 { end = source.index(after: end) }
+        }
+        guard depth == 0 else { throw MissingDeclaration(signature: signature) }
+        return String(source[start.upperBound..<end])
+    }
+
+    /// Every `Text("…")` string literal in a fragment of Swift source.
+    private static func textLiterals(in fragment: String) -> [String] {
+        var out: [String] = []
+        var remainder = Substring(fragment)
+        while let open = remainder.range(of: "Text(\"") {
+            let after = remainder[open.upperBound...]
+            guard let close = after.firstIndex(of: "\"") else { break }
+            let literal = String(after[..<close])
+            // Skip interpolated labels — they are not fixed strings and
+            // cannot be width-measured up front.
+            if !literal.contains("\\(") { out.append(literal) }
+            remainder = after[close...]
+        }
+        return out
+    }
+
+    /// The specific label that broke, called out on its own so a
+    /// regression names the reported symptom rather than a sweep index.
+    @Test("recommended card: \"Download\" renders in full")
+    func downloadLabelIsNotTruncated() {
+        let needed = RecommendedCardLayout.buttonWidth(title: "Download")
+        #expect(needed <= RecommendedCardLayout.actionColumnWidth)
+        // And the width is genuinely derived from the labels rather than
+        // being a literal that happens to be large today.
+        #expect(RecommendedCardLayout.actionColumnWidth >= needed)
+        #expect(RecommendedCardLayout.actionColumnWidth < needed + 40)
+    }
+
+    /// Why the size caption had to leave the action slot: with it, the
+    /// old 92pt column could not fit "Download" alongside it, which is
+    /// exactly the arithmetic that produced "Dow…". Pinned so nobody
+    /// re-adds a caption there without hitting this.
+    @Test("recommended card: a caption beside the button re-creates the squeeze")
+    func sizeCaptionBesideTheButtonDoesNotFit() {
+        let legacyColumn: CGFloat = 92
+        let caption = RecommendedCardLayout.captionWidth("7.6 GB")
+        let button = RecommendedCardLayout.buttonWidth(title: "Download")
+        #expect(caption + 8 + button > legacyColumn)
+    }
+
+    // MARK: - Models table geometry
+
+    /// Defect 3's other half: now that a cached cell carries a figure and
+    /// not just two glyphs, the Size column has to be wide enough to hold
+    /// it — including on the machines with the largest caches, which are
+    /// exactly the users who go looking for this tab.
+    @Test("size column: a cached cell fits glyph + measured size + delete")
+    func cachedCellFitsTheSizeColumn() {
+        for size in ["7.9 GiB", "512 MiB", "123.4 GiB"] {
+            let needed = ModelTableLayout.cachedCellWidth(size: size)
+            #expect(
+                needed <= ModelTableLayout.sizeColumnWidth,
+                "\"\(size)\" needs \(needed)pt, column is \(ModelTableLayout.sizeColumnWidth)pt"
+            )
+        }
+        // Why the column had to move at all: the 84pt it replaced would
+        // have clipped the largest caches.
+        #expect(ModelTableLayout.cachedCellWidth(size: "123.4 GiB") > 84)
+    }
+
+    @Test("size column: a not-cached cell still fits after the ~ marker")
+    func notCachedCellFitsTheSizeColumn() {
+        for size in ["0.5 GB", "42.7 GB", "123.4 GB"] {
+            let needed = ModelTableLayout.notCachedCellWidth(size: size)
+            #expect(
+                needed <= ModelTableLayout.sizeColumnWidth,
+                "\"~\(size)\" needs \(needed)pt, column is \(ModelTableLayout.sizeColumnWidth)pt"
+            )
+        }
+    }
+
+    /// Settings is not inside the chat surface's Dynamic Type clamp, so
+    /// these `.caption` figures grow with the system text size against a
+    /// fixed-width column — the exact shape of the truncation this pass
+    /// is fixing, just triggered by the user's text setting instead of
+    /// the layout. The cells carry a shrink floor; this pins that the
+    /// floor actually covers the non-accessibility sizes (~1.25x) with
+    /// the largest figures.
+    @Test("size column: cells survive non-accessibility text growth")
+    func sizeCellsSurviveTextScaling() {
+        let scale: CGFloat = 1.25
+        for size in ["7.9 GiB", "123.4 GiB"] {
+            #expect(
+                ModelTableLayout.fits(
+                    ModelTableLayout.cachedCellWidth(size: size), atTextScale: scale
+                ),
+                "cached \"\(size)\" truncates at \(scale)x text"
+            )
+            #expect(
+                ModelTableLayout.fits(
+                    ModelTableLayout.inUseCellWidth(size: size), atTextScale: scale
+                ),
+                "serving \"\(size)\" truncates at \(scale)x text"
+            )
+        }
+        for size in ["0.5 GB", "123.4 GB"] {
+            #expect(
+                ModelTableLayout.fits(
+                    ModelTableLayout.notCachedCellWidth(size: size), atTextScale: scale
+                ),
+                "not cached \"~\(size)\" truncates at \(scale)x text"
+            )
+        }
+        // The floor is a bound, not a Dynamic Type pass — say so in the
+        // suite rather than implying the AX sizes are covered.
+        #expect(
+            !ModelTableLayout.fits(
+                ModelTableLayout.inUseCellWidth(size: "123.4 GiB"), atTextScale: 2.0
+            ),
+            "if this now passes, the column reflows and the comment on cellMinimumScaleFactor is stale"
+        )
+    }
+
+    /// The serving row is a cached row too — it owes the same size, and
+    /// the "Serving" label it carries instead of a delete button is wider
+    /// than that button, so it needs its own width check.
+    @Test("size column: a serving cell fits its size next to \"Serving\"")
+    func inUseCellFitsTheSizeColumn() {
+        for size in ["7.9 GiB", "35.2 GiB", "123.4 GiB"] {
+            let needed = ModelTableLayout.inUseCellWidth(size: size)
+            #expect(
+                needed <= ModelTableLayout.sizeColumnWidth,
+                "serving \"\(size)\" needs \(needed)pt, column is \(ModelTableLayout.sizeColumnWidth)pt"
+            )
+        }
+    }
+
+    // MARK: - Size column: measured vs. estimated
+
+    /// A cached row must quote what was MEASURED on disk
+    /// (``ModelEntry.sizeOnDisk``, from `rapid-mlx ls`), verbatim, so the
+    /// Model Management table and Settings → Models cannot print
+    /// different numbers for the same model.
+    @Test("size column: a cached row quotes the measured on-disk size")
+    func cachedRowUsesMeasuredSize() {
+        let entry = ModelEntry(
+            alias: "bonsai-27b-2bit", hfRepo: nil, sizeOnDisk: "7.9 GiB", cached: true
+        )
+        #expect(SettingsModelManagementPanel.onDiskSizeLabel(entry) == "7.9 GiB")
+    }
+
+    /// No measurement, no number. Substituting the alias-derived
+    /// estimate here would dress a guess as a measurement — #1550 is the
+    /// same confusion in the download strip, where the estimate came in
+    /// ~12% under the real bytes.
+    @Test("size column: an unmeasured cached row shows nothing, not an estimate")
+    func cachedRowWithoutMeasurementFallsBackToNothing() {
+        let unmeasured = ModelEntry(
+            alias: "qwen3.5-9b-4bit", hfRepo: nil, sizeOnDisk: nil, cached: true
+        )
+        #expect(SettingsModelManagementPanel.onDiskSizeLabel(unmeasured) == nil)
+        // The estimate for that alias exists and is NOT what we show.
+        #expect(SettingsModelManagementPanel.downloadSizeLabel("qwen3.5-9b-4bit") != nil)
+
+        let blank = ModelEntry(
+            alias: "qwen3.5-9b-4bit", hfRepo: nil, sizeOnDisk: "   ", cached: true
+        )
+        #expect(SettingsModelManagementPanel.onDiskSizeLabel(blank) == nil)
+    }
+
+    /// The two numbers now share a column, so they must not share a
+    /// format: the estimate is rendered with a leading "~" by the row,
+    /// and the helper hands back the bare figure for that to be added to
+    /// exactly once.
+    @Test("size column: the download estimate is a bare figure the row marks as approximate")
+    func downloadEstimateIsBare() {
+        let estimate = SettingsModelManagementPanel.downloadSizeLabel("qwen3.5-9b-4bit")
+        #expect(estimate?.hasPrefix("~") == false)
+        #expect(estimate?.hasSuffix(" GB") == true)
+        // An alias ``ModelSizing`` cannot size at all yields no figure
+        // rather than "~0.0 GB".
+        #expect(SettingsModelManagementPanel.downloadSizeLabel("") == nil)
+    }
 }
