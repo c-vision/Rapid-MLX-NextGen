@@ -26,6 +26,8 @@
 	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSAccentColorName</key>
+	<string>AccentColor</string>
 	<key>NSNetworkVolumesUsageDescription</key>
 	<string>Rapid needs access when you choose a network drive for model storage or approve a file tool there. Click Allow to continue.</string>
 	<key>NSRemovableVolumesUsageDescription</key>

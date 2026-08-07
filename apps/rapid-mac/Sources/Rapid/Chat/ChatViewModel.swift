@@ -202,7 +202,12 @@ final class ChatViewModel {
                 at: now
             ) { conversation in
                 conversation.messages = messages
-                conversation.title = title
+                // A renamed row keeps its name. Re-deriving unconditionally
+                // meant the next streamed token silently reverted the user's
+                // rename back to the first prompt's opening words.
+                if !conversation.hasCustomTitle {
+                    conversation.title = title
+                }
             }
         } else {
             conversations.insert(
@@ -216,9 +221,64 @@ final class ChatViewModel {
                 at: 0
             )
         }
-        if persistsConversations {
-            ConversationStore.save(conversations, to: conversationStoreURL)
-        }
+        saveConversations()
+    }
+
+    // MARK: - Conversation row actions (rename / pin / archive)
+
+    /// Rename a saved conversation.
+    ///
+    /// Trimmed, and blank input is rejected rather than accepted as an empty
+    /// row label — an unnamed row already has a sensible derived title, so
+    /// "clear the name" is better served by the caller not committing.
+    /// Setting ``hasCustomTitle`` is what stops ``persistActive`` re-deriving
+    /// the title from the transcript on the next save.
+    ///
+    /// A rename is not conversation *activity*, so ``updatedAt`` and the row's
+    /// position are left alone — the same reasoning ``ConversationOrdering``
+    /// applies to merely opening a conversation.
+    @discardableResult
+    func renameConversation(_ id: UUID, to newTitle: String) -> Bool {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        guard let index = conversations.firstIndex(where: { $0.id == id }) else { return false }
+        conversations[index].title = trimmed
+        conversations[index].hasCustomTitle = true
+        saveConversations()
+        return true
+    }
+
+    /// Pin / unpin a conversation. Pinned rows get their own sidebar section
+    /// above the date buckets.
+    func setConversationPinned(_ id: UUID, _ pinned: Bool) {
+        guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
+        guard conversations[index].isPinned != pinned else { return }
+        conversations[index].isPinned = pinned
+        // Pinning something archived is contradictory — the row would be
+        // pinned to a list it isn't in. Surfacing it is the intent.
+        if pinned { conversations[index].isArchived = false }
+        saveConversations()
+    }
+
+    /// Archive / unarchive a conversation. Archiving is deliberately NOT a
+    /// delete: the transcript stays on disk and the row remains reachable
+    /// from the sidebar's Archived section, which is why — unlike Delete —
+    /// it needs no confirmation and is one click to undo.
+    ///
+    /// Archiving the OPEN conversation leaves it open. Closing the transcript
+    /// out from under the user would turn a filing action into an unexpected
+    /// navigation, and re-reading what you just archived is normal.
+    func setConversationArchived(_ id: UUID, _ archived: Bool) {
+        guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
+        guard conversations[index].isArchived != archived else { return }
+        conversations[index].isArchived = archived
+        if archived { conversations[index].isPinned = false }
+        saveConversations()
+    }
+
+    private func saveConversations() {
+        guard persistsConversations else { return }
+        ConversationStore.save(conversations, to: conversationStoreURL)
     }
 
     /// Load a saved conversation into the transcript, archiving whatever is
@@ -260,9 +320,7 @@ final class ChatViewModel {
             lastFailureAlias = nil
         }
         conversations.removeAll { $0.id == id }
-        if persistsConversations {
-            ConversationStore.save(conversations, to: conversationStoreURL)
-        }
+        saveConversations()
     }
 
     // MARK: - In-memory message storage
@@ -873,8 +931,16 @@ final class ChatViewModel {
     /// Edit a user turn in place: replace its prose, drop everything
     /// that came after it, and re-send. Matches ChatGPT Desktop's
     /// "edit message" pattern — the edit point becomes the new
-    /// conversation tip. The prior transcript is retained as a sidebar branch
-    /// so later turns are never destroyed by the replay.
+    /// conversation tip.
+    ///
+    /// The replay stays on the CURRENT conversation id. An earlier build
+    /// forked to a fresh id here so the pre-edit transcript survived as a
+    /// recoverable branch, but the branch was indistinguishable from a real
+    /// chat in the sidebar: every edit and every Retry silently spawned a
+    /// duplicate row with the same title, so a few regenerations buried the
+    /// history list under near-identical entries. Rewinding in place is what
+    /// ChatGPT and Claude desktop do, and it is what the row the user is
+    /// looking at appears to promise.
     @discardableResult
     func editUserMessage(
         id: UUID,
@@ -885,10 +951,6 @@ final class ChatViewModel {
         let trimmed = newContent.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         guard let idx = messages.firstIndex(where: { $0.id == id && $0.role == .user }) else { return false }
-        // Preserve the original transcript under its current conversation id,
-        // then continue the edit as a new branch. A one-click edit of an older
-        // turn must never overwrite all later turns on disk.
-        forkConversationForReplay()
         messages = Array(messages.prefix(idx))
         send(trimmed, alias: alias)
         return true
@@ -923,21 +985,11 @@ final class ChatViewModel {
         guard !userText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return false
         }
-        // The selected response and every later turn remain available in the
-        // original sidebar conversation; the regenerated path gets a new id.
-        forkConversationForReplay()
+        // In place, on the SAME conversation id — see ``editUserMessage``
+        // for why the old fork-into-a-branch behaviour was removed.
         messages = Array(messages.prefix(userIndex))
         send(userText, alias: alias)
         return true
-    }
-
-    /// Snapshot the current transcript and move subsequent replay mutations
-    /// onto a fresh conversation id. This is a lightweight conversation branch:
-    /// the UI can keep its simple linear transcript while Edit/Retry remains
-    /// lossless and the original is recoverable from the sidebar.
-    private func forkConversationForReplay() {
-        persistActive(touching: false)
-        activeConversationID = UUID()
     }
 
     /// Same as ``regenerateLast(alias:)`` but brings up ``newAlias``

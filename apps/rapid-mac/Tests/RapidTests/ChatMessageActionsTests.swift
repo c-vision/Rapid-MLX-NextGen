@@ -66,8 +66,8 @@ struct ChatMessageActionsTests {
         #expect(!viewModel.messages.contains(where: { $0.id == secondAssistant.id }))
     }
 
-    @Test("Retrying an older response preserves the original conversation as a branch")
-    func retryOlderAssistantPreservesOriginalBranch() throws {
+    @Test("Retrying an older response replays in place, without spawning a sidebar entry")
+    func retryOlderAssistantStaysOnTheSameConversation() throws {
         let store = try isolatedStoreURL()
         defer { try? FileManager.default.removeItem(at: store.root) }
         let viewModel = ChatViewModel(conversationStoreURL: store.file)
@@ -75,8 +75,7 @@ struct ChatMessageActionsTests {
         let firstAssistant = ChatMessage(role: .assistant, content: "first answer")
         let secondUser = ChatMessage(role: .user, content: "second question")
         let secondAssistant = ChatMessage(role: .assistant, content: "second answer")
-        let original = [firstUser, firstAssistant, secondUser, secondAssistant]
-        viewModel.devSeedMessages(original)
+        viewModel.devSeedMessages([firstUser, firstAssistant, secondUser, secondAssistant])
         let originalID = viewModel.activeConversationID
 
         let retried = viewModel.retryAssistantMessage(
@@ -84,17 +83,19 @@ struct ChatMessageActionsTests {
             alias: "test-model"
         )
         #expect(retried)
-        #expect(viewModel.activeConversationID != originalID)
+        #expect(viewModel.activeConversationID == originalID)
         viewModel.stopAndPersist()
         ConversationStore.flush()
 
+        // Exactly one row on disk: the retry rewrote the conversation it was
+        // fired from rather than forking a duplicate-titled branch beside it.
         let reloaded = ChatViewModel(conversationStoreURL: store.file)
-        let preserved = reloaded.conversations.first(where: { $0.id == originalID })
-        #expect(preserved?.messages == original)
+        #expect(reloaded.conversations.count == 1)
+        #expect(reloaded.conversations.first?.id == originalID)
     }
 
-    @Test("Editing an older message preserves the original conversation as a branch")
-    func editOlderUserPreservesOriginalBranch() throws {
+    @Test("Editing an older message replays in place, without spawning a sidebar entry")
+    func editOlderUserStaysOnTheSameConversation() throws {
         let store = try isolatedStoreURL()
         defer { try? FileManager.default.removeItem(at: store.root) }
         let viewModel = ChatViewModel(conversationStoreURL: store.file)
@@ -102,8 +103,7 @@ struct ChatMessageActionsTests {
         let firstAssistant = ChatMessage(role: .assistant, content: "first answer")
         let secondUser = ChatMessage(role: .user, content: "second question")
         let secondAssistant = ChatMessage(role: .assistant, content: "second answer")
-        let original = [firstUser, firstAssistant, secondUser, secondAssistant]
-        viewModel.devSeedMessages(original)
+        viewModel.devSeedMessages([firstUser, firstAssistant, secondUser, secondAssistant])
         let originalID = viewModel.activeConversationID
 
         let edited = viewModel.editUserMessage(
@@ -112,12 +112,12 @@ struct ChatMessageActionsTests {
             alias: "test-model"
         )
         #expect(edited)
-        #expect(viewModel.activeConversationID != originalID)
+        #expect(viewModel.activeConversationID == originalID)
         viewModel.stopAndPersist()
         ConversationStore.flush()
 
         let reloaded = ChatViewModel(conversationStoreURL: store.file)
-        let preserved = reloaded.conversations.first(where: { $0.id == originalID })
-        #expect(preserved?.messages == original)
+        #expect(reloaded.conversations.count == 1)
+        #expect(reloaded.conversations.first?.id == originalID)
     }
 }

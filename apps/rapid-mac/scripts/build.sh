@@ -124,6 +124,32 @@ else
     echo "warning: benchmark-scores.json missing — picker hover tooltip will show dashed bars only" >&2
 fi
 
+# App accent colour. AppKit paints NSMenu highlights, checkboxes and focus
+# rings with the app's accent colour, and nothing in SwiftUI reaches those:
+# ``.tint()`` styles SwiftUI's own views only, so without this the ··· row
+# menu highlighted in stock macOS system blue — the one colour the v0.6
+# palette deliberately avoids.
+#
+# The lookup is Info.plist ``NSAccentColorName`` → a NAMED COLOR inside a
+# COMPILED Assets.car. A raw .xcassets directory is not readable at
+# runtime, so it has to go through actool. actool ships with Xcode, not
+# the Command Line Tools: a machine with only the CLT builds a .app whose
+# menus fall back to system blue rather than failing the build, which is a
+# cosmetic degradation and not worth blocking a local build over.
+ASSETS_SRC="$ROOT/Sources/Rapid/Resources/Assets.xcassets"
+if [[ -d "$ASSETS_SRC" ]]; then
+    if ACTOOL="$(xcrun --find actool 2>/dev/null)"; then
+        "$ACTOOL" "$ASSETS_SRC" \
+            --compile "$CONTENTS/Resources" \
+            --platform macosx \
+            --minimum-deployment-target 14.0 \
+            --output-format human-readable-text \
+            >/dev/null
+    else
+        echo "warning: actool not found (Xcode not selected) — menus will use the system accent colour" >&2
+    fi
+fi
+
 # v0.6.6: embed rapid-mlx sidecar (issue #171). MONOREPO: the sidecar is
 # built from the rapid-mlx engine that lives at the repository ROOT (two
 # levels up from apps/rapid-mac). There is NO git submodule here — the

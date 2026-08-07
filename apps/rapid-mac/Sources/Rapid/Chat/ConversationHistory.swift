@@ -1,6 +1,6 @@
 import Foundation
 
-/// A saved conversation — the unit the sidebar "Older" list shows and the
+/// A saved conversation — the unit the sidebar history list shows and the
 /// on-disk history persists. ``ChatMessage`` is already ``Codable``, so a
 /// conversation serialises as-is.
 struct ChatConversation: Identifiable, Codable, Equatable {
@@ -9,6 +9,59 @@ struct ChatConversation: Identifiable, Codable, Equatable {
     var messages: [ChatMessage]
     let createdAt: Date
     var updatedAt: Date
+
+    /// Pinned rows sort into their own section above the date buckets and
+    /// stay there regardless of how stale ``updatedAt`` gets.
+    var isPinned: Bool = false
+
+    /// Archived rows leave the main list entirely. They are NOT deleted —
+    /// the transcript is untouched on disk — they just stop competing for
+    /// attention with active work, and are reachable through the sidebar's
+    /// Archived disclosure.
+    var isArchived: Bool = false
+
+    /// Set once the user renames the row. ``ChatViewModel.persistActive``
+    /// re-derives ``title`` from the first user turn on every save, which
+    /// would silently stomp a manual rename on the next streamed token;
+    /// this flag is what makes the derivation skip an owned title.
+    var hasCustomTitle: Bool = false
+
+    init(
+        id: UUID,
+        title: String,
+        messages: [ChatMessage],
+        createdAt: Date,
+        updatedAt: Date,
+        isPinned: Bool = false,
+        isArchived: Bool = false,
+        hasCustomTitle: Bool = false
+    ) {
+        self.id = id
+        self.title = title
+        self.messages = messages
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.isPinned = isPinned
+        self.isArchived = isArchived
+        self.hasCustomTitle = hasCustomTitle
+    }
+
+    /// Hand-written so a history file written before pin/archive shipped
+    /// still decodes. The synthesised initialiser treats every stored
+    /// property as required, so a missing `isPinned` key would throw —
+    /// and ``ConversationStore.load`` turns one throw into "the whole
+    /// history is corrupt", i.e. an apparently wiped sidebar on upgrade.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        messages = try c.decode([ChatMessage].self, forKey: .messages)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        isPinned = try c.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+        isArchived = try c.decodeIfPresent(Bool.self, forKey: .isArchived) ?? false
+        hasCustomTitle = try c.decodeIfPresent(Bool.self, forKey: .hasCustomTitle) ?? false
+    }
 }
 
 extension ChatConversation: ConversationOrderingItem {}

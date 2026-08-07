@@ -50,6 +50,23 @@ struct SidebarView: View {
     /// no trash, no undo), so — unlike navigating — it must be confirmed first.
     @State private var pendingDeletion: ChatConversation?
 
+    /// The conversation currently being renamed inline, plus its draft text.
+    /// Inline (rather than a sheet) because a rename is a one-field edit on a
+    /// row the user is already pointing at; a modal for it reads as a much
+    /// heavier action than it is.
+    @State private var renamingID: UUID?
+    @State private var renameDraft = ""
+
+    /// Whether the Archived group is expanded. Collapsed by default — the
+    /// whole point of archiving is to get those rows out of the way.
+    @State private var showArchived = false
+
+    /// Which history row the pointer is over. Tracked here rather than inside
+    /// ``SidebarRow`` because the pin / ··· controls are siblings of the row
+    /// button (a `Menu` inside a `Button` label is unclickable), so they need
+    /// a hover signal the row itself doesn't own.
+    @State private var hoveredConversationID: UUID?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             row(
@@ -80,6 +97,7 @@ struct SidebarView: View {
                                 conversationRow(conv)
                             }
                         }
+                        archivedSection
                     }
                 }
                 .scrollIndicators(.never)
@@ -158,9 +176,14 @@ struct SidebarView: View {
         let conversations: [ChatConversation]
     }
 
-    /// Bucket conversations by recency. ``now`` is injected rather than read
-    /// inside, matching ``RelativeTimestamp`` — it keeps the function pure so
-    /// the day boundaries can be exercised without waiting for midnight.
+    /// Bucket conversations for the main list. ``now`` is injected rather than
+    /// read inside, matching ``RelativeTimestamp`` — it keeps the function pure
+    /// so the day boundaries can be exercised without waiting for midnight.
+    ///
+    /// Pinned rows are lifted into their own leading section and are exempt
+    /// from the date buckets entirely: a pin means "keep this where I can see
+    /// it", which a "Previous 7 Days" heading would immediately undo. Archived
+    /// rows are excluded here — ``archivedConversations`` owns them.
     ///
     /// Uses `Calendar` (not a fixed 86 400s divisor) because the buckets are
     /// *calendar* days: something sent at 23:55 belongs to "Yesterday" once
@@ -171,6 +194,7 @@ struct SidebarView: View {
         now: Date,
         calendar: Calendar = .current
     ) -> [HistorySection] {
+        var pinned: [ChatConversation] = []
         var today: [ChatConversation] = []
         var yesterday: [ChatConversation] = []
         var week: [ChatConversation] = []
@@ -182,8 +206,10 @@ struct SidebarView: View {
         let startOfToday = calendar.startOfDay(for: now)
         let weekCutoff = calendar.date(byAdding: .day, value: -7, to: startOfToday)
 
-        for conv in conversations {
-            if calendar.isDate(conv.updatedAt, inSameDayAs: now) {
+        for conv in conversations where !conv.isArchived {
+            if conv.isPinned {
+                pinned.append(conv)
+            } else if calendar.isDate(conv.updatedAt, inSameDayAs: now) {
                 today.append(conv)
             } else if calendar.isDateInYesterday(conv.updatedAt) {
                 yesterday.append(conv)
@@ -195,6 +221,7 @@ struct SidebarView: View {
         }
 
         return [
+            ("Pinned", pinned),
             ("Today", today),
             ("Yesterday", yesterday),
             ("Previous 7 Days", week),
@@ -204,27 +231,175 @@ struct SidebarView: View {
         .map { HistorySection(title: $0.0, conversations: $0.1) }
     }
 
-    /// One history row — the conversation's derived title, amber-selected
-    /// when it's the open one, with a right-click Delete.
-    private func conversationRow(_ conv: ChatConversation) -> some View {
-        let isActive = selection == .chat && conv.id == chat.activeConversationID
-        return SidebarRow(isSelected: isActive) {
-            onSelectConversation(conv.id)
-        } content: {
-            // History rows carry no icon but keep the same leading inset
-            // as the nav rows above, so titles and nav labels align down
-            // one column instead of stepping in and out.
-            Text(conv.title)
-                .font(RapidFont.body)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .padding(.leading, RapidTheme.Layout.iconSlot + RapidTheme.Space.sm)
-        }
-        .contextMenu {
-            Button("Delete", role: .destructive) {
-                pendingDeletion = conv
+    /// Archived rows, newest-updated first. Kept out of ``sections`` so the
+    /// main list can never accidentally render one.
+    static func archived(for conversations: [ChatConversation]) -> [ChatConversation] {
+        conversations.filter { $0.isArchived }
+    }
+
+    private var archivedConversations: [ChatConversation] {
+        SidebarView.archived(for: chat.conversations)
+    }
+
+    /// The collapsed Archived group. Renders nothing at all when empty, so a
+    /// user who never archives anything never sees the affordance.
+    @ViewBuilder
+    private var archivedSection: some View {
+        let archived = archivedConversations
+        if !archived.isEmpty {
+            Button {
+                showArchived.toggle()
+            } label: {
+                HStack(spacing: RapidTheme.Space.xs) {
+                    Image(systemName: showArchived ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                    SectionHeader("Archived (\(archived.count))")
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, RapidTheme.Space.sm)
+            .padding(.top, RapidTheme.Space.lg)
+            .padding(.bottom, RapidTheme.Space.xs)
+
+            if showArchived {
+                ForEach(archived) { conv in
+                    conversationRow(conv)
+                }
             }
         }
+    }
+
+    /// One history row — the conversation's derived title, amber-selected
+    /// when it's the open one, with a hover-revealed pin toggle and overflow
+    /// menu (and the same actions duplicated on right-click, since a context
+    /// menu is what a macOS user reaches for first).
+    ///
+    /// The controls are an OVERLAY rather than trailing content inside the
+    /// row's button: a `Menu` nested in a `Button` label is decorative — the
+    /// outer button swallows the click, so the ··· would just open the
+    /// conversation. Layering them as siblings keeps each one hittable.
+    @ViewBuilder
+    private func conversationRow(_ conv: ChatConversation) -> some View {
+        if renamingID == conv.id {
+            renameField(conv)
+        } else {
+            let isActive = selection == .chat && conv.id == chat.activeConversationID
+            // Controls appear on hover OR on the selected row; a pinned row
+            // always shows its pin, because otherwise the only signal that a
+            // row is pinned would be its position, which reads as an
+            // unexplained ordering bug.
+            let hovering = hoveredConversationID == conv.id
+            let showsControls = hovering || isActive || conv.isPinned
+            ZStack(alignment: .trailing) {
+                SidebarRow(isSelected: isActive) {
+                    onSelectConversation(conv.id)
+                } content: {
+                    // History rows carry no icon but keep the same leading
+                    // inset as the nav rows above, so titles and nav labels
+                    // align down one column instead of stepping in and out.
+                    Text(conv.title)
+                        .font(RapidFont.body)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.leading, RapidTheme.Layout.iconSlot + RapidTheme.Space.sm)
+                        // Reserve the controls' width so revealing them
+                        // re-truncates the title instead of overlapping it.
+                        .padding(.trailing, showsControls ? Self.rowControlsWidth : 0)
+                }
+                if showsControls {
+                    rowControls(conv, showsPin: hovering || isActive)
+                }
+            }
+            .onHover { hoveredConversationID = $0 ? conv.id : nil }
+            .contextMenu { rowMenuItems(conv) }
+        }
+    }
+
+    /// Width the pin + ··· pair occupies, reserved in the title's layout.
+    private static let rowControlsWidth =
+        RapidTheme.ControlHeight.mini * 2 + RapidTheme.Space.xs
+
+    private func rowControls(_ conv: ChatConversation, showsPin: Bool) -> some View {
+        HStack(spacing: 0) {
+            if showsPin || conv.isPinned {
+                QuietIconButton(
+                    symbol: conv.isPinned ? "pin.slash" : "pin",
+                    label: conv.isPinned ? "Unpin conversation" : "Pin conversation",
+                    size: RapidTheme.ControlHeight.mini
+                ) {
+                    chat.setConversationPinned(conv.id, !conv.isPinned)
+                }
+            }
+            Menu {
+                rowMenuItems(conv)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(
+                        width: RapidTheme.ControlHeight.mini,
+                        height: RapidTheme.ControlHeight.mini
+                    )
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel("Conversation actions")
+        }
+        .foregroundStyle(.secondary)
+        .padding(.trailing, RapidTheme.Space.xs)
+    }
+
+    /// The row's actions, shared by the hover menu and the right-click menu so
+    /// the two can't drift apart.
+    @ViewBuilder
+    private func rowMenuItems(_ conv: ChatConversation) -> some View {
+        Button {
+            renameDraft = conv.title
+            renamingID = conv.id
+        } label: {
+            Label("Rename", systemImage: "pencil")
+        }
+        Divider()
+        Button {
+            chat.setConversationPinned(conv.id, !conv.isPinned)
+        } label: {
+            Label(conv.isPinned ? "Unpin" : "Pin", systemImage: conv.isPinned ? "pin.slash" : "pin")
+        }
+        Button {
+            chat.setConversationArchived(conv.id, !conv.isArchived)
+        } label: {
+            Label(
+                conv.isArchived ? "Unarchive" : "Archive",
+                systemImage: conv.isArchived ? "tray.and.arrow.up" : "archivebox"
+            )
+        }
+        Divider()
+        Button("Delete", role: .destructive) {
+            pendingDeletion = conv
+        }
+    }
+
+    /// Inline rename editor, occupying the row it replaces. Return commits,
+    /// Escape (and losing focus) cancels — the standard Finder rename
+    /// contract, so a rename can't be committed by accidentally clicking away.
+    private func renameField(_ conv: ChatConversation) -> some View {
+        TextField("Conversation name", text: $renameDraft)
+            .textFieldStyle(.plain)
+            .font(RapidFont.body)
+            .padding(.horizontal, RapidTheme.Space.sm)
+            .frame(height: RapidTheme.ControlHeight.row)
+            .background(
+                RoundedRectangle(cornerRadius: RapidTheme.Radius.row, style: .continuous)
+                    .fill(RapidTheme.hoverFill)
+            )
+            .onSubmit {
+                chat.renameConversation(conv.id, to: renameDraft)
+                renamingID = nil
+            }
+            .onExitCommand { renamingID = nil }
     }
 
     /// One nav row — icon in a fixed-width slot so every label starts on
