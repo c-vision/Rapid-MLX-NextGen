@@ -13,8 +13,82 @@ can actually understand.
 
 ## [Unreleased]
 
+## [0.12.6] — 2026-08-07
+
+Rapid can now look things up. The headline is a set of built-in tools —
+weather, web search, and fetching a page — that a model can use mid-answer,
+with you deciding what it is allowed to reach. The rest of the release is
+about the app telling the truth: a first question that got a real answer, a
+Rename box that took what you typed, buttons that did what they said, and a
+model list that stopped offering models that can never chat.
+
+Bundles the **Rapid-MLX 0.12.5** engine.
+
+### Added
+
+- **Built-in tools: weather, web search, and reading a web page.** Ask about
+  the weather or something recent and the model can go and find out, showing
+  a card for each lookup that you can open to see exactly what it asked for
+  and what came back. Fetching a page asks your permission first, naming the
+  site, and "Don't allow" is a normal answer rather than an error. Search
+  works out of the box; you can switch the backend in Settings → Tools, and
+  private and local addresses are refused.
+- **Conversations can be pinned, renamed and archived.** Right-click a chat in
+  the sidebar, or use the ··· button that appears when you hover it. Pinned
+  chats sit in their own group above everything else; archived ones move into
+  a collapsed "Archived" group you can reopen at any time. Renaming a chat
+  stops Rapid from re-titling it for you afterwards.
+- **Deleting a conversation asks first**, names the chat it is about to
+  delete, and says plainly that it cannot be undone.
+- **Every message has its own actions.** Copy any message; edit a question you
+  already sent; regenerate an answer you did not like.
+
 ### Fixed
 
+- **The first question in a chat gets a real answer again.** Because Rapid's
+  web tools are on by default, every opening message quietly carried an
+  instruction telling the model that anything not in "the tool result" was
+  unknown to it — when there was no tool result at all. Asked *what is the
+  capital of France?*, the starter model answered "I don't have access to
+  current or external data". That instruction now only travels with a message
+  that actually has a tool result behind it.
+- **Regenerating a reply replaces it instead of piling up.** The retry button
+  under an answer used to append a second answer below the first.
+- **Renaming a chat works.** Picking Rename put a text box on the row, but the
+  keyboard never moved to it: what you typed went into the message box at the
+  bottom of the window instead, so the title you meant to set became a draft
+  message, and neither Return nor Escape could get you out of the row. The
+  same fault affected editing a message you had already sent.
+- **The setup wizard appears for everyone again.** If your Mac already had any
+  model downloaded — from an earlier version, from the command line, from
+  anything — Rapid started that model the instant it launched, and starting a
+  model was enough to suppress the first-run wizard entirely. New users on
+  such a Mac never saw it, and instead of the small starter model the wizard
+  offers, they silently got whichever model happened to sort first
+  alphabetically. Now nothing starts until either the wizard is done or you
+  have used Rapid before — and nothing starts before you have answered the
+  "Help improve Rapid-MLX" question, either.
+- **Models that can only make video are no longer offered as chat models.**
+  Eight of them sat in the model picker and in Model Management looking like
+  ordinary chat models, with nothing to distinguish them. They cannot hold a
+  conversation at all, so picking one led to "Couldn't start… Try again" —
+  advice that would fail every time — and you could reach that after
+  downloading up to 64 GB.
+- **Buttons in Settings that did nothing now do something.** Several recovery
+  buttons — including the one on the first-run card you see when a download or
+  a model start has just failed — highlighted when you hovered them, accepted
+  the click, and then did nothing at all. They now open the Settings page they
+  name. The one that offered to open a "Permissions" screen has been removed:
+  there is no such screen.
+- **"Open-source credits" and "Privacy policy" no longer open a 404.** Both
+  links pointed at addresses that do not exist. The credits list itself was
+  wrong as well — it named two libraries Rapid does not use, left out three it
+  does, and said the engine's Python dependencies are not bundled, which
+  stopped being true in 0.6.6.
+- **Model Management and the readiness banner stop saying untrue things** about
+  what is installed, what is running, and what a button is about to do.
+- **A model that wedges while starting no longer leaves the app stuck.** Rapid
+  now notices and recovers instead of waiting forever.
 - **Web search now says what actually went wrong.** DuckDuckGo — the free
   backend Rapid uses out of the box — starts refusing searches from your Mac
   after the first few, and Rapid read that refusal as an ordinary success with
