@@ -87,6 +87,11 @@ Bundles the **Rapid-MLX 0.12.5** engine.
   stopped being true in 0.6.6.
 - **Model Management and the readiness banner stop saying untrue things** about
   what is installed, what is running, and what a button is about to do.
+- **Settings switches work with VoiceOver again.** The toggles in Settings
+  rendered as inert text to assistive technology: VoiceOver announced them as
+  labels rather than checkboxes, and activating one reported success without
+  changing anything. They are native checkboxes again, and the sidebar's New
+  Chat, Launch and conversation rows now carry stable identifiers.
 - **A model that wedges while starting no longer leaves the app stuck.** Rapid
   now notices and recovers instead of waiting forever.
 - **Web search now says what actually went wrong.** DuckDuckGo — the free
