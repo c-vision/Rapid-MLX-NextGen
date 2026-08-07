@@ -1027,14 +1027,17 @@ final class ChatViewModel {
             // Ambient anti-confabulation guidance, prepended for the wire body
             // only (never appended to the transcript) so the user's history
             // stays prose-only. Skipped when the transcript already opens with
-            // a system row, and when no tools are advertised.
-            history.insert(
-                contentsOf: ChatViewModel.ambientSystemMessages(
-                    historyOpensWithSystem: history.first?.role == .system,
-                    toolsAdvertised: !definitions.isEmpty
-                ),
-                at: 0
+            // a system row, when no tools are advertised, and — the point of
+            // #1549 — on rounds that carry no tool result for it to talk about.
+            let ambient = ChatViewModel.ambientSystemMessages(
+                historyOpensWithSystem: history.first?.role == .system,
+                toolsAdvertised: !definitions.isEmpty,
+                toolResultPresent: ChatViewModel.carriesToolResultForThisTurn(history)
             )
+            // Inserted BEFORE the trim so its tokens are inside the budget the
+            // trim works to, not added on top of a body already sized to fill
+            // the window.
+            history.insert(contentsOf: ambient, at: 0)
             // v0.5.11 / issue #363: silent context-window trim against the
             // engine-reported window (captured on the last profile fetch),
             // falling back to the per-family heuristic in ``ModelInfoCatalog``.
@@ -1049,6 +1052,19 @@ final class ChatViewModel {
                 history,
                 contextWindow: ctxWindow
             )
+            // The trim drops the oldest rows to fit and deliberately preserves
+            // a leading system row, so on an over-budget turn it can carry the
+            // preamble through while taking the tool result it describes. That
+            // puts "your only source of truth is the tool result" on the wire
+            // with no tool result behind it — #1549 again, just needing a long
+            // enough conversation to reach. If the evidence didn't survive,
+            // neither does the instruction.
+            if !ambient.isEmpty,
+                history.first?.content == ChatViewModel.toolGuidancePreamble,
+                !ChatViewModel.carriesToolResultForThisTurn(history)
+            {
+                history.removeFirst()
+            }
             let request: ChatStreamClient.Request
             if let s = sampling {
                 let resolved = s.resolved(toolsEnabled: !definitions.isEmpty)
@@ -1232,19 +1248,53 @@ final class ChatViewModel {
         return "unknown tool '\(name)'\(list.isEmpty ? "" : " — available: \(list)"). Answer directly instead."
     }
 
-    /// Ambient anti-confabulation guidance — prepended to the wire body
-    /// whenever at least one tool is advertised.
+    /// Ambient anti-confabulation guidance — prepended to the wire body on
+    /// rounds where a tool result is actually in play.
     ///
     /// Small models routinely fire a tool, get faithful snippets back, then
     /// fabricate the rest of the list from training-data priors. The preamble
-    /// is the cheapest mitigation and costs nothing when no tool is offered.
+    /// is the cheapest mitigation against that.
+    ///
+    /// It is gated on a tool RESULT being present, not merely on a tool being
+    /// advertised. The rules it states ("if a fact is not in the tool result,
+    /// you DO NOT KNOW IT") describe how to read a result that exists; a model
+    /// shown them with no result in context can only conclude it knows nothing.
+    /// That is not hypothetical — issue #1549: with the built-in web tools
+    /// advertised by default, the preamble rode along on every first turn and
+    /// the shipped starter model answered "I don't have access to current or
+    /// external data" to *what is the capital of France?*, a question it
+    /// answers correctly the moment the preamble is absent.
+    ///
+    /// Both conditions are required rather than just the result: a transcript
+    /// can carry ``.tool`` rows from an earlier round after the user has since
+    /// disabled the tool, and re-asserting "your only source of truth is the
+    /// tool result" would then bind the model to a result it can no longer
+    /// refresh.
+    ///
     /// Returns an empty array when the transcript already opens with a
     /// ``role: "system"`` row so we never ship competing system messages.
+    /// Does this wire body carry a tool result for the turn being answered?
+    ///
+    /// Scoped to the rows after the last ``.user`` message, because a
+    /// ``.tool`` row from an earlier question is not evidence about this one.
+    /// Asking the whole transcript instead means a single weather lookup
+    /// re-arms the preamble for every ordinary question that follows it —
+    /// #1549 again, wearing a longer conversation.
+    static func carriesToolResultForThisTurn(_ history: [ChatMessage]) -> Bool {
+        let start =
+            history.lastIndex { $0.role == .user }
+            .map { history.index(after: $0) } ?? history.startIndex
+        return history[start...].contains { $0.role == .tool }
+    }
+
     static func ambientSystemMessages(
         historyOpensWithSystem: Bool,
-        toolsAdvertised: Bool
+        toolsAdvertised: Bool,
+        toolResultPresent: Bool
     ) -> [ChatMessage] {
-        guard !historyOpensWithSystem, toolsAdvertised else { return [] }
+        guard !historyOpensWithSystem, toolsAdvertised, toolResultPresent else {
+            return []
+        }
         return [ChatMessage(role: .system, content: toolGuidancePreamble, status: .complete)]
     }
 

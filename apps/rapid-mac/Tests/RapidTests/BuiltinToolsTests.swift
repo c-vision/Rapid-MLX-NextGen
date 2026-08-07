@@ -142,20 +142,77 @@ final class BuiltinToolsTests {
 
     // MARK: - Ambient guidance
 
-    @Test("The anti-confabulation preamble rides along only when tools are advertised")
-    func ambientGuidanceGatedOnTools() {
+    @Test("The anti-confabulation preamble rides along once a tool result is in play")
+    func ambientGuidanceGatedOnToolResult() {
+        let withResult = ChatViewModel.ambientSystemMessages(
+            historyOpensWithSystem: false,
+            toolsAdvertised: true,
+            toolResultPresent: true
+        )
+        #expect(withResult.count == 1)
+        #expect(withResult.first?.role == .system)
+        #expect(withResult.first?.content == ChatViewModel.toolGuidancePreamble)
+    }
+
+    @Test("A tool merely being advertised does not summon the preamble (#1549)")
+    func ambientGuidanceStaysHomeUntilThereIsAResult() {
+        // The regression this guards is the whole first-turn experience. The
+        // built-in web tools are advertised by default, so before #1549 every
+        // opening message shipped a preamble telling the model that anything
+        // absent from "the tool result" was unknown to it — with no tool result
+        // in context. The shipped starter answered "I don't have access to
+        // current or external data" to *what is the capital of France?*.
         #expect(ChatViewModel.ambientSystemMessages(
             historyOpensWithSystem: false,
-            toolsAdvertised: false
+            toolsAdvertised: true,
+            toolResultPresent: false
         ).isEmpty)
+    }
 
-        let withTools = ChatViewModel.ambientSystemMessages(
+    @Test("A stale tool result cannot re-bind the model once the tool is gone")
+    func ambientGuidanceNeedsTheToolStillAdvertised() {
+        // A transcript keeps its ``.tool`` rows after the user disables the
+        // tool in Settings. Re-asserting "your only source of truth is the tool
+        // result" would then pin the model to a result it can no longer
+        // refresh, which is the same failure wearing older evidence.
+        #expect(ChatViewModel.ambientSystemMessages(
             historyOpensWithSystem: false,
-            toolsAdvertised: true
-        )
-        #expect(withTools.count == 1)
-        #expect(withTools.first?.role == .system)
-        #expect(withTools.first?.content == ChatViewModel.toolGuidancePreamble)
+            toolsAdvertised: false,
+            toolResultPresent: true
+        ).isEmpty)
+    }
+
+    @Test("A tool result only counts for the turn it belongs to")
+    func toolResultScopedToTheCurrentTurn() {
+        func msg(_ role: ChatMessage.Role, _ text: String) -> ChatMessage {
+            ChatMessage(role: role, content: text, status: .complete)
+        }
+
+        // Turn 1 used a tool; turn 2 is an ordinary question. Scanning the
+        // whole transcript would re-arm the preamble here and reproduce
+        // #1549 from the second question onward.
+        let laterPlainTurn = [
+            msg(.user, "weather in Tokyo?"),
+            msg(.assistant, ""),
+            msg(.tool, "{\"temp_c\": 29.2}"),
+            msg(.assistant, "It's 29.2°C in Tokyo."),
+            msg(.user, "what is the capital of France?"),
+        ]
+        #expect(!ChatViewModel.carriesToolResultForThisTurn(laterPlainTurn))
+
+        // The round right after a tool returned — this is what the preamble
+        // exists for, so it must still count.
+        let midToolLoop = [
+            msg(.user, "weather in Tokyo?"),
+            msg(.assistant, ""),
+            msg(.tool, "{\"temp_c\": 29.2}"),
+        ]
+        #expect(ChatViewModel.carriesToolResultForThisTurn(midToolLoop))
+
+        // A transcript with no user row at all (defensive: the tool loop
+        // never produces one, but the helper must not crash or misread it).
+        #expect(!ChatViewModel.carriesToolResultForThisTurn([]))
+        #expect(ChatViewModel.carriesToolResultForThisTurn([msg(.tool, "{}")]))
     }
 
     @Test("No second system row is injected when the transcript already opens with one")
@@ -163,7 +220,8 @@ final class BuiltinToolsTests {
         // Two competing system messages is a documented chat-template foot-gun.
         #expect(ChatViewModel.ambientSystemMessages(
             historyOpensWithSystem: true,
-            toolsAdvertised: true
+            toolsAdvertised: true,
+            toolResultPresent: true
         ).isEmpty)
     }
 }
