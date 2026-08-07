@@ -185,6 +185,14 @@ struct RapidApp: App {
                     AppDelegate.openSettingsWindow = {
                         openWindow(id: "settings")
                     }
+                    AppDelegate.openSettingsWindowAt = { category in
+                        // `route(to:open:)` assigns the pending category
+                        // BEFORE opening — that ordering is load-bearing, see
+                        // SettingsRouter.
+                        settingsRouter.route(to: category) {
+                            openWindow(id: "settings")
+                        }
+                    }
                 }
                 .task {
                     // First update check on launch, then re-check every
@@ -657,6 +665,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// ``sendAction`` from the status-item menu never reached it and the
     /// tray "Settings…" item silently did nothing.
     static var openSettingsWindow: (@MainActor () -> Void)?
+
+    /// Open Settings deep-linked to a category, for call sites outside the
+    /// SwiftUI environment (the tray reads its dependencies through
+    /// ``AppDelegate.shared`` and cannot see ``SettingsRouter`` directly).
+    ///
+    /// Exists because the tray's "Check for updates…" had nowhere to report
+    /// to: it fired the check and discarded the result, so a user on the
+    /// latest version clicked and saw nothing at all. Settings → App already
+    /// renders that state ("Up to date — vX.Y.Z is the latest release."), so
+    /// the item routes there rather than growing a second surface that could
+    /// disagree with the first.
+    static var openSettingsWindowAt: (@MainActor (SettingsView.Category?) -> Void)?
 
     /// Canonical termination ordering. Audit P1 wants the in-flight
     /// chat stream cancelled BEFORE the session envelope is

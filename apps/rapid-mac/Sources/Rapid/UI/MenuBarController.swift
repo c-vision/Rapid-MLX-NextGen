@@ -222,7 +222,21 @@ final class MenuBarController: NSObject {
         case .update:
             openUpdateWindow()
         case .checkForUpdates:
+            // Fire the check AND take the user somewhere that reports it.
+            //
+            // This used to be `Task { _ = await updater?.check() }` — result
+            // discarded, no UI. When an update exists the menu grows an
+            // "Update available" item on the next open, so that path looked
+            // fine; when you are already current, clicking produced nothing
+            // observable at all, which is indistinguishable from a broken
+            // build or a click that missed (#1605).
+            //
+            // Settings → App already renders the outcome, including the
+            // running version, so route there rather than inventing a second
+            // surface that could drift from the first.
             Task { _ = await AppDelegate.shared.updater?.check() }
+            NSApp.activate(ignoringOtherApps: true)
+            AppDelegate.openSettingsWindowAt?(.app)
         case .about:
             if let server = AppDelegate.shared.server {
                 AboutPanel.show(server: server)
