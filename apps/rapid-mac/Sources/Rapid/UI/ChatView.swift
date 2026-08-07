@@ -995,6 +995,19 @@ private struct ToolCallChip: View {
     let call: ToolCall
     let result: ChatMessage?
 
+    /// Deep-link channel into Settings. Optional so the chip still renders in
+    /// any host that hasn't injected the router (previews, snapshot harness) —
+    /// the non-optional form traps at lookup time. Absence also suppresses the
+    /// inline button entirely; see ``FailureDiagnosis.inlineToolCardAction``.
+    @Environment(SettingsRouter.self) private var settingsRouter: SettingsRouter?
+    /// ``openWindow(id: "settings")``, NOT ``@Environment(\.openSettings)``.
+    /// This app has no SwiftUI ``Settings`` scene — it declares a real
+    /// ``Window("Settings", id: "settings")`` so the tray item can reach it
+    /// (see ``RapidApp``), and ``OpenSettingsAction`` against a missing
+    /// ``Settings`` scene is a silent no-op. ⌘, and the tray's "Settings…"
+    /// item both go through ``openWindow`` for the same reason.
+    @Environment(\.openWindow) private var openWindow
+
     /// Manual override. Tracks the user's last toggle so a click always wins
     /// over the auto-collapse-on-success rule; without it, expanding a
     /// completed chip would be silently re-collapsed on the next body pass.
@@ -1024,14 +1037,45 @@ private struct ToolCallChip: View {
         return ChatTextSanitizer.sanitizeForDisplay(str)
     }
 
+    /// Stable diagnosis for a failed result. ``nil`` while the tool is still
+    /// running or when it succeeded.
+    private var failureDiagnosis: FailureDiagnosis? {
+        guard let result, result.status == .failed else { return nil }
+        return result.toolFailureDiagnosis(toolName: call.function.name)
+    }
+
     /// A failed result renders its stable diagnosis, never the raw tool
     /// payload — that stays in the model's context, not on screen.
     private var resultBody: String? {
         guard let result else { return nil }
-        if result.status == .failed {
-            return result.toolFailureDiagnosis(toolName: call.function.name).message
-        }
+        if let failureDiagnosis { return failureDiagnosis.message }
         return ChatTextSanitizer.sanitizeForDisplay(result.content)
+    }
+
+    /// The one recovery action the chip offers inline, or nil for no button.
+    /// Policy lives in ``FailureDiagnosis`` so it can be pinned by a test —
+    /// this view is private and a SwiftUI body isn't reachable from the suite.
+    private var inlineAction: FailureDiagnosis.Action? {
+        FailureDiagnosis.inlineToolCardAction(
+            for: failureDiagnosis,
+            canRouteToSettings: settingsRouter != nil
+        )
+    }
+
+    private func perform(_ action: FailureDiagnosis.Action) {
+        switch action {
+        case .openWebSearchSettings:
+            // Order matters: the router field must be set BEFORE the window
+            // opens. ``SettingsView`` consumes it from ``.onAppear`` (first
+            // open of the session) and ``.onChange`` (already-open window
+            // being re-focused); setting it after the open would race the
+            // ``.onAppear`` read and land the user on the last-used tab.
+            // Same pairing ``QuickstartView`` uses for its deep-links.
+            settingsRouter?.requestedCategory = .tools
+            openWindow(id: "settings")
+        case .retry, .restart, .openModelManagement, .switchDownloadSource, .openPermissions:
+            break
+        }
     }
 
     private var statusIcon: String {
@@ -1086,6 +1130,16 @@ private struct ToolCallChip: View {
                             .foregroundStyle(result?.status == .failed ? RapidTheme.statusError : .secondary)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if let action = inlineAction {
+                        Button {
+                            perform(action)
+                        } label: {
+                            Label(action.title, systemImage: action.systemImage)
+                        }
+                        .buttonStyle(.link)
+                        .font(.system(size: 11))
+                        .accessibilityIdentifier("ToolCallChip.\(action.rawValue)")
                     }
                 }
                 .padding(.horizontal, 10)
