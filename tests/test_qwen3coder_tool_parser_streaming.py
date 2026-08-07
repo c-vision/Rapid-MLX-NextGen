@@ -427,3 +427,81 @@ def test_string_aliases_all_stream_incrementally(param_type):
         f"type={param_type!r}: expected incremental emission, got "
         f"{len(value_frags)} value-bearing fragments"
     )
+
+
+# ``(value, ensure_ascii settings worth running)``. Escaping is what this
+# exercises, so a value is only run under both settings when the two produce
+# different wires — for pure ASCII they are byte-identical and the second run
+# would assert nothing the first did not.
+_QUOTE_FIDELITY_VALUES = [
+    # the shape #1600 fixes — controls that must come out clean
+    ("https://example.com", (False,)),
+    ("https://example.com/a-b.c?q=1&r=2", (False,)),
+    ("/tmp/.hermes-read-0123456789abcdef0123456789abcdef.txt", (False,)),
+    # the mirror risk: content that GENUINELY carries the quotes
+    ('"hello world"', (False,)),
+    ('"opening only', (False,)),
+    ('closing only"', (False,)),
+    ('""', (False,)),
+    ('"</parameter> inside"', (False,)),
+    ('"trailing backslash \\"', (False,)),
+    # non-ASCII: the two settings differ, and with escaping on the mid-value
+    # cut lands inside a \uXXXX sequence
+    ('"天气预报 北京"', (True, False)),
+]
+
+
+def _quote_fidelity_cases():
+    for value, ascii_modes in _QUOTE_FIDELITY_VALUES:
+        for ensure_ascii in ascii_modes:
+            for cut in ("mid-value", "before-closing-quote"):
+                for lead in ("", " ", "\n "):
+                    yield pytest.param(value, ensure_ascii, cut, lead)
+
+
+@pytest.mark.parametrize(
+    ("value", "ensure_ascii", "cut", "lead"), _quote_fidelity_cases()
+)
+def test_wrapper_quotes_dropped_without_eating_real_quotes(
+    value: str, ensure_ascii: bool, cut: str, lead: str
+):
+    """Dropping the JSON wrapper quotes must not drop the value's own.
+
+    #1600 stops the wrapper quotes reaching the caller when formatting
+    whitespace splits the chunk before the opening quote. The failure mode
+    on the other side is a value whose real first and last bytes are ``"``
+    losing them as well — indistinguishable from the wrapper to anything
+    that strips by position rather than by JSON structure.
+
+    A live model cannot settle this: asked for a quoted phrase it usually
+    just omits the quotes. Drive the parser instead, and require the
+    streamed fragments to agree with non-streaming on the same wire.
+
+    Two body splits per value, because they ask different questions.
+    ``mid-value`` lands inside the content — inside a ``\\uXXXX`` escape for
+    the CJK case with ``ensure_ascii`` on, which is a shape real token
+    boundaries produce. ``before-closing-quote`` puts the wrapper's closing
+    quote alone in its own chunk, which is where a positional strip would
+    take the value's own trailing quote with it.
+    """
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("write", {"content": {"type": "string"}})
+    encoded = json.dumps(value, ensure_ascii=ensure_ascii)
+    at = len(encoded) // 2 if cut == "mid-value" else len(encoded) - 1
+    chunks = [
+        "<tool_call>\n",
+        "<function=write>\n",
+        f"<parameter=content>\n{lead}",
+        encoded[:at],
+        encoded[at:] + "\n</parameter>\n",
+        "</function>\n",
+        "</tool_call>",
+    ]
+
+    streamed = json.loads("".join(_argument_fragments(_feed(parser, chunks, request))))
+    assert streamed == {"content": value}
+
+    parser.reset()
+    non_streaming = parser.extract_tool_calls("".join(chunks), request=request)
+    assert non_streaming.tools_called
+    assert json.loads(non_streaming.tool_calls[0]["arguments"]) == {"content": value}
