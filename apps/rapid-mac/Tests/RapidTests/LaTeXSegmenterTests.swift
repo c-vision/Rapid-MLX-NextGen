@@ -270,6 +270,292 @@ struct LaTeXSegmenterTests {
         ])
     }
 
+    // MARK: - LaTeX bracket delimiters, \( … \) and \[ … \]
+    //
+    // 2026-08 dogfood regression. `bonsai-27b-2bit` (reproduced on a
+    // DeepSeek model) answered a plain word problem using ONLY the
+    // bracket delimiters — no `$` anywhere. The segmenter knew only
+    // `$`, so the whole body went to MarkdownUI, and CommonMark's
+    // backslash-escape rule ate the delimiters: `\(`, `\)`, `\[`, `\]`
+    // all wrap ASCII punctuation, so they collapse to bare brackets,
+    // while `\frac` / `\times` (backslash + letter, not an escape)
+    // survive verbatim. Verified independently:
+    //   AttributedString(markdown: #"So: \[ 0.85P = 47 \]"#)
+    //     → "So: [ 0.85P = 47 ]"
+    // which is byte-for-byte what the dogfood screenshots showed.
+
+    @Test("Inline bracket math \\( … \\) splits like $ … $")
+    func inlineBracketMath() {
+        let segments = LaTeXSegmenter.segment(#"Let \( P \) be the price."#)
+        #expect(segments == [
+            .markdown("Let "),
+            .math(latex: " P ", displayMode: false),
+            .markdown(" be the price.")
+        ])
+    }
+
+    @Test("Display bracket math \\[ … \\] splits like $$ … $$")
+    func displayBracketMath() {
+        let segments = LaTeXSegmenter.segment(#"So: \[ 0.85P = 47 \]"#)
+        #expect(segments == [
+            .markdown("So: "),
+            .math(latex: " 0.85P = 47 ", displayMode: true)
+        ])
+    }
+
+    @Test("Multi-line display bracket math")
+    func multiLineDisplayBracketMath() {
+        let segments = LaTeXSegmenter.segment("\\[\nf(x) = ax^2\n\\]")
+        #expect(segments == [.math(latex: "\nf(x) = ax^2\n", displayMode: true)])
+    }
+
+    @Test("LaTeX row break \\\\ inside \\[ … \\] does not fake a closer")
+    func rowBreakDoesNotClose() {
+        // ``\\`` is LaTeX's row break. Read one character at a time its
+        // second backslash + a following ``]`` would look like ``\]``,
+        // truncating the formula. The scanner must consume both.
+        let segments = LaTeXSegmenter.segment(#"\[ a \\ b \]"#)
+        #expect(segments == [.math(latex: #" a \\ b "#, displayMode: true)])
+    }
+
+    @Test("\\right] inside display math does not close the run early")
+    func rightBracketDoesNotClose() {
+        let segments = LaTeXSegmenter.segment(#"\[ x \in \left[0,1\right] \]"#)
+        #expect(segments == [.math(latex: #" x \in \left[0,1\right] "#, displayMode: true)])
+    }
+
+    @Test("Dollar and bracket delimiters mix in one body")
+    func mixedDollarAndBracketDelimiters() {
+        let segments = LaTeXSegmenter.segment(#"$a$ and \(b\) and $$c$$ and \[d\]"#)
+        #expect(segments == [
+            .math(latex: "a", displayMode: false),
+            .markdown(" and "),
+            .math(latex: "b", displayMode: false),
+            .markdown(" and "),
+            .math(latex: "c", displayMode: true),
+            .markdown(" and "),
+            .math(latex: "d", displayMode: true)
+        ])
+    }
+
+    @Test("Inline bracket math may wrap across a single newline")
+    func inlineBracketWrapsOneNewline() {
+        // Unlike ``$``, ``\(`` is unambiguous, so the single-line guard
+        // that protects prose dollars is not needed here — only a blank
+        // line ends the search.
+        let segments = LaTeXSegmenter.segment("Val \\( a +\nb \\) done.")
+        #expect(segments == [
+            .markdown("Val "),
+            .math(latex: " a +\nb ", displayMode: false),
+            .markdown(" done.")
+        ])
+    }
+
+    // MARK: - Bracket anti-cases (opener scan)
+    //
+    // NOTE for future maintainers: every test in THIS section also
+    // passes against the pre-fix segmenter, which treated bracket
+    // delimiters as plain text and so could never produce a false
+    // positive. They do not pin the fix — they pin that the fix stays
+    // conservative. The tests above are the ones that fail on a revert.
+    //
+    // These four also only exercise the OPENER scan: the opener sits
+    // inside the code region, so the run never starts and the closer
+    // scan is never entered. The "closer scan" section below covers
+    // the mirror image — opener in prose, closer inside the region —
+    // which is where the interesting failures live.
+
+    @Test("Unclosed \\( stays literal markdown")
+    func unclosedBracketOpener() {
+        let body = #"Use \( to open a group."#
+        #expect(LaTeXSegmenter.segment(body) == [.markdown(body)])
+    }
+
+    @Test("\\\\( is an escaped backslash, not a math opener")
+    func escapedBackslashBeforeParen() {
+        let body = #"Escaped: \\(not math\\)"#
+        #expect(LaTeXSegmenter.segment(body) == [.markdown(body)])
+    }
+
+    @Test("Inline bracket math stops at a blank line")
+    func inlineBracketStopsAtParagraphBreak() {
+        // An opener the model forgot to close must not swallow the
+        // rest of the reply into "math".
+        let body = "Start \\( x\n\nEnd \\) done."
+        #expect(LaTeXSegmenter.segment(body) == [.markdown(body)])
+    }
+
+    @Test("Bracket math inside a fenced code block stays literal")
+    func bracketMathInFenceSurvives() {
+        let body = "Snippet:\n\n```tex\n\\( x \\) and \\[ y \\]\n```\n\nAfter."
+        #expect(LaTeXSegmenter.segment(body) == [.markdown(body)])
+    }
+
+    @Test("Bracket math inside a code span stays literal")
+    func bracketMathInCodeSpanSurvives() {
+        let body = #"Write `\(x\)` for inline math."#
+        #expect(LaTeXSegmenter.segment(body) == [.markdown(body)])
+    }
+
+    @Test("Bracket math inside an indented code block stays literal")
+    func bracketMathInIndentedCodeSurvives() {
+        let body = "Before:\n\n    echo \"\\( x \\)\"\n\nAfter."
+        #expect(LaTeXSegmenter.segment(body) == [.markdown(body)])
+    }
+
+    // MARK: - Closer scan
+    //
+    // Every test here has an opener in PROSE and a candidate closer
+    // somewhere the scan must not honour, so the run is actually
+    // started and `findBracketClose` actually walks. That is the gap
+    // the opener-side anti-cases above leave open.
+
+    @Test("Nested \\( : the first opener is prose, the second renders")
+    func nestedInlineOpenerIsProse() {
+        // LaTeX cannot nest inline math, so a second \( before any
+        // closer means the first one was never math. Without the bail
+        // the first opener reaches the SECOND expression's closer and
+        // eats the prose between them.
+        let segments = LaTeXSegmenter.segment(#"Use \( to group, then \(x\)."#)
+        #expect(segments == [
+            .markdown(#"Use \( to group, then "#),
+            .math(latex: "x", displayMode: false),
+            .markdown(".")
+        ])
+    }
+
+    @Test("Nested \\[ : the first opener is prose, the second renders")
+    func nestedDisplayOpenerIsProse() {
+        let segments = LaTeXSegmenter.segment(#"Use \[ then \[x\]."#)
+        #expect(segments == [
+            .markdown(#"Use \[ then "#),
+            .math(latex: "x", displayMode: true),
+            .markdown(".")
+        ])
+    }
+
+    @Test("A nested opener of the OTHER kind does not abandon the run")
+    func nestedOtherKindOpenerKeepsRun() {
+        // Deliberate asymmetry: bailing here would hand the formula
+        // back to CommonMark, which strips \[ \] to bare brackets —
+        // the original bug. Keeping it degrades to MathView's
+        // literal-source fallback instead, which shows more.
+        let segments = LaTeXSegmenter.segment(#"\[ a \( b \) c \]"#)
+        #expect(segments == [.math(latex: #" a \( b \) c "#, displayMode: true)])
+    }
+
+    @Test("A closer inside a fenced code block does not close the run")
+    func closerInsideFenceIsNotAClose() {
+        let body = "Use \\[ to open.\n\n```tex\n\\]\n```\n\nDone."
+        #expect(LaTeXSegmenter.segment(body) == [.markdown(body)])
+    }
+
+    @Test("A closer inside a code span does not close the run")
+    func closerInsideCodeSpanIsNotAClose() {
+        let body = #"Use \[ to open, and `\]` to close."#
+        #expect(LaTeXSegmenter.segment(body) == [.markdown(body)])
+    }
+
+    @Test("A closer inside an indented code block does not close the run")
+    func closerInsideIndentedCodeIsNotAClose() {
+        let body = "Use \\[ to open.\n\n    echo \"\\]\"\n\nDone."
+        #expect(LaTeXSegmenter.segment(body) == [.markdown(body)])
+    }
+
+    @Test("An indented CONTINUATION line still closes the run")
+    func indentedContinuationStillCloses() {
+        // The counterweight to the three tests above. Math bodies are
+        // routinely indented, and an indented line that merely follows
+        // the `\[` line is not a CommonMark code block — there is no
+        // blank line before it. Testing indentation alone (what the
+        // opener scan does) would abandon this formula.
+        let segments = LaTeXSegmenter.segment("\\[\n    P = 47 \\]")
+        #expect(segments == [.math(latex: "\n    P = 47 ", displayMode: true)])
+    }
+
+    @Test("First closer wins for a stray opener in plain prose")
+    func firstCloserWinsInProse() {
+        // Pinning the decision, not an accident of the scan: with no
+        // nested opener and no code region in between, the first
+        // closer closes. Accepted because CommonMark would have
+        // rendered both bracket escapes as bare brackets anyway.
+        let segments = LaTeXSegmenter.segment(#"Use \[ then later \] here."#)
+        #expect(segments == [
+            .markdown("Use "),
+            .math(latex: " then later ", displayMode: true),
+            .markdown(" here.")
+        ])
+    }
+
+    // MARK: - The two dogfood answers, verbatim
+
+    /// The shirt-discount answer exactly as `bonsai-27b-2bit` emitted
+    /// it. The user-visible contract is the assertion below: NOTHING
+    /// that MarkdownUI will mangle may remain in a `.markdown`
+    /// segment.
+    private static let discountAnswer = #"""
+    Let \( P \) be the original price of the shirt.
+    A 15% discount means you pay \( 100\% - 15\% = 85\% \) of the original price.
+    So: \[ 0.85P = 47 \]
+    Solving for \( P \): \[ P = \frac{47}{0.85} \approx 55.29 \]
+    Answer: The original price was $55.29.
+    """#
+
+    private static let billSplitAnswer = #"""
+    Let \( B \) = Bob's payment
+    Alice pays 40% more than Bob: \( A = 1.4B \)
+    Substitute \( A = 1.4B \): \[ C = \frac{1}{2}(2.4B) = 1.2B \]
+    """#
+
+    /// Concatenation of everything that would be handed to MarkdownUI.
+    private static func markdownHandedToRenderer(_ body: String) -> String {
+        LaTeXSegmenter.segment(body).compactMap { segment -> String? in
+            guard case .markdown(let text) = segment else { return nil }
+            return text
+        }.joined()
+    }
+
+    @Test("Discount answer: no delimiter or LaTeX command reaches MarkdownUI")
+    func discountAnswerFullySegmented() {
+        let markdown = Self.markdownHandedToRenderer(Self.discountAnswer)
+        // Delimiters: CommonMark would strip these to bare brackets.
+        #expect(!markdown.contains(#"\("#))
+        #expect(!markdown.contains(#"\)"#))
+        #expect(!markdown.contains(#"\["#))
+        #expect(!markdown.contains(#"\]"#))
+        // Commands: CommonMark leaves these as visible source.
+        #expect(!markdown.contains(#"\frac"#))
+        #expect(!markdown.contains(#"\approx"#))
+    }
+
+    @Test("Bill-split answer: no delimiter or LaTeX command reaches MarkdownUI")
+    func billSplitAnswerFullySegmented() {
+        let markdown = Self.markdownHandedToRenderer(Self.billSplitAnswer)
+        #expect(!markdown.contains(#"\("#))
+        #expect(!markdown.contains(#"\)"#))
+        #expect(!markdown.contains(#"\["#))
+        #expect(!markdown.contains(#"\]"#))
+        #expect(!markdown.contains(#"\frac"#))
+    }
+
+    @Test("Dogfood answer: the two display formulas become display-math segments")
+    func discountAnswerDisplayMath() {
+        let display = LaTeXSegmenter.segment(Self.discountAnswer).compactMap { segment -> String? in
+            guard case .math(let latex, let displayMode) = segment, displayMode else { return nil }
+            return latex
+        }
+        #expect(display == [" 0.85P = 47 ", #" P = \frac{47}{0.85} \approx 55.29 "#])
+    }
+
+    @Test("Dogfood answer: trailing currency is NOT swallowed as math")
+    func discountAnswerCurrencyUntouched() {
+        // "$55.29." ends the reply. The currency guard must keep it in
+        // markdown — a lone trailing `$` has no closer anyway, but this
+        // pins that the bracket work did not disturb it.
+        let segments = LaTeXSegmenter.segment(Self.discountAnswer)
+        #expect(segments.last == LaTeXSegment.markdown("\nAnswer: The original price was $55.29."))
+    }
+
     @Test("Round-trip: segments concatenated with delimiters re-form input")
     func roundTrip() {
         let inputs = [
@@ -291,5 +577,44 @@ struct LaTeXSegmenterTests {
             #expect(reconstructed == body,
                     "segmenter must be lossless: '\(body)' → '\(reconstructed)'")
         }
+    }
+
+    @Test("Round-trip: bracket delimiters normalise onto their $ form")
+    func roundTripBracketNormalises() {
+        // Delimiter STYLE is deliberately not preserved — `\(x\)` and
+        // `$x$` mean the same thing and produce the same segment. So
+        // the round-trip lands on the `$` form, not byte-for-byte
+        // input. This pins that choice.
+        let segments = LaTeXSegmenter.segment(#"Let \(x\) then \[y\]"#)
+        let reconstructed = segments.map { seg -> String in
+            switch seg {
+            case .markdown(let s): return s
+            case .math(let latex, let display):
+                return display ? "$$\(latex)$$" : "$\(latex)$"
+            }
+        }.joined()
+        #expect(reconstructed == "Let $x$ then $$y$$")
+    }
+
+    @Test("displayMathOnly: bracket-sourced inline math folds back as $ … $")
+    func displayMathOnlyBracketInlineCollapse() {
+        // v1 still does not RENDER inline math (see the deferral note
+        // on ``LaTeXMarkdownView``). What changes with the bracket fix
+        // is that the fold-back emits `$A = 1.4B$` rather than letting
+        // CommonMark strip `\( … \)` down to a bare `( A = 1.4B )`.
+        let segs = LaTeXSegmenter.segment(#"Alice pays: \( A = 1.4B \) total."#)
+        #expect(LaTeXMarkdownView.displayMathOnly(segs) == [
+            .markdown("Alice pays: $ A = 1.4B $ total.")
+        ])
+    }
+
+    @Test("displayMathOnly: bracket display math survives as its own segment")
+    func displayMathOnlyBracketDisplaySurvives() {
+        let segs = LaTeXSegmenter.segment(#"So: \[ 0.85P = 47 \] done."#)
+        #expect(LaTeXMarkdownView.displayMathOnly(segs) == [
+            .markdown("So: "),
+            .math(latex: " 0.85P = 47 ", displayMode: true),
+            .markdown(" done.")
+        ])
     }
 }

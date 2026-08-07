@@ -20,6 +20,30 @@ import Foundation
 ///   Single-line only (a literal newline ends the inline run so a
 ///   stray dollar sign in prose doesn't swallow the rest of the
 ///   reply into "math").
+/// * ``\[ ... \]`` — display math, LaTeX bracket form.
+/// * ``\( ... \)`` — inline math, LaTeX bracket form.
+///
+/// The bracket forms are NOT optional extras: they are what
+/// instruction-tuned models actually emit. A 2026-08 dogfood run
+/// (`bonsai-27b-2bit`, reproduced on a DeepSeek model) emitted only
+/// bracket delimiters for a plain word problem — no ``$`` anywhere.
+/// Missing them is not a cosmetic gap, because the raw body then
+/// reaches MarkdownUI and CommonMark's backslash-escape rule eats
+/// the delimiters: ``\(``, ``\)``, ``\[`` and ``\]`` all wrap ASCII
+/// punctuation, so they collapse to bare ``(``, ``)``, ``[``, ``]``
+/// while ``\frac`` / ``\times`` (backslash + letter, not a valid
+/// escape) survive verbatim. The user sees
+/// ``( P = \frac{47}{0.85} \approx 55.29 )`` — delimiters silently
+/// stripped, LaTeX left as source. Verified directly:
+/// ``AttributedString(markdown: #"So: \[ 0.85P = 47 \]"#)`` yields
+/// ``So: [ 0.85P = 47 ]``.
+///
+/// Delimiter STYLE is not preserved. ``\( x \)`` and ``$x$`` both
+/// produce ``.math(latex: "x", displayMode: false)`` — the choice
+/// carries no meaning downstream, and normalising keeps the segment
+/// enum (and every equality assertion built on it) unchanged. The
+/// round-trip property below therefore holds up to that
+/// normalisation.
 ///
 /// Anti-cases we intentionally do NOT treat as math:
 ///
@@ -32,6 +56,12 @@ import Foundation
 ///   shell prose, not math. The segmenter skips ``...`` runs.
 /// * **Escaped dollar** — ``\$`` stays a literal dollar sign and
 ///   never opens a math run.
+/// * **Escaped backslash before a bracket** — ``\\(`` is CommonMark's
+///   escaped backslash followed by a literal paren, so it does NOT
+///   open inline math. Same for ``\\[``.
+/// * **Unclosed bracket opener** — ``Use \( to group`` has no ``\)``,
+///   so the opener stays literal markdown rather than swallowing the
+///   rest of the reply.
 /// * **Bare dollar in prose** — ``it costs $20 today`` has only one
 ///   ``$`` so there's no closing pair; the segmenter requires a
 ///   close before the next blank line / EOF before opening math.
@@ -69,8 +99,10 @@ enum LaTeXSegmenter {
     /// Split ``input`` into alternating ``.markdown`` / ``.math``
     /// segments. The returned array reconstructs ``input`` exactly
     /// when ``.markdown`` bodies are concatenated and ``.math``
-    /// bodies are re-wrapped with their delimiters, so a future
-    /// "round-trip" sanity test can pin the contract.
+    /// bodies are re-wrapped with ``$``/``$$``, so a "round-trip"
+    /// sanity test can pin the contract. Bodies written with the
+    /// bracket delimiters round-trip onto their ``$``-form (see the
+    /// normalisation note in the type doc).
     ///
     /// Empty ``.markdown("")`` segments are NOT emitted — the caller
     /// just sees ``[.math, .math]`` if two math runs sit
@@ -112,11 +144,38 @@ enum LaTeXSegmenter {
                 continue
             }
 
-            // Escaped dollar — literal, skip both characters.
-            if c == "\\",
-               input.index(after: cursor) < input.endIndex,
-               input[input.index(after: cursor)] == "$" {
-                cursor = input.index(cursor, offsetBy: 2)
+            // Backslash: either a LaTeX bracket-delimiter opener
+            // (``\(`` / ``\[``) or a CommonMark escape (``\$``, ``\\``,
+            // ``\_``, …). Both consume TWO characters, so a doubled
+            // backslash can never be re-read as a delimiter opener:
+            // ``\\(`` is an escaped backslash followed by a literal
+            // paren, not math.
+            if c == "\\", input.index(after: cursor) < input.endIndex {
+                let markerIndex = input.index(after: cursor)
+                let marker = input[markerIndex]
+                if marker == "(" || marker == "[" {
+                    // ``\[`` is display, ``\(`` is inline — the
+                    // bracket forms carry the same meaning as
+                    // ``$$``/``$`` and normalise onto the same cases.
+                    let isDisplay = (marker == "[")
+                    let bodyStart = input.index(after: markerIndex)
+                    if let bodyEnd = findBracketClose(input, from: bodyStart, displayMode: isDisplay) {
+                        // Emit any leading plain markdown.
+                        if plainStart < cursor {
+                            segments.append(.markdown(String(input[plainStart..<cursor])))
+                        }
+                        let latex = String(input[bodyStart..<bodyEnd])
+                        segments.append(.math(latex: latex, displayMode: isDisplay))
+                        // The closer is two characters: ``\)`` / ``\]``.
+                        let closeEnd = input.index(bodyEnd, offsetBy: 2)
+                        plainStart = closeEnd
+                        cursor = closeEnd
+                        continue
+                    }
+                }
+                // ``\$``, an opener with no closer, or any other
+                // backslash escape — literal. Skip both characters.
+                cursor = input.index(after: markerIndex)
                 continue
             }
 
@@ -223,6 +282,34 @@ enum LaTeXSegmenter {
             return thisLineStart
         }
         return lastConsumedBlockEnd
+    }
+
+    /// Strict form of the indented-code test, used by the closer scan.
+    /// True only where CommonMark would actually OPEN an indented code
+    /// block: at a line start, indented 4+ spaces (or a tab), AND
+    /// preceded by a blank line or the start of input.
+    ///
+    /// ``endOfIndentedCodeBlock`` alone answers "does this line look
+    /// indented", which is the right question when deciding whether to
+    /// scan a region for math openers and the wrong one when deciding
+    /// whether to abandon a formula already in progress — see the note
+    /// on ``findBracketClose``.
+    private static func startsIndentedCodeBlock(_ s: String, at index: String.Index) -> Bool {
+        guard isAtLineStart(s, at: index), isIndentedCodeLine(s, lineStart: index) else {
+            return false
+        }
+        if index == s.startIndex { return true }
+        // ``index`` is at a line start, so the character before it is
+        // the newline that ended the previous line. Walk back over that
+        // line and require it to be blank.
+        let newline = s.index(before: index)
+        var previousLineStart = newline
+        while previousLineStart > s.startIndex {
+            let before = s.index(before: previousLineStart)
+            if s[before] == "\n" { break }
+            previousLineStart = before
+        }
+        return isBlankLine(s, lineStart: previousLineStart, lineEnd: newline)
     }
 
     private static func isIndentedCodeLine(_ s: String, lineStart: String.Index) -> Bool {
@@ -351,6 +438,116 @@ enum LaTeXSegmenter {
             i = s.index(after: i)
         }
         return bodyStart  // unclosed → consume only the open
+    }
+
+    /// Find the closing ``\)`` (inline) / ``\]`` (display) for a
+    /// bracket-delimited math run whose body starts at ``bodyStart``.
+    /// Returns the index of the closing BACKSLASH — the body is
+    /// ``bodyStart..<result`` and the closer occupies two characters —
+    /// or ``nil`` when no closer is found.
+    ///
+    /// A backslash inside the body always consumes the character that
+    /// follows it. That is what keeps LaTeX's own row break, ``\\``,
+    /// from faking a closer: in ``\[ a \\] b \]`` the ``\\`` is a row
+    /// break and the ``]`` right after it is a literal bracket, so the
+    /// run closes at the final ``\]`` and not at the third character
+    /// of ``\\]``.
+    ///
+    /// ## Code regions are skipped, exactly like the opener scan
+    ///
+    /// A closer that lives inside a fenced block, a code span or an
+    /// indented code block does NOT close the run. Without this, an
+    /// unclosed ``\[`` in prose reaches forward and matches the ``\]``
+    /// a user wrote *inside* a code sample — swallowing the prose and
+    /// the code block in between into one "formula". The opener scan
+    /// is careful to skip those three regions; the closer scan has to
+    /// be equally careful or the care is one-sided.
+    ///
+    /// The indented-code test is deliberately STRICTER here than in
+    /// the opener scan, which treats any 4-space line as code. The two
+    /// mistakes are not symmetric: a false skip in the opener scan
+    /// only means "do not look for math here", which loses nothing,
+    /// while a false skip here abandons a real formula. Math bodies
+    /// are very commonly indented —
+    ///
+    /// ```
+    /// \[
+    ///     P = \frac{47}{0.85} \]
+    /// ```
+    ///
+    /// — so this requires what CommonMark actually requires to OPEN an
+    /// indented code block: a preceding blank line (or the start of
+    /// input). The indented continuation of a ``\[`` line is not a
+    /// code block under that rule, and its closer is still honoured.
+    ///
+    /// ## Nested openers: first closer wins, same-kind opener bails
+    ///
+    /// LaTeX cannot nest ``\( … \( … \) … \)`` — a second opener of
+    /// the same kind before any closer is therefore strong evidence
+    /// the FIRST opener was prose, not math. The scan gives up, the
+    /// caller emits that opener as literal text and rescans from just
+    /// past it, so ``Use \( to group, then \(x\).`` keeps the prose
+    /// and still renders ``x``.
+    ///
+    /// A nested opener of the OTHER kind does not bail. Rejecting the
+    /// outer run there would drop the whole formula back to CommonMark,
+    /// which strips the delimiters to bare brackets — the original bug.
+    /// Keeping it degrades instead to ``MathView``'s literal-source
+    /// fallback, which is strictly more informative.
+    ///
+    /// Beyond those two rules the first closer wins. A stray ``\[`` in
+    /// prose followed much later by a stray ``\]`` does become one math
+    /// run; that is accepted, because CommonMark would have rendered
+    /// both as bare brackets anyway, and because models do not emit
+    /// lone bracket escapes in prose.
+    private static func findBracketClose(_ s: String, from bodyStart: String.Index, displayMode: Bool) -> String.Index? {
+        let closer: Character = displayMode ? "]" : ")"
+        let opener: Character = displayMode ? "[" : "("
+        var i = bodyStart
+        while i < s.endIndex {
+            let c = s[i]
+
+            // Code regions — a closer inside one does not close the run.
+            if startsIndentedCodeBlock(s, at: i),
+               let codeBlockEnd = endOfIndentedCodeBlock(s, lineStart: i) {
+                i = codeBlockEnd
+                continue
+            }
+            if c == "`", isFenceStart(s, at: i) {
+                i = endOfFencedBlock(s, fenceStart: i)
+                continue
+            }
+            if c == "`" {
+                i = endOfInlineCode(s, openStart: i)
+                continue
+            }
+
+            if c == "\\" {
+                let next = s.index(after: i)
+                if next == s.endIndex { return nil }
+                if s[next] == closer { return i }
+                // Nested opener of the same kind — the first opener was
+                // prose. Give up so the caller can rescan past it.
+                if s[next] == opener { return nil }
+                i = s.index(after: next)
+                continue
+            }
+            // Inline-math paragraph guard: an unclosed ``\(`` must not
+            // swallow the rest of the reply. Unlike ``$``, a bare
+            // ``\(`` in prose is vanishingly rare (it is CommonMark's
+            // escape for a literal paren, which models never emit), so
+            // a SINGLE newline is tolerated — models do wrap long
+            // inline runs — and only a blank line ends the search.
+            // Display math keeps the lenient ``$$`` behaviour because
+            // multi-line ``\[ … \]`` blocks are the norm.
+            if !displayMode, c == "\n" {
+                let next = s.index(after: i)
+                if next == s.endIndex { return nil }
+                if s[next] == "\n" { return nil }
+            }
+            i = s.index(after: i)
+        }
+        return nil
     }
 
     /// Find the closing ``$`` (or ``$$``) for a math run starting
