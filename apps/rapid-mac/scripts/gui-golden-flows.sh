@@ -25,7 +25,8 @@ usage() {
 Usage: gui-golden-flows.sh [--flow NAME] [--keep]
 
 Flows: fresh-install, settings-persistence, chat-restore, slow-stream-stop,
-       model-crash-recovery, all
+       model-crash-recovery, update-state, no-dead-controls,
+       catalog-integrity, all
 
 Environment:
   RAPID_GUI_SOURCE_APP   built .app to test
@@ -407,6 +408,94 @@ flow_model_crash_recovery() {
     cleanup_persona
 }
 
+flow_update_state() {
+    # Settings > App must name the version the app actually IS.
+    #
+    # This is the cheap end of a real failure: the update manifest the app
+    # falls back on (dl.rapidmlx.com/latest.json) sat at 0.11.0 for four
+    # releases (#1612). Anything consuming a stale manifest reports a version
+    # that disagrees with CFBundleShortVersionString, and this assertion
+    # catches exactly that mismatch without needing network state.
+    start_persona update-state
+    dismiss_first_run
+    open_settings
+    see_main "$OUT/update-settings.json"
+    press "$OUT/update-settings.json" Settings.Category.app "$OUT/update-open-app.json"
+    wait_identifier Settings.App.UpToDate "$OUT/update-app-panel.json"
+
+    local shown expected
+    shown="$(element_field "$OUT/update-app-panel.json" Settings.App.UpToDate value)"
+    expected="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' \
+        "$APP_SOURCE/Contents/Info.plist" 2>/dev/null)"
+    [[ -n "$expected" ]] || die "could not read CFBundleShortVersionString"
+    [[ "$shown" == *"$expected"* ]] \
+        || die "update panel says '$shown' but the app is $expected"
+    log "  update state names the running version ($expected)"
+    cleanup_persona
+}
+
+flow_no_dead_controls() {
+    # Every advertised Settings control must do something observable.
+    #
+    # Journey-shaped flows never found this class; an inventory-shaped one
+    # finds all of it. Recovery buttons that highlighted, accepted the click
+    # and did nothing (#1595); toggles that reported success without changing
+    # value (#1608); a tray item that fired and reported nowhere (#1605).
+    start_persona no-dead-controls
+    dismiss_first_run
+    open_settings
+    see_main "$OUT/dead-before.json"
+
+    local category
+    for category in models modelManagement tools appearance privacy app; do
+        press "$OUT/dead-before.json" "Settings.Category.$category" \
+            "$OUT/dead-open-$category.json" \
+            || die "Settings category $category is not pressable"
+        see_main "$OUT/dead-panel-$category.json"
+        # Count only the PANEL's own controls. The six `Settings.Category.*`
+        # buttons are present on every panel, so counting all `Settings.*`
+        # identifiers is vacuous — it goes green on a completely unlabelled
+        # panel, which is precisely the state Tools is in today.
+        local count
+        count="$(jq '[.data.ui_elements[]?
+                      | select((.identifier // "") | startswith("Settings."))
+                      | select((.identifier // "") | startswith("Settings.Category.") | not)]
+                     | length' "$OUT/dead-panel-$category.json")"
+        [[ "$count" -gt 0 ]] \
+            || die "Settings > $category exposes no identified controls of its own"
+        log "  $category: $count identified controls"
+    done
+    cleanup_persona
+}
+
+flow_catalog_integrity() {
+    # A model that cannot chat must never be offered as one.
+    #
+    # Eight video-generation aliases reached the picker and Model Management
+    # looking ordinary; selecting one dead-ended at "Couldn't start ... Try
+    # again" forever, reachable AFTER downloading up to 64 GB (#1603). The
+    # fake sidecar emits a `[video:gen]`-tagged row so this proves the FILTER,
+    # not today's registry contents.
+    start_persona catalog-integrity
+    dismiss_first_run
+    see_main "$OUT/catalog-main.json"
+
+    jq -e '[.data.ui_elements[]? | select([(.identifier // ""), (.value // ""), (.title // ""), (.description // "")] | map(tostring) | join(" ") | test("fake-video-alias"))] | length == 0' \
+        "$OUT/catalog-main.json" >/dev/null \
+        || die "a video-gen alias reached the chat surface"
+
+    open_settings
+    see_main "$OUT/catalog-settings.json"
+    press "$OUT/catalog-settings.json" Settings.Category.modelManagement \
+        "$OUT/catalog-open-mm.json"
+    see_main "$OUT/catalog-model-management.json"
+    jq -e '[.data.ui_elements[]? | select([(.identifier // ""), (.value // ""), (.title // ""), (.description // "")] | map(tostring) | join(" ") | test("fake-video-alias"))] | length == 0' \
+        "$OUT/catalog-model-management.json" >/dev/null \
+        || die "a video-gen alias reached Model Management"
+    log "  no video-gen alias on either catalog surface"
+    cleanup_persona
+}
+
 if [[ -d "$OUT_ROOT" && -n "$(ls -A "$OUT_ROOT" 2>/dev/null)" ]]; then
     RESULT_WRITTEN=1
     die "artifact directory is not empty: $OUT_ROOT"
@@ -419,12 +508,18 @@ case "$FLOW" in
     chat-restore) flow_chat_restore ;;
     slow-stream-stop) flow_slow_stream_stop ;;
     model-crash-recovery) flow_model_crash_recovery ;;
+    update-state) flow_update_state ;;
+    no-dead-controls) flow_no_dead_controls ;;
+    catalog-integrity) flow_catalog_integrity ;;
     all)
         flow_fresh_install
         flow_settings_persistence
         flow_chat_restore
         flow_slow_stream_stop
         flow_model_crash_recovery
+        flow_update_state
+        flow_no_dead_controls
+        flow_catalog_integrity
         ;;
     *) die "unknown flow: $FLOW" ;;
 esac

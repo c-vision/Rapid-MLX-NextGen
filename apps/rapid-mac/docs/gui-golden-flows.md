@@ -1,13 +1,62 @@
 # AX-first GUI golden flows
 
-`scripts/gui-golden-flows.sh` runs the five release journeys against a built
-Rapid-MLX Desktop app without loading a real model:
+`scripts/gui-golden-flows.sh` runs the release journeys against a built
+Rapid-MLX Desktop app without loading a real model.
+
+**Journeys** — a user walking a path end to end:
 
 1. fresh install, consent, onboarding, and steady-state shell;
 2. Settings mutation and persistence across an app relaunch;
 3. basic chat, persisted conversation row, and restored transcript;
 4. a deliberately slow stream and semantic **Stop generating** action;
 5. model start, a one-shot sidecar crash, automatic respawn, and ready state.
+
+**Invariants** — properties that must hold, not paths a user walks. These were
+added after a release where every escaped defect landed on a surface no journey
+covered, and each one names the defect it would have caught:
+
+6. `update-state` — Settings → App must name the version the app actually is.
+7. `no-dead-controls` — every Settings panel must expose controls of its own.
+8. `catalog-integrity` — a model that cannot chat must never be offered as one.
+
+The distinction matters. A journey answers *"can someone do this?"*; an
+invariant answers *"is this still true everywhere?"*. The three defects below
+were all invisible to journey-shaped tests:
+
+| Flow | Would have caught | Why a journey missed it |
+| --- | --- | --- |
+| `update-state` | [#1612](https://github.com/raullenchai/Rapid-MLX/issues/1612) — the fallback update manifest sat at 0.11.0 for four releases | Nothing in a journey compares what the panel *says* to what the bundle *is* |
+| `no-dead-controls` | [#1595](https://github.com/raullenchai/Rapid-MLX/pull/1595) dead recovery buttons, [#1608](https://github.com/raullenchai/Rapid-MLX/pull/1608) toggles that reported success without changing value, [#1605](https://github.com/raullenchai/Rapid-MLX/issues/1605) a tray item that reported nowhere | A journey visits the controls it needs; these were the ones nobody scripted |
+| `catalog-integrity` | [#1603](https://github.com/raullenchai/Rapid-MLX/issues/1603) — eight video-generation models offered as chat models, dead-ending *after* a download of up to 64 GB | The picker renders them perfectly; the bug is that they are there at all |
+
+### Current baseline
+
+Run against `main` on 2026-08-07, on a build of this checkout:
+
+| Flow | Result |
+| --- | --- |
+| `update-state` | **PASS** — panel reads "Up to date — v0.12.6 is the latest release.", matching `CFBundleShortVersionString` |
+| `catalog-integrity` | **PASS** — `fake-video-alias` reaches neither the chat surface nor Model Management |
+| `no-dead-controls` | **FAILS on `tools`** — see below |
+
+`no-dead-controls` fails today, correctly: Settings → Tools renders three tool
+toggles, a backend radio group and a browsing toggle, and **none of them carry
+an identifier**. The controls work — they are real `AXCheckBox`/`AXRadioButton`
+with correct values — they are simply unaddressable. That is a coverage gap in
+product code, not a harness bug, and it is tracked separately. Expect this flow
+to go green when those identifiers land; until then it is the gate for that work.
+
+Two notes on writing assertions here, both learned the hard way while adding
+these:
+
+- The first version of `no-dead-controls` counted every `Settings.*` identifier
+  on the panel. The six `Settings.Category.*` buttons appear on *every* panel,
+  so the count was never below six and the flow went green on a completely
+  unlabelled Tools panel. Count the panel's **own** controls.
+- `catalog-integrity` proves it discriminates rather than trivially passing:
+  the non-video `fake-alias` appears 9 times in the same tree where
+  `fake-video-alias` appears 0 times. A test that asserts an absence must show
+  that the corresponding presence is detectable.
 
 Every journey gets a unique bundle identifier and throwaway `HOME` through
 `dogfood-isolate.sh`. The fake sidecar emits deterministic SSE and JSONL
@@ -29,7 +78,16 @@ Run one journey or retain its isolated persona for diagnosis:
 ```bash
 ./scripts/gui-golden-flows.sh --flow slow-stream-stop
 ./scripts/gui-golden-flows.sh --flow chat-restore --keep
+./scripts/gui-golden-flows.sh --flow no-dead-controls
 ```
+
+The suite needs a **local login session** — not SSH or tmux. It also needs the
+screen to stay awake: when the session goes idle, `CGSSessionScreenIsLocked`
+flips to `Yes`, every app reports zero windows through AX, and `screencapture`
+returns wallpaper. That looks exactly like a broken app. Hold the session with
+`caffeinate -dimsu -t <seconds>` for the length of the run — `-u` is the
+load-bearing flag, since plain `-d` stops display sleep but not the idle path —
+and re-read the lock state before trusting any window assertion.
 
 Set `RAPID_GUI_SOURCE_APP` to test a release candidate bundle and
 `RAPID_GUI_GOLDEN_OUT` to choose the artifact directory. Each run records AX

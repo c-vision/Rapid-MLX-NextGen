@@ -252,6 +252,17 @@ def _emit_catalog(subcommand, alias):
         print("Alias                  Parser           Reasoning")
         print("---------------------  ---------------  ---------")
         print("fake-alias             hermes           qwen3")
+        # A video-generation row, in the tagged section the real engine
+        # emits (#1607). It has no tokenizer and cannot answer a chat
+        # request, so the desktop must filter it out of every catalog
+        # surface. Emitting it here lets `flow_catalog_integrity` prove the
+        # FILTER works, rather than asserting against whatever the real
+        # registry happens to contain today.
+        print()
+        print("Video models (1 aliases)")
+        print("Alias                  Size       Kind        HF id")
+        print("---------------------  ---------  ----------  ------")
+        print("fake-video-alias       13.3 GiB   [video:gen] fake/video-mlx")
         return True
     if subcommand == "ls":
         print("Cached models")
