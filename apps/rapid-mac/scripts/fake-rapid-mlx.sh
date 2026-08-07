@@ -40,6 +40,17 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+try:
+    with open(os.path.join(os.environ.get("HOME", ""), ".rapid-golden-fake.json"), encoding="utf-8") as stream:
+        FILE_CONFIG = json.load(stream)
+except (OSError, ValueError):
+    FILE_CONFIG = {}
+
+
+def _setting(name, default=None):
+    return os.environ.get(name, FILE_CONFIG.get(name, default))
+
+
 def _parse_args(argv):
     """Match the real rapid-mlx CLI shape closely enough that
     ServerManager's spawn arguments work unmodified.
@@ -74,7 +85,24 @@ CONTENT_CHUNKS = [
 REASONING_CHUNKS = [
     "Let", " me", " think", " about", " the", " prompt", "."
 ]
-INTER_TOKEN_SLEEP_S = 0.01  # ~20 deltas in 200 ms — fast enough for smoke
+try:
+    INTER_TOKEN_SLEEP_S = float(_setting("FAKE_INTER_TOKEN_SLEEP_S", "0.01"))
+except ValueError:
+    INTER_TOKEN_SLEEP_S = 0.01
+try:
+    CONTENT_REPEAT = max(1, int(_setting("FAKE_CONTENT_REPEAT", "1")))
+except ValueError:
+    CONTENT_REPEAT = 1
+
+
+def _event(name, **fields):
+    """Append machine-readable lifecycle evidence for GUI golden flows."""
+    path = _setting("FAKE_EVENT_LOG")
+    if not path:
+        return
+    record = {"event": name, "time": time.time(), **fields}
+    with open(path, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def _sse(data):
@@ -128,6 +156,7 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length", "0") or "0")
         if length:
             self.rfile.read(length)
+        _event("chat_request")
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -143,18 +172,25 @@ class Handler(BaseHTTPRequestHandler):
         # ChatStreamClient sees partial deltas followed by EOF
         # WITHOUT a [DONE] sentinel or a finish_reason chunk — the
         # exact failure mode v0.4.5 maps to ``.streamTruncated``.
-        die_after_chunks_raw = os.environ.get("FAKE_DIE_AFTER_CHUNKS", "")
+        die_after_chunks_raw = _setting("FAKE_DIE_AFTER_CHUNKS", "")
         try:
             die_after_chunks = int(die_after_chunks_raw)
         except ValueError:
             die_after_chunks = 0
+        die_once_state = _setting("FAKE_DIE_ONCE_STATE")
+        if die_after_chunks > 0 and die_once_state:
+            try:
+                marker_fd = os.open(die_once_state, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(marker_fd)
+            except FileExistsError:
+                die_after_chunks = 0
+        content_emitted = 0
         try:
             for r in REASONING_CHUNKS:
                 self.wfile.write(_sse(_delta(reasoning=r)))
                 self.wfile.flush()
                 time.sleep(INTER_TOKEN_SLEEP_S)
-            content_emitted = 0
-            for c in CONTENT_CHUNKS:
+            for c in CONTENT_CHUNKS * CONTENT_REPEAT:
                 self.wfile.write(_sse(_delta(content=c)))
                 self.wfile.flush()
                 content_emitted += 1
@@ -179,9 +215,11 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
-        except BrokenPipeError:
+            _event("chat_finished", chunks=content_emitted)
+        except (BrokenPipeError, ConnectionResetError):
             # Client disconnected mid-stream — fine, the smoke
             # cancelled the stream on its own.
+            _event("chat_cancelled", chunks=content_emitted)
             return
 
     def _json(self, status, body):
@@ -252,6 +290,8 @@ def main():
     if args.subcommand != "serve":
         _emit_catalog(args.subcommand, args.alias)
         sys.exit(0)
+
+    _event("server_started", alias=args.alias, pid=os.getpid())
 
     # Match the real server's startup banner shape closely enough
     # that DownloadProgress's "Loading model with" detection fires
