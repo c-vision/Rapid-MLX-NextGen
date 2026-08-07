@@ -21,6 +21,10 @@ struct ContentView: View {
     @Environment(BrowseApprovalStore.self) private var browseApproval
 
     @State private var alias: String = ""
+    /// Monotonic signal from picker row taps. Catalog initialization also
+    /// writes ``alias``, so the value alone cannot distinguish automation
+    /// from a real user override while launch probing is suspended.
+    @State private var userSelectionRevision: UInt = 0
     /// Which detail surface the sidebar shows (chat vs the Launch page).
     @State private var section: SidebarSection = .chat
     /// An absent telemetry preference is an undecided first run, not
@@ -426,6 +430,7 @@ struct ContentView: View {
                 server: server,
                 alias: $alias,
                 readiness: readiness,
+                onUserModelSelection: { userSelectionRevision &+= 1 },
                 onReadinessAction: performReadinessAction
             )
         case .missing:
@@ -674,6 +679,7 @@ struct ContentView: View {
         _ = QuickstartModel.installAllSnapshotSymlinks()
 
         let aliasAtEntry = alias
+        let userSelectionRevisionAtEntry = userSelectionRevision
         var cachedAliases: Set<String> = []
         if let binary = server.binaryPath {
             let entries = await ModelCatalogCache.shared.entries(
@@ -686,7 +692,11 @@ struct ContentView: View {
             autoStartPendingDownload = nil
             return
         }
-        if alias != aliasAtEntry, !alias.isEmpty {
+        if Self.launchSelectionWasReplaced(
+            aliasAtEntry: aliasAtEntry,
+            currentAlias: alias,
+            userSelectionChanged: userSelectionRevision != userSelectionRevisionAtEntry
+        ) {
             autoStartPendingDownload = nil
             return
         }
@@ -738,6 +748,20 @@ struct ContentView: View {
         case .skip:
             autoStartPendingDownload = nil
         }
+    }
+
+    /// Catalog loading may populate an initially-empty picker while the
+    /// launch probe awaits subprocesses. That is initialization, not a user
+    /// override. Once launch entered with a concrete selection, however, a
+    /// different non-empty alias means the user took control and auto-start
+    /// must stand down.
+    nonisolated static func launchSelectionWasReplaced(
+        aliasAtEntry: String,
+        currentAlias: String,
+        userSelectionChanged: Bool = false
+    ) -> Bool {
+        userSelectionChanged
+            || (!aliasAtEntry.isEmpty && !currentAlias.isEmpty && currentAlias != aliasAtEntry)
     }
 
     // MARK: - Pure helpers (testable seams)

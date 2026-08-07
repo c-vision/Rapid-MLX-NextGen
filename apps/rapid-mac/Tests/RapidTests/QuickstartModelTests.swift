@@ -375,6 +375,68 @@ struct QuickstartModelTests {
         ) == .noQuickstartModel)
     }
 
+    @Test("missing Quickstart source removes only our dangling HF cache stub")
+    func missingSourceRemovesOwnedDanglingStub() throws {
+        let env = try TestEnv.make()
+        defer { env.tearDown() }
+        let spec = QuickstartModel.knownAliases["bonsai-1.7b-2bit"]!
+        let flat = try stageFlatModel(alias: spec.alias, installRoot: env.installRoot)
+        #expect(QuickstartModel.installSnapshotSymlink(
+            spec: spec, installRoot: env.installRoot, environment: env.envDict
+        ) == .installed)
+        try FileManager.default.removeItem(at: flat.deletingLastPathComponent())
+
+        #expect(QuickstartModel.installSnapshotSymlink(
+            spec: spec, installRoot: env.installRoot, environment: env.envDict
+        ) == .removedStaleStub)
+        let cacheDir = env.userHubURL.appendingPathComponent(spec.cacheDirName)
+        #expect(!FileManager.default.fileExists(atPath: cacheDir.path))
+    }
+
+    @Test("missing Quickstart source never removes a real HF cache entry")
+    func missingSourcePreservesRealCache() throws {
+        let env = try TestEnv.make()
+        defer { env.tearDown() }
+        let spec = QuickstartModel.knownAliases["bonsai-1.7b-2bit"]!
+        let cacheDir = env.userHubURL.appendingPathComponent(spec.cacheDirName)
+        try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        let sentinel = cacheDir.appendingPathComponent("user-data")
+        try Data("keep".utf8).write(to: sentinel)
+
+        #expect(QuickstartModel.installSnapshotSymlink(
+            spec: spec, installRoot: env.installRoot, environment: env.envDict
+        ) == .noQuickstartModel)
+        #expect(FileManager.default.fileExists(atPath: sentinel.path))
+    }
+
+    @Test("missing source removes Quickstart leaves but preserves coexisting HF revisions")
+    func missingSourcePreservesCoexistingHFRevision() throws {
+        let env = try TestEnv.make()
+        defer { env.tearDown() }
+        let spec = QuickstartModel.knownAliases["bonsai-1.7b-2bit"]!
+        let flat = try stageFlatModel(alias: spec.alias, installRoot: env.installRoot)
+        #expect(QuickstartModel.installSnapshotSymlink(
+            spec: spec, installRoot: env.installRoot, environment: env.envDict
+        ) == .installed)
+        let cacheDir = env.userHubURL.appendingPathComponent(spec.cacheDirName)
+        let pinnedRef = cacheDir.appendingPathComponent("refs/v1")
+        let realSnapshot = cacheDir.appendingPathComponent("snapshots/abc123")
+        try Data("abc123".utf8).write(to: pinnedRef)
+        try FileManager.default.createDirectory(at: realSnapshot, withIntermediateDirectories: true)
+        let realWeight = realSnapshot.appendingPathComponent("weights.safetensors")
+        try Data("real".utf8).write(to: realWeight)
+        try FileManager.default.removeItem(at: flat.deletingLastPathComponent())
+
+        #expect(QuickstartModel.installSnapshotSymlink(
+            spec: spec, installRoot: env.installRoot, environment: env.envDict
+        ) == .removedStaleStub)
+        #expect(FileManager.default.fileExists(atPath: pinnedRef.path))
+        #expect(FileManager.default.fileExists(atPath: realWeight.path))
+        #expect(!FileManager.default.fileExists(
+            atPath: cacheDir.appendingPathComponent("snapshots/quickstart").path
+        ))
+    }
+
     @Test("installSnapshotSymlink is userCacheUnavailable without HOME / HF env")
     func installNoUserCache() throws {
         let env = try TestEnv.make()

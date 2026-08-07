@@ -192,6 +192,10 @@ enum QuickstartModel {
         /// No Quickstart install under the install root for this
         /// alias (slim-DMG never ran, or user pruned the install).
         case noQuickstartModel
+        /// The Quickstart source is gone and the stale HF-cache stub we
+        /// previously fabricated was removed. A real cache entry is never
+        /// eligible for this cleanup.
+        case removedStaleStub
         /// Resolving the user HF cache failed (no HOME / HF_HOME).
         case userCacheUnavailable
         /// FileManager raised during mkdir / symlink / write.
@@ -244,15 +248,18 @@ enum QuickstartModel {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default
     ) -> InstallOutcome {
-        guard let flatModelDir = resolveFlatModelDir(
+        let flatModelDir = resolveFlatModelDir(
             alias: spec.alias,
             installRoot: installRoot,
             fileManager: fileManager
-        ) else {
-            return .noQuickstartModel
-        }
+        )
         guard let userCache = BundledModel.userHFCacheURL(environment: environment) else {
             return .userCacheUnavailable
+        }
+        let cacheDir = userCache.appendingPathComponent(spec.cacheDirName, isDirectory: true)
+        guard let flatModelDir else {
+            return removeStaleStubIfOwned(cacheDir: cacheDir, fileManager: fileManager)
+                ?? .noQuickstartModel
         }
         do {
             try fileManager.createDirectory(
@@ -263,8 +270,6 @@ enum QuickstartModel {
         } catch {
             return .failed("create user cache dir: \(error.localizedDescription)")
         }
-
-        let cacheDir = userCache.appendingPathComponent(spec.cacheDirName, isDirectory: true)
 
         // Three "already correct" shapes — return early without
         // mutation. Order matters:
@@ -342,17 +347,93 @@ enum QuickstartModel {
         let refsMain = cacheDir
             .appendingPathComponent("refs", isDirectory: true)
             .appendingPathComponent("main")
-        guard let data = try? Data(contentsOf: refsMain),
-              let content = String(data: data, encoding: .utf8) else {
-            return false
-        }
-        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed == stubRevisionMarker else { return false }
+        guard markerMatches(at: refsMain) else { return false }
         let snapshotDir = cacheDir
             .appendingPathComponent("snapshots", isDirectory: true)
             .appendingPathComponent(stubRevisionMarker, isDirectory: true)
         var isDir: ObjCBool = false
         return fileManager.fileExists(atPath: snapshotDir.path, isDirectory: &isDir) && isDir.boolValue
+    }
+
+    private static func markerMatches(at refsMain: URL) -> Bool {
+        guard let data = try? Data(contentsOf: refsMain),
+              let content = String(data: data, encoding: .utf8) else {
+            return false
+        }
+        return content.trimmingCharacters(in: .whitespacesAndNewlines) == stubRevisionMarker
+    }
+
+    /// Remove only the two directories this installer owns when its source
+    /// model disappeared. Keeping an unrelated ``blobs`` directory avoids
+    /// deleting data from a partial/real Hub download that happened to share
+    /// the cache entry after our stub was created.
+    private static func removeStaleStubIfOwned(
+        cacheDir: URL,
+        fileManager: FileManager
+    ) -> InstallOutcome? {
+        let attrs = try? fileManager.attributesOfItem(atPath: cacheDir.path)
+        guard attrs?[.type] as? FileAttributeType == .typeDirectory else {
+            return nil
+        }
+        let refs = cacheDir.appendingPathComponent("refs", isDirectory: true)
+        let refsMain = refs.appendingPathComponent("main")
+        let snapshots = cacheDir.appendingPathComponent("snapshots", isDirectory: true)
+        let quickstartSnapshot = snapshots.appendingPathComponent(
+            stubRevisionMarker, isDirectory: true
+        )
+        guard markerMatches(at: refsMain) else { return nil }
+        // Never traverse a cache-internal directory symlink. The marker read
+        // above can follow one, so ownership alone is insufficient for safe
+        // deletion; both parents must lstat as real directories.
+        let refsAttrs = try? fileManager.attributesOfItem(atPath: refs.path)
+        guard refsAttrs?[.type] as? FileAttributeType == .typeDirectory else {
+            return .failed("stale Quickstart refs path is not a real directory; refusing cleanup")
+        }
+        let snapshotsAttrs = try? fileManager.attributesOfItem(atPath: snapshots.path)
+        if let snapshotsType = snapshotsAttrs?[.type] as? FileAttributeType,
+           snapshotsType != .typeDirectory {
+            return .failed("stale Quickstart snapshots path is not a real directory; refusing cleanup")
+        }
+        do {
+            // Re-lstat immediately before mutation. A sync daemon may swap
+            // any checked directory between ownership validation and here.
+            let rootRecheck = try fileManager.attributesOfItem(atPath: cacheDir.path)
+            let refsRecheck = try fileManager.attributesOfItem(atPath: refs.path)
+            guard rootRecheck[.type] as? FileAttributeType == .typeDirectory,
+                  refsRecheck[.type] as? FileAttributeType == .typeDirectory else {
+                return .failed("stale Quickstart cache path changed during cleanup; refusing mutation")
+            }
+            if snapshotsAttrs != nil {
+                let snapshotsRecheck = try fileManager.attributesOfItem(atPath: snapshots.path)
+                guard snapshotsRecheck[.type] as? FileAttributeType == .typeDirectory else {
+                    return .failed("stale Quickstart snapshots path changed during cleanup; refusing mutation")
+                }
+            }
+            // A previous attempt may already have removed the snapshot. The
+            // marker remains the retry token until every destructive step is
+            // complete.
+            if (try? fileManager.attributesOfItem(atPath: quickstartSnapshot.path)) != nil {
+                try fileManager.removeItem(at: quickstartSnapshot)
+            }
+            // Keep the ownership marker until the destructive step succeeds;
+            // a transient snapshot-removal failure must remain retryable on
+            // the next launch.
+            try fileManager.removeItem(at: refsMain)
+            if try fileManager.contentsOfDirectory(atPath: refs.path).isEmpty {
+                try fileManager.removeItem(at: refs)
+            }
+            if snapshotsAttrs != nil,
+               try fileManager.contentsOfDirectory(atPath: snapshots.path).isEmpty {
+                try fileManager.removeItem(at: snapshots)
+            }
+            let remaining = try fileManager.contentsOfDirectory(atPath: cacheDir.path)
+            if remaining.isEmpty {
+                try fileManager.removeItem(at: cacheDir)
+            }
+            return .removedStaleStub
+        } catch {
+            return .failed("remove stale Quickstart stub: \(error.localizedDescription)")
+        }
     }
 
     /// Verify every leaf symlink in our stub still points at the
