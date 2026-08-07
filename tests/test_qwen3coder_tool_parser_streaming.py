@@ -180,6 +180,27 @@ def test_close_tag_never_leaks_into_emitted_fragment():
     )
 
 
+def test_json_encoded_string_preserves_embedded_xml_closers():
+    """The constrained #1542 wire must keep every XML marker as string data."""
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("write", {"content": {"type": "string"}})
+    value = 'before </parameter> </function> </tool_call> after "quoted"'
+    encoded = json.dumps(value, ensure_ascii=False)
+    chunks = [
+        "<tool_call>\n",
+        "<function=write>\n",
+        "<parameter=content>\n",
+        encoded[:17],
+        encoded[17:38],
+        encoded[38:] + "\n</parameter>\n",
+        "</function>\n",
+        "</tool_call>",
+    ]
+
+    fragments = _argument_fragments(_feed(parser, chunks, request))
+    assert json.loads("".join(fragments)) == {"content": value}
+
+
 def test_streaming_json_matches_non_streaming():
     """Concatenating all streamed ``function.arguments`` fragments and
     ``json.loads``-ing the result must equal the arguments dict

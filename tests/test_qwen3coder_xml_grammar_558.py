@@ -159,17 +159,11 @@ _XML_GOLDEN_LARK = (
     "tag_end: TAG_TEXT\n"
     "SEP: /[ \\t\\r\\n]*/\n"
     "TAG_TEXT: /(.|\\n)*/\n"
-    # The lazy string-value construct: XML_PARAM_TEXT admits ANY byte (``<``
-    # included); the lazy rule binds it to the FIRST ``</parameter>``.
-    "XML_PARAM_TEXT: /(.|\\n)*/\n"
-    'xml_param_value[lazy]: XML_PARAM_TEXT "</parameter>"\n'
     "\n"
-    # A string value is the lazy rule + only the trailing ``\\n`` separator
-    # (the rule already consumed ``\\n</parameter>``). An enum is a literal
-    # alternation, a scalar is ``%json``; both keep the ``\\n</parameter>\\n``
-    # close. Optional params are wrapped in ``( ... )?``.
+    # Strings ride %json so delimiter-looking bytes are payload inside the
+    # quoted JSON string rather than the XML close (#1542).
     'tag_0: <tool_call> "\\n<function=run_code>\\n" '
-    '"<parameter=code>\\n" xml_param_value "\\n" '
+    '"<parameter=code>\\n" %json {"type": "string"} "\\n</parameter>\\n" '
     '"<parameter=language>\\n" ("python" | "cpp") "\\n</parameter>\\n" '
     '( "<parameter=timeout>\\n" %json {"type": "integer"} "\\n</parameter>\\n" )? '
     '( "<parameter=verbose>\\n" %json {"type": "boolean"} "\\n</parameter>\\n" )? '
@@ -201,18 +195,13 @@ def test_xml_lark_frame_and_sentinels():
     assert '"</function>\\n"' in lark
 
 
-def test_xml_string_value_uses_lazy_rule_not_raw_charclass():
-    # GAP #1 fix, at the grammar-string level: a string param value must be the
-    # LAZY ``xml_param_value`` rule (any text up to the first ``</parameter>``),
-    # NOT the pilot's ``XMLSTR: /[^<]*/`` terminal that stopped at any ``<``.
+def test_xml_string_value_uses_json_string_not_delimiter_lazy_rule():
     from vllm_mlx.api.tool_grammar import build_tool_lark
 
     lark = build_tool_lark(XML_TOOLS, "required", [_xml_structure_info("run_code")])
-    # The lazy value construct is declared once and referenced for the string.
-    assert 'xml_param_value[lazy]: XML_PARAM_TEXT "</parameter>"' in lark
-    assert "XML_PARAM_TEXT: /(.|\\n)*/" in lark
-    assert '"<parameter=code>\\n" xml_param_value "\\n"' in lark
-    # The truncating raw terminal is GONE.
+    assert '"<parameter=code>\\n" %json {"type": "string"}' in lark
+    assert "xml_param_value" not in lark
+    assert "XML_PARAM_TEXT" not in lark
     assert "XMLSTR" not in lark
     assert "/[^<]*/" not in lark
 
@@ -224,7 +213,10 @@ def test_xml_required_vs_optional_framing():
 
     lark = build_tool_lark(XML_TOOLS, "required", [_xml_structure_info("run_code")])
     # Required string: bare (not inside a ``( ... )?`` group).
-    assert '"<parameter=code>\\n" xml_param_value "\\n" "<parameter=language>' in lark
+    assert (
+        '"<parameter=code>\\n" %json {"type": "string"} '
+        '"\\n</parameter>\\n" "<parameter=language>' in lark
+    )
     # Optional scalars: each wrapped in an optional group.
     assert (
         '( "<parameter=timeout>\\n" %json {"type": "integer"} "\\n</parameter>\\n" )?'
@@ -269,10 +261,7 @@ def test_xml_ref_defs_propagated_into_value_schema():
     assert f"%json {json.dumps(expected_schema)}" in lark
 
 
-def test_xml_no_string_param_tool_still_declares_lazy_rule():
-    # An XML tool with NO string params still declares the lazy rule (arg_style
-    # is xml). The unused rule must not break the grammar (a reference-free rule
-    # is tolerated) — the enforcement test below compiles exactly such a case.
+def test_xml_no_string_param_tool_has_no_string_helper_rule():
     from vllm_mlx.api.tool_grammar import build_tool_lark
 
     int_only = [
@@ -287,8 +276,8 @@ def test_xml_no_string_param_tool_still_declares_lazy_rule():
         }
     ]
     lark = build_tool_lark(int_only, "required", [_xml_structure_info("cfg")])
-    assert "xml_param_value[lazy]:" in lark
-    assert "xml_param_value" not in lark.split("\ntag_0:", 1)[1]  # unused in the tag
+    assert "xml_param_value" not in lark
+    assert "XML_PARAM_TEXT" not in lark
 
 
 # --------------------------------------------------------------------------
@@ -517,7 +506,7 @@ def _wire(code, *, language="python", timeout=None, verbose=None):
     """Build the Qwen3-Coder XML wire for the ``run_code`` tool."""
     s = (
         "<tool_call>\n<function=run_code>\n"
-        f"<parameter=code>\n{code}\n</parameter>\n"
+        f"<parameter=code>\n{json.dumps(code, ensure_ascii=False)}\n</parameter>\n"
         f"<parameter=language>\n{language}\n</parameter>\n"
     )
     if timeout is not None:
@@ -592,17 +581,13 @@ def test_xml_normal_value_still_round_trips_no_regression(tok, lltok):
 
 
 @_requires_llguidance
-def test_xml_value_containing_close_tag_closes_at_first(tok, lltok):
-    # FIRST-``</parameter>`` semantics (same as XGrammar, acceptable): a value
-    # that literally contains ``</parameter>`` closes THERE, so the trailing
-    # remainder is not part of a single value and the full wire is not a
-    # complete derivation (accepted < total). This pins the documented behavior.
+def test_xml_value_containing_close_tag_is_data_not_a_delimiter(tok, lltok):
     grammar = _xml_grammar(XML_TOOLS, "required", tok)
-    accepted, total, _ = _consume(grammar, lltok, tok, _wire("a</parameter>b"))
-    assert accepted < total, (
-        "a value literally containing </parameter> must close at the FIRST one "
-        "(XGrammar semantics), not swallow the rest of the wire"
-    )
+    wire = _wire("a</parameter>b")
+    accepted, total, accepting = _consume(grammar, lltok, tok, wire)
+    assert accepted == total and accepting
+    _, args = _parse(wire, XML_TOOLS)
+    assert args["code"] == "a</parameter>b"
 
 
 @_requires_llguidance
@@ -1019,7 +1004,7 @@ def test_representable_total_required_guard_never_raises():
 
 
 # ---- F3 REAL FIX: $ref resolved BEFORE the string-vs-%json decision ------
-def test_xml_ref_to_string_uses_raw_lazy_path_not_json():
+def test_xml_ref_to_string_uses_json_string_path():
     # Grammar-string level: a `$ref` -> string property emits the LAZY raw value
     # rule, NOT `%json` (whose quotes the parser would keep). The tool's only
     # param is a `$ref` -> string, so the whole grammar has NO `%json` at all.
@@ -1028,8 +1013,8 @@ def test_xml_ref_to_string_uses_raw_lazy_path_not_json():
     lark = build_tool_lark(
         XML_REF_STRING_TOOL, "required", [_xml_structure_info("geo")]
     )
-    assert '"<parameter=city>\\n" xml_param_value "\\n"' in lark
-    assert "%json" not in lark
+    assert '"<parameter=city>\\n" %json' in lark
+    assert "xml_param_value" not in lark
 
 
 def test_xml_ref_to_object_still_uses_json():
@@ -1051,7 +1036,7 @@ def test_xml_ref_to_string_roundtrips_without_quotes(tok, lltok):
     assert grammar is not None
     wire = (
         "<tool_call>\n<function=geo>\n"
-        "<parameter=city>\nParis\n</parameter>\n"
+        '<parameter=city>\n"Paris"\n</parameter>\n'
         "</function>\n</tool_call>"
     )
     accepted, total, accepting = _consume(grammar, lltok, tok, wire)

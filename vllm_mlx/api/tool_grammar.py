@@ -395,39 +395,6 @@ def _emit_literal_with_sentinels(text: str, sentinels: tuple[str, ...]) -> str:
     return " ".join(p for p in parts if p)
 
 
-# The raw-string value construct used by the XML arg body (see
-# ``_emit_xml_param_value``). A Qwen3-Coder string parameter value is "any text
-# up to the FIRST literal ``</parameter>`` close tag" — so a value MAY contain a
-# literal ``<`` (a ``code`` arg such as ``a < b``, ``<html>...``, or C++
-# ``vector<int>``), it just may not contain the whole ``</parameter>`` delimiter.
-# We express that with llguidance's first-class LAZY lexeme (``rule[lazy]:``): a
-# lazy rule matches its leading text terminal MINIMALLY, stopping at the first
-# occurrence of the trailing literal. This is the exact idiom llguidance's own
-# ``StructTag.to_grammar`` uses for "text until a tag" (``_struct_tag.py``:
-# ``..._trig[lazy]: TAG_TEXT <trigger>``), and it mirrors XGrammar's ``qwen_xml``
-# style (value = any text up to the first ``</parameter>``).
-#
-# ``XML_PARAM_TEXT: /(.|\n)*/`` admits ANY byte (crucially including ``<``); the
-# lazy rule then binds it to the ``</parameter>`` delimiter so the value
-# terminates at the first close. The lazy rule consumes the value, the single
-# ``\n`` the wire puts BEFORE ``</parameter>``, AND the ``</parameter>`` tag
-# itself — so ``_emit_xml_param_value`` appends only the trailing ``\n`` (the
-# separator AFTER the close). The ``qwen3_coder`` parser strips the leading /
-# trailing ``\n`` from the captured value, so this reproduces the exact surface
-# form it round-trips. FIRST-``</parameter>`` semantics: a value that literally
-# contains ``</parameter>`` closes there (same as XGrammar — acceptable).
-# NOTE (previous limitation, now FIXED): the pilot used ``XMLSTR: /[^<]*/`` which
-# stopped at ANY ``<`` and thus SILENTLY TRUNCATED a ``<``-containing code arg.
-_XML_STRING_VALUE_TERMINAL = "XML_PARAM_TEXT"
-_XML_STRING_VALUE_RULE = "xml_param_value"
-# ``\\n`` here is a LITERAL backslash-n (the Lark regex ``/(.|\n)*/``), matching
-# how ``TAG_TEXT`` is declared; the trailing ``\n`` are real line breaks.
-_XML_STRING_TERMINAL_DECL = (
-    f"{_XML_STRING_VALUE_TERMINAL}: /(.|\\n)*/\n"
-    f'{_XML_STRING_VALUE_RULE}[lazy]: {_XML_STRING_VALUE_TERMINAL} "</parameter>"\n'
-)
-
-
 # The gemma4 string-value construct (#558 E4). A string value is wrapped in the
 # ``<|"|>`` marker, a SINGLE SPECIAL TOKEN (id 52 on the target tokenizer). The
 # value is a RULE ``<|"|> GEMMA_STR_TEXT <|"|>`` with BOTH ``<|"|>`` as RULE-LEVEL
@@ -1083,15 +1050,8 @@ def _emit_xml_param_value(subschema: Any, defs: dict[str, Any]) -> str:
       * ENUM -> an alternation of the literal enum values (raw string form for
         string enums, JSON scalar for numeric/bool enums), then the
         ``\\n</parameter>\\n`` close.
-      * STRING (non-enum) -> the LAZY ``xml_param_value`` rule (NOT ``%json``,
-        whose surrounding quotes the parser keeps verbatim, yielding
-        ``"\\"Paris\\""``). The lazy rule matches ANY text (``<`` included) up to
-        AND INCLUDING the first ``</parameter>`` — so it absorbs the value, the
-        ``\\n`` before ``</parameter>``, AND the ``</parameter>`` tag itself. The
-        close appended here is therefore just the trailing ``\\n`` separator (NO
-        ``</parameter>`` — the rule already consumed it). This is what lets a
-        ``<``-containing code arg (``a < b``, ``vector<int>``) round-trip instead
-        of truncating at the first ``<`` (the pilot's ``/[^<]*/`` bug).
+      * STRING (non-enum) -> a ``%json`` string. Its quoting/escaping layer makes
+        delimiter-looking text payload rather than XML structure (#1542).
       * EVERYTHING ELSE (number / integer / boolean / object / array / null) ->
         JSON-constrained via ``%json`` (these surface forms match the parser's
         int / float / bool / ``json.loads`` paths), then the ``\\n</parameter>\\n``
@@ -1101,17 +1061,10 @@ def _emit_xml_param_value(subschema: Any, defs: dict[str, Any]) -> str:
     ``%json`` value sub-schema so an internal ``$ref`` still resolves.
     """
     close_json = _lark_escape("\n</parameter>\n")
-    # The lazy rule already consumed ``\n</parameter>``; only the trailing
-    # separator newline (AFTER the close tag) remains for the string case.
-    close_lazy = _lark_escape("\n")
     if not isinstance(subschema, dict):
-        return f"{_XML_STRING_VALUE_RULE} {close_lazy}"
-    # F3 (#558 E3 codex converge): resolve a single-level local ``$ref`` BEFORE
-    # the enum/string-vs-``%json`` decision, so a ``$ref``->string takes the
-    # RAW-string (lazy) path and round-trips WITHOUT surrounding quotes — the
-    # pilot attached ``$defs`` only AFTER this decision, so a ``$ref``->string
-    # fell through to ``%json`` and emitted QUOTED JSON the parser returned with
-    # quotes preserved (``"\\"Paris\\""``). A ``$ref``->object still takes the
+        return f"%json {json.dumps({'type': 'string'})} {close_json}"
+    # Resolve a single-level local ``$ref`` before the string-vs-object decision.
+    # The parser decodes the JSON-string wire quotes; a ``$ref``->object takes the
     # ``%json`` path below (over the ORIGINAL ``$ref`` + merged ``$defs``, which
     # llguidance resolves internally). ``_resolve_local_ref`` returns the schema
     # unchanged when there is no ``$ref``; a ``None`` (unresolvable) is defensive
@@ -1132,12 +1085,15 @@ def _emit_xml_param_value(subschema: Any, defs: dict[str, Any]) -> str:
             literal = value if isinstance(value, str) else json.dumps(value)
             alts.append(_lark_escape(literal))
         return f"({' | '.join(alts)}) {close_json}"
-    # Lazy import: keep this module importable independently of api.tool_calling
+    # Keep this module importable independently of api.tool_calling
     # (no cycle today, but the lazy import future-proofs it).
     from .tool_calling import _schema_type
 
     if _schema_type(resolved) == "string":
-        return f"{_XML_STRING_VALUE_RULE} {close_lazy}"
+        value_schema = dict(subschema)
+        for def_key, def_val in defs.items():
+            value_schema.setdefault(def_key, def_val)
+        return f"%json {json.dumps(value_schema)} {close_json}"
     value_schema = dict(subschema)
     for def_key, def_val in defs.items():
         value_schema.setdefault(def_key, def_val)
@@ -1665,15 +1621,6 @@ def build_tool_lark(
         )
         prefix_ref = "bal_prefix"
 
-    # Declare the lazy string-value construct (``XML_PARAM_TEXT`` terminal +
-    # ``xml_param_value[lazy]`` rule) ONCE, iff any tag uses the XML arg body
-    # (``arg_style == "xml"``). A JSON-only tool-set (hermes/qwen/harmony) never
-    # emits it, so its grammar is byte-identical to before this change. The rule
-    # is declared whenever ANY xml tag is present (even one with no string
-    # params); llguidance tolerates the reference-free rule, and gating it on the
-    # per-param string check would need a second schema walk for no benefit.
-    if any(getattr(si, "arg_style", "json") == "xml" for si in structure_infos):
-        lark += _XML_STRING_TERMINAL_DECL
     # Same for the gemma4 string-value rule (``<|"|> GEMMA_STR_TEXT <|"|>``),
     # declared once iff any tag uses the gemma4 arg body. A JSON/XML-only tool-set
     # never emits it, so those grammars stay byte-identical.

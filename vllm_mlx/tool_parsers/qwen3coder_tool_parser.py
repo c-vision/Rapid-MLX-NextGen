@@ -32,6 +32,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from ..api.tool_calling import _decode_json_like, _schema_type
+from ..tool_call_scan import split_marked_parameters
 from .abstract_tool_parser import (
     ExtractedToolCallInformation,
     ToolParser,
@@ -94,6 +95,12 @@ def _convert_param_value(
         return _decode_json_like(param_value)
 
     if param_type in ("string", "str", "text", "varchar", "char", "enum"):
+        try:
+            decoded = json.loads(param_value)
+        except (json.JSONDecodeError, TypeError):
+            decoded = None
+        if isinstance(decoded, str):
+            return decoded
         return param_value
     elif param_type.startswith(("int", "uint", "long", "short", "unsigned")):
         try:
@@ -164,8 +171,8 @@ class Qwen3CoderToolParser(ToolParser):
         The ARGUMENTS are an XML body, NOT a JSON object, so we return a
         ``StructureInfo`` with ``arg_style="xml"``: the builder emits one
         ``<parameter=KEY>\\nVALUE\\n</parameter>`` block per schema property, each
-        VALUE constrained per its sub-schema (raw text for strings, ``%json`` for
-        scalars / objects / arrays, an alternation for enums) — see
+        VALUE constrained per its sub-schema (JSON strings for free-form strings,
+        ``%json`` for scalars / objects / arrays, an alternation for enums) — see
         ``vllm_mlx.api.tool_grammar._emit_xml_arg_body``. Those surface forms are
         exactly what ``_parse_xml_function_call`` / ``_convert_param_value``
         round-trip back into JSON ``arguments``.
@@ -315,17 +322,33 @@ class Qwen3CoderToolParser(ToolParser):
         param_config = _get_arguments_config(function_name, tools)
         parameters = function_call_str[end_index + 1 :]
         param_dict = {}
+        parsed = (
+            split_marked_parameters(
+                parameters,
+                r"<parameter=([^>]+)>",
+                self.parameter_end_token,
+                valid_names=set(param_config) or None,
+            )
+            or []
+        )
+        for p_name, p_value in parsed:
+            param_dict[p_name] = _convert_param_value(
+                p_value, p_name, param_config, function_name
+            )
+        # Preserve the upstream recovery behavior for malformed free-form
+        # output that omitted one close tag: the positional scanner correctly
+        # protects complete JSON-string payloads, while this fallback recovers
+        # later declared parameters that would otherwise be swallowed by the
+        # unterminated predecessor. Never overwrite a value the safe scan found.
         for match_text in self.tool_call_parameter_regex.findall(parameters):
             try:
                 idx = match_text.index(">")
             except ValueError:
                 continue
             p_name = match_text[:idx]
-            p_value = str(match_text[idx + 1 :])
-            if p_value.startswith("\n"):
-                p_value = p_value[1:]
-            if p_value.endswith("\n"):
-                p_value = p_value[:-1]
+            if p_name in param_dict or p_name not in param_config:
+                continue
+            p_value = str(match_text[idx + 1 :]).strip("\n")
             param_dict[p_name] = _convert_param_value(
                 p_value, p_name, param_config, function_name
             )
@@ -336,15 +359,14 @@ class Qwen3CoderToolParser(ToolParser):
         }
 
     def _get_function_calls(self, model_output: str) -> list[str]:
-        matched_ranges = self.tool_call_regex.findall(model_output)
-        raw_tool_calls = [m[0] if m[0] else m[1] for m in matched_ranges]
-        if not raw_tool_calls:
-            raw_tool_calls = [model_output]
-
-        raw_function_calls = []
-        for tc in raw_tool_calls:
-            raw_function_calls.extend(self.tool_call_function_regex.findall(tc))
-        return [m[0] if m[0] else m[1] for m in raw_function_calls]
+        calls = []
+        for start in self._function_start_positions(model_output):
+            end = self._top_level_function_close(model_output, start)
+            if end == -1:
+                continue
+            body_start = start + len(self.tool_call_prefix)
+            calls.append(model_output[body_start:end])
+        return calls
 
     @staticmethod
     def _named_tool_choice(request: dict[str, Any] | None) -> str | None:
@@ -525,12 +547,37 @@ class Qwen3CoderToolParser(ToolParser):
                 header_end = text.find(">", next_param + param_open_len)
                 if header_end == -1:
                     return -1
-                pclose = text.find(self.parameter_end_token, header_end + 1)
+                pclose = self._find_parameter_close(text, header_end + 1)
                 if pclose == -1:
                     return -1
                 j = pclose + param_close_len
                 continue
             return next_close
+        return -1
+
+    def _find_parameter_close(self, text: str, value_start: int) -> int:
+        """Find the structural parameter close, skipping JSON-string payload.
+
+        Constrained XML strings are JSON encoded (#1542), so delimiter-looking
+        text inside the quotes is data. Legacy raw model output keeps the old
+        first-close behavior.
+        """
+        i = value_start
+        if i < len(text) and text[i] == "\n":
+            i += 1
+        if i >= len(text) or text[i] != '"':
+            return text.find(self.parameter_end_token, i)
+        i += 1
+        escaped = False
+        while i < len(text):
+            char = text[i]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                return text.find(self.parameter_end_token, i + 1)
+            i += 1
         return -1
 
     def _top_level_function_close_count(
@@ -584,7 +631,7 @@ class Qwen3CoderToolParser(ToolParser):
                 header_end = text.find(">", next_param + param_open_len)
                 if header_end == -1:
                     return positions
-                close_pos = text.find(self.parameter_end_token, header_end + 1)
+                close_pos = self._find_parameter_close(text, header_end + 1)
                 if close_pos == -1:
                     return positions
                 i = close_pos + param_close_len
@@ -647,7 +694,8 @@ class Qwen3CoderToolParser(ToolParser):
                 self.accumulated_params = {}
                 if self.current_tool_index >= tool_count:
                     self.is_tool_call_started = False
-                return None
+                else:
+                    return None
 
         # Handle content before tool calls. Either opener (wrapper or bare
         # ``<function=``) transitions us out of content-only mode; the
@@ -775,15 +823,11 @@ class Qwen3CoderToolParser(ToolParser):
                     # tool call in one chunk to prevent header-only output
                     # when coarse deltas or max_tokens truncation leave no
                     # further parser calls.
-                    if self.function_end_token in tool_text:
+                    if func_close_idx != -1:
                         tools = None
                         if request and isinstance(request, dict):
                             tools = request.get("tools")
-                        fc = tool_text[
-                            func_start : tool_text.find(
-                                self.function_end_token, func_start
-                            )
-                        ]
+                        fc = tool_text[func_start : -len(self.function_end_token)]
                         parsed = self._parse_xml_function_call(fc, tools)
                         args = parsed["arguments"] if parsed else "{}"
                         self.json_started = True
@@ -881,8 +925,8 @@ class Qwen3CoderToolParser(ToolParser):
                     if value_text.startswith("\n"):
                         value_text = value_text[1:]
 
-                    end_idx = value_text.find(self.parameter_end_token)
-                    if end_idx == -1:
+                    end_idx = self._find_parameter_close(value_text, 0)
+                    if end_idx == -1 and not value_text.startswith('"'):
                         # Defensive fallback: model emitted next-param-prefix,
                         # </function>, or </tool_call> without a </parameter>.
                         # Use any of those as the close to avoid hanging
@@ -932,8 +976,8 @@ class Qwen3CoderToolParser(ToolParser):
                 if value_text.startswith("\n"):
                     value_text = value_text[1:]
 
-                param_end_idx = value_text.find(self.parameter_end_token)
-                if param_end_idx == -1:
+                param_end_idx = self._find_parameter_close(value_text, 0)
+                if param_end_idx == -1 and not value_text.startswith('"'):
                     # Try next parameter or function end as delimiter
                     next_param = value_text.find(self.parameter_prefix)
                     func_end = value_text.find(self.function_end_token)
@@ -951,6 +995,8 @@ class Qwen3CoderToolParser(ToolParser):
                             # emit partial JSON (half an int isn't valid),
                             # so fall through to the existing break path.
                             if _is_string_param(current_param_name, param_config):
+                                if value_text.startswith('"'):
+                                    break
                                 frag = self._emit_string_increment(
                                     current_param_name, value_text
                                 )
@@ -990,9 +1036,7 @@ class Qwen3CoderToolParser(ToolParser):
             # document instead of leaving the close stranded for a later
             # call (which may never come if the stream ended).
             close_pending = (
-                not self.in_param
-                and not self.json_closed
-                and self.function_end_token in tool_text
+                not self.in_param and not self.json_closed and func_close_idx != -1
             )
             if close_pending:
                 self.json_closed = True
@@ -1006,7 +1050,7 @@ class Qwen3CoderToolParser(ToolParser):
                 func_start = tool_text.find(self.tool_call_prefix) + len(
                     self.tool_call_prefix
                 )
-                func_content_end = tool_text.find(self.function_end_token, func_start)
+                func_content_end = len(tool_text) - len(self.function_end_token)
                 if func_content_end != -1:
                     fc = tool_text[func_start:func_content_end]
                     try:

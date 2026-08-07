@@ -197,11 +197,6 @@ KNOWN_BROKEN: dict[tuple[str, str, str], str] = {
     #     `vllm_mlx/tool_call_scan` fixes both for tool_calling.py, nemotron
     #     and hermes; porting is mechanical but touches qwen3coder's four
     #     instance-level regexes across the streaming and non-streaming paths.
-    ("qwen3_coder_xml", "xml_body", "literal_close_tool_call"): "own scan",
-    ("qwen3_coder_xml", "xml_body", "literal_close_parameter"): "own scan",
-    ("qwen3_coder_xml", "xml_body", "literal_close_function"): "own scan",
-    ("qwen3_coder_xml", "xml_body", "literal_open_parameter"): "own scan",
-    ("qwen3_coder_xml", "xml_body", "literal_open_and_close"): "own scan",
     ("minicpm", "minicpm_native", "literal_close_tool_call"): "own scan",
     ("minicpm", "minicpm_native", "literal_close_parameter"): "own scan",
     ("minicpm", "minicpm_native", "literal_close_function"): "own scan",
