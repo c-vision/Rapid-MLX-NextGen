@@ -2,19 +2,20 @@ import Testing
 @testable import Rapid
 
 /// Pin the RAM tier → recommended-pick table. v0.13 replaced the old
-/// 6-bucket × 5-role matrix with one primary pick per RAM tier (plus an
-/// optional faster alt on the smallest tier) and per-pick launch flags.
+/// 6-bucket × 5-role matrix with exactly two choices per RAM tier: a smart
+/// primary and a faster/lighter alternative.
 ///
 /// The tiers are keyed by machine RAM and a Mac rounds DOWN to the
 /// nearest floor: a 20 GB Mac gets the 18 GB pick (which fits), not the
 /// 24 GB pick. Table (see ``RAMBucketedDefault`` docstring for the full
 /// numbers):
 ///
-///    8 GB  → lfm2.5-2.6b-4bit  (· Not for coding — only model that fits)
-///   16 GB  → qwen3.5-4b-4bit
+///    8 GB  → lfm2.5-2.6b-4bit  (+ fast lfm2.5-1b-4bit)
+///   16 GB  → qwen3.5-4b-4bit   (+ fast lfm2.5-1b-4bit)
 ///   18 GB  → qwen3.5-9b-4bit   (+ fast qwen3.5-4b-4bit)
-///   24 GB  → gemma-4-26b-4bit  (--no-mllm --kv-cache-dtype bf16 --cache-memory-mb 512)
-///   32 GB  → qwen3.6-35b-4bit
+///   24 GB  → bonsai-27b-2bit   (+ fast qwen3.5-4b-4bit)
+///   32 GB  → gemma-4-26b-4bit  (+ fast qwen3.5-4b-4bit)
+///   48 GB  → gemma-4-26b-4bit  (+ fast qwen3.6-35b-4bit)
 ///   64 GB  → qwen3.6-35b-8bit  (+ fast qwen3.6-35b-4bit)
 ///   96 GB+ → qwen3.5-122b-mxfp4 (+ fast qwen3.6-35b-4bit)
 ///
@@ -34,9 +35,9 @@ struct RAMBucketedDefaultTests {
         #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 16) == "qwen3.5-4b-4bit")
         #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 17) == "qwen3.5-4b-4bit")
         #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 18) == "qwen3.5-9b-4bit")
-        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 24) == "gemma-4-26b-4bit")
-        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 32) == "qwen3.6-35b-4bit")
-        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 48) == "qwen3.6-35b-4bit")   // 32 tier
+        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 24) == "bonsai-27b-2bit")
+        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 32) == "gemma-4-26b-4bit")
+        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 48) == "gemma-4-26b-4bit")
         #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 64) == "qwen3.6-35b-8bit")
         #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 96) == "qwen3.5-122b-mxfp4")
         #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 256) == "qwen3.5-122b-mxfp4") // 96 tier
@@ -45,7 +46,7 @@ struct RAMBucketedDefaultTests {
     @Test("A 20 GB Mac rounds DOWN to the 18 GB pick (fits), not up to 24 GB")
     func roundsDownNotUp() {
         #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 20) == "qwen3.5-9b-4bit")
-        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 30) == "gemma-4-26b-4bit")
+        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 30) == "bonsai-27b-2bit")
     }
 
     @Test("Pathological zero / negative RAM clamps to the smallest tier, no crash")
@@ -58,24 +59,27 @@ struct RAMBucketedDefaultTests {
 
     @Test("Each tier surfaces a smart pick + a fast alt where speed warrants it")
     func smartAndFastPicks() {
-        // 8 GB: one pick, and it carries the publisher's own caveat rather
-        // than a capability % — nothing else in the catalog fits.
+        // Every tier deliberately exposes the same two-choice decision.
         let smallest = RAMBucketedDefault.picks(forPhysicalRAMGB: 8)
-        #expect(smallest.count == 1)
+        #expect(smallest.count == 2)
         #expect(smallest[0].alias == "lfm2.5-2.6b-4bit")
         #expect(smallest[0].caveat == "Not for coding")
-        // 16 GB: conservative general-purpose default, no duplicate alt.
+        #expect(smallest[1].alias == "lfm2.5-1b-4bit")
         let tier16 = RAMBucketedDefault.picks(forPhysicalRAMGB: 16)
-        #expect(tier16.count == 1)
+        #expect(tier16.count == 2)
         #expect(tier16[0].alias == "qwen3.5-4b-4bit")
+        #expect(tier16[1].alias == "lfm2.5-1b-4bit")
         // 18 GB: 9B smart + 4B fast, both verified for tools.
         let tier18 = RAMBucketedDefault.picks(forPhysicalRAMGB: 18)
         #expect(tier18.count == 2)
         #expect(tier18[0].alias == "qwen3.5-9b-4bit")
         #expect(tier18[1].alias == "qwen3.5-4b-4bit")
-        // 24/32 GB: smart pick is already MoE-fast → stands alone.
-        #expect(RAMBucketedDefault.picks(forPhysicalRAMGB: 24).count == 1)
-        #expect(RAMBucketedDefault.picks(forPhysicalRAMGB: 32).count == 1)
+        #expect(RAMBucketedDefault.picks(forPhysicalRAMGB: 24).map(\.alias)
+            == ["bonsai-27b-2bit", "qwen3.5-4b-4bit"])
+        #expect(RAMBucketedDefault.picks(forPhysicalRAMGB: 32).map(\.alias)
+            == ["gemma-4-26b-4bit", "qwen3.5-4b-4bit"])
+        #expect(RAMBucketedDefault.picks(forPhysicalRAMGB: 48).map(\.alias)
+            == ["gemma-4-26b-4bit", "qwen3.6-35b-4bit"])
         // 64/96 GB: fast alt is the lighter 4-bit Qwen3.6-35B (no caveat).
         let tier64 = RAMBucketedDefault.picks(forPhysicalRAMGB: 64)
         #expect(tier64.count == 2)
@@ -91,9 +95,9 @@ struct RAMBucketedDefaultTests {
     @Test("Flags apply only when the alias IS the pick for that Mac's RAM")
     func launchFlagsAreRAMGated() {
         #expect(RAMBucketedDefault.launchFlags(forAlias: "qwen3.5-9b-4bit", physicalRAMGB: 18).isEmpty)
-        #expect(RAMBucketedDefault.launchFlags(forAlias: "gemma-4-26b-4bit", physicalRAMGB: 24)
+        #expect(RAMBucketedDefault.launchFlags(forAlias: "gemma-4-26b-4bit", physicalRAMGB: 32)
             == ["--no-mllm", "--kv-cache-dtype", "bf16", "--cache-memory-mb", "512"])
-        #expect(RAMBucketedDefault.launchFlags(forAlias: "qwen3.6-35b-4bit", physicalRAMGB: 32).isEmpty)
+        #expect(RAMBucketedDefault.launchFlags(forAlias: "qwen3.6-35b-4bit", physicalRAMGB: 48).isEmpty)
         // Hand-picking gemma-26b on a 64 GB Mac (where it is NOT the pick)
         // → no forced flags, so it keeps vision.
         #expect(RAMBucketedDefault.launchFlags(forAlias: "gemma-4-26b-4bit", physicalRAMGB: 64).isEmpty)
@@ -157,6 +161,13 @@ struct RAMBucketedDefaultTests {
                 #expect(pick.capabilityPct > 0 && pick.capabilityPct <= 100,
                         "\(pick.alias) capability \(pick.capabilityPct) out of range")
             }
+        }
+    }
+
+    @Test("Every RAM tier exposes exactly smart and fast choices")
+    func exactlyTwoChoices() {
+        for tier in RAMBucketedDefault.tiers {
+            #expect(tier.picks.count == 2, "Tier \(tier.floorGB) GB must have exactly two picks")
         }
     }
 }

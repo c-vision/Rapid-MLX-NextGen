@@ -3,8 +3,7 @@ import Foundation
 /// Pure RAM tier → curated model recommendation for "what should this
 /// Mac run". Replaces the old 6-bucket × 5-role matrix (Default / Speed /
 /// Quality / Coding / Vision) with a much simpler table: per RAM tier, a
-/// **smart** pick (the most capable model that fits) and, when a genuinely
-/// faster/lighter model is worth surfacing, a **fast** alternative — plus
+/// **smart** pick (the most capable model that fits) and a **fast** alternative — plus
 /// the exact launch flags each pick needs.
 ///
 /// ## Why the roles went away
@@ -24,42 +23,31 @@ import Foundation
 /// pick (which would be borderline). Sub-8 GB Macs clamp to the 8 GB
 /// tier; the app's per-row fit warning still flags anything too big.
 ///
-/// A tier only carries a **fast** alt when it beats the smart pick on
-/// speed by a margin worth a second card. The 24 & 32 GB smart picks are
-/// already MoE-fast (42 / 60 tok/s), so they stand alone — a slower or
-/// much weaker "fast" option there would only mislead.
+/// Every tier carries exactly two choices. This keeps the decision stable:
+/// choose responsiveness, or trade some responsiveness for capability.
 ///
 /// | RAM    | 🧠 Smart            | GB   | Cap | tok/s | 🚀 Fast                          |
 /// | ------ | ------------------- | ---- | --- | ----- | -------------------------------- |
-/// |  8 GB  | lfm2.5-2.6b-4bit    |  2.0 |  —  | 97.8  | — (only model that fits)         |
-/// | 16 GB  | qwen3.5-4b-4bit     |  5.9 | 78% | 157.6 | —                                |
-/// | 18 GB  | qwen3.5-9b-4bit     |  8.7 | 82% | 106.4 | qwen3.5-4b-4bit · 78% · 157.6    |
-/// | 24 GB  | gemma-4-26b-4bit    | 14.6 | 87% | 41.7  | — (smart pick already fast)      |
-/// | 32 GB  | qwen3.6-35b-4bit    | 20.0 | 87% | 60.0  | — (smart pick already fast)      |
+/// |  8 GB  | lfm2.5-2.6b-4bit    |  3.2 | 62% | 94.2  | lfm2.5-1b-4bit · basic · 214.5   |
+/// | 16 GB  | qwen3.5-4b-4bit     |  5.8 | 78% | 62.2  | lfm2.5-1b-4bit · basic · 214.5   |
+/// | 18 GB  | qwen3.5-9b-4bit     |  8.7 | 82% | 36.2  | qwen3.5-4b-4bit · 78% · 62.2     |
+/// | 24 GB  | bonsai-27b-2bit     | 13.0 | 86% | 17.8  | qwen3.5-4b-4bit · 78% · 62.2     |
+/// | 32 GB  | gemma-4-26b-4bit    | 20.0 | 87% | 50.1  | qwen3.5-4b-4bit · 78% · 62.2     |
+/// | 48 GB  | gemma-4-26b-4bit    | 20.0 | 87% | 50.1  | qwen3.6-35b-4bit · 87% · 60      |
 /// | 64 GB  | qwen3.6-35b-8bit    | 37.7 | 87% | —     | qwen3.6-35b-4bit · 87% · 60      |
 /// | 96 GB+ | qwen3.5-122b-mxfp4  | 65.0 | 88% | —     | qwen3.6-35b-4bit · 87% · 60      |
 ///
-/// Laptop tiers deliberately use the same conservative footprint model as
-/// the launch-time memory guard. A low-bit large model must not be labelled
-/// "Recommended" using a short-prompt RSS measurement only to be rejected
-/// later by the guard's KV/runtime budget. Capability % and tok/s are the
-/// maintainer's measured scores (M2/M3); the 64/96 GB smart rows have no
-/// local tok/s measurement yet (rendered without a speed figure).
+/// The measured rows use the standard ~8K prompt peak of the complete
+/// ``rapid-mlx serve`` process tree on an M2 Pro 32 GB Mac mini, not weight
+/// size or an idle/short-prompt RSS. Recommendations require zero new swap,
+/// peak below 75% of the tier floor, 8K prefill >=100 tok/s, and decode
+/// >=10 tok/s. The 64/96 GB rows predate this run and remain explicitly
+/// unmeasured until matching hardware is available.
 ///
-/// The GB column is peak resident memory of the whole ``rapid-mlx serve``
-/// process tree, measured on an M3 Ultra. It must be measured THROUGH
-/// serve: the engine quantizes the KV cache to int4 by default, and a
-/// bare ``mlx_lm`` probe without that default reads about two gigabytes
-/// higher on a 27B. bonsai briefly shipped 10.7 GB here from exactly that
-/// mistake — an M2 Pro probe with an unquantized cache, reported via
-/// MLX's device high-water mark rather than RSS. Served, it is 8.4 GB on
-/// a short prompt and 8.5 GB on a 2 K-token one, so the figure is not
-/// especially workload-sensitive either.
-///
-/// The column had also drifted into meaning *weights on disk* for bonsai
-/// (7.6 GB) while the field is documented as active memory. tok/s are
-/// M2 Pro measurements. The column is display-only (``pickStatsLine``),
-/// so this corrects what users read, not what the app allows them to run.
+/// These figures must be measured THROUGH serve: a bare ``mlx_lm`` probe
+/// does not exercise the product's cache configuration or full process
+/// tree. The column is display-only (``pickStatsLine``); safety gates still
+/// apply independently at launch.
 ///
 /// The capability column is monotonic non-decreasing by RAM, with ONE
 /// deliberate tie documented at the tier: the 64 GB smart 8-bit is floored
@@ -73,7 +61,7 @@ enum RAMBucketedDefault {
     /// tier's RAM (e.g. ``--no-mllm`` to drop the vision tower).
     struct Pick: Sendable, Equatable {
         let alias: String
-        /// Active-memory footprint in GB (what the model actually uses).
+        /// Standard ~8K prompt peak footprint in GB for measured picks.
         let footprintGB: Double
         /// Blended capability score 0–100 (tool / coding / reasoning /
         /// general) — the single number that ranks picks.
@@ -94,8 +82,7 @@ enum RAMBucketedDefault {
     }
 
     /// A RAM tier: the ``floorGB`` it applies from (up to the next tier),
-    /// its ``primary`` (smart) pick, and an optional ``alt`` (fast/light)
-    /// pick — present only when a faster model is worth a second card.
+    /// its ``primary`` (smart) pick, and its ``alt`` (fast/light) pick.
     struct Tier: Sendable, Equatable {
         let floorGB: Double
         let primary: Pick
@@ -108,19 +95,24 @@ enum RAMBucketedDefault {
     /// Conservative general-purpose laptop picks. Both have verified tool
     /// calling and stay within the same footprint budget enforced at launch.
     private static let qwen4Pick = Pick(
-        alias: "qwen3.5-4b-4bit", footprintGB: 5.9, capabilityPct: 78,
-        tokensPerSec: 157.6, launchFlags: [])
+        alias: "qwen3.5-4b-4bit", footprintGB: 5.8, capabilityPct: 78,
+        tokensPerSec: 62.2, launchFlags: [])
 
     private static let qwen9Pick = Pick(
         alias: "qwen3.5-9b-4bit", footprintGB: 8.7, capabilityPct: 82,
-        tokensPerSec: 106.4, launchFlags: [])
+        tokensPerSec: 36.2, launchFlags: [])
 
-    /// The 8 GB tier's only pick: LFM2.5-2.6B, a 2.6 B dense model whose
+    private static let lfm1Pick = Pick(
+        alias: "lfm2.5-1b-4bit", footprintGB: 2.1, capabilityPct: 50,
+        tokensPerSec: 214.5, launchFlags: [], caveat: "Basic chat")
+
+    /// The 8 GB tier's smarter pick: LFM2.5-2.6B, a 2.6 B dense model whose
     /// 30 layers are 22 short-convolution blocks and just 8 GQA. Those 8
     /// attention layers are why it belongs here — the KV cache costs
     /// ~16 KB/token, so a 32 K conversation adds only ~0.5 GB on top of
-    /// 1.6 GB of weights. Served on an M3 Ultra it peaks at 2.0 GB; on an
-    /// M2 Pro it decodes at 97.8 tok/s and prefills at 503 tok/s.
+    /// 1.6 GB of weights. On an M2 Pro it peaks at 3.2 GB on the standard
+    /// 8K prompt, decodes at
+    /// 94.2 tok/s on the short prompt, and prefills at 488 tok/s at 8K.
     ///
     /// It carries a caveat rather than a capability %, and the caveat is
     /// Liquid's own: they publish this model as "not recommended for
@@ -133,12 +125,19 @@ enum RAMBucketedDefault {
     /// is deliberately the same band as the other caveat pick in the
     /// family, not an independently measured score.
     private static let lfm26Pick = Pick(
-        alias: "lfm2.5-2.6b-4bit", footprintGB: 2.0, capabilityPct: 62,
-        tokensPerSec: 97.8, launchFlags: [], caveat: "Not for coding")
+        alias: "lfm2.5-2.6b-4bit", footprintGB: 3.2, capabilityPct: 62,
+        tokensPerSec: 94.2, launchFlags: [], caveat: "Not for coding")
 
-    /// The fast/light pick for the big-MoE tiers: the 4-bit Qwen3.6-35B
-    /// (same weights as the 32 GB smart pick) — near-equal capability to
-    /// the tier's smart model but much faster than an 8-bit / 122B load.
+    private static let bonsaiPick = Pick(
+        alias: "bonsai-27b-2bit", footprintGB: 13.0, capabilityPct: 86,
+        tokensPerSec: 17.8, launchFlags: [])
+
+    private static let gemma26Pick = Pick(
+        alias: "gemma-4-26b-4bit", footprintGB: 20.0, capabilityPct: 87,
+        tokensPerSec: 50.1,
+        launchFlags: ["--no-mllm", "--kv-cache-dtype", "bf16", "--cache-memory-mb", "512"])
+
+    /// Existing reviewed fast/light pick for the unmeasured 48/64/96 GB tiers.
     private static let qwen35bFastPick = Pick(
         alias: "qwen3.6-35b-4bit", footprintGB: 20.0, capabilityPct: 87,
         tokensPerSec: 60.0, launchFlags: [])
@@ -154,38 +153,36 @@ enum RAMBucketedDefault {
         // rejected the only thing it was offered and fell through to
         // ``SafeDefaultFallback``. The user's first run was a model the app
         // had just told them not to run. Nothing in the catalog fit until
-        // LFM2.5-2.6B: 2.70 GB peak leaves room for macOS on an 8 GB
-        // machine, where the 16 GB tier's 5.3 GB "fast" alt did not.
-        Tier(floorGB: 8, primary: lfm26Pick, alt: nil),
+        // LFM2.5-2.6B: 3.21 GB standard-8K peak leaves room for macOS on
+        // an 8 GB machine; LFM 1B supplies the even lighter fast choice.
+        Tier(floorGB: 8, primary: lfm26Pick, alt: lfm1Pick),
         Tier(
             floorGB: 16,
             primary: qwen4Pick,
-            alt: nil
+            alt: lfm1Pick
         ),
         // 18 GB gets the verified 9B general-purpose model plus the 4B fast
-        // option. Do not promote bonsai-27b-2bit here: its measured 8.4 GB
-        // short-prompt RSS conflicts with the launch guard's conservative
-        // ~15 GB budget, producing a recommendation followed by a crash
-        // warning after the user has downloaded it.
+        // option. Do not promote bonsai-27b-2bit here: its 13 GB standard
+        // 8K peak leaves too little headroom at the 18 GB tier floor.
         Tier(
             floorGB: 18,
             primary: qwen9Pick,
             alt: qwen4Pick
         ),
-        // 24 & 32 GB: the smart pick is already MoE-fast (42 / 60 tok/s),
-        // so it stands alone — a slower or much-weaker "fast" card here
-        // would only mislead.
         Tier(
             floorGB: 24,
-            primary: Pick(
-                alias: "gemma-4-26b-4bit", footprintGB: 14.6, capabilityPct: 87, tokensPerSec: 41.7,
-                launchFlags: ["--no-mllm", "--kv-cache-dtype", "bf16", "--cache-memory-mb", "512"]),
-            alt: nil
+            primary: bonsaiPick,
+            alt: qwen4Pick
         ),
         Tier(
             floorGB: 32,
-            primary: Pick(alias: "qwen3.6-35b-4bit", footprintGB: 20.0, capabilityPct: 87, tokensPerSec: 60.0, launchFlags: []),
-            alt: nil
+            primary: gemma26Pick,
+            alt: qwen4Pick
+        ),
+        Tier(
+            floorGB: 48,
+            primary: gemma26Pick,
+            alt: qwen35bFastPick
         ),
         // 64 GB smart pick is the 8-bit of the same Qwen3.6-35B whose 4-bit
         // is the fast alt. Its capability is floored at the 4-bit's measured
@@ -233,7 +230,7 @@ enum RAMBucketedDefault {
     /// Launch flags to apply when starting ``alias`` AS the recommended
     /// model for a Mac at ``physicalRAMGB`` — empty unless the alias is
     /// this Mac's primary or alt pick. This is why a 64 GB Mac that hand-
-    /// picks ``gemma-4-26b-4bit`` (the 24 GB tier's pick, not its own)
+    /// picks ``gemma-4-26b-4bit`` (a 32/48 GB tier pick, not its own)
     /// keeps vision: the flags (``--no-mllm`` …) only ride along with the
     /// recommendation on the tier they were curated for.
     static func launchFlags(forAlias alias: String, physicalRAMGB: Double) -> [String] {

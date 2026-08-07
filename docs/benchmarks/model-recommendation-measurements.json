@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "timestamp_utc": "2026-08-07T19:40:00Z",
+    "hostname": "Raullens-Mini",
+    "machine": "Mac mini",
+    "chip": "Apple M2 Pro (10-core)",
+    "chip_model": "Mac14,12",
+    "physical_ram_gb": 32,
+    "macos": "26.5.2",
+    "rapid_mlx": "0.12.5",
+    "git_sha": "1bc6244be3d7e49c7f91a195175e5167244a0e1f",
+    "mlx": "0.31.2",
+    "mlx_lm": "0.31.3",
+    "mlx_vlm": "0.6.3",
+    "python": "3.13.2"
+  },
+  "method": {
+    "serve_path": "python -m vllm_mlx.cli serve",
+    "output_tokens": 96,
+    "long_prompt_tokens": 8110,
+    "models_are_sequential": true,
+    "max_recommended_ram_fraction": 0.75,
+    "min_decode_tps": 10.0,
+    "min_8k_prefill_tps": 100.0,
+    "max_new_swap_mb": 0.0
+  },
+  "measurements": [
+    {"model":"lfm2.5-1b-4bit","load_s":5.07,"idle_gb":0.965,"peak_8k_gb":2.054,"prefill_8k_tps":1121.96,"decode_short_tps":214.45,"decode_8k_tps":127.25,"swap_delta_mb":0.0},
+    {"model":"lfm2.5-2.6b-4bit","load_s":4.06,"idle_gb":1.908,"peak_8k_gb":3.207,"prefill_8k_tps":488.09,"decode_short_tps":94.15,"decode_8k_tps":51.97,"swap_delta_mb":0.0},
+    {"model":"lfm2.5-8b-a1b-4bit","load_s":7.10,"idle_gb":4.868,"peak_8k_gb":6.067,"prefill_8k_tps":631.63,"decode_short_tps":120.12,"decode_8k_tps":83.50,"swap_delta_mb":0.0},
+    {"model":"qwen3.5-4b-4bit","load_s":5.05,"idle_gb":2.761,"peak_8k_gb":5.818,"prefill_8k_tps":313.18,"decode_short_tps":62.17,"decode_8k_tps":39.09,"swap_delta_mb":0.0},
+    {"model":"qwen3.5-9b-4bit","load_s":6.07,"idle_gb":5.262,"peak_8k_gb":8.680,"prefill_8k_tps":172.50,"decode_short_tps":36.19,"decode_8k_tps":31.80,"swap_delta_mb":0.0},
+    {"model":"gemma-4-12b-4bit","load_s":14.11,"idle_gb":7.322,"peak_8k_gb":11.0,"prefill_8k_tps":52.27,"decode_short_tps":23.39,"decode_8k_tps":22.04,"swap_delta_mb":0.0},
+    {"model":"bonsai-27b-2bit","load_s":8.07,"idle_gb":7.813,"peak_8k_gb":13.0,"prefill_8k_tps":169.52,"decode_short_tps":17.78,"decode_8k_tps":15.82,"swap_delta_mb":0.0},
+    {"model":"gemma-4-26b-4bit","serve_args":["--no-mllm","--kv-cache-dtype","bf16","--cache-memory-mb","512"],"load_s":12.12,"idle_gb":14.0,"peak_8k_gb":20.0,"prefill_8k_tps":226.94,"decode_short_tps":50.06,"decode_8k_tps":23.61,"swap_delta_mb":0.0},
+    {"model":"qwen3.5-35b-4bit","load_s":17.14,"idle_gb":19.0,"peak_8k_gb":22.0,"prefill_8k_tps":335.90,"decode_short_tps":60.26,"decode_8k_tps":50.30,"swap_delta_mb":988.8},
+    {"model":"qwen3.6-27b-4bit","load_s":13.51,"idle_gb":15.0,"peak_8k_gb":21.0,"prefill_8k_tps":48.88,"decode_short_tps":11.30,"decode_8k_tps":10.72,"swap_delta_mb":0.0}
+  ]
+}

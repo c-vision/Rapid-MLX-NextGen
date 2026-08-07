@@ -99,16 +99,16 @@ fi
 # single command, so it takes the app's PRIMARY (smart) pick only.
 #
 # RECOMMENDED_FLAGS carries the tier's launch flags. It is not cosmetic:
-# ``gemma-4-26b-4bit`` at 24 GB needs its vision tower dropped and its KV
-# budget capped, and printing the bare ``serve`` line would hand a 24 GB
+# ``gemma-4-26b-4bit`` at 32–63 GB needs its vision tower dropped and its KV
+# budget capped, and printing the bare ``serve`` line would hand that Mac
 # Mac a command that does not fit in it.
 RAM_GB=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%d", $1/1073741824}')
 RECOMMENDED_FLAGS=""
 if   [ "$RAM_GB" -ge 96 ]; then RECOMMENDED_MODEL="qwen3.5-122b-mxfp4";  RAM_TIER="96+ GB"
 elif [ "$RAM_GB" -ge 64 ]; then RECOMMENDED_MODEL="qwen3.6-35b-8bit";    RAM_TIER="64-95 GB"
-elif [ "$RAM_GB" -ge 32 ]; then RECOMMENDED_MODEL="qwen3.6-35b-4bit";    RAM_TIER="32-63 GB"
-elif [ "$RAM_GB" -ge 24 ]; then RECOMMENDED_MODEL="gemma-4-26b-4bit";    RAM_TIER="24-31 GB"
+elif [ "$RAM_GB" -ge 32 ]; then RECOMMENDED_MODEL="gemma-4-26b-4bit";    RAM_TIER="32-63 GB"
                                 RECOMMENDED_FLAGS=" --no-mllm --kv-cache-dtype bf16 --cache-memory-mb 512"
+elif [ "$RAM_GB" -ge 24 ]; then RECOMMENDED_MODEL="bonsai-27b-2bit";     RAM_TIER="24-31 GB"
 elif [ "$RAM_GB" -ge 18 ]; then RECOMMENDED_MODEL="qwen3.5-9b-4bit";     RAM_TIER="18-23 GB"
 elif [ "$RAM_GB" -ge 16 ]; then RECOMMENDED_MODEL="qwen3.5-4b-4bit";     RAM_TIER="16-17 GB"
 else                            RECOMMENDED_MODEL="lfm2.5-2.6b-4bit";    RAM_TIER="8-15 GB"

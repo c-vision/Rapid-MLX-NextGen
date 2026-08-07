@@ -49,7 +49,7 @@ or Homebrew — prebuilt bottle straight from homebrew-core:
 brew install rapid-mlx
 ```
 
-Both land the same `rapid-mlx` CLI. The curl installer additionally installs Python 3.10+ if missing, creates an isolated venv at `~/.rapid-mlx/`, symlinks the `rapid-mlx` CLI into `~/.local/bin/`, and prints a serve command sized to your Mac (8–15 GB → `lfm2.5-2.6b-4bit`; 16–17 GB → `qwen3.5-4b-4bit`; 18–23 GB → `qwen3.5-9b-4bit`; 24–31 GB → `gemma-4-26b-4bit`; 32–63 GB → `qwen3.6-35b-4bit`; 64–95 GB → `qwen3.6-35b-8bit`; 96 GB+ → `qwen3.5-122b-mxfp4`).
+Both land the same `rapid-mlx` CLI. The curl installer additionally installs Python 3.10+ if missing, creates an isolated venv at `~/.rapid-mlx/`, symlinks the `rapid-mlx` CLI into `~/.local/bin/`, and prints a serve command sized to your Mac (8–15 GB → `lfm2.5-2.6b-4bit`; 16–17 GB → `qwen3.5-4b-4bit`; 18–23 GB → `qwen3.5-9b-4bit`; 24–31 GB → `bonsai-27b-2bit`; 32–63 GB → `gemma-4-26b-4bit`; 64–95 GB → `qwen3.6-35b-8bit`; 96 GB+ → `qwen3.5-122b-mxfp4`).
 
 > **Install security.** `install.sh` is served over HTTPS (HSTS-preload) from `rapidmlx.com` and is a byte-identical mirror of [`install.sh`](install.sh) at the release commit — read it before running if you like. If you want a cryptographically verified installer rather than trusting the website pipe, don't `curl | bash` the URL above: instead download the release's `install.sh` asset, verify it against the cosign-signed `SHA256SUMS.txt` shipped alongside it, and run that verified copy — full recipe in [SECURITY.md](SECURITY.md). PyPI artifacts additionally carry Sigstore attestations (PEP 740). Two more low-trust paths:
 > - **Pin to a commit hash** — `curl -fsSL https://raw.githubusercontent.com/raullenchai/Rapid-MLX/<commit>/install.sh -o install.sh && shasum -a 256 install.sh && bash install.sh`
@@ -237,21 +237,20 @@ The installer's RAM detector picks a sensible default. If you want to shop the f
 
 This table is the same one the desktop app's picker reads, and the installer
 prints the matching line for your Mac — a CI test parses both files and fails
-if they drift apart. Peak RSS is measured through `rapid-mlx serve` on an
-M3 Ultra (the engine quantizes the KV cache to int4 by default, so a bare
-`mlx_lm` probe will read higher).
+if they drift apart. Measured rows use the standard ~8K prompt peak of the
+complete `rapid-mlx serve` process tree on an M2 Pro 32 GB Mac mini.
 
 | RAM | Recommended | Peak RSS | One-shot |
 |---|---|---:|---|
-| **8–15 GB** MacBook Air / base Mini | `lfm2.5-2.6b-4bit` | 2.0 GB | `rapid-mlx serve lfm2.5-2.6b-4bit` |
-| **16–17 GB** MacBook Air / Pro | `qwen3.5-4b-4bit` | 5.9 GB | `rapid-mlx serve qwen3.5-4b-4bit` |
+| **8–15 GB** MacBook Air / base Mini | `lfm2.5-2.6b-4bit` | 3.2 GB | `rapid-mlx serve lfm2.5-2.6b-4bit` |
+| **16–17 GB** MacBook Air / Pro | `qwen3.5-4b-4bit` | 5.8 GB | `rapid-mlx serve qwen3.5-4b-4bit` |
 | **18–23 GB** MacBook Pro | `qwen3.5-9b-4bit` | 8.7 GB | `rapid-mlx serve qwen3.5-9b-4bit` |
-| **24–31 GB** Mac Mini / MacBook Pro | `gemma-4-26b-4bit` | 15.6 GB | `rapid-mlx serve gemma-4-26b-4bit --no-mllm --kv-cache-dtype bf16 --cache-memory-mb 512` |
-| **32–63 GB** Mac Studio / high-spec Mini | `qwen3.6-35b-4bit` | 20.4 GB | `rapid-mlx serve qwen3.6-35b-4bit` |
+| **24–31 GB** Mac Mini / MacBook Pro | `bonsai-27b-2bit` | 13.0 GB | `rapid-mlx serve bonsai-27b-2bit` |
+| **32–63 GB** Mac Studio / high-spec Mini | `gemma-4-26b-4bit` | 20.0 GB | `rapid-mlx serve gemma-4-26b-4bit --no-mllm --kv-cache-dtype bf16 --cache-memory-mb 512` |
 | **64–95 GB** Mac Studio | `qwen3.6-35b-8bit` | 37.7 GB | `rapid-mlx serve qwen3.6-35b-8bit` |
 | **96 GB+** Mac Studio / Pro | `qwen3.5-122b-mxfp4` | — | `rapid-mlx serve qwen3.5-122b-mxfp4` |
 
-The 24–31 GB flags are not optional: Gemma 4 26B ships a vision tower that tier
+The 32–63 GB flags are not optional: Gemma 4 26B ships a vision tower that tier
 has no memory for, and an uncapped KV budget claims the headroom the rest of
 your Mac needs.
 

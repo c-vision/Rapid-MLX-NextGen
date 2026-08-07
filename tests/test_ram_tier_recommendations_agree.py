@@ -183,10 +183,10 @@ def _render_banner(ram_gb: int) -> str:
 
 
 def test_the_banner_actually_prints_the_launch_flags():
-    """gemma-4-26b-4bit at 24 GB needs its vision tower dropped and its KV
+    """gemma-4-26b-4bit at 32 GB needs its vision tower dropped and its KV
     budget capped. That is not advice — without the flags the command does
     not fit on the Mac it is being handed to."""
-    printed = _render_banner(24)
+    printed = _render_banner(32)
     assert "gemma-4-26b-4bit" in printed, printed
     for flag in ("--no-mllm", "--kv-cache-dtype", "bf16", "--cache-memory-mb", "512"):
         assert flag in printed, (
@@ -196,7 +196,7 @@ def test_the_banner_actually_prints_the_launch_flags():
 
 def test_the_banner_prints_a_bare_command_where_no_flags_are_needed():
     """Control: the flags must not leak onto tiers that do not want them."""
-    for ram in (8, 16, 32, 64):
+    for ram in (8, 16, 24, 64):
         printed = _render_banner(ram)
         assert "rapid-mlx serve" in printed
         assert "--no-mllm" not in printed, f"{ram} GB banner: {printed}"

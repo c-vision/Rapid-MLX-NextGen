@@ -289,13 +289,13 @@ struct BenchScoresTests {
         // surface in the recommendation stats line, not the bench meters.
         // The picker degrades gracefully for these (no bar block, no card
         // meters), so a bench JSON row is not required.
-        // lfm2.5-2.6b-4bit joined 2026-08-04 as the 8-15 GB pick. It is
-        // genuinely unscored — not on Artificial Analysis, no published
-        // standard bench — so it belongs here rather than getting a
-        // fabricated row. The anti-fabrication check below is what keeps
-        // that honest.
+        // The LFM2.5 small picks are genuinely unscored — not on Artificial
+        // Analysis, no comparable published standard bench — so they belong
+        // here rather than getting fabricated rows. The anti-fabrication
+        // check below is what keeps that honest.
         let noStandardBench: Set<String> = [
-            "bonsai-27b-2bit", "lfm2.5-8b-a1b-4bit", "lfm2.5-2.6b-4bit",
+            "bonsai-27b-2bit", "lfm2.5-1b-4bit", "lfm2.5-8b-a1b-4bit",
+            "lfm2.5-2.6b-4bit",
         ]
         let known = Set(BenchScoresCatalog.allAliases)
         let missing = distinct.subtracting(known).subtracting(noStandardBench)
