@@ -581,7 +581,13 @@ class Qwen3CoderToolParser(ToolParser):
         first-close behavior.
         """
         i = value_start
-        if i < len(text) and text[i] == "\n":
+        # The XML template permits formatting whitespace between the parameter
+        # opener and its JSON-string value.  Treat that whitespace as wire, not
+        # as part of a legacy raw string.  In particular, token streaming can
+        # expose the whitespace one delta before the opening quote; failing to
+        # skip it makes the incremental path escape both JSON wrapper quotes
+        # into the user value (``/tmp/x`` becomes ``\"/tmp/x\"``).
+        while i < len(text) and text[i].isspace():
             i += 1
         if i >= len(text) or text[i] != '"':
             return text.find(self.parameter_end_token, i)
@@ -944,7 +950,8 @@ class Qwen3CoderToolParser(ToolParser):
                         value_text = value_text[1:]
 
                     end_idx = self._find_parameter_close(value_text, 0)
-                    if end_idx == -1 and not value_text.startswith('"'):
+                    json_string_pending = value_text.lstrip().startswith('"')
+                    if end_idx == -1 and not json_string_pending:
                         # Defensive fallback: model emitted next-param-prefix,
                         # </function>, or </tool_call> without a </parameter>.
                         # Use any of those as the close to avoid hanging
@@ -971,7 +978,7 @@ class Qwen3CoderToolParser(ToolParser):
                         self.in_param_name = None
                         self.in_param_emitted_chars = 0
                         self.in_param_opened = False
-                    else:
+                    elif not json_string_pending:
                         frag = self._emit_string_increment(
                             self.in_param_name, value_text
                         )
@@ -995,7 +1002,8 @@ class Qwen3CoderToolParser(ToolParser):
                     value_text = value_text[1:]
 
                 param_end_idx = self._find_parameter_close(value_text, 0)
-                if param_end_idx == -1 and not value_text.startswith('"'):
+                json_string_pending = value_text.lstrip().startswith('"')
+                if param_end_idx == -1 and not json_string_pending:
                     # Try next parameter or function end as delimiter
                     next_param = value_text.find(self.parameter_prefix)
                     func_end = value_text.find(self.function_end_token)
@@ -1013,7 +1021,7 @@ class Qwen3CoderToolParser(ToolParser):
                             # emit partial JSON (half an int isn't valid),
                             # so fall through to the existing break path.
                             if _is_string_param(current_param_name, param_config):
-                                if value_text.startswith('"'):
+                                if json_string_pending:
                                     break
                                 frag = self._emit_string_increment(
                                     current_param_name, value_text
