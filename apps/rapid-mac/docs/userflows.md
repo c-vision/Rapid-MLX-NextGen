@@ -289,6 +289,14 @@ First run has **two distinct surfaces**, shown in order:
 
 **Known issues.** Sandbox + connector approval prompts are `confirmationDialog`/`alert` (no AXIdentifier) — manual verification only.
 
+> **Stale — these two flows describe surfaces that are not in the tree.**
+> `ToolApprovalDialog` and `MCPToolApprovalStore` resolve to **zero** files under
+> `apps/rapid-mac/Sources/`, and the cited `ContentView.swift:2135` is past the end of a
+> 1182-line file. This app's only tool-approval prompt today is the `browse` per-fetch
+> sheet inventoried at the end of this document. Left in place rather than deleted
+> because the connector/permissions *product* intent is still wanted; the identifiers,
+> file references and "known issues" above must not be trusted until it is rebuilt.
+
 ---
 
 ## Flow 14 — In-chat controls: system prompt & tools toggle  *(NEW surface — v0.7.x→v0.10.x)*
@@ -343,7 +351,13 @@ First run has **two distinct surfaces**, shown in order:
 - **Permissions** — `SettingsPermissionsPanel.swift`: `Settings.Permissions.MasterToggle` (:113), `Settings.Permissions.ResetConnectorApprovals` (:190), per-category dynamic rows (:244).
 - **Banners / misc** — `FailedReplaceBanner` (`FailedReplaceBanner.swift:90`), `StaleSessionAliasBanner{,.Dismiss}`, `SessionLoadFailureBanner{,.ShowInFinder,.Dismiss}`, `PoppedConversation.CloseUnavailableWindow` (`PoppedConversationView.swift:88`).
 
-**No identifier (can't be AX-driven):** the MCP `ToolApprovalDialog` and the sandbox approval prompt are `confirmationDialog`/`alert` — verify these manually.
+- **Settings → Tools** — `SettingsToolsPanel.swift`: `Settings.Tools.Toggle.<tool>` (`web_search`, `browse`, `weather`), `Settings.Tools.WebSearch.Backend` (the radio group) + `Settings.Tools.WebSearch.Backend.<duckduckgo|brave|tavily>`, `Settings.Tools.WebSearch.KeyField.<provider>`, `Settings.Tools.WebSearch.SaveKey.<provider>`, `Settings.Tools.WebSearch.KeyDashboardLink.<provider>` (the "Get a <provider> key" link — only rendered for a provider that has a dashboard URL, which is why it was missed on the first pass), `Settings.Tools.Browse.AutoApproveToggle`.
+- **Settings → Privacy** — `SettingsView.swift`: `Settings.Privacy.TelemetryToggle`, `Settings.Privacy.Link.{PrivacyPolicy,License,Credits}` (each link keyed on the document it opens, not on its label). Caveat: the toggle is addressable and its press does write the preference, but the switch does not re-render until you leave the panel and return — see `docs/gui-golden-flows.md`.
+- **Conversation row controls** — `SidebarView.swift`: `Sidebar.Conversation.{Pin,Unpin}.<UUID>` (hover control, named for the action the press performs), `Sidebar.Conversation.Menu.<UUID>` (the ··· menu button), and its items `Sidebar.Conversation.Action.{Rename,Pin,Unpin,Archive,Unarchive,Delete}` (shared with the right-click menu). Delete confirmation: `Sidebar.DeleteConversation.{Confirm,Keep}`.
+- **Message actions** — `ChatView.swift`: `ChatView.Message.{Copy,Edit,Retry,CancelEdit,SaveEdit}.<message UUID>`.
+- **Tool approval** — `ContentView.swift`: `ToolApproval.Browse.{Allow,Deny}` (the per-fetch `browse` approval). The enclosing sheet is deliberately **unnamed**: an accessibility modifier on a container that is not its own accessibility element applies to the elements it contains, so naming the wrapper risks stamping it over the two buttons. Wait for `ToolApproval.Browse.Allow` to assert the prompt is up.
+
+**No identifier (can't be AX-driven):** nothing on the current surface is known to be unreachable. The note that used to sit here named the MCP `ToolApprovalDialog` and a sandbox approval prompt — neither exists in `apps/rapid-mac`; this app's tool approval is the `browse` sheet listed above. `confirmationDialog`/`alert` buttons were the remaining doubt, and they were measured on a build of the current tree: the presented dialog is an `AXSheet` whose `AXButton` children do carry the identifiers declared at the call site.
 
 ---
 
@@ -365,6 +379,6 @@ Three "verified" levels, kept distinct so a reviewer doesn't conflate them:
 
 - **3-A residual — SwiftUI `Window` scene AX bridge still returns the `AXApplication` instead of the `AppKitWindow`.** `setActivationPolicy(.regular)` + `AXEnhancedUserInterface = true` lands the floor; the deeper bridge (real `AXWindow` with navigable `AXTextArea` / `AXButton` children) still needs custom `NSAccessibilityElement` wrappers. P2 — affects VoiceOver, not sighted keyboard+mouse users. **This gates whether `walkthrough.sh`'s `first button … whose AXIdentifier is …` lookups actually resolve** — verify on a fresh v0.10.6 run before trusting the AXIdentifier walk (an older note recorded these lookups returning empty; confirm current state).
 - **3-B residual — no harness-driven UI test from SSH.** Run the walk on a local login GUI session; cliclick for focus, AXIdentifier `click` for buttons, real keystrokes for submit. cliclick coordinate clicks do NOT fire SwiftUI handlers (re-confirmed v0.10.6).
-- **Approval dialogs lack identifiers.** `ToolApprovalDialog` (MCP) and the sandbox prompt are `confirmationDialog`/`alert` with no `.accessibilityIdentifier` — either add identifiers or accept manual-only verification for F12/F13.
+- ~~**Approval dialogs lack identifiers.**~~ Closed. The two surfaces this named (`ToolApprovalDialog`, the sandbox prompt) do not exist in `apps/rapid-mac`; the app's tool approval is the `browse` per-fetch sheet, which now carries `ToolApproval.Browse.{Allow,Deny}`. The underlying worry — that a `confirmationDialog`/`alert` cannot carry an identifier — was tested rather than assumed, and the AppKit alert bridge does forward them (see the identifier inventory above).
 - **Re-smoke the v0.10.x additions.** F10–F15 (Model Management, custom folder, Connectors, Permissions, in-chat controls, delete/undo/search) have current definitions but no full manual pass yet — walk each once on a local Mac and stamp the date.
 - **Compose editor doc drift fixed.** `ComposeTextEditor` is the `NSViewRepresentable`; the `NSTextView` subclass it hosts is `AutosizingTextView`. Keep this straight in future edits.
