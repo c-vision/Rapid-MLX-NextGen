@@ -92,9 +92,9 @@ def setup_agent_config(
 ) -> str:
     """Write the agent's config file or print env vars to set up the integration.
 
-    For file-based configs (YAML/JSON), if the config file already exists
-    it is *merged* rather than overwritten — user customizations are
-    preserved while connection details are updated.
+    For file-based configs (YAML/JSON/TOML), if the config file already
+    exists it is *merged* rather than overwritten — user customizations
+    are preserved while connection details are updated.
 
     Returns a human-readable summary of what was done.
     """
@@ -163,6 +163,12 @@ def setup_agent_config(
             summary = f"Wrote config to {config_path}"
         else:
             summary = f"Merged config into {config_path} (custom keys preserved)"
+            if cfg.type == "toml":
+                # Say it plainly: the round trip through the parser keeps
+                # every key but drops comments, and a user who hand-wrote
+                # notes into ~/.codex/config.toml should hear that from us
+                # rather than discover it.
+                summary += "; comments were not"
         return summary
 
     return "No config to write (template not specified)"
@@ -178,8 +184,8 @@ def _merge_file_config(existing_path: Path, rendered: str, config_type: str) -> 
     if not existing_path.exists():
         return rendered
 
-    # toml / unknown — overwrite without reading (no merge support)
-    if config_type not in ("yaml", "json"):
+    # Unknown type — overwrite without reading (no merge support).
+    if config_type not in ("yaml", "json", "toml"):
         return rendered
 
     # Let OSError propagate — caller must not silently overwrite an
@@ -188,7 +194,52 @@ def _merge_file_config(existing_path: Path, rendered: str, config_type: str) -> 
 
     if config_type == "yaml":
         return _merge_yaml(existing_text, rendered)
+    if config_type == "toml":
+        return _merge_toml(existing_text, rendered)
     return _merge_json(existing_text, rendered)
+
+
+def _merge_toml(existing_text: str, rendered: str) -> str:
+    """Parse both TOML strings, deep-merge, and re-serialize.
+
+    Same error semantics as ``_merge_yaml``.
+
+    Until this existed, ``toml`` fell into the "unknown type" branch above
+    and ``--setup`` replaced the file wholesale. Codex is the only TOML
+    profile, so one ``rapid-mlx agents codex --setup`` deleted the user's
+    ``approval_policy``, every ``[mcp_servers.*]`` block and every
+    ``[projects.*]`` trust entry — with no backup, and a summary line that
+    said a neutral "Wrote config to …" while the code already knew it had
+    overwritten rather than merged (issue #1532).
+
+    Comments do not survive the round trip, which is the same trade the
+    JSON and YAML paths have always made. Losing the formatting of a
+    hand-tuned config is an annoyance; losing its contents is data loss.
+    """
+    import tomli_w
+
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover — Python 3.10 only
+        # ``tomllib`` is stdlib from 3.11; ``pyproject`` still supports 3.10,
+        # where a bare import would abort --setup with ModuleNotFoundError on
+        # the merge path only — every fresh-write test would stay green.
+        # ``tomli`` is the same parser under its pre-stdlib name and is now a
+        # runtime dependency under that marker, not just a [test] one.
+        import tomli as tomllib
+
+    if not existing_text.strip():
+        return rendered
+    try:
+        existing = tomllib.loads(existing_text)
+    except Exception as exc:
+        raise _MergeParseError(f"invalid TOML: {exc}") from exc
+    try:
+        template = tomllib.loads(rendered)
+    except Exception as exc:
+        raise _MergeParseError(f"rendered template is not valid TOML: {exc}") from exc
+    merged = _deep_merge(existing, template)
+    return tomli_w.dumps(merged)
 
 
 def _merge_yaml(existing_text: str, rendered: str) -> str:

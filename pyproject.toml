@@ -85,6 +85,18 @@ dependencies = [
     # pillow is opt-in via [vision] extras — only the MLLM paths (mllm.py,
     # benchmark.py image mode) touch PIL, and mlx-vlm requires it anyway.
     "pyyaml>=6.0",
+    # Writing TOML, so ``rapid-mlx agents codex --setup`` can deep-merge into
+    # an existing ~/.codex/config.toml instead of replacing it (#1532).
+    # Reading is stdlib ``tomllib`` on our supported floor; only the write
+    # side needs a package, and this is the companion to the ``tomli`` the
+    # [test] extra already pins. Pure Python, no transitive deps.
+    "tomli-w>=1.0.0",
+    # The read side is stdlib ``tomllib`` from 3.11; 3.10 is still a supported
+    # floor and has no ``tomllib``, so the merge path needs the backport there.
+    # It was a [test]-only pin before, which would have made `codex --setup`
+    # abort with ModuleNotFoundError on 3.10 — and only when a config already
+    # existed, so every fresh-write test would still have passed.
+    'tomli>=2.0.1; python_version < "3.11"',
     "requests>=2.28.0",
     "rich>=13.8.0",
     "tabulate>=0.9.0",

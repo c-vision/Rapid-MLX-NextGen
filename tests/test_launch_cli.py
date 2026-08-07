@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -366,6 +367,126 @@ class TestCommon:
         b2 = _common.backup_existing(target)
         assert b1 is not None and b2 is not None
         assert b1 != b2
+
+    def test_backup_is_never_more_permissive_than_its_source(self, tmp_path):
+        """A backup must not widen access to what it copies.
+
+        ``atomic_write_json`` writes the config itself through ``mkstemp``,
+        so the live file is 0600 — and ``launch`` puts ``RAPID_MLX_API_KEY``
+        into it. The backup used to be a plain ``write_bytes``, i.e.
+        ``0666 & ~umask`` — 0644 on a default install — so every second
+        ``rapid-mlx launch`` dropped the live bearer token into a
+        world-readable file beside the protected one.
+
+        Mutation check: restore ``bak.write_bytes(path.read_bytes())`` and
+        this fails with 0644 (or whatever the ambient umask yields).
+        """
+        target = tmp_path / "config.json"
+        _common.atomic_write_json(target, {"apiKey": "sk-secret"})
+        source_mode = target.stat().st_mode & 0o777
+        assert source_mode == 0o600, (
+            "precondition: the config itself is written restrictively — if "
+            "this changed, the backup expectation below must change with it"
+        )
+
+        bak = _common.backup_existing(target)
+
+        assert bak is not None
+        assert bak.read_bytes() == target.read_bytes()
+        assert bak.stat().st_mode & 0o777 == source_mode
+
+    def test_backup_matches_an_open_source_only_when_acls_are_readable(self, tmp_path):
+        """Mirror a deliberately-open source — but only where we can prove it.
+
+        A user who chmod'd their own config group-readable did so on purpose,
+        and silently tightening the backup makes the recovery copy behave
+        differently from the thing it recovers. That reasoning holds only
+        while the mode bits tell the whole story. An ACL can *deny* a
+        principal the bits would otherwise admit, and a freshly created file
+        carries none — so reproducing 0644 from a 0644-plus-deny-ACL source
+        hands the file to exactly the account it shut out.
+
+        On Linux the ACL shows up as a ``system.posix_acl_*`` xattr, so
+        absence is proof and the mode is reproduced. macOS has no
+        ``os.listxattr`` at all and its ACLs are not xattrs anyway, so
+        equivalence can never be established there and the backup stays
+        owner-only. Tighter than the source still restores; wider does not
+        un-leak.
+        """
+        target = tmp_path / "config.json"
+        target.write_text('{"a": 1}')
+        target.chmod(0o644)
+
+        bak = _common.backup_existing(target)
+
+        assert bak is not None
+        if hasattr(os, "listxattr"):
+            assert bak.stat().st_mode & 0o777 == 0o644
+        else:
+            assert bak.stat().st_mode & 0o777 == 0o600, (
+                "without an ACL API we cannot vouch for group/other access"
+            )
+
+    def test_backup_drops_group_bits_when_the_group_cannot_be_matched(
+        self, tmp_path, monkeypatch
+    ):
+        """Mode bits are numbers; what matters is who they authorize.
+
+        A new file takes the *directory's* group, not the source's. Copying
+        0640 from an ``alice:secrets`` config onto an ``alice:staff`` backup
+        keeps the number and changes the audience — every member of staff can
+        then read the API key. When the group cannot be adopted, the backup
+        stays owner-only: tighter than the source still restores.
+        """
+        target = tmp_path / "config.json"
+        target.write_text('{"apiKey": "sk-secret"}')
+        target.chmod(0o640)
+
+        def _refuse(*args, **kwargs):
+            raise PermissionError("not a member of that group")
+
+        monkeypatch.setattr(_common.os, "fchown", _refuse)
+
+        bak = _common.backup_existing(target)
+
+        assert bak is not None
+        assert bak.read_bytes() == target.read_bytes()
+        assert bak.stat().st_mode & 0o077 == 0, (
+            "backup kept group/other access it could not vouch for"
+        )
+
+    def test_backup_never_touches_the_destination_by_name(self, tmp_path, monkeypatch):
+        """Ownership and mode go through the descriptor, never the path.
+
+        Anyone who can write the config's *directory* can unlink our backup
+        and leave a symlink where it was. A pathname-based chown/chmod would
+        then follow that symlink and re-permission someone else's file. The
+        O_EXCL create is what makes the name ours; addressing the descriptor
+        from then on is what keeps it ours.
+
+        A 0640 source is what forces the interesting path: the mode-narrowing
+        block only runs when the source has group/other bits, so a 0600 source
+        would pass this test without ever reaching a chown or a chmod.
+        """
+        target = tmp_path / "config.json"
+        target.write_text('{"apiKey": "sk-secret"}')
+        target.chmod(0o640)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("backup_existing addressed the backup by pathname")
+
+        monkeypatch.setattr(_common.os, "chown", _boom)
+        monkeypatch.setattr(_common.os, "chmod", _boom)
+
+        bak = _common.backup_existing(target)
+
+        assert bak is not None
+        assert bak.read_bytes() == target.read_bytes()
+        # The mode still has to have been applied — through the descriptor,
+        # since the pathname calls above would have raised. How wide it lands
+        # is the ACL policy's business (see the test above), so assert only
+        # that it is a mode this function could legitimately have chosen.
+        assert bak.stat().st_mode & 0o777 in (0o600, 0o640)
 
     def test_load_json_lenient_missing(self, tmp_path):
         assert _common.load_json_lenient(tmp_path / "missing.json") == {}

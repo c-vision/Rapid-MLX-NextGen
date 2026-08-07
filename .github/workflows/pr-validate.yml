@@ -65,7 +65,11 @@ jobs:
           #   `targeted_tests` see the same import surface they would
           #   if a contributor ran `make smoke` locally.
           pip install pyyaml requests pip-audit ruff rich mcp
-          pip install pytest pytest-asyncio pytest-cov pydantic fastapi jsonschema httpx psutil transformers
+          # tomli-w is a RUNTIME dep (agents/adapter.py merges ~/.codex/config.toml).
+          # This runner installs a curated list rather than the package, so a new
+          # runtime dependency has to be named here too or targeted_tests fails on
+          # import while the main-branch control passes.
+          pip install pytest pytest-asyncio pytest-cov pydantic fastapi jsonschema httpx psutil transformers tomli-w
 
       - name: Resolve PR number
         id: prnum
