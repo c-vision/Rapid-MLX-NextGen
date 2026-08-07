@@ -59,45 +59,21 @@ enum ModelCatalog {
         binary: URL,
         hubCacheOverride: URL? = ModelsFolderPreference.validatedOverrideURL()
     ) async -> [ModelEntry] {
-        async let availableTask: [(String, String?)] = listAvailable(binary: binary)
+        async let availableTask: (entries: [(String, String?)], excluded: Set<String>) =
+            listAvailableWithExclusions(binary: binary)
         async let cachedTask: [(String, String?, String?)] = listCached(
             binary: binary,
             hubCacheOverride: hubCacheOverride
         )
 
-        let available = await availableTask
+        let (available, excludedAliases) = await availableTask
         let cached = await cachedTask
 
-        // Build a quick lookup of cached aliases for the merge below.
-        var cachedIndex: [String: (hfRepo: String?, size: String?)] = [:]
-        for (alias, hf, size) in cached where !alias.isEmpty && alias != "(unmapped)" {
-            cachedIndex[alias] = (hf, size)
-        }
-
-        var entries: [ModelEntry] = []
-        var seenAliases: Set<String> = []
-        for (alias, hfHint) in available {
-            seenAliases.insert(alias)
-            let cachedHit = cachedIndex[alias]
-            entries.append(ModelEntry(
-                alias: alias,
-                hfRepo: cachedHit?.hfRepo ?? hfHint,
-                sizeOnDisk: cachedHit?.size,
-                cached: cachedHit != nil
-            ))
-        }
-        // A cached model with no row in ``rapid-mlx models`` is unusual
-        // but possible if the user pinned an alias by hand in their
-        // rapid-mlx config. Surface them anyway so they show up in the
-        // picker (otherwise the user can't pick them without typing).
-        for (alias, hf, size) in cached where !alias.isEmpty && alias != "(unmapped)" && !seenAliases.contains(alias) {
-            entries.append(ModelEntry(
-                alias: alias,
-                hfRepo: hf,
-                sizeOnDisk: size,
-                cached: true
-            ))
-        }
+        var entries = mergeAvailableAndCached(
+            available: available,
+            cached: cached,
+            excluded: excludedAliases
+        )
 
         // Repo-aware cached marking (issue #576): a bare alias like
         // ``qwen3-0.6b`` and its default-quant alias ``qwen3-0.6b-4bit``
@@ -261,6 +237,114 @@ enum ModelCatalog {
         return parseAvailable(output)
     }
 
+    /// Merges the ``models`` and ``ls`` listings into catalog rows.
+    ///
+    /// Pure so the exclusion rule is testable without spawning the
+    /// engine: the decisive condition is that a cached alias which was
+    /// deliberately withheld from ``models`` must NOT be re-admitted here.
+    static func mergeAvailableAndCached(
+        available: [(String, String?)],
+        cached: [(String, String?, String?)],
+        excluded: Set<String>
+    ) -> [ModelEntry] {
+        var cachedIndex: [String: (hfRepo: String?, size: String?)] = [:]
+        for (alias, hf, size) in cached where !alias.isEmpty && alias != "(unmapped)" {
+            cachedIndex[alias] = (hf, size)
+        }
+
+        var entries: [ModelEntry] = []
+        var seenAliases: Set<String> = []
+        for (alias, hfHint) in available {
+            seenAliases.insert(alias)
+            let cachedHit = cachedIndex[alias]
+            entries.append(ModelEntry(
+                alias: alias,
+                hfRepo: cachedHit?.hfRepo ?? hfHint,
+                sizeOnDisk: cachedHit?.size,
+                cached: cachedHit != nil
+            ))
+        }
+        // A cached model with no row in ``rapid-mlx models`` is unusual
+        // but possible if the user pinned an alias by hand in their
+        // rapid-mlx config. Surface them anyway so they show up in the
+        // picker (otherwise the user can't pick them without typing) —
+        // except for the ones ``parseAvailable`` deliberately withheld.
+        // ``rapid-mlx ls`` has no modality tag, so without this check a
+        // cached audio or video model has no row in ``models`` for
+        // exactly the reason it must stay hidden, and would be re-admitted
+        // here on that basis (#1603).
+        for (alias, hf, size) in cached
+        where !alias.isEmpty
+            && alias != "(unmapped)"
+            && !seenAliases.contains(alias)
+            && !excluded.contains(alias) {
+            entries.append(ModelEntry(
+                alias: alias,
+                hfRepo: hf,
+                sizeOnDisk: size,
+                cached: true
+            ))
+        }
+        return entries
+    }
+
+    /// Runs ``rapid-mlx models`` and returns both the chat-capable rows
+    /// and the aliases deliberately withheld from them.
+    ///
+    /// ``rapid-mlx ls`` carries no modality tag, so filtering
+    /// ``parseAvailable`` alone is not enough: ``load`` re-admits any
+    /// cached alias that has no row in ``models``, which would hand a
+    /// cached audio or video model straight back to the picker through
+    /// the side door. Pairing the two parses closes that (#1603).
+    private static func listAvailableWithExclusions(
+        binary: URL
+    ) async -> (entries: [(String, String?)], excluded: Set<String>) {
+        let output = await runRapidMlx(binary: binary, args: ["models"])
+        return (parseAvailable(output), parseExcludedAliases(output))
+    }
+
+    /// True when the line carries a non-chat Kind tag in its own column.
+    ///
+    /// Matching the bare substring ``"[audio:"`` would let any row whose
+    /// HF id or description happened to contain those characters
+    /// disappear from the catalog. Require a whole whitespace-delimited
+    /// token of the shape the engine actually prints — ``[audio:tts]``,
+    /// ``[audio:stt]``, ``[video:gen]`` — without hardcoding the
+    /// subtypes, which the engine derives from its registries and may
+    /// extend.
+    static func hasNonChatKindTag(_ line: String) -> Bool {
+        for field in line.split(whereSeparator: { $0.isWhitespace }) {
+            guard field.hasPrefix("["), field.hasSuffix("]") else { continue }
+            let body = field.dropFirst().dropLast()
+            guard let colon = body.firstIndex(of: ":") else { continue }
+            let kind = body[body.startIndex..<colon]
+            let subtype = body[body.index(after: colon)...]
+            guard kind == "audio" || kind == "video" else { continue }
+            guard !subtype.isEmpty, subtype.allSatisfy({ $0.isLetter || $0 == "-" }) else {
+                continue
+            }
+            return true
+        }
+        return false
+    }
+
+    /// Aliases ``parseAvailable`` drops for being a non-chat modality.
+    ///
+    /// Deliberately narrow: only rows carrying an explicit engine-side
+    /// Kind tag count. Banner lines, dividers and headers are noise, not
+    /// exclusions, and must not end up suppressing a real model.
+    static func parseExcludedAliases(_ output: String) -> Set<String> {
+        var excluded: Set<String> = []
+        for rawLine in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = String(rawLine).trimmingCharacters(in: .whitespaces)
+            guard hasNonChatKindTag(line) else { continue }
+            let token = line.split(maxSplits: 1, whereSeparator: { $0.isWhitespace }).first
+            guard let alias = token.map(String.init), isSafeAlias(alias) else { continue }
+            excluded.insert(alias)
+        }
+        return excluded
+    }
+
     /// Runs ``rapid-mlx ls`` (cached models). Returns
     /// ``(alias, hfRepo, sizeOnDisk)`` tuples. ``hubCacheOverride``
     /// (issue #503) points the probe at the user's chosen models folder
@@ -315,6 +399,19 @@ enum ModelCatalog {
             // Model Management, auto-start).
             if line.hasPrefix("Audio models") { continue }
             if line.contains("[audio:") { continue }
+            // Video-generation aliases, same reasoning and same shape.
+            // A ``video-gen`` model has no tokenizer and no
+            // ``stream_chat``, so it can never answer a chat request; the
+            // sidecar exits 2 before binding a port when the video extras
+            // are absent, and the user is told only "Couldn't start X.
+            // Try again" — advice that will fail identically forever,
+            // after a download of up to 64 GiB (#1603). The engine tags
+            // these rows ``[video:gen]`` under a "Video models (N
+            // aliases)" section; skip the header (its first token would
+            // otherwise pass ``isSafeAlias`` and leak a phantom "Video"
+            // model) and every tagged row.
+            if line.hasPrefix("Video models") { continue }
+            if hasNonChatKindTag(line) { continue }
             // Skip engine/server banner lines that can share stdout with
             // the table.
             //

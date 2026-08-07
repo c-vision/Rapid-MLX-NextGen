@@ -81,6 +81,118 @@ struct DownloadCatalogHardeningTests {
         }
     }
 
+    @Test("parseAvailable drops video-gen aliases + the section-header phantom")
+    func catalogParserDropsVideoAliases() {
+        // Same shape as the audio case. A `video-gen` model has no
+        // tokenizer and no `stream_chat`, so it can never answer a chat
+        // request — offering one costs the user up to 64 GiB of download
+        // and ends at "Couldn't start X. Try again", forever (#1603).
+        let output =
+            """
+              Available models (2 aliases)
+              ────────────────────────────────────────
+              Alias                 Tools      Reasoning
+              qwen3.6-27b           hermes     qwen3
+              bonsai-1.7b-2bit      hermes     —
+
+              Video models (3 aliases)
+              ────────────────────────────────────────
+              Alias                 Size       Kind        HF id
+              cogvideox-fun-5b-q4   13.3 GiB   [video:gen] dgrauet/CogVideoX-Fun-V1.5-5b-InP-mlx-q4
+              ltx-2.3-mlx-q4        21.2 GiB   [video:gen] notapalindrome/ltx23-mlx-av-q4
+              wan2.2-t2v-a14b-bf16  64.3 GiB   [video:gen] rickylin20260522/Wan2.2-T2V-A14B-mlx
+            """
+        let aliases = ModelCatalog.parseAvailable(output).map { $0.0 }
+        #expect(aliases == ["qwen3.6-27b", "bonsai-1.7b-2bit"])
+        for banned in [
+            "Video", "cogvideox-fun-5b-q4", "ltx-2.3-mlx-q4", "wan2.2-t2v-a14b-bf16",
+        ] {
+            #expect(!aliases.contains(banned), "video/phantom alias leaked: \(banned)")
+        }
+
+        // The same rows must be reported as *deliberately* excluded, so
+        // `load` can refuse to re-admit them off `rapid-mlx ls` — which
+        // carries no modality tag of its own.
+        let excluded = ModelCatalog.parseExcludedAliases(output)
+        #expect(excluded == ["cogvideox-fun-5b-q4", "ltx-2.3-mlx-q4", "wan2.2-t2v-a14b-bf16"])
+        #expect(!excluded.contains("qwen3.6-27b"))
+        #expect(!excluded.contains("Video"))
+    }
+
+    @Test("parseExcludedAliases covers audio too, and ignores untagged noise")
+    func excludedAliasesCoversAudioAndIgnoresNoise() {
+        let excluded = ModelCatalog.parseExcludedAliases(
+            """
+              Available models (1 aliases)
+              ────────────────────────────────────────
+              qwen3.6-27b           hermes     qwen3
+              Loading model with BatchedEngine: qwen3.6-27b
+
+              Audio models (2 aliases)
+              ────────────────────────────────────────
+              kokoro                [audio:tts] kokoro     mlx-community/Kokoro-82M-bf16
+              whisper               [audio:stt] whisper    mlx-community/whisper-large-v3-mlx
+            """
+        )
+        #expect(excluded == ["kokoro", "whisper"])
+        // Only explicitly tagged rows count — a banner line or a plain
+        // text row must never suppress a real model.
+        #expect(!excluded.contains("qwen3.6-27b"))
+        #expect(!excluded.contains("Loading"))
+    }
+
+    @Test("a withheld alias is not re-admitted through the cached listing")
+    func excludedAliasesAreNotReadmittedFromCache() {
+        // The decisive half of #1603. `rapid-mlx ls` carries no modality
+        // tag, and the merge re-admits any cached alias with no row in
+        // `models` — which is exactly the state a correctly-filtered
+        // video model is in. Without the exclusion check the fix is
+        // one-sided and the model returns through the side door.
+        let available = [("qwen3.6-27b", String?.none)]
+        let cached: [(String, String?, String?)] = [
+            ("qwen3.6-27b", "mlx-community/Qwen3.6-27B-4bit", "16 GiB"),
+            ("cogvideox-fun-5b-q4", "dgrauet/CogVideoX-Fun-V1.5-5b-InP-mlx-q4", "13.3 GiB"),
+            ("kokoro", "mlx-community/Kokoro-82M-bf16", "0.3 GiB"),
+            // A hand-pinned text alias with no `models` row must still be
+            // surfaced — the re-admission path exists for this case.
+            ("my-custom-llama", "me/llama-mlx", "8 GiB"),
+        ]
+
+        let merged = ModelCatalog.mergeAvailableAndCached(
+            available: available,
+            cached: cached,
+            excluded: ["cogvideox-fun-5b-q4", "kokoro"]
+        )
+        let aliases = merged.map(\.alias)
+        #expect(aliases.contains("qwen3.6-27b"))
+        #expect(aliases.contains("my-custom-llama"))
+        #expect(!aliases.contains("cogvideox-fun-5b-q4"))
+        #expect(!aliases.contains("kokoro"))
+
+        // Guard the guard: with no exclusions the same input re-admits
+        // them, so the assertions above are testing the condition and not
+        // some unrelated filter.
+        let unfiltered = ModelCatalog.mergeAvailableAndCached(
+            available: available,
+            cached: cached,
+            excluded: []
+        )
+        #expect(unfiltered.map(\.alias).contains("cogvideox-fun-5b-q4"))
+    }
+
+    @Test("Kind-tag matching requires a real column token, not a substring")
+    func nonChatKindTagIsColumnScoped() {
+        #expect(ModelCatalog.hasNonChatKindTag("kokoro [audio:tts] kokoro mlx/Kokoro"))
+        #expect(ModelCatalog.hasNonChatKindTag("cog 13.3 GiB [video:gen] org/repo"))
+        // A model whose repo or description merely contains the
+        // characters must not vanish from the catalog.
+        #expect(!ModelCatalog.hasNonChatKindTag("weird-model hermes org/repo[audio:tts]x"))
+        #expect(!ModelCatalog.hasNonChatKindTag("weird-model hermes org/audio:tts"))
+        #expect(!ModelCatalog.hasNonChatKindTag("qwen3.6-27b hermes qwen3 ✓ avoid — —"))
+        #expect(!ModelCatalog.hasNonChatKindTag("odd [audio:] org/repo"))
+        #expect(!ModelCatalog.hasNonChatKindTag("odd [image:gen] org/repo"))
+    }
+
     @Test("ModelInfoCatalog sanitizes repo ids before UI link construction")
     func modelInfoSanitizesHuggingFaceRepo() {
         let safe = ModelInfoCatalog.info(for: "qwen3-8b", hfRepo: "mlx-community/Qwen3-8B-4bit")

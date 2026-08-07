@@ -26,14 +26,65 @@ def _capture_models_output() -> str:
     return buf.getvalue()
 
 
+def _split_by_modality() -> tuple[dict, dict]:
+    """``(text_profiles, video_profiles)`` — the split the listing renders."""
+    profiles = list_profiles()
+    video = {
+        a: p
+        for a, p in profiles.items()
+        if getattr(p, "modality", "text") == "video-gen"
+    }
+    return {a: p for a, p in profiles.items() if a not in video}, video
+
+
 def test_models_command_lists_all_aliases():
-    """Every alias in aliases.json must appear in the table."""
+    """Every alias in aliases.json must appear somewhere in the output.
+
+    The listing is split by modality: chat-capable aliases in the main
+    table, video-generation aliases in their own tagged section (#1603).
+    Every alias is still listed — the split is about telling a GUI
+    catalog consumer which ones can answer a chat request, not about
+    hiding them from the CLI.
+    """
     out = _capture_models_output()
     profiles = list_profiles()
     assert len(profiles) >= 20, "expected 20+ aliases (per project goal)"
     for alias in profiles:
         assert alias in out, f"alias {alias!r} missing from `rapid-mlx models` output"
-    assert f"({len(profiles)} aliases)" in out
+
+    text_profiles, video_profiles = _split_by_modality()
+    assert f"({len(text_profiles)} aliases)" in out
+    assert len(text_profiles) + len(video_profiles) == len(profiles)
+
+
+def test_models_command_sections_video_aliases_out_of_the_text_table():
+    """Video-gen aliases must not sit in the chat table, and must carry a Kind tag.
+
+    A ``video-gen`` model has no tokenizer and no ``stream_chat``, so it
+    can never answer ``/v1/chat/completions``. The desktop catalog reads
+    this output and had no way to tell one apart from a chat model, so it
+    offered up-to-64 GiB downloads that dead-end at "Couldn't start"
+    (#1603). The section header and the ``[video:gen]`` tag are the
+    contract it filters on — mirroring ``[audio:tts]`` / ``[audio:stt]``.
+    """
+    _, video_profiles = _split_by_modality()
+    if not video_profiles:
+        pytest.skip("no video-gen aliases in the registry")
+
+    out = _capture_models_output()
+    head, _, video_section = out.partition("Video models (")
+    assert video_section, "expected a 'Video models (N aliases)' section"
+    assert f"{len(video_profiles)} aliases)" in video_section.split("\n", 1)[0]
+
+    for alias in video_profiles:
+        assert alias not in head, (
+            f"video alias {alias!r} leaked into the chat table — a catalog "
+            "consumer would offer it as a chat model"
+        )
+        assert alias in video_section
+    # Every video row carries the Kind tag the desktop filters on.
+    tagged = [ln for ln in video_section.splitlines() if "[video:gen]" in ln]
+    assert len(tagged) == len(video_profiles)
 
 
 def test_models_command_shows_capability_columns():

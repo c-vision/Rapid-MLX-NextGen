@@ -4968,7 +4968,21 @@ def models_command(args):
         _print_cached_models()
         return
 
-    profiles = list_profiles()
+    all_profiles = list_profiles()
+    # Video-generation aliases are not chat models: they have no
+    # tokenizer and no ``stream_chat``, so ``/v1/chat/completions`` on one
+    # is an AttributeError, and ``serve`` exits 2 before binding a port
+    # when the video extras are absent. Listing them inline in the text
+    # table is how a GUI catalog consumer ends up offering a 64 GiB
+    # download that can never chat (#1603). Split them into their own
+    # tagged section, exactly as audio aliases already are, so a consumer
+    # can tell the two kinds apart without hardcoding alias names.
+    video_profiles = {
+        alias: p
+        for alias, p in all_profiles.items()
+        if getattr(p, "modality", "text") == "video-gen"
+    }
+    profiles = {a: p for a, p in all_profiles.items() if a not in video_profiles}
     print()
     print(f"  Available models ({len(profiles)} aliases)")
 
@@ -5068,6 +5082,32 @@ def models_command(args):
                 f"{entry.family:<12} {entry.hf_id:<40}"
             )
         print(audio_sep)
+
+    # Video-generation aliases, in their own tagged section for the same
+    # reason audio has one: they are not chat models, and a catalog
+    # consumer must be able to tell that from the output rather than by
+    # hardcoding names (#1603). The ``[video:gen]`` Kind tag mirrors
+    # ``[audio:tts]`` / ``[audio:stt]``.
+    if video_profiles:
+        video_alias_width = max(
+            24, max((len(a) for a in video_profiles), default=0) + 2
+        )
+        print()
+        print(f"  Video models ({len(video_profiles)} aliases)")
+        video_sep = "  " + "─" * width
+        print(video_sep)
+        print(
+            f"  {'Alias':<{video_alias_width}} {'Size':<10} {'Kind':<11} {'HF id':<40}"
+        )
+        print(video_sep)
+        for alias in sorted(video_profiles):
+            p = video_profiles[alias]
+            print(
+                f"  {alias:<{video_alias_width}} "
+                f"{format_size(p.hf_path):<10} {'[video:gen]':<11} "
+                f"{p.hf_path:<40}"
+            )
+        print(video_sep)
 
     print()
     print(
