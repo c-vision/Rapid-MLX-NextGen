@@ -202,15 +202,17 @@ struct ModelSizingTests {
         #expect(ModelSizing.memorySafety(footprint: g, usedBytes: 0, totalBytes: 0) == .safe)
     }
 
-    @Test("MemoryWarning copy names the model, the GB need, and the free GB")
+    @Test("MemoryWarning explains the projected utilisation and actionable headroom")
     func memoryWarningCopy() {
         let w = ModelSizing.MemoryWarning(
             alias: "gemma-4-12b", hfPath: nil, isAutoRespawn: false,
-            severity: .unsafe, footprintGB: 11.8, freeGB: 6.0
+            severity: .unsafe, footprintGB: 5.9, freeGB: 8.8, totalGB: 24.0
         )
         #expect(w.title.contains("gemma-4-12b"))
-        #expect(w.message.contains("12")) // rounded need
-        #expect(w.message.contains("6"))  // rounded free
+        #expect(w.message.contains("88%"))
+        #expect(w.message.contains("85%"))
+        #expect(w.message.contains("1 GB"))
+        #expect(!w.message.contains("only about 9 GB is free"))
         #expect(w.confirmTitle.localizedCaseInsensitiveContains("anyway"))
     }
 

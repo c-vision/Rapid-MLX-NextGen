@@ -63,10 +63,8 @@ _USER_AGENT = "Mozilla/5.0 (rapid-mlx mirror client)"
 # caches them ``public, max-age=300``. 10 s is plenty.
 _CATALOG_TIMEOUT = 10.0
 
-# Per-file timeout for R2 connect + initial response. Large shards stream
-# via ``resp.read()`` after this point, which uses the socket-level
-# default timeout (no per-read clock). 60 s matches the old
-# ``_try_mirror_prefetch`` value.
+# Per-file socket timeout for R2 connect, response, and each streaming read.
+# A silent path therefore fails within this bound and can resume from `.part`.
 _FILE_TIMEOUT = 60.0
 
 # Polite cap. Cloudflare can take more, but four parallel connections to
@@ -520,7 +518,8 @@ def _download_one_from_r2(
 
     Returns ``(True, "")`` on success. On any failure returns
     ``(False, <reason>)`` where reason is a short tag used for the
-    summary line. Cleans up partial ``.part`` files on failure.
+    summary line. Integrity failures remove ``.part``; retryable transport
+    failures preserve a non-empty prefix for the next ranged attempt.
 
     Supports resume via ``Range: bytes=<offset>-`` when a non-empty
     ``.part`` already exists from a prior aborted run.
@@ -775,7 +774,14 @@ def _do_r2_download(
         OSError,
         ValueError,
     ) as e:
-        _safe_unlink(tmp)
+        # Keep a non-empty prefix for retryable transport failures. The next
+        # attempt validates the server's 206/Content-Range response before
+        # appending, while all integrity failures above still unlink it.
+        try:
+            if not tmp.exists() or tmp.stat().st_size == 0:
+                _safe_unlink(tmp)
+        except OSError:
+            _safe_unlink(tmp)
         # ``chunks_credited`` may not be bound if the exception fired
         # before the chunk loop reached the credit branch (e.g. urlopen
         # raised). ``locals().get`` keeps the rollback safe in either

@@ -96,6 +96,8 @@ final class DownloadManager {
         /// job has already exited. Retained here so the manager can
         /// cancel the monitor on exit alongside the subprocess.
         fileprivate(set) var byteMonitor: HFCacheByteMonitor.Handle?
+        fileprivate var lastProgressAt: Date
+        fileprivate var lastObservedBytes: Int64?
 
         enum Status: Equatable {
             /// Subprocess is running. Most lines we see are tqdm ticks
@@ -130,6 +132,8 @@ final class DownloadManager {
             self.source = source
             self.failureKind = nil
             self.byteMonitor = nil
+            self.lastProgressAt = Date()
+            self.lastObservedBytes = nil
         }
 
         nonisolated static func == (lhs: Job, rhs: Job) -> Bool { lhs.id == rhs.id }
@@ -176,6 +180,8 @@ final class DownloadManager {
 
     private var processes: [String: Process] = [:]
     private var cancellingProcesses: [String: Process] = [:]
+    private var stalledProcesses: [String: Process] = [:]
+    private var stallWatchdogs: [String: Task<Void, Never>] = [:]
     private let cancellationTracker = DownloadCancellationTracker()
     private var stdoutPipes: [String: Pipe] = [:]
     private var stderrPipes: [String: Pipe] = [:]
@@ -186,6 +192,17 @@ final class DownloadManager {
     private let stderrTailCapacity: Int = 12
     nonisolated private static let maxOutputChunkBytes = 64 * 1024
     nonisolated private static let maxOutputLineBytes = 8 * 1024
+    /// Two minutes without a progress tick or byte growth is long enough to
+    /// distinguish a dead network path from an ordinary slow shard.
+    nonisolated static let downloadStallWindow: TimeInterval = 120
+
+    nonisolated static func isStalled(
+        lastProgressAt: Date,
+        now: Date,
+        window: TimeInterval = downloadStallWindow
+    ) -> Bool {
+        now.timeIntervalSince(lastProgressAt) >= window
+    }
 
     // MARK: - Construction
 
@@ -400,7 +417,47 @@ final class DownloadManager {
             hfPath: hfPath,
             totalBytes: totalBytes
         )
+        installStallWatchdog(alias: trimmed, process: process, job: job)
         return true
+    }
+
+    private func installStallWatchdog(alias: String, process: Process, job: Job) {
+        stallWatchdogs[alias]?.cancel()
+        stallWatchdogs[alias] = Task { @MainActor [weak self, weak job] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard let self, let job, process.isRunning else { return }
+                // The network transfer is over. Model loading / shader
+                // compilation can legitimately be quiet for minutes and is
+                // covered by ServerManager's separate startup watchdog.
+                if case .warmingUp = job.progress.phase { return }
+                if let bytes = job.progress.bytesDownloaded,
+                   bytes != job.lastObservedBytes {
+                    job.lastObservedBytes = bytes
+                    job.lastProgressAt = Date()
+                }
+                guard Self.isStalled(
+                    lastProgressAt: job.lastProgressAt,
+                    now: Date()
+                ) else {
+                    continue
+                }
+                self.stalledProcesses[alias] = process
+                job.failureKind = .downloadFailed
+                job.status = .failed(
+                    message: "The download stopped making progress. Check your network and try again — saved partial data will be reused."
+                )
+                process.terminate()
+                let deadline = Date().addingTimeInterval(2)
+                while process.isRunning && Date() < deadline {
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+                if process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                }
+                return
+            }
+        }
     }
 
     /// Retry a terminal job while preserving the cache-monitor metadata.
@@ -413,6 +470,9 @@ final class DownloadManager {
         let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let previous = jobs[trimmed] else { return false }
         guard previous.status != .running else { return false }
+        // A watchdog failure is surfaced before SIGTERM/SIGKILL reaps the old
+        // child. Do not overlap two writers against the same cache sidecars.
+        guard processes[trimmed] == nil else { return false }
         let hfPath = previous.hfPath
         let totalBytes = previous.totalBytes
         let nextSource = source ?? previous.source
@@ -592,6 +652,7 @@ final class DownloadManager {
         guard let job = jobs[alias] else { return }
         for line in lines {
             let consumed = job.progress.ingest(line)
+            if consumed { job.lastProgressAt = Date() }
             if isStderr && !consumed {
                 var tail = stderrTails[alias] ?? []
                 // Scrub before storage — the stderr tail feeds the
@@ -621,6 +682,11 @@ final class DownloadManager {
         }
         // Drain readability handlers so ARC can free the pipes.
         cleanupProcessBookkeeping(alias: alias, process: process)
+
+        if stalledProcesses.removeValue(forKey: alias) === process {
+            // The watchdog already installed the actionable retry state.
+            return
+        }
 
         if wasCancelling {
             job.status = .cancelled
@@ -812,6 +878,7 @@ final class DownloadManager {
     }
 
     private func cleanupProcessBookkeeping(alias: String, process: Process) {
+        stallWatchdogs.removeValue(forKey: alias)?.cancel()
         stdoutPipes[alias]?.fileHandleForReading.readabilityHandler = nil
         stderrPipes[alias]?.fileHandleForReading.readabilityHandler = nil
         stdoutPipes.removeValue(forKey: alias)

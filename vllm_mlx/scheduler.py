@@ -3102,6 +3102,10 @@ class Scheduler:
         self.num_requests_processed = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        # Last observed text-path throughput. The upstream BatchGenerator has
+        # no stats object, so derive rates from request timing in our wrapper.
+        self._last_prompt_tps = 0.0
+        self._last_generation_tps = 0.0
         # Agent-only safety stop for exact token loops.  This remains separate
         # from normal completed-request accounting so operators can distinguish
         # healthy EOS stops from model degeneration.
@@ -6311,6 +6315,7 @@ class Scheduler:
                 self.uid_to_request_id[uid] = request.request_id
                 request.batch_uid = uid
                 request.status = RequestStatus.RUNNING
+                request._prefill_started_at = time.time()
                 # #558 PR-3 / #558 budget: record this request's FULL processor
                 # list (grammar + penalties + budget) by uid as the authoritative
                 # state the per-tick realign guard rebuilds from — immune to
@@ -6359,6 +6364,7 @@ class Scheduler:
         """
         outputs = []
         finished_ids = set()
+        prompt_tps_this_batch = 0.0
 
         for response in responses:
             request_id = self.uid_to_request_id.get(response.uid)
@@ -6391,6 +6397,16 @@ class Scheduler:
                 import time as _time
 
                 request.first_token_time = _time.time()
+                prefill_s = request.first_token_time - getattr(
+                    request, "_prefill_started_at", request.arrival_time
+                )
+                if prefill_s > 0:
+                    prompt_tps_this_batch += request.num_prompt_tokens / prefill_s
+
+            if request.first_token_time is not None and request.num_output_tokens > 0:
+                generation_s = time.time() - request.first_token_time
+                if generation_s > 0:
+                    self._last_generation_tps = request.num_output_tokens / generation_s
 
             # Decode the new token using IncrementalDecoder for multi-byte
             # safety (emoji, CJK). Skip stop tokens — they are not content.
@@ -6643,6 +6659,8 @@ class Scheduler:
 
             outputs.append(output)
 
+        if prompt_tps_this_batch > 0:
+            self._last_prompt_tps = prompt_tps_this_batch
         return outputs, finished_ids
 
     def _safe_disk_checkpoint(self, request: Request, response: Any) -> None:
@@ -7383,6 +7401,15 @@ class Scheduler:
 
     def get_stats(self) -> dict[str, Any]:
         """Get scheduler statistics."""
+        now = time.time()
+        active_generation_rates = []
+        for request in self.running.values():
+            if request.first_token_time is not None and request.num_output_tokens > 0:
+                elapsed = now - request.first_token_time
+                if elapsed > 0:
+                    active_generation_rates.append(request.num_output_tokens / elapsed)
+        if active_generation_rates:
+            self._last_generation_tps = sum(active_generation_rates)
         stats = {
             "num_waiting": len(self.waiting),
             "num_running": len(self.running),
@@ -7391,6 +7418,10 @@ class Scheduler:
             "num_repetition_loop_breaks": self.num_repetition_loop_breaks,
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
+            "batch_generator": {
+                "prompt_tps": round(self._last_prompt_tps, 2),
+                "generation_tps": round(self._last_generation_tps, 2),
+            },
             # M-02: PFlash observability counters. ``bypass_count`` is
             # the number of requests where PFlash compression engaged
             # and the prefix-cache fetch/store was skipped;

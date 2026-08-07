@@ -894,7 +894,8 @@ final class ServerManager {
                     isAutoRespawn: isAutoRespawn,
                     severity: safety,
                     footprintGB: footprint.totalGB,
-                    freeGB: Double(snapshot.freeBytes) / Double(1 << 30)
+                    freeGB: Double(snapshot.freeBytes) / Double(1 << 30),
+                    totalGB: Double(snapshot.totalBytes) / Double(1 << 30)
                 )
                 memoryLoadConfirmed = false
                 // The user is now the decision-maker for this alias, so a

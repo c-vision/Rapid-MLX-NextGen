@@ -348,6 +348,19 @@ struct DownloadManagerTests {
         }
     }
 
+    @Test("download stall watchdog only advances for actual progress")
+    func stallWindowUsesActualProgress() {
+        let now = Date()
+        #expect(DownloadManager.isStalled(
+            lastProgressAt: now.addingTimeInterval(-121),
+            now: now
+        ))
+        #expect(!DownloadManager.isStalled(
+            lastProgressAt: now.addingTimeInterval(-10),
+            now: now
+        ))
+    }
+
     // MARK: - Cache generation
     //
     // Dogfood report: "I deleted the two qwens in Settings, but the

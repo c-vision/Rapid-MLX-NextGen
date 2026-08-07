@@ -3522,6 +3522,64 @@ def test_progress_tracker_clamps_display_at_total():
         _mirror._PROGRESS_HEARTBEAT_SECONDS = saved
 
 
+def test_r2_transport_timeout_preserves_part_and_next_attempt_resumes(
+    tmp_path: Path,
+):
+    """A network-path drop keeps trusted streamed bytes for Range resume."""
+    target = tmp_path / "snapshot" / "model.safetensors"
+    sidecar = tmp_path / "sidecar"
+    part = sidecar / "model.part"
+    target.parent.mkdir(parents=True)
+    sidecar.mkdir(parents=True)
+
+    class _DropsMidBody(_FakeResponse):
+        def __init__(self):
+            super().__init__(200, b"", headers={"Content-Length": "1000"})
+            self.calls = 0
+
+        def read(self, _size=-1):
+            self.calls += 1
+            if self.calls == 1:
+                return b"x" * 400
+            raise TimeoutError("network changed")
+
+    with patch("urllib.request.urlopen", return_value=_DropsMidBody()):
+        ok, reason = _mirror._do_r2_download(
+            "https://models.example/model.safetensors",
+            target,
+            part,
+            1000,
+        )
+    assert not ok
+    assert reason == "TimeoutError"
+    assert part.read_bytes() == b"x" * 400
+
+    seen_range = None
+
+    def _resume(req, timeout=None):
+        nonlocal seen_range
+        seen_range = req.headers.get("Range")
+        return _FakeResponse(
+            206,
+            b"x" * 600,
+            headers={
+                "Content-Length": "600",
+                "Content-Range": "bytes 400-999/1000",
+            },
+        )
+
+    with patch("urllib.request.urlopen", side_effect=_resume):
+        ok, reason = _mirror._do_r2_download(
+            "https://models.example/model.safetensors",
+            target,
+            part,
+            1000,
+        )
+    assert ok, reason
+    assert seen_range == "bytes=400-"
+    assert target.read_bytes() == b"x" * 1000
+
+
 def test_safe_display_name_strips_control_chars():
     """Filenames from external HF metadata can't inject terminal escapes.
 

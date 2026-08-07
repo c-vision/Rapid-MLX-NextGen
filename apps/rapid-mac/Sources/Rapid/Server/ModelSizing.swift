@@ -204,6 +204,9 @@ enum ModelSizing {
         let footprintGB: Double
         /// GB free at the moment the load was attempted.
         let freeGB: Double
+        /// Total unified memory. Needed because the guard is based on
+        /// projected utilisation, not on footprint-versus-free alone.
+        var totalGB: Double = 0
 
         var title: String {
             switch severity {
@@ -217,10 +220,19 @@ enum ModelSizing {
         var message: String {
             let need = max(1, Int(footprintGB.rounded()))
             let free = max(0, Int(freeGB.rounded()))
-            let facts = "\(alias) needs about \(need) GB, but only about \(free) GB is free right now — other apps or a running model are using memory."
+            guard totalGB > 0 else {
+                let facts = "\(alias) needs about \(need) GB, and about \(free) GB is free right now."
+                return facts + " Close some apps or pick a smaller model before loading it."
+            }
+            let usedGB = max(0, totalGB - freeGB)
+            let projectedPercent = Int(((usedGB + footprintGB) / totalGB * 100).rounded())
+            let threshold = severity == .unsafe ? 85.0 : 75.0
+            let toFree = max(0, usedGB + footprintGB - threshold / 100 * totalGB)
+            let freeAction = max(1, Int(toFree.rounded(.up)))
+            let facts = "Loading it would put memory use at about \(projectedPercent)% of \(Int(totalGB.rounded())) GB."
             switch severity {
             case .unsafe:
-                return facts + " Loading it may freeze or crash your Mac. Close some apps, or pick a smaller model."
+                return facts + " Past about 85%, macOS may freeze or restart. Free about \(freeAction) GB by closing some apps, or pick a smaller model."
             case .tight, .safe:
                 return facts + " It should load but may stall under longer chats. Consider closing some apps or picking a smaller model."
             }
