@@ -536,7 +536,7 @@ _DISAMBIGUATING_PARSERS = ["hermes", "nemotron", "nemotron3"]
 
 @pytest.mark.parametrize("parser_name", _DISAMBIGUATING_PARSERS)
 @pytest.mark.parametrize(
-    "case,value", AMBIGUOUS_ORDERINGS, ids=[c for c, _ in AMBIGUOUS_ORDERINGS]
+    "case,value", [AMBIGUOUS_ORDERINGS[1]], ids=["open_then_close"]
 )
 def test_parser_itself_does_not_invent_parameters(parser_name, case, value):
     """Asserted against the NAMED parser, with no scanner fallback."""
@@ -554,7 +554,7 @@ def test_parser_itself_does_not_invent_parameters(parser_name, case, value):
 
 
 @pytest.mark.parametrize(
-    "case,value", AMBIGUOUS_ORDERINGS, ids=[c for c, _ in AMBIGUOUS_ORDERINGS]
+    "case,value", [AMBIGUOUS_ORDERINGS[1]], ids=["open_then_close"]
 )
 def test_ambiguous_marker_ordering_does_not_invent_parameters(case, value):
     """A value holding marker-shaped text must not become extra arguments.
@@ -578,6 +578,51 @@ def test_ambiguous_marker_ordering_does_not_invent_parameters(case, value):
     assert args[_KEY] == value, (
         f"[{case}] value truncated.\n  sent: {value!r}\n  got:  {args[_KEY]!r}"
     )
+
+
+@pytest.mark.parametrize("parser_name", _DISAMBIGUATING_PARSERS)
+@pytest.mark.parametrize(
+    "case,value",
+    [AMBIGUOUS_ORDERINGS[0], AMBIGUOUS_ORDERINGS[2]],
+    ids=["close_then_open", "open_then_close_then_open"],
+)
+def test_undeclared_sibling_after_close_refuses_parser_call(parser_name, case, value):
+    """An undeclared sibling after a close is ambiguous, so fail closed (#1541)."""
+    text = _render_xml_body(_NAME, _KEY, value)
+    assert _extract_parser_only(parser_name, text) == [], (
+        f"{parser_name} [{case}] executed an ambiguous call whose argument could "
+        "have been silently rewritten"
+    )
+
+
+@pytest.mark.parametrize(
+    "case,value",
+    [AMBIGUOUS_ORDERINGS[0], AMBIGUOUS_ORDERINGS[2]],
+    ids=["close_then_open", "open_then_close_then_open"],
+)
+def test_undeclared_sibling_after_close_refuses_fallback_call(case, value):
+    from vllm_mlx.api.tool_calling import parse_tool_calls
+
+    text = _render_xml_body(_NAME, _KEY, value)
+    _, calls = parse_tool_calls(text, _REQUEST)
+    assert not calls, (
+        f"[{case}] fallback executed an ambiguous call whose argument could have "
+        "been silently rewritten"
+    )
+
+
+def test_undeclared_sibling_never_splices_into_previous_value():
+    """Exact #1541 repro: a hallucinated parameter must not rewrite a path."""
+    from vllm_mlx.api.tool_calling import parse_tool_calls
+
+    text = (
+        f"<tool_call><function={_NAME}>"
+        f"<parameter={_KEY}>/ok</parameter>"
+        "<parameter=mode>force</parameter>"
+        "</function></tool_call>"
+    )
+    _, calls = parse_tool_calls(text, _REQUEST)
+    assert not calls
 
 
 @pytest.mark.parametrize("parser_name", _DISAMBIGUATING_PARSERS)

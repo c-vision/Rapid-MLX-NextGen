@@ -28,7 +28,7 @@ def generate_tool_id() -> str:
 
 def _parse_function_body(
     body: str, valid_names: set[str] | None = None
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Parse the body of any ``<function=name>...</function>`` block.
 
     Called both for wrapped (``<tool_call><function=...>...``) and
@@ -62,9 +62,16 @@ def _parse_function_body(
     # ``</parameter>`` the value happened to contain and silently dropped
     # the rest (jundot/omlx#2507). Shared with the other implementations of
     # this wire format — see ``vllm_mlx/tool_call_scan``.
-    for p_name, p_value in split_marked_parameters(
-        body, r"<parameter=([^>]+)>", "</parameter>", valid_names=valid_names
-    ):
+    params = split_marked_parameters(
+        body,
+        r"<parameter=([^>]+)>",
+        "</parameter>",
+        valid_names=valid_names,
+        reject_undeclared_siblings=valid_names is not None,
+    )
+    if params is None:
+        return None
+    for p_name, p_value in params:
         arguments[p_name] = _parse_param_value(p_value)
     return arguments
 
@@ -296,6 +303,8 @@ class HermesToolParser(ToolParser):
                 args = _parse_function_body(
                     m.group(2), declared_parameter_names(name, request)
                 )
+                if args is None:
+                    return None
                 return (m.end(), name, json.dumps(args, ensure_ascii=False))
             return None
         if shape == "function_eq":
@@ -306,6 +315,8 @@ class HermesToolParser(ToolParser):
                 args = _parse_function_body(
                     m.group(2), declared_parameter_names(name, request)
                 )
+                if args is None:
+                    return None
                 return (m.end(), name, json.dumps(args, ensure_ascii=False))
             return None
         if shape == "function_open":
@@ -317,6 +328,8 @@ class HermesToolParser(ToolParser):
                 args = _parse_function_body(
                     args_body, declared_parameter_names(name, request)
                 )
+                if args is None:
+                    return None
                 if not args and args_body.strip().startswith("{"):
                     # Body looked like JSON but failed both paths — keep
                     # raw to avoid silently dropping argument content.

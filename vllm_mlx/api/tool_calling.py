@@ -545,9 +545,16 @@ def parse_tool_calls(
         # scanner exists to remove. Repeated names are NOT filtered: two
         # real elements with one name are last-value-wins here.
         declared = set(_get_tool_param_config(name, request)) or None
-        for p_name, val in split_marked_parameters(
-            params_block, r"<parameter=([^>]+)>", "</parameter>", valid_names=declared
-        ):
+        parsed_params = split_marked_parameters(
+            params_block,
+            r"<parameter=([^>]+)>",
+            "</parameter>",
+            valid_names=declared,
+            reject_undeclared_siblings=declared is not None,
+        )
+        if parsed_params is None:
+            continue
+        for p_name, val in parsed_params:
             try:
                 arguments[p_name] = json.loads(val)
             except (json.JSONDecodeError, ValueError):

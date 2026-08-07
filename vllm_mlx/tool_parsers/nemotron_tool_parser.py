@@ -259,7 +259,10 @@ class NemotronToolParser(ToolParser):
                 r"<parameter=([^>]+)>",
                 "</parameter>",
                 valid_names=declared_parameter_names(func_name, request),
+                reject_undeclared_siblings=True,
             )
+            if params is None:
+                continue
             if params:
                 arguments = {}
                 for param_name, param_value in params:

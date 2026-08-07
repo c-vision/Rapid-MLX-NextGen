@@ -215,7 +215,9 @@ def split_marked_parameters(
     opener: str,
     closer: str,
     valid_names: frozenset[str] | set[str] | None = None,
-) -> list[tuple[str, str]]:
+    *,
+    reject_undeclared_siblings: bool = False,
+) -> list[tuple[str, str]] | None:
     """``(name, value)`` for each parameter in ``block``.
 
     ``opener`` must capture the parameter name in group 1. Values are
@@ -227,6 +229,18 @@ def split_marked_parameters(
     out: list[tuple[str, str]] = []
     i = 0
     while i < len(openers):
+        if reject_undeclared_siblings and valid_names is not None:
+            current_end = openers[i].end()
+            for candidate in openers[i + 1 :]:
+                if candidate.group(1).strip() in valid_names:
+                    continue
+                if closer in block[current_end : candidate.start()]:
+                    # Syntax cannot distinguish an undeclared sibling from
+                    # marker-shaped payload after a close.  Continuing would
+                    # splice the entire undeclared element into the previous
+                    # value (#1541).  Refuse the call rather than execute a
+                    # silently rewritten argument.
+                    return None
         segmented = segment_by_next_opener(block, openers, i, closer, valid_names)
         sibling = _next_sibling(block, openers, i, closer, valid_names)
         if segmented is not None:
