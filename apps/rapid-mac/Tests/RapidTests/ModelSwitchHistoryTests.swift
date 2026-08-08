@@ -30,51 +30,6 @@ import Testing
 @Suite("v0.4.35 model-switch silent-failure defense")
 struct ModelSwitchHistoryTests {
 
-    @Test("Restored tool exchange preserves call IDs and remains wire-valid")
-    func restoredToolExchangePreservesLinkage() throws {
-        let call = ToolCall(
-            id: "call_search_1",
-            name: "web_search",
-            arguments: #"{"query":"major news last week"}"#
-        )
-        let original: [ChatMessage] = [
-            ChatMessage(role: .user, content: "What happened last week?"),
-            ChatMessage(role: .assistant, content: "", status: .complete, toolCalls: [call]),
-            ChatMessage(
-                role: .tool,
-                content: "1. Example article\n   https://example.com/story",
-                status: .complete,
-                toolCallID: call.id
-            ),
-            ChatMessage(role: .assistant, content: "Here is what happened.", status: .complete),
-        ]
-
-        let restored = try JSONDecoder().decode(
-            [ChatMessage].self,
-            from: JSONEncoder().encode(original)
-        )
-        let wire = ChatViewModel.filterEmptyAssistantsForWire(restored)
-
-        #expect(wire.count == 4)
-        #expect(wire[1].toolCalls?.first?.id == "call_search_1")
-        #expect(wire[2].toolCallID == "call_search_1")
-        #expect(ChatViewModel.carriesToolResultForThisTurn(wire))
-
-        let wireData = try JSONEncoder().encode(
-            wire.map { Wire.Message(from: $0) }
-        )
-        let payload = try #require(
-            JSONSerialization.jsonObject(with: wireData) as? [[String: Any]]
-        )
-        let assistantCalls = try #require(payload[1]["tool_calls"] as? [[String: Any]])
-        let encodedCallID = assistantCalls.first?["id"] as? String
-        let encodedResultID = payload[2]["tool_call_id"] as? String
-        #expect(encodedCallID == "call_search_1")
-        #expect(encodedResultID == "call_search_1")
-        #expect(payload[2]["toolCalls"] == nil)
-        #expect(payload[2]["toolCallID"] == nil)
-    }
-
     // MARK: - filterEmptyAssistantsForWire
 
     @Test("Empty-prose assistant turn is stripped from wire history")

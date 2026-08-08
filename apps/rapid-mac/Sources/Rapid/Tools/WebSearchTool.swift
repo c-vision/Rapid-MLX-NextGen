@@ -65,16 +65,10 @@ enum WebSearchTool {
               let args = try? JSONDecoder().decode(Args.self, from: data) else {
             return ToolCallResult(toolCallID: "", content: "\(toolName) error: could not parse arguments JSON", isError: true)
         }
-        let rawQuery = args.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawQuery.isEmpty else {
+        let q = args.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else {
             return ToolCallResult(toolCallID: "", content: "\(toolName) error: empty query", isError: true)
         }
-        // Small local models commonly pass relative dates through verbatim
-        // ("last week", "上周"). Search engines then tend to return evergreen
-        // section homepages instead of an article from the requested window.
-        // Resolve the date on the application side so search quality does not
-        // depend on the model knowing today's date or deciding to retry.
-        let q = preparedQuery(rawQuery)
         var effectiveProvider = provider
         var fallbackNote: String? = nil
         if provider.requiresKey, apiKey == nil {
@@ -89,47 +83,6 @@ enum WebSearchTool {
         case .tavily:
             return await runTavily(query: q, apiKey: apiKey ?? "")
         }
-    }
-
-    /// Expand relative-time language into an explicit, stable date window.
-    ///
-    /// This deliberately keeps the user's original words and appends dates:
-    /// providers still see the semantic intent, while the date range prevents
-    /// generic news homepages from dominating queries such as "major news
-    /// story last week". ``now`` and ``calendar`` are injectable so the
-    /// boundary behavior is deterministic in tests.
-    static func preparedQuery(
-        _ query: String,
-        now: Date = Date(),
-        calendar inputCalendar: Calendar = .autoupdatingCurrent
-    ) -> String {
-        let folded = query.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
-        let asksForEnglishLastWeek = folded.range(
-            of: #"\blast week\b(?!\s+of\b)"#,
-            options: .regularExpression
-        ) != nil
-        let asksForChineseLastWeek = query.range(
-            of: #"(?<!上)(?:上周|上一周)(?!末)"#,
-            options: .regularExpression
-        ) != nil
-        let asksForLastWeek = asksForEnglishLastWeek || asksForChineseLastWeek
-        guard asksForLastWeek else { return query }
-
-        let calendar = inputCalendar
-        let today = calendar.startOfDay(for: now)
-        guard let currentWeek = calendar.dateInterval(of: .weekOfYear, for: today),
-              let start = calendar.date(byAdding: .weekOfYear, value: -1, to: currentWeek.start),
-              let end = calendar.date(byAdding: .day, value: -1, to: currentWeek.start) else {
-            return query
-        }
-        let formatter = DateFormatter()
-        var formattingCalendar = Calendar(identifier: .gregorian)
-        formattingCalendar.timeZone = calendar.timeZone
-        formatter.calendar = formattingCalendar
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = "yyyy-MM-dd"
-        return "\(query) (date range: \(formatter.string(from: start)) through \(formatter.string(from: end)))"
     }
 
     /// Shared formatting: takes a list of provider-agnostic
