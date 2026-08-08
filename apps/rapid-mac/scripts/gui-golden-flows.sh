@@ -32,8 +32,8 @@ Usage: gui-golden-flows.sh [--flow NAME] [--keep] [--update-baselines]
 
 Flows: fresh-install, settings-persistence, chat-restore, slow-stream-stop,
        model-crash-recovery, low-memory-choice, loaded-model-benchmark,
-       update-state, no-dead-controls,
-       catalog-integrity, all
+       update-state, no-dead-controls, catalog-integrity,
+       browse-all-destination, all
 
 Options:
   --update-baselines  rewrite the committed AX structural baselines instead of
@@ -730,6 +730,132 @@ flow_no_dead_controls() {
     cleanup_persona
 }
 
+flow_browse_all_destination() {
+    # An advertised destination must actually be one, and must not cost the
+    # user what they already chose.
+    #
+    # "Browse all models →" on Quickstart step 2 was implemented as one line
+    # that set a dismiss flag (#1653). It was present, enabled, correctly
+    # labelled and carried an AXIdentifier, so every structural check passed —
+    # the wizard simply vanished, the user's pick was discarded, and they
+    # landed on whatever the alphabetical fallback chose (a 7.6 GB download
+    # nobody asked for). None of that is visible in a tree dump. This flow
+    # presses the control and drives the whole round trip.
+    start_persona browse-all-destination
+
+    # Only the consent sheet — the wizard has to stay up, it is the subject.
+    local tree="$OUT/ba-first-run.json"
+    see_main "$tree"
+    if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.DontShare")' "$tree" >/dev/null; then
+        press "$tree" TelemetryConsent.DontShare "$OUT/ba-consent.json" \
+            || die "could not answer the telemetry consent sheet"
+        sleep 0.5
+    fi
+
+    wait_identifier Quickstart.GetStarted "$OUT/ba-welcome.json"
+    press "$OUT/ba-welcome.json" Quickstart.GetStarted "$OUT/ba-get-started.json" \
+        || die "Quickstart.GetStarted is not pressable"
+    wait_identifier Quickstart.BrowseAll "$OUT/ba-chooser.json"
+
+    # Choose a card that is NOT the default. The bug discarded the user's
+    # selection; asserting the survival of a pick nobody made proves nothing,
+    # so make one, and make it a different one.
+    local chosen
+    chosen="$(jq -r '[.data.ui_elements[]?
+                      | select((.identifier // "") | startswith("Quickstart.Choice."))
+                      | select(.selected != true)][0].identifier // empty' \
+              "$OUT/ba-chooser.json")"
+    [[ -n "$chosen" ]] || die "the chooser offers no unselected model card to pick"
+    press "$OUT/ba-chooser.json" "$chosen" "$OUT/ba-choose.json" \
+        || die "$chosen is not pressable"
+    sleep 0.5
+    see_main "$OUT/ba-chosen.json"
+    jq -e --arg id "$chosen" '.data.ui_elements[]? | select(.identifier == $id) | select(.selected == true)' \
+        "$OUT/ba-chosen.json" >/dev/null \
+        || die "pressing $chosen did not select it — the chooser cannot record a choice"
+    log "  chose $chosen"
+
+    press "$OUT/ba-chosen.json" Quickstart.BrowseAll "$OUT/ba-press.json" \
+        || die "Quickstart.BrowseAll is not pressable"
+
+    # 1. It opened the catalogue. `open_settings` drives the menu, so assert
+    #    the window the BUTTON opened rather than opening one ourselves.
+    local i
+    for ((i=0; i<40; i++)); do
+        pb list windows --app "PID:$APP_PID" --json > "$OUT/ba-windows.json"
+        SETTINGS_WINDOW_ID="$(jq -r '.data.windows[]? | select(.title == "Settings") | .window_id' "$OUT/ba-windows.json" | head -1)"
+        [[ -n "$SETTINGS_WINDOW_ID" ]] && break
+        sleep 0.25
+    done
+    [[ -n "$SETTINGS_WINDOW_ID" ]] \
+        || die "Browse all models did not open anything — it is a dismiss button again (#1653)"
+
+    # 2. On the models tab, not merely "Settings somewhere". The wizard's own
+    #    copy promises the catalogue; landing on the user's last-used tab is a
+    #    different bug wearing the same green check.
+    wait_settings_stable "$OUT/ba-settings.json" Settings.Models.ShowAllModelsToggle
+    log "  landed on Model Management"
+
+    # 3. Settings is actually USABLE, not merely present. A window opened
+    #    behind a modal sheet still publishes its whole subtree to AX, and
+    #    AXUIElementPerformAction reaches it there too — so neither the tree
+    #    nor an AXPress can tell a usable window from a trapped one. Focus it,
+    #    click it the way a person would, and require the panel to change.
+    pb window focus --window-id "$SETTINGS_WINDOW_ID" --json > "$OUT/ba-focus.json" \
+        || die "could not focus the Settings window the button opened"
+    # Coordinates re-read AFTER the focus, because focusing can raise or move
+    # the window and a stale point would click whatever now sits there.
+    see_settings "$OUT/ba-focused.json"
+    local cx cy
+    read -r cx cy < <(jq -r '.data.ui_elements[]
+                             | select(.identifier == "Settings.Category.privacy")
+                             | [(.bounds.x + .bounds.width / 2), (.bounds.y + .bounds.height / 2)]
+                             | @tsv' "$OUT/ba-focused.json")
+    [[ -n "$cx" && -n "$cy" ]] || die "Settings.Category.privacy has no bounds to click"
+    # ``--foreground`` is the whole point. Peekaboo's default is background
+    # delivery — a coordinate hit-test followed by an accessibility action,
+    # which reaches UI a person cannot, and is therefore exactly as blind to
+    # "trapped behind a modal sheet" as the AXPress this replaced.
+    # ``--window-id`` also pins the click to the Settings window rather than
+    # whatever else the app has on screen at that point.
+    pb click --coords "$cx,$cy" --global-coords --foreground \
+        --window-id "$SETTINGS_WINDOW_ID" --json > "$OUT/ba-click.json" \
+        || die "the Settings window did not accept a real click — it is behind the wizard sheet"
+    # A real click that changed nothing is the same failure as no click at all,
+    # so require the panel's own control to appear, not merely that the press
+    # returned success.
+    wait_settings_stable "$OUT/ba-privacy.json" Settings.Privacy.TelemetryToggle
+    log "  Settings is focused and responds to a real click"
+
+    # 4. Close it, the way the user would, and land back on the wizard with
+    #    the same pick. This is the half the bug actually broke.
+    #
+    #    Scoped to the window, not the app: ``menu click --app`` routes Close
+    #    to whichever window is key, which on a bad day is the main one — and
+    #    then every assertion below runs against a wizard that was never
+    #    actually returned to.
+    pb menu click --window-id "$SETTINGS_WINDOW_ID" --item 'Close' --json > "$OUT/ba-close.json" \
+        || die "could not close the Settings window"
+    local closed=0
+    for ((i=0; i<40; i++)); do
+        pb list windows --app "PID:$APP_PID" --json > "$OUT/ba-windows-after.json"
+        if jq -e '[.data.windows[]? | select(.title == "Settings")] | length == 0' \
+            "$OUT/ba-windows-after.json" >/dev/null; then closed=1; break; fi
+        sleep 0.25
+    done
+    # Not a cosmetic check: with Settings still open, the app-wide AX dump
+    # below carries the wizard AND the Settings tree, so the round-trip
+    # assertion would pass without any round trip having happened.
+    [[ "$closed" == 1 ]] || die "the Settings window did not close — the round trip below would be vacuous"
+
+    wait_identifier Quickstart.BrowseAll "$OUT/ba-after.json"
+    jq -e --arg id "$chosen" '.data.ui_elements[]? | select(.identifier == $id) | select(.selected == true)' \
+        "$OUT/ba-after.json" >/dev/null \
+        || die "the wizard came back without the user's selection — browsing must not discard it (#1653)"
+    log "  back on the wizard, $chosen still selected"
+    cleanup_persona
+}
+
 flow_catalog_integrity() {
     # A model that cannot chat must never be offered as one.
     #
@@ -775,6 +901,7 @@ case "$FLOW" in
     update-state) flow_update_state ;;
     no-dead-controls) flow_no_dead_controls ;;
     catalog-integrity) flow_catalog_integrity ;;
+    browse-all-destination) flow_browse_all_destination ;;
     all)
         flow_fresh_install
         flow_settings_persistence
@@ -786,6 +913,7 @@ case "$FLOW" in
         flow_update_state
         flow_no_dead_controls
         flow_catalog_integrity
+        flow_browse_all_destination
         ;;
     *) die "unknown flow: $FLOW" ;;
 esac
