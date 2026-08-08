@@ -688,7 +688,13 @@ class BlockAwarePrefixCache:
                         f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
                     )
 
-            # Register hash for full blocks (for deduplication)
+            # Record the block's content hash so the fetch-side ownership
+            # guard can detect a freed-then-reallocated block for EVERY
+            # block, including the trailing partial one. Only FULL blocks
+            # are additionally registered in ``hash_to_block`` for dedup —
+            # partial blocks must never be shared, but they still need a
+            # hash_value the guard can re-derive and compare.
+            block.hash_value = self.paged_cache.compute_block_hash(block_tokens)
             if len(block_tokens) == self.block_size:
                 self.paged_cache.register_block_hash(block, block_tokens)
 
@@ -1096,6 +1102,44 @@ class BlockAwarePrefixCache:
             if prefix_hash in self._prefix_index:
                 cached_tokens, block_ids = self._prefix_index[prefix_hash]
                 if cached_tokens == prefix_tokens and len(cached_tokens) > best_len:
+                    # Hermes patch: stale-block guard. The prefix index
+                    # is never pruned when a block is released to the
+                    # free queue (ref_count -> 0) or when the paged
+                    # manager force-releases KV tensor memory under
+                    # Metal pressure (release_pressure_blocks). A stale
+                    # hit would truncate ``remaining`` past tokens whose
+                    # blocks no longer hold cache_data — dropping the
+                    # prefix from the decode is a correctness bomb.
+                    # Require every referenced block to still be live
+                    # with resident tensor data AND still own the tokens
+                    # this prefix expects before trusting the hit.
+                    live = True
+                    bs = self.block_size
+                    for j, bid in enumerate(block_ids):
+                        blk = self.paged_cache.allocated_blocks.get(bid)
+                        if blk is None or blk.cache_data is None:
+                            live = False
+                            break
+                        # Ownership check. cache_data != None is necessary
+                        # but NOT sufficient: a block freed under pressure
+                        # and then REALLOCATED for different tokens carries
+                        # fresh cache_data yet the wrong KV, so it would
+                        # pass the liveness test above and corrupt decode.
+                        # store_cache records EVERY block's
+                        # ``hash_value = compute_block_hash(its tokens)`` —
+                        # full and trailing partial alike — and a
+                        # reallocation resets/replaces that hash. Re-derive
+                        # the expected hash for this block's token slice and
+                        # require it to still match, so a reallocated block
+                        # (full or partial) is rejected even though its
+                        # cache_data is non-None.
+                        block_tokens = cached_tokens[j * bs : (j + 1) * bs]
+                        expected = self.paged_cache.compute_block_hash(block_tokens)
+                        if blk.hash_value != expected:
+                            live = False
+                            break
+                    if not live:
+                        continue
                     best_match = (cached_tokens, block_ids)
                     best_len = len(cached_tokens)
 
