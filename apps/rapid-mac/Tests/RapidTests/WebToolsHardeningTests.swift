@@ -7,6 +7,101 @@ import Testing
 /// logic that previously had no direct unit tests.
 @Suite("Web tools hardening")
 struct WebToolsHardeningTests {
+    // MARK: - Relative-date query grounding
+
+    @Test("Last-week news query gets the previous complete calendar week")
+    func lastWeekQueryGetsConcreteDates() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(secondsFromGMT: 0))
+        let now = try #require(calendar.date(from: DateComponents(
+            year: 2026, month: 8, day: 8, hour: 19
+        )))
+
+        let prepared = WebSearchTool.preparedQuery(
+            "What's a major news story from the last week?",
+            now: now,
+            calendar: calendar
+        )
+
+        #expect(prepared.contains("2026-07-26 through 2026-08-01"))
+        #expect(prepared.hasPrefix("What's a major news story from the last week?"))
+    }
+
+    @Test("Chinese last-week query gets the same explicit date window")
+    func chineseLastWeekQueryGetsConcreteDates() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(secondsFromGMT: 0))
+        let now = try #require(calendar.date(from: DateComponents(
+            year: 2026, month: 8, day: 8
+        )))
+
+        let prepared = WebSearchTool.preparedQuery(
+            "上周有什么重大新闻？",
+            now: now,
+            calendar: calendar
+        )
+        #expect(prepared.contains("2026-07-26 through 2026-08-01"))
+    }
+
+    @Test("Last weekend is not broadened into a week-long query")
+    func lastWeekendIsNotRewritten() {
+        let query = "What happened last weekend?"
+        #expect(WebSearchTool.preparedQuery(query) == query)
+    }
+
+    @Test("A historical last-week-of phrase is not treated as relative")
+    func historicalLastWeekOfIsNotRewritten() {
+        let query = "What happened in the last week of July 2020?"
+        #expect(WebSearchTool.preparedQuery(query) == query)
+    }
+
+    @Test("Chinese last weekend is not broadened into a week-long query")
+    func chineseLastWeekendIsNotRewritten() {
+        let query = "上周末有什么活动？"
+        #expect(WebSearchTool.preparedQuery(query) == query)
+    }
+
+    @Test("The Chinese week-before-last phrase is not shifted forward")
+    func chineseWeekBeforeLastIsNotRewritten() {
+        let query = "上上周有什么新闻？"
+        #expect(WebSearchTool.preparedQuery(query) == query)
+    }
+
+    @Test("A standalone Chinese last-week phrase still matches beside last-weekend")
+    func standaloneChineseLastWeekStillMatches() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(secondsFromGMT: 0))
+        let now = try #require(calendar.date(from: DateComponents(
+            year: 2026, month: 8, day: 8
+        )))
+        let prepared = WebSearchTool.preparedQuery(
+            "总结上周新闻，不包括上周末",
+            now: now,
+            calendar: calendar
+        )
+        #expect(prepared.contains("2026-07-26 through 2026-08-01"))
+    }
+
+    @Test("Date constraint stays Gregorian for a non-Gregorian user calendar")
+    func dateConstraintUsesGregorianYear() throws {
+        var calendar = Calendar(identifier: .buddhist)
+        calendar.timeZone = try #require(TimeZone(secondsFromGMT: 0))
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-08T12:00:00Z"))
+        let prepared = WebSearchTool.preparedQuery(
+            "major news last week",
+            now: now,
+            calendar: calendar
+        )
+        #expect(prepared.contains("2026-"))
+        #expect(!prepared.contains("2569-"))
+    }
+
+    @Test("Timeless query is not rewritten")
+    func timelessQueryPassesThrough() {
+        let query = "Swift concurrency actor isolation"
+        #expect(WebSearchTool.preparedQuery(query) == query)
+    }
+
     // MARK: - #4 DuckDuckGo query encoding
 
     @Test("A query with & and # is one opaque q value, not injected parameters")
