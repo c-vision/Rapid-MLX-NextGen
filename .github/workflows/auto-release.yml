@@ -242,6 +242,42 @@ jobs:
           # the previous tag, not only the version-bump commit.
           fetch-depth: 0
 
+      # FIRST, because everything after it is irreversible. rapid-mac-release.yml
+      # extracts ``## [VERSION]`` from apps/rapid-mac/CHANGELOG.md for the app
+      # release body, and a missing section yields an EMPTY release rather than a
+      # loud failure. Checked after the engine had already published, this would
+      # produce exactly the half-release — engine out, app not — that tagging both
+      # from one job exists to prevent.
+      - name: Pre-check the desktop app CHANGELOG
+        id: appcheck
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          # Presence only — the value never enters the log. The app tag has to
+          # be created by a real user or the DMG workflow never fires (see the
+          # tag step below), so whether we hold a PAT decides whether this run
+          # can cut the app half at all. Deciding it HERE, before anything is
+          # published, is what makes the skip recoverable.
+          HAVE_PAT: ${{ secrets.RELEASE_PAT != '' }}
+        run: |
+          set -euo pipefail
+          if ! grep -qE "^## \[${VERSION//./\\.}\]" apps/rapid-mac/CHANGELOG.md; then
+            echo "::error::apps/rapid-mac/CHANGELOG.md has no '## [${VERSION}]' section — the app release would ship empty notes. Add it and re-run; nothing has been published yet."
+            exit 1
+          fi
+          echo "apps/rapid-mac/CHANGELOG.md has a [${VERSION}] section."
+
+          # Fail HERE, before anything is published, because there is no good
+          # answer later. Skipping the app tag would leave a green run with only
+          # the engine released, and a re-run then sees the published engine
+          # Release, sets should_release=false and never reaches the app step —
+          # the version would be permanently engine-only. Failing now costs
+          # nothing: set the secret and re-run, and the whole release proceeds.
+          if [ "$HAVE_PAT" != "true" ]; then
+            echo "::error::RELEASE_PAT is not set. The app tag has to be created by a real user — a ref written with the default GITHUB_TOKEN triggers no workflow, so no DMG would ever be built for ${VERSION}. Nothing has been published yet: add the RELEASE_PAT secret and re-run this workflow."
+            exit 1
+          fi
+          echo "have_pat=${HAVE_PAT}" >> "$GITHUB_OUTPUT"
+
       - name: Build release notes
         id: changelog
         env:
@@ -280,14 +316,55 @@ jobs:
           echo "--- release notes ---"
           cat "$NOTES_FILE"
 
+      # The engine and the desktop app are ONE version, enforced by
+      # scripts/check_version_sync.py — so a release is one event, not two.
+      # Cutting them separately is what produced the 0.12.5-vs-0.12.6 split that
+      # reached users: the engine shipped, the app tag was a manual step somebody
+      # had to remember, and for four releases nobody did.
+      #
+      # Creating ``refs/tags/rapid-mac-v$VERSION`` hands off to
+      # .github/workflows/rapid-mac-release.yml, which builds, signs, notarises
+      # and attaches the DMG from this same tree (its sidecar is built from repo
+      # source at the tag, so it does not wait on the engine Release or PyPI).
+      #
+      # BEFORE the engine Release, deliberately. Publishing the engine is the
+      # irreversible step: once it exists, ``detect`` sets should_release=false
+      # and no re-run can ever reach this step again. So anything that can refuse
+      # the app tag — it already exists at another commit, a ruleset rejects the
+      # namespace, a transient API failure — has to refuse while the release can
+      # still be re-run from the top. Claiming the tag first inverts the failure:
+      # the worst case is an app tag whose engine Release lands seconds later on
+      # the re-run, instead of a version that is engine-only forever.
+      #
+      # RELEASE_PAT because the tag is created through the API under a real user:
+      # a ref written with the default GITHUB_TOKEN fires no ``push`` event. Its
+      # absence is already fatal in the pre-flight step above; the script
+      # re-checks anyway, so a hand-run cannot walk into it either.
+      - name: Tag the desktop app at the same version
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          HAVE_PAT: ${{ steps.appcheck.outputs.have_pat }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          # Resolved once by "Build release notes". The app is built from the
+          # same tree the engine releases, so the tag must land on that commit.
+          RELEASE_SHA: ${{ steps.changelog.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          # Atomic tag claim + annotated-tag-aware recovery, extracted so both
+          # paths are testable offline against a mock ``gh``.
+          bash scripts/tag_desktop_app.sh
+
       - name: Create tag and release
         env:
           # Use a user PAT (RELEASE_PAT) so the resulting ``release: published``
           # event fires downstream workflows. Releases created with the default
           # ``GITHUB_TOKEN`` are suppressed by GitHub's anti-loop guard, leaving
           # ``publish.yml`` un-triggered and the version stranded between tag and
-          # PyPI/Homebrew. Falls back to ``GITHUB_TOKEN`` if the secret is absent
-          # so forks don't break — the release just won't auto-publish.
+          # PyPI/Homebrew. The ``|| GITHUB_TOKEN`` fallback is now unreachable in
+          # practice: the pre-flight step fails the job when RELEASE_PAT is
+          # absent, because the app tag cannot be created without it and a
+          # half-released version is not recoverable. It stays as the expression
+          # default rather than as a working fork path.
           GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
           TAG: v${{ needs.detect.outputs.version }}
           # Resolved once by the step above. The notes describe exactly this
