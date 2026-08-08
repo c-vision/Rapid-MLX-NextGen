@@ -289,12 +289,11 @@ class TestBatchingPerformance:
 
         This is a regression guard, not a perf benchmark. The threshold
         is loose (0.7x) on purpose — real batching wins are 2-3x but
-        the workload here is tiny (40 tokens × 2 runs) so engine
-        startup overhead and Metal kernel JIT swamp the signal. A
-        warmup pass per-engine eliminates the cold/warm asymmetry that
-        used to make this test flake under any concurrent system load.
-        Catastrophic regressions (sequential outperforming batched by
-        more than 30%) still fire.
+        the workload here is tiny, so host scheduling noise can swamp
+        the signal. Three alternating pairs plus best-of-N reject a
+        one-off stall in either leg while a persistent catastrophic
+        regression (sequential beating batched by more than 30%) still
+        fires.
         """
         from vllm_mlx import (
             AsyncEngineCore,
@@ -354,21 +353,31 @@ class TestBatchingPerformance:
                 tokens = await asyncio.gather(*[get_output(r) for r in request_ids])
                 return sum(tokens)
 
-        # Time sequential
-        start = time.perf_counter()
-        seq_tokens = await run_sequential()
-        seq_time = time.perf_counter() - start
+        async def measure(run):
+            start = time.perf_counter()
+            tokens = await run()
+            elapsed = time.perf_counter() - start
+            return tokens / elapsed
 
-        # Time batched
-        start = time.perf_counter()
-        batch_tokens = await run_batched()
-        batch_time = time.perf_counter() - start
+        seq_samples = []
+        batch_samples = []
+        for pair in range(3):
+            # Alternate order so a monotonic change in host load or thermal
+            # state does not systematically favour one execution mode.
+            if pair % 2 == 0:
+                seq_samples.append(await measure(run_sequential))
+                batch_samples.append(await measure(run_batched))
+            else:
+                batch_samples.append(await measure(run_batched))
+                seq_samples.append(await measure(run_sequential))
 
-        seq_throughput = seq_tokens / seq_time
-        batch_throughput = batch_tokens / batch_time
+        seq_throughput = max(seq_samples)
+        batch_throughput = max(batch_samples)
 
-        print(f"\nSequential: {seq_throughput:.1f} tok/s")
-        print(f"Batched: {batch_throughput:.1f} tok/s")
+        print(f"\nSequential samples: {[round(v, 1) for v in seq_samples]} tok/s")
+        print(f"Batched samples: {[round(v, 1) for v in batch_samples]} tok/s")
+        print(f"Best sequential: {seq_throughput:.1f} tok/s")
+        print(f"Best batched: {batch_throughput:.1f} tok/s")
         print(f"Speedup: {batch_throughput / seq_throughput:.2f}x")
 
         # Catastrophic-regression guard. Real batching wins are 2-3x;
