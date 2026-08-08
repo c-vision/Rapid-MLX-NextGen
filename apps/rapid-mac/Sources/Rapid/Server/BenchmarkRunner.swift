@@ -1,26 +1,22 @@
 import Foundation
 
-/// Runs the bundled `rapid-mlx bench` for the in-app "Speed on this Mac"
-/// card, and drives the community-leaderboard submission.
+/// Measures the already-loaded desktop server for the in-app "Speed on this
+/// Mac" card, and drives the community-leaderboard submission.
 ///
-/// Two paths, both delegating to the proven CLI so the app never
-/// reimplements the benchmark or the submission wire format:
-///   * ``run`` → `rapid-mlx bench <alias>` (freeform), parses the
-///     `Throughput: N tok/s` summary line for display.
+/// Two deliberately different paths:
+///   * ``run`` sends a warm-up plus one measured OpenAI-compatible request to
+///     the server the user is already chatting with. It never starts another
+///     process or loads a second copy of the model.
 ///   * ``submit`` → `rapid-mlx bench <alias> --submit` (the
 ///     standardized B=1 community runner that POSTs to
 ///     rapidmlx.com/api/benchmarks). The CLI asks for a y/N consent on
 ///     stdin; the app shows its OWN consent first, then pipes "y" so the
 ///     user only answers once.
 ///
-/// Both paths are multi-minute for a large model — a cold model load
-/// plus (for submit) a full standardized short+long workload. The CLI
-/// emits little incremental output, so a plain spinner reads as "hung".
-/// We stream the child's stdout to advance a coarse stage label, run a
-/// one-second ticker for a live elapsed clock, and show a size-derived
-/// ETA so the user knows roughly how long to wait. The elapsed clock is
-/// the source of truth; the ETA is an estimate that gracefully degrades
-/// to "almost there…" once a slow Mac blows past it.
+/// The loaded-model measurement is normally seconds; leaderboard submission
+/// can still take minutes because it intentionally runs the standardized
+/// workload. Both keep a live elapsed clock, while submission also streams the
+/// child's stdout to advance its stage label.
 @MainActor
 @Observable
 final class BenchmarkRunner {
@@ -140,9 +136,8 @@ final class BenchmarkRunner {
 
     private var ticker: Task<Void, Never>?
     /// The in-flight run/submit. Owned here (not by the view's button) so
-    /// closing the sheet or starting another run can cancel it — which
-    /// terminates the underlying `rapid-mlx bench` child so a closed card
-    /// can't leave a GPU-bound benchmark running or overlap two runs.
+    /// closing the sheet or starting another run can cancel either the live
+    /// HTTP request or the submission child, preventing overlapping work.
     private var inFlight: Task<Void, Never>?
 
     /// Public leaderboard the submission lands on.
@@ -159,13 +154,13 @@ final class BenchmarkRunner {
     // MARK: - Lifecycle / cancellation
 
     /// Start a benchmark, owning the task so the view can cancel it.
-    /// Supersedes any in-flight run (which terminates its child process).
+    /// Supersedes any in-flight request or submission process.
     /// The generation is allocated *synchronously here* (not inside the
     /// task body): a task cancelled before it starts still runs its body,
     /// so binding "who is current" at launch time — not execution time —
     /// is what lets the stale task's top guard reject it before it mutates
     /// any state (codex round-3 MAJOR).
-    func launchRun(binary: URL, alias: String, chip: String) {
+    func launchRun(baseURL: URL, bearer: String, alias: String, chip: String) {
         inFlight?.cancel()
         // Clear a superseded submit's transient phase so it can't linger
         // as a stale "Submitting…" behind the new run (UI-gated today, but
@@ -174,7 +169,9 @@ final class BenchmarkRunner {
         runGeneration &+= 1
         let gen = runGeneration
         inFlight = Task { [weak self] in
-            await self?.run(binary: binary, alias: alias, chip: chip, generation: gen)
+            await self?.run(
+                baseURL: baseURL, bearer: bearer, alias: alias,
+                chip: chip, generation: gen)
         }
     }
 
@@ -189,11 +186,10 @@ final class BenchmarkRunner {
         }
     }
 
-    /// Cancel the in-flight run/submit — terminates the `rapid-mlx bench`
-    /// child. Call from the view's `.onDisappear` so a closed card never
-    /// leaves a benchmark burning the GPU in the background. Bumping the
-    /// generation also neutralizes any task that hasn't run its top guard
-    /// yet.
+    /// Cancel the in-flight HTTP measurement or submission child. Call from
+    /// the view's `.onDisappear` so a closed card never leaves GPU work in the
+    /// background. Bumping the generation also neutralizes any task that has
+    /// not run its top guard yet.
     func cancelActive() {
         inFlight?.cancel()
         inFlight = nil
@@ -213,7 +209,10 @@ final class BenchmarkRunner {
 
     // MARK: - Benchmark (display)
 
-    func run(binary: URL, alias: String, chip: String, generation gen: UInt64) async {
+    func run(
+        baseURL: URL, bearer: String, alias: String, chip: String,
+        generation gen: UInt64
+    ) async {
         // Superseded/cancelled before we even started, or another run has
         // already advanced past us: do nothing, touch no state.
         guard !Task.isCancelled, runGeneration == gen else { return }
@@ -221,53 +220,136 @@ final class BenchmarkRunner {
             phase = .failed("Choose a model first.")
             return
         }
-        // Pre-load memory guard (#324). `rapid-mlx bench` spawns its own
-        // process that loads the full model — a *second* resident copy
-        // if the app's sidecar already has this alias loaded. Projecting
-        // the footprint onto live `usedBytes` (which already includes the
-        // first copy) catches that 2× case, so we refuse to spawn a bench
-        // that would push unified memory past the kernel-panic line.
-        if let snapshot = MemoryProbe.snapshot(),
-           ModelSizing.memorySafety(
-               footprint: ModelSizing.estimate(alias: alias),
-               usedBytes: snapshot.usedBytes,
-               totalBytes: snapshot.totalBytes
-           ) == .unsafe {
-            phase = .failed(
-                "Not enough free memory to benchmark \(alias) right now — it loads a second copy of the model on top of what's already running. Close some apps or restart the model, then try again.")
-            return
-        }
         phase = .running
         beginProgress(gen, kind: .benchmark, alias: alias)
         defer { endProgress(gen) }
 
-        let output = await runStreaming(
-            binary: binary, args: ["bench", alias], stdinLine: nil, generation: gen)
+        progress?.observe("Running benchmark against the loaded model")
+        let output = await Self.measureLoadedModel(
+            baseURL: baseURL, bearer: bearer, alias: alias)
         // Cancelled (sheet closed) or superseded (another run bumped the
-        // generation): the child was terminated and the output is a
+        // generation): the request was cancelled and the output is a
         // spurious failure — leave the UI state untouched rather than
         // flashing an error on a dead card or clobbering the newer run.
         guard !Task.isCancelled, runGeneration == gen else { return }
         switch output {
         case .failure(let msg):
             phase = .failed(msg)
-        case .success(let text):
-            guard let result = Self.parse(text, alias: alias, chip: chip) else {
-                phase = .failed("Couldn't read the benchmark result.")
-                return
-            }
-            // A zero/garbage throughput means the run produced no tokens
-            // (e.g. the model errored mid-generation but the summary line
-            // still printed "0.00 tok/s" and the process exited cleanly).
-            // Never surface a confident "0 tokens / second" — and never
-            // let a zero reach the community leaderboard.
-            guard result.throughputTPS > 0 else {
+        case .success(let measurement):
+            guard measurement.tokensPerSecond > 0 else {
                 phase = .failed(
                     "The benchmark didn't produce a usable number — the model generated no tokens. Try again, or restart the model.")
                 return
             }
-            phase = .done(result)
+            phase = .done(BenchmarkResult(
+                alias: alias,
+                chip: chip,
+                throughputTPS: measurement.tokensPerSecond,
+                tokensPerSecond: measurement.tokensPerSecond
+            ))
         }
+    }
+
+    struct LoadedMeasurement: Equatable, Sendable {
+        let completionTokens: Int
+        let elapsedSeconds: TimeInterval
+
+        var tokensPerSecond: Double {
+            guard completionTokens > 0, elapsedSeconds > 0 else { return 0 }
+            return Double(completionTokens) / elapsedSeconds
+        }
+    }
+
+    private enum LoadedRunOutput: Sendable {
+        case success(LoadedMeasurement)
+        case failure(String)
+    }
+
+    /// Benchmark the model already resident in the desktop sidecar. A short
+    /// warm-up avoids charging one-time Metal compilation to the displayed
+    /// decode speed; the measured request is intentionally single-user (B=1),
+    /// matching what somebody experiences in Chat.
+    private nonisolated static func measureLoadedModel(
+        baseURL: URL, bearer: String, alias: String
+    ) async -> LoadedRunOutput {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 180
+        config.timeoutIntervalForResource = 180
+        let session = URLSession(configuration: config)
+
+        do {
+            _ = try await completion(
+                session: session, baseURL: baseURL, bearer: bearer,
+                alias: alias, maxTokens: 8,
+                prompt: "Reply with exactly eight short words.")
+            let start = ContinuousClock.now
+            let tokens = try await completion(
+                session: session, baseURL: baseURL, bearer: bearer,
+                alias: alias, maxTokens: 128,
+                prompt: "Write exactly 128 words describing a calm walk through a forest. Do not use headings or lists.")
+            let elapsed = start.duration(to: .now)
+            let seconds = Double(elapsed.components.seconds)
+                + Double(elapsed.components.attoseconds) / 1e18
+            return .success(LoadedMeasurement(
+                completionTokens: tokens, elapsedSeconds: seconds))
+        } catch is CancellationError {
+            return .failure("The benchmark was cancelled.")
+        } catch {
+            return .failure(
+                "The running model couldn't complete the speed test. Make sure it is still running, then try again. (\(error.localizedDescription))")
+        }
+    }
+
+    private nonisolated static func completion(
+        session: URLSession, baseURL: URL, bearer: String, alias: String,
+        maxTokens: Int, prompt: String
+    ) async throws -> Int {
+        let request = try loadedBenchmarkRequest(
+            baseURL: baseURL, bearer: bearer, alias: alias,
+            maxTokens: maxTokens, prompt: prompt)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            throw NSError(
+                domain: "RapidBenchmark", code: status,
+                userInfo: [NSLocalizedDescriptionKey: "Local server returned HTTP \(status)."])
+        }
+        return try loadedCompletionTokens(from: data)
+    }
+
+    nonisolated static func loadedBenchmarkRequest(
+        baseURL: URL, bearer: String, alias: String,
+        maxTokens: Int, prompt: String
+    ) throws -> URLRequest {
+        let url = baseURL.appendingPathComponent("chat/completions")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 180
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !bearer.isEmpty {
+            request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "model": alias,
+            "messages": [["role": "user", "content": prompt]],
+            "max_tokens": maxTokens,
+            "temperature": 0,
+            "stream": false,
+        ])
+        return request
+    }
+
+    nonisolated static func loadedCompletionTokens(from data: Data) throws -> Int {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let usage = root["usage"] as? [String: Any],
+              let completionTokens = usage["completion_tokens"] as? Int,
+              completionTokens > 0 else {
+            throw NSError(
+                domain: "RapidBenchmark", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The local server returned no completion-token count."])
+        }
+        return completionTokens
     }
 
     // MARK: - Submit (community leaderboard)
@@ -363,49 +445,16 @@ final class BenchmarkRunner {
         progress = nil
     }
 
-    /// Coarse total-duration estimate. Load time is dominated by the
-    /// weight bytes (disk read + Metal upload) and generation is a fixed
-    /// token budget, so both scale roughly with parameter count. These
-    /// constants are a UX ballpark calibrated against the bundled models
-    /// on Apple Silicon (~4B ≈ 1 min, ~12B ≈ 2 min, ~30B ≈ 4–5 min); the
-    /// live elapsed clock, not this number, is the source of truth. The
-    /// submit path re-runs the full standardized short+long workload, so
-    /// it takes ~1.6× the freeform pass. Returns ``nil`` for a custom
-    /// alias with no parseable size.
+    /// Coarse total-duration estimate. The loaded-model path has no weight
+    /// load and a fixed 128-token ceiling, so a small constant is more honest
+    /// than parameter-scaled cold-start time. Submission still loads and runs
+    /// the standardized workload, so it scales with model size.
     nonisolated static func etaSeconds(alias: String, kind: Progress.Kind) -> Int? {
+        if kind == .benchmark { return 30 }
         let footprint = ModelSizing.estimate(alias: alias)
         guard let params = footprint.paramsBillions else { return nil }
         let base = 20.0 + params * 8.0
-        let mult = kind == .submit ? 1.6 : 1.0
-        return Int((base * mult).rounded())
-    }
-
-    // MARK: - Parsing
-
-    /// Pulls the throughput + tokens/second out of the freeform bench
-    /// summary. Format (rapid-mlx bench):
-    ///     Tokens/second: 781.55
-    ///     Throughput: 836.26 tok/s
-    static func parse(_ text: String, alias: String, chip: String) -> BenchmarkResult? {
-        let throughput = firstDouble(in: text, pattern: #"Throughput:\s*([\d.]+)\s*tok"#)
-        let tokensPerSec = firstDouble(in: text, pattern: #"Tokens/second:\s*([\d.]+)"#)
-        // Prefer throughput (end-to-end); fall back to tokens/second.
-        guard let primary = throughput ?? tokensPerSec else { return nil }
-        return BenchmarkResult(
-            alias: alias,
-            chip: chip,
-            throughputTPS: primary,
-            tokensPerSecond: tokensPerSec ?? primary
-        )
-    }
-
-    private static func firstDouble(in text: String, pattern: String) -> Double? {
-        guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
-        let range = NSRange(text.startIndex..., in: text)
-        guard let m = re.firstMatch(in: text, range: range),
-              m.numberOfRanges > 1,
-              let r = Range(m.range(at: 1), in: text) else { return nil }
-        return Double(text[r])
+        return Int((base * 1.6).rounded())
     }
 
     private static func firstErrorLine(_ text: String) -> String? {

@@ -237,14 +237,16 @@ struct ChatView: View {
                 host: "127.0.0.1",
                 port: server.activePort,
                 bearer: server.activeBearer ?? "",
-                alias: alias,
+                alias: server.servingAlias ?? alias,
                 onClose: { showConnectTools = false }
             )
         }
         .sheet(isPresented: $showBenchmark) {
             BenchmarkView(
                 binary: server.binaryPath,
-                alias: alias,
+                baseURL: ChatStreamClient.loopbackURL(port: server.activePort),
+                bearer: server.activeBearer ?? "",
+                alias: server.servingAlias ?? alias,
                 hardware: MacHardware.detect(),
                 onClose: { showBenchmark = false }
             )
@@ -408,6 +410,7 @@ struct ChatView: View {
                 } label: {
                     Label("Speed on this Mac", systemImage: "gauge.with.dots.needle.67percent")
                 }
+                .accessibilityIdentifier("ChatView.SpeedOnThisMac")
                 // Enablement is derived from live server state, so the
                 // button flips to enabled on its own the moment the
                 // model reaches .ready — no user action, no re-render

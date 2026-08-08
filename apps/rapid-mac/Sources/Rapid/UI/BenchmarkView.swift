@@ -16,15 +16,20 @@ struct BenchmarkView: View {
     @State private var showFailureDetails = false
 
     let binary: URL?
+    let baseURL: URL
+    let bearer: String
     let alias: String
     let hardware: MacHardware
     var onClose: () -> Void
 
     init(
-        binary: URL?, alias: String, hardware: MacHardware,
+        binary: URL?, baseURL: URL = ChatStreamClient.defaultBaseURL,
+        bearer: String = "", alias: String, hardware: MacHardware,
         onClose: @escaping () -> Void, runner: BenchmarkRunner = BenchmarkRunner()
     ) {
         self.binary = binary
+        self.baseURL = baseURL
+        self.bearer = bearer
         self.alias = alias
         self.hardware = hardware
         self.onClose = onClose
@@ -83,13 +88,15 @@ struct BenchmarkView: View {
                 .font(.system(size: 40))
                 .foregroundStyle(RapidTheme.brandAmber)
                 .padding(.top, 24)
-            Text("Run a quick benchmark to see \(displayAlias)'s tokens per second on your \(hardware.brandString).")
+            Text("Test the \(displayAlias) model already running on your \(hardware.brandString) — no second copy is loaded.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
             Button {
-                runner.launchRun(binary: binary ?? URL(fileURLWithPath: "/"), alias: alias, chip: hardware.brandString)
+                runner.launchRun(
+                    baseURL: baseURL, bearer: bearer,
+                    alias: alias, chip: hardware.brandString)
             } label: {
                 Label("Benchmark this Mac", systemImage: "play.fill")
                     .frame(maxWidth: .infinity)
@@ -97,7 +104,8 @@ struct BenchmarkView: View {
             .controlSize(.large)
             .buttonStyle(.borderedProminent)
             .tint(RapidTheme.amber)
-            .disabled(binary == nil || alias.isEmpty)
+            .disabled(alias.isEmpty)
+            .accessibilityIdentifier("Benchmark.RunLoadedModel")
         }
         .frame(maxWidth: .infinity)
     }
@@ -118,7 +126,7 @@ struct BenchmarkView: View {
         .frame(maxWidth: .infinity)
     }
 
-    /// Live progress used by both the freeform benchmark and the submit
+    /// Live progress used by both the loaded-model benchmark and the submit
     /// re-bench: a determinate bar toward the ETA (indeterminate when the
     /// model size is unknown), the current stage, and an elapsed + ETA
     /// caption so a multi-minute run never reads as frozen.
@@ -163,6 +171,8 @@ struct BenchmarkView: View {
                 Text("tokens / second")
                     .font(.callout).foregroundStyle(.secondary)
             }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("Benchmark.LoadedModelResult")
             .padding(.top, 12)
             .frame(maxWidth: .infinity)
 
@@ -195,7 +205,9 @@ struct BenchmarkView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(RapidTheme.brand)
                 Button("Run again") {
-                    runner.launchRun(binary: binary ?? URL(fileURLWithPath: "/"), alias: alias, chip: hardware.brandString)
+                    runner.launchRun(
+                        baseURL: baseURL, bearer: bearer,
+                        alias: alias, chip: hardware.brandString)
                 }
                 .buttonStyle(.plain)
                 .font(.callout)
@@ -258,12 +270,10 @@ struct BenchmarkView: View {
 
     /// Failure state.
     ///
-    /// ``BenchmarkRunner`` returns the last four lines of the child's
-    /// combined stdout+stderr on a non-zero exit, which for a Python
-    /// sidecar is a raw traceback tail. Rendering that as the primary
-    /// message told the user nothing actionable and looked like a
-    /// crash. The raw text is still preserved — it just moves behind a
-    /// collapsed disclosure, and a classified sentence takes the front.
+    /// Runner details can be a local HTTP error or (for leaderboard publish)
+    /// a child-process traceback tail. Rendering either as the primary message
+    /// tells the user little, so raw text stays behind a disclosure and a
+    /// classified sentence takes the front.
     private func failedState(_ msg: String) -> some View {
         let diagnosis = BenchmarkView.classifyFailure(msg)
         return VStack(spacing: RapidTheme.Space.md) {
@@ -281,7 +291,8 @@ struct BenchmarkView: View {
 
             Button("Try again") {
                 runner.launchRun(
-                    binary: binary ?? URL(fileURLWithPath: "/"),
+                    baseURL: baseURL,
+                    bearer: bearer,
                     alias: alias,
                     chip: hardware.brandString
                 )
@@ -321,8 +332,8 @@ struct BenchmarkView: View {
     /// in one place rather than a new branch in the view.
     ///
     /// ``showsDetails`` is false for messages we authored ourselves
-    /// (they are already the explanation) and true for anything that
-    /// came out of the child process.
+    /// (they are already the explanation) and true for raw transport/process
+    /// details.
     static func classifyFailure(_ raw: String) -> (headline: String, showsDetails: Bool) {
         let lowered = raw.lowercased()
 

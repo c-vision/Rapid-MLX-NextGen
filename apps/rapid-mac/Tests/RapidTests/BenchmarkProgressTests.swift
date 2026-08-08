@@ -60,21 +60,22 @@ struct BenchmarkProgressTests {
 
     // MARK: - ETA estimate
 
-    @Test("ETA scales with model size and is larger for submit")
+    @Test("Loaded-model ETA is fixed; submit still scales with size")
     func etaScalesWithSize() {
         let small = BenchmarkRunner.etaSeconds(alias: "qwen3.5-4b", kind: .benchmark)
         let big = BenchmarkRunner.etaSeconds(alias: "qwen3.6-27b-8bit", kind: .benchmark)
-        #expect(small != nil && big != nil)
-        #expect((big ?? 0) > (small ?? 0), "a 27B should take longer than a 4B")
+        #expect(small == 30)
+        #expect(big == 30)
 
         let free = BenchmarkRunner.etaSeconds(alias: "gemma-4-12b", kind: .benchmark)!
         let submit = BenchmarkRunner.etaSeconds(alias: "gemma-4-12b", kind: .submit)!
         #expect(submit > free, "submit re-runs the full standardized workload")
     }
 
-    @Test("ETA is nil for a custom alias with no parseable size")
+    @Test("Only submit needs a parseable model size for ETA")
     func etaNilForUnknown() {
-        #expect(BenchmarkRunner.etaSeconds(alias: "my-custom-model", kind: .benchmark) == nil)
+        #expect(BenchmarkRunner.etaSeconds(alias: "my-custom-model", kind: .benchmark) == 30)
+        #expect(BenchmarkRunner.etaSeconds(alias: "my-custom-model", kind: .submit) == nil)
     }
 
     // MARK: - Caption + bar fraction

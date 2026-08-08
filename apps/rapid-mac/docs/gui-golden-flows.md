@@ -13,14 +13,17 @@ Rapid-MLX Desktop app without loading a real model.
 6. a memory-constrained user can see and select an honestly labelled sub-1B
    fallback instead of being sent back to a chooser whose smallest visible
    model is the one that just failed the live-memory guard.
+7. “Speed on this Mac” benchmarks the model already resident in the desktop
+   server: one server start, then one warm-up plus one measured request, with
+   no second model process and no duplicate weight load.
 
 **Invariants** — properties that must hold, not paths a user walks. These were
 added after a release where every escaped defect landed on a surface no journey
 covered, and each one names the defect it would have caught:
 
-7. `update-state` — Settings → App must name the version the app actually is.
-8. `no-dead-controls` — every Settings panel must expose controls of its own.
-9. `catalog-integrity` — a model that cannot chat must never be offered as one.
+8. `update-state` — Settings → App must name the version the app actually is.
+9. `no-dead-controls` — every Settings panel must expose controls of its own.
+10. `catalog-integrity` — a model that cannot chat must never be offered as one.
 
 The distinction matters. A journey answers *"can someone do this?"*; an
 invariant answers *"is this still true everywhere?"*. The three defects below
@@ -150,6 +153,22 @@ the original live-memory snapshot against the fallback footprint and exposes
 promise or a warning loop; **Cancel** still returns to the chooser where the
 low-memory category remains visible.
 
+### Loaded-model speed test
+
+`loaded-model-benchmark` pins the resource contract behind **Speed on this
+Mac**. The action is only available after the selected model is ready. It then
+reuses that server's live loopback port and bearer, sends a short warm-up and an
+up-to-128-token measured request, and calculates completion tokens per wall
+second. It must not invoke `rapid-mlx bench`, start another server, or load a
+second copy of the weights.
+
+The deterministic fake sidecar records the evidence the UI alone cannot show:
+exactly one `server_started` event and exactly two `benchmark_request` events.
+The flow also waits for `Benchmark.LoadedModelResult`, proving the number made
+it back through the real sheet. This would have caught the old implementation,
+which rejected an 8B speed test for lack of memory precisely because it tried
+to load an unnecessary second 8B copy.
+
 ## Run
 
 Build the current checkout, then run all flows:
@@ -165,6 +184,7 @@ Run one journey or retain its isolated persona for diagnosis:
 ```bash
 ./scripts/gui-golden-flows.sh --flow slow-stream-stop
 ./scripts/gui-golden-flows.sh --flow low-memory-choice
+./scripts/gui-golden-flows.sh --flow loaded-model-benchmark
 ./scripts/gui-golden-flows.sh --flow chat-restore --keep
 ./scripts/gui-golden-flows.sh --flow no-dead-controls
 ```
