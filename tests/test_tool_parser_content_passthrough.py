@@ -28,6 +28,7 @@ not be able to lose text to the tool layer.
 
 import pytest
 
+from vllm_mlx.api.models import ToolDefinition
 from vllm_mlx.config import get_config
 from vllm_mlx.service import helpers
 from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParserManager
@@ -282,6 +283,80 @@ class TestOnlyDeclaredToolsBecomeCalls:
         assert result.tools_called is True
         assert result.tool_calls[0]["name"] == "write_file"
 
+    def test_pydantic_tool_definition_is_executable(self):
+        tool = ToolDefinition.model_validate(DECLARED_TOOLS[0])
+        wire = (
+            "<tool_call><function=write_file>"
+            "<parameter=path>a.md</parameter>"
+            "<parameter=content>hi</parameter>"
+            "</function></tool_call>"
+        )
+        result = _qwen3coder().extract_tool_calls(wire, {"tools": [tool]})
+
+        assert result.tools_called is True
+        assert result.tool_calls[0]["name"] == "write_file"
+        assert result.tool_calls[0]["arguments"] == (
+            '{"path": "a.md", "content": "hi"}'
+        )
+
+        streaming = _qwen3coder().extract_tool_calls_streaming(
+            "", wire, wire, request={"tools": [tool]}
+        )
+        assert streaming is not None
+        assert streaming["tool_calls"][0]["function"] == {
+            "name": "write_file",
+            "arguments": '{"path": "a.md", "content": "hi"}',
+        }
+
+    def test_rejected_prose_does_not_hide_a_later_declared_call(self):
+        text = (
+            "Docs: <function=read_file></function> then call: "
+            "<tool_call><function=write_file>"
+            "<parameter=path>a.md</parameter>"
+            "<parameter=content>hi</parameter>"
+            "</function></tool_call>"
+        )
+        result = _qwen3coder().extract_tool_calls(
+            text, {"tools": DECLARED_TOOLS, "tool_choice": "auto"}
+        )
+
+        assert result.tools_called is True
+        assert [call["name"] for call in result.tool_calls] == ["write_file"]
+        assert result.content == ("Docs: <function=read_file></function> then call: ")
+
+    def test_shared_wrapper_is_preserved_for_a_rejected_sibling(self):
+        text = (
+            "<tool_call><function=read_file></function>"
+            "<function=write_file>"
+            "<parameter=path>a.md</parameter>"
+            "<parameter=content>hi</parameter>"
+            "</function></tool_call>"
+        )
+        result = _qwen3coder().extract_tool_calls(text, {"tools": DECLARED_TOOLS})
+
+        assert result.tools_called is True
+        assert [call["name"] for call in result.tool_calls] == ["write_file"]
+        assert result.content == (
+            "<tool_call><function=read_file></function></tool_call>"
+        )
+
+    def test_shared_wrapper_admits_a_later_zero_argument_call(self):
+        ping = {
+            "type": "function",
+            "function": {"name": "ping", "parameters": {}},
+        }
+        text = (
+            "<tool_call><function=read_file></function>"
+            "<function=ping></function></tool_call>"
+        )
+        result = _qwen3coder().extract_tool_calls(text, {"tools": [ping]})
+
+        assert result.tools_called is True
+        assert [call["name"] for call in result.tool_calls] == ["ping"]
+        assert result.content == (
+            "<tool_call><function=read_file></function></tool_call>"
+        )
+
     @pytest.mark.parametrize(
         "request_payload",
         [
@@ -422,6 +497,7 @@ class TestTruncatedCallsStillRecover:
         result = _qwen3coder().extract_tool_calls(wire, {"tools": DECLARED_TOOLS})
         assert result.tools_called is True
         assert result.tool_calls[0]["name"] == "write_file"
+        assert result.content is None
 
     def test_wrapped_zero_arg_call_truncated_after_header_recovers(self):
         request = {
@@ -440,6 +516,7 @@ class TestTruncatedCallsStillRecover:
         )
         assert result.tools_called is True
         assert result.tool_calls[0]["name"] == "ping"
+        assert result.content is None
 
         # Without canonical framing, a zero-argument span is indistinguishable
         # from prose documenting the protocol and remains non-executable.
@@ -449,6 +526,18 @@ class TestTruncatedCallsStillRecover:
             "<tool_call></tool_call> prose <function=ping>", request
         )
         assert unrelated_wrapper.tools_called is False
+
+    def test_call_truncated_after_function_close_removes_open_wrapper(self):
+        wire = (
+            "<tool_call><function=write_file>"
+            "<parameter=path>a.md</parameter>"
+            "<parameter=content>hi</parameter>"
+            "</function>"
+        )
+        result = _qwen3coder().extract_tool_calls(wire, {"tools": DECLARED_TOOLS})
+
+        assert result.tools_called is True
+        assert result.content is None
 
     def test_complete_call_is_unaffected(self):
         wire = (

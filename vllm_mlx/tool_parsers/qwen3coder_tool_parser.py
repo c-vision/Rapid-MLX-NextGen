@@ -46,16 +46,21 @@ def _generate_tool_id() -> str:
     return f"call_{uuid.uuid4().hex[:8]}"
 
 
-def _get_arguments_config(func_name: str, tools: list[dict] | None) -> dict:
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    """Read a request field from either its wire dict or Pydantic model."""
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _get_arguments_config(func_name: str, tools: list[Any] | None) -> dict:
     """Extract argument config from tools list for type conversion."""
     if tools is None:
         return {}
     for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        func = tool.get("function", {})
-        if func.get("name") == func_name:
-            params = func.get("parameters", {})
+        func = _field(tool, "function", {})
+        if _field(func, "name") == func_name:
+            params = _field(func, "parameters", {})
             if isinstance(params, dict) and "properties" in params:
                 return params["properties"]
             return {}
@@ -311,7 +316,7 @@ class Qwen3CoderToolParser(ToolParser):
         return f'{inner}"'
 
     def _parse_xml_function_call(
-        self, function_call_str: str, tools: list[dict] | None
+        self, function_call_str: str, tools: list[Any] | None
     ) -> dict | None:
         """Parse a single function call from XML and return a tool call dict."""
         try:
@@ -359,45 +364,151 @@ class Qwen3CoderToolParser(ToolParser):
         }
 
     def _get_function_calls(self, model_output: str) -> list[str]:
-        calls = []
+        return [body for body, _, _, _ in self._function_call_candidates(model_output)]
+
+    def _function_call_candidates(
+        self, model_output: str
+    ) -> list[tuple[str, int, int, bool]]:
+        """Return function bodies and the exact framing span each occupies."""
+        candidates: list[tuple[str, int, int, bool]] = []
         for start in self._function_start_positions(model_output):
-            end = self._top_level_function_close(model_output, start)
+            close = self._top_level_function_close(model_output, start)
             body_start = start + len(self.tool_call_prefix)
-            if end == -1:
-                # Preserve the established max-token recovery contract: a
-                # function whose parameter blocks are complete is executable
-                # even when generation stopped before ``</function>``.  Do not
-                # recover a partially emitted parameter value.
-                candidate = model_output[body_start:]
-                complete_params = self.parameter_prefix in candidate and (
-                    candidate.rstrip().endswith(self.parameter_end_token)
+            if close == -1:
+                body = model_output[body_start:]
+                complete_params = (
+                    self.parameter_prefix in body
+                    and body.rstrip().endswith(self.parameter_end_token)
                 )
-                header_end = candidate.find(">")
                 wrapper_start = model_output.rfind(self.tool_call_start_token, 0, start)
                 wrapper_close = model_output.rfind(self.tool_call_end_token, 0, start)
                 wrapped_zero_arg = (
                     wrapper_start > wrapper_close
-                    and header_end >= 0
-                    and not candidate[header_end + 1 :].strip()
+                    and body.find(">") >= 0
+                    and not body[body.find(">") + 1 :].strip()
                 )
-                if complete_params or wrapped_zero_arg:
-                    calls.append(candidate)
-                continue
-            calls.append(model_output[body_start:end])
-        return calls
+                if not (complete_params or wrapped_zero_arg):
+                    continue
+                function_end = len(model_output)
+            else:
+                body = model_output[body_start:close]
+                function_end = close + len(self.function_end_token)
+
+            span_start = start
+            wrapper_start = model_output.rfind(self.tool_call_start_token, 0, start)
+            wrapper_close_before = model_output.rfind(
+                self.tool_call_end_token, 0, start
+            )
+            is_wrapped = wrapper_start > wrapper_close_before
+            if (
+                wrapper_start >= 0
+                and not model_output[
+                    wrapper_start + len(self.tool_call_start_token) : start
+                ].strip()
+            ):
+                span_start = wrapper_start
+
+            span_end = function_end
+            wrapper_end = model_output.find(self.tool_call_end_token, function_end)
+            if wrapper_end >= 0 and not model_output[function_end:wrapper_end].strip():
+                span_end = wrapper_end + len(self.tool_call_end_token)
+            candidates.append((body, span_start, span_end, is_wrapped))
+        return candidates
+
+    def _content_without_admitted_calls(
+        self, model_output: str, admitted_spans: list[tuple[int, int]]
+    ) -> str:
+        """Remove admitted functions without leaving half of a shared wrapper."""
+        ranges: list[tuple[int, int]] = []
+        for span_start, span_end in admitted_spans:
+            function_start = model_output.find(
+                self.tool_call_prefix, span_start, span_end
+            )
+            function_close = self._top_level_function_close(
+                model_output, function_start
+            )
+            function_end = (
+                function_close + len(self.function_end_token)
+                if function_close >= 0
+                else span_end
+            )
+            owns_wrapper = model_output[span_start:].startswith(
+                self.tool_call_start_token
+            )
+            wrapper_close = model_output.find(self.tool_call_end_token, function_end)
+            if owns_wrapper and (function_close < 0 or wrapper_close < 0):
+                function_start = span_start
+            ranges.append((function_start, function_end))
+
+        ranges.sort()
+        merged_ranges: list[tuple[int, int]] = []
+        for start, end in ranges:
+            if merged_ranges and start <= merged_ranges[-1][1]:
+                merged_ranges[-1] = (
+                    merged_ranges[-1][0],
+                    max(end, merged_ranges[-1][1]),
+                )
+            else:
+                merged_ranges.append((start, end))
+        ranges = merged_ranges
+
+        # A wrapper may frame more than one function. Strip its delimiters only
+        # when every non-whitespace byte inside it is already being removed;
+        # otherwise both delimiters belong to the rejected content sibling.
+        search_from = 0
+        range_index = 0
+        wrapper_ranges: list[tuple[int, int]] = []
+        while True:
+            wrapper_start = model_output.find(self.tool_call_start_token, search_from)
+            if wrapper_start < 0:
+                break
+            inner_start = wrapper_start + len(self.tool_call_start_token)
+            wrapper_close = model_output.find(self.tool_call_end_token, inner_start)
+            if wrapper_close < 0:
+                break
+            while range_index < len(ranges) and ranges[range_index][1] <= inner_start:
+                range_index += 1
+            cursor = inner_start
+            residual = False
+            candidate_index = range_index
+            while (
+                candidate_index < len(ranges)
+                and ranges[candidate_index][0] < wrapper_close
+            ):
+                start, end = ranges[candidate_index]
+                if model_output[cursor : max(cursor, start)].strip():
+                    residual = True
+                    break
+                cursor = max(cursor, min(end, wrapper_close))
+                candidate_index += 1
+            if not residual and model_output[cursor:wrapper_close].strip():
+                residual = True
+            if not residual:
+                wrapper_ranges.append(
+                    (
+                        wrapper_start,
+                        wrapper_close + len(self.tool_call_end_token),
+                    )
+                )
+            search_from = wrapper_close + len(self.tool_call_end_token)
+
+        content_parts = []
+        cursor = 0
+        for start, end in sorted([*ranges, *wrapper_ranges]):
+            if start > cursor:
+                content_parts.append(model_output[cursor:start])
+            cursor = max(cursor, end)
+        content_parts.append(model_output[cursor:])
+        return "".join(content_parts)
 
     @staticmethod
     def _named_tool_choice(request: dict[str, Any] | None) -> str | None:
         if not isinstance(request, dict):
             return None
         choice = request.get("tool_choice")
-        if isinstance(choice, dict):
-            function = choice.get("function")
-            selected = (
-                function.get("name")
-                if isinstance(function, dict)
-                else choice.get("name")
-            )
+        if isinstance(choice, dict) or choice is not None:
+            function = _field(choice, "function")
+            selected = _field(function, "name") or _field(choice, "name")
             if isinstance(selected, str) and selected:
                 return selected
         return None
@@ -409,14 +520,8 @@ class Qwen3CoderToolParser(ToolParser):
             return set()
         names: set[str] = set()
         for tool in request.get("tools") or []:
-            if not isinstance(tool, dict):
-                continue
-            function = tool.get("function")
-            if isinstance(function, dict):
-                name = function.get("name")
-            else:
-                # Responses-native tools are flat: {type, name, parameters}.
-                name = tool.get("name")
+            function = _field(tool, "function")
+            name = _field(function, "name") or _field(tool, "name")
             if isinstance(name, str) and name:
                 names.add(name)
         selected = cls._named_tool_choice(request)
@@ -433,8 +538,8 @@ class Qwen3CoderToolParser(ToolParser):
             )
 
         try:
-            function_calls = self._get_function_calls(model_output)
-            if not function_calls:
+            candidates = self._function_call_candidates(model_output)
+            if not candidates:
                 return ExtractedToolCallInformation(
                     tools_called=False, tool_calls=[], content=model_output
                 )
@@ -444,10 +549,11 @@ class Qwen3CoderToolParser(ToolParser):
             selected = self._named_tool_choice(request)
 
             tool_calls = []
-            for fc_str in function_calls:
+            accepted_spans: list[tuple[int, int]] = []
+            for fc_str, span_start, span_end, is_wrapped in candidates:
                 candidate_name = fc_str.split(">", 1)[0]
                 if (
-                    self.tool_call_start_token not in model_output
+                    not is_wrapped
                     and self.parameter_prefix not in fc_str
                     and candidate_name != selected
                 ):
@@ -456,9 +562,7 @@ class Qwen3CoderToolParser(ToolParser):
                     # documenting the wire format. Require either canonical
                     # framing or parameter structure before model text can
                     # become executable data.
-                    return ExtractedToolCallInformation(
-                        tools_called=False, tool_calls=[], content=model_output
-                    )
+                    continue
                 tc = self._parse_xml_function_call(fc_str, tools)
                 if not tc:
                     continue
@@ -466,22 +570,18 @@ class Qwen3CoderToolParser(ToolParser):
                     # Framing alone cannot distinguish executable wire from
                     # prose documenting that wire. A name the caller did not
                     # offer (including every name under tool_choice=none) is
-                    # never executable, so preserve the entire answer as text.
-                    return ExtractedToolCallInformation(
-                        tools_called=False, tool_calls=[], content=model_output
-                    )
+                    # never executable. Preserve that span as text while still
+                    # admitting independent, later candidates.
+                    continue
                 tool_calls.append(tc)
+                accepted_spans.append((span_start, span_end))
 
             if not tool_calls:
                 return ExtractedToolCallInformation(
                     tools_called=False, tool_calls=[], content=model_output
                 )
 
-            # Extract content before tool calls
-            content_index = model_output.find(self.tool_call_start_token)
-            idx = model_output.find(self.tool_call_prefix)
-            content_index = content_index if content_index >= 0 else idx
-            content = model_output[:content_index]
+            content = self._content_without_admitted_calls(model_output, accepted_spans)
 
             return ExtractedToolCallInformation(
                 tools_called=len(tool_calls) > 0,
