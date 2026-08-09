@@ -241,6 +241,30 @@ def test_legacy_raw_string_preserves_embedded_xml_closers(value: str, chunking: 
 
 
 @pytest.mark.parametrize(
+    "wrapper_chunks",
+    [
+        pytest.param(["</tool_call>"[:cut], "</tool_call>"[cut:]], id=f"cut-{cut}")
+        for cut in range(1, len("</tool_call>"))
+    ]
+    + [pytest.param(list("</tool_call>"), id="one-byte")],
+)
+def test_trailing_wrapper_never_leaks_across_chunk_boundaries(wrapper_chunks):
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("write_file", {"content": {"type": "string"}})
+    chunks = [
+        "<tool_call>\n",
+        "<function=write_file>\n",
+        "<parameter=content>\nhello\n</parameter>\n",
+        "</function>\n",
+        *wrapper_chunks,
+    ]
+
+    deltas = _feed(parser, chunks, request)
+    assert json.loads("".join(_argument_fragments(deltas))) == {"content": "hello"}
+    assert "".join(delta.get("content", "") for delta in deltas) == ""
+
+
+@pytest.mark.parametrize(
     ("tool_name", "param_name", "value"),
     [
         (

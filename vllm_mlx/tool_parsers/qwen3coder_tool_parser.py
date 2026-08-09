@@ -269,6 +269,7 @@ class Qwen3CoderToolParser(ToolParser):
         self.in_param_emitted_chars = 0
         self.in_param_opened = False
         self.in_param_name: str | None = None
+        self._trailing_wrapper_buffer = ""
 
     def _emit_string_increment(self, param_name: str, value_text: str) -> str:
         """Return a JSON fragment for the safe (already-final) portion of an
@@ -835,6 +836,24 @@ class Qwen3CoderToolParser(ToolParser):
         # content-before-strip position is whichever opener appears first
         # in ``delta_text`` so wrapper framing never leaks to the client.
         if not self.is_tool_call_started:
+            if self._trailing_wrapper_buffer or previous_text.rstrip().endswith(
+                self.function_end_token
+            ):
+                candidate = self._trailing_wrapper_buffer + delta_text
+                stripped = candidate.lstrip()
+                if self.tool_call_end_token.startswith(stripped):
+                    self._trailing_wrapper_buffer = (
+                        "" if stripped == self.tool_call_end_token else candidate
+                    )
+                    return None
+                if (
+                    stripped.startswith(self.tool_call_end_token)
+                    and not stripped[len(self.tool_call_end_token) :].strip()
+                ):
+                    self._trailing_wrapper_buffer = ""
+                    return None
+                self._trailing_wrapper_buffer = ""
+                return {"content": candidate}
             if self._has_new_opener(delta_text, delta_token_ids):
                 self.is_tool_call_started = True
                 opener_pos = self._first_opener_pos(delta_text)
@@ -884,16 +903,9 @@ class Qwen3CoderToolParser(ToolParser):
                 # emit an empty tail. ``</function>`` is the actual tool
                 # close; ``</tool_call>`` may follow as optional framing.
                 trailing = current_text.rstrip()
-                if (
-                    delta_text.strip() == ""
-                    and (
-                        trailing.endswith(self.tool_call_end_token)
-                        or trailing.endswith(self.function_end_token)
-                    )
-                ) or (
-                    delta_text.strip() == self.tool_call_end_token
-                    and previous_text.rstrip().endswith(self.function_end_token)
-                    and trailing.endswith(self.tool_call_end_token)
+                if delta_text.strip() == "" and (
+                    trailing.endswith(self.tool_call_end_token)
+                    or trailing.endswith(self.function_end_token)
                 ):
                     return None
                 return {"content": delta_text}
