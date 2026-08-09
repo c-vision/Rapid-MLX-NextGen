@@ -2211,13 +2211,51 @@ def _decode_tts_ref_audio(value: str) -> bytes:
     return decoded
 
 
+def _served_tts_default() -> str | None:
+    """The served TTS model's name, or ``None`` when no TTS model is served.
+
+    ``rapid-mlx serve qwen3-tts-voicedesign`` stamps the served alias onto
+    ``ServerConfig.model_alias`` and its HF id onto ``model_name`` (see the
+    audio branch of ``cli.serve_command``). Without consulting it, the TTS
+    routes fall back to :data:`DEFAULT_TTS_ALIAS` for an omitted ``model``, so a
+    server started on one TTS model answers a bare ``/v1/audio/voices`` with
+    Kokoro's voices — and a bare ``/v1/audio/speech`` tries to LOAD Kokoro —
+    contradicting the ``Audio mode: <alias>`` banner it printed at boot.
+
+    Returns ``None`` (caller falls back to :data:`DEFAULT_TTS_ALIAS`) whenever
+    nothing served resolves to a TTS registry entry: a text model running with
+    ``--enable-audio``, a served STT-only model, or the API-only test config
+    whose ``model_alias`` / ``model_name`` are both unset.
+    """
+    from ..audio.registry import resolve_audio_alias
+    from ..config import get_config
+
+    cfg = get_config()
+    # Check the alias AND the HF id independently, not ``alias or name``: under
+    # ``--served-model-name foo`` the alias is the operator's opaque gateway
+    # name (which resolves to nothing) while the real TTS model lives on
+    # ``model_name``. Short-circuiting on the truthy-but-unrecognised alias
+    # would wrongly fall back to Kokoro. First TTS hit wins.
+    for served in (getattr(cfg, "model_alias", None), getattr(cfg, "model_name", None)):
+        if not served:
+            continue
+        entry = resolve_audio_alias(served)
+        if entry is not None and entry.type == "tts":
+            return served
+    return None
+
+
 def _resolve_tts_model(model: str | None) -> str:
     """Map a TTS request-time alias to its HF repo id.
 
     Recognises:
 
-    * ``None`` / ``""`` / ``"default"`` → :data:`DEFAULT_TTS_ALIAS`'s
-      mapped HF id (R-03 OpenAI-canonical placeholder).
+    * ``None`` / ``""`` / ``"default"`` → the served TTS model when this
+      process was started to serve one (:func:`_served_tts_default`), else
+      :data:`DEFAULT_TTS_ALIAS`'s mapped HF id (R-03 OpenAI-canonical
+      placeholder). Honouring the served model first is what makes
+      ``rapid-mlx serve qwen3-tts-voicedesign`` answer a bare request with
+      that model instead of silently loading Kokoro.
     * A short alias listed in :data:`TTS_MODEL_ALIASES` → its mapped
       HF id.
     * Anything else → pass through verbatim (a HuggingFace repo id
@@ -2233,6 +2271,11 @@ def _resolve_tts_model(model: str | None) -> str:
     short alias table, never for passthrough.
     """
     if not model or model == "default":
+        served = _served_tts_default()
+        if served is not None:
+            # ``served`` is a concrete alias / HF id, never a placeholder, so
+            # this reuses the exact mapping rule below without recursing again.
+            return _resolve_tts_model(served)
         return TTS_MODEL_ALIASES[DEFAULT_TTS_ALIAS]
     return TTS_MODEL_ALIASES.get(model.lower(), model)
 
@@ -2546,7 +2589,15 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
 
     # Pydantic already validated min_length / non-blank — past this
     # point the input is safe to forward.
-    model = request.model
+    #
+    # An OMITTED ``model`` follows the served model, not the Pydantic
+    # placeholder default ("kokoro"): serving qwen3-tts-voicedesign and posting
+    # a bare request should render with THAT model, not silently load Kokoro.
+    # Detected via ``model_fields_set`` — the same mechanism the voice default
+    # below uses — so an EXPLICIT ``"model": "kokoro"`` on a non-Kokoro server
+    # is still honoured, while the omitted case flows through
+    # ``_resolve_tts_model(None)`` to :func:`_served_tts_default`.
+    model = request.model if "model" in request.model_fields_set else None
     input_text = request.input
     voice = request.voice
     speed = request.speed
@@ -3210,8 +3261,15 @@ async def create_music(request: AudioMusicRequest = Body(...)):
 
 
 @router.get("/v1/audio/voices", dependencies=[Depends(verify_api_key)])
-async def list_voices(model: str = "kokoro"):
+async def list_voices(model: str | None = None):
     """List available voices for a TTS model.
+
+    When ``model`` is omitted the listing follows the model this server is
+    actually serving (:func:`_served_tts_default`), falling back to
+    :data:`DEFAULT_TTS_ALIAS` only when no TTS model is served. Pre-fix the
+    query defaulted to the literal ``"kokoro"``, so a server started on a
+    different TTS model advertised Kokoro's voices here and then 400'd with
+    ``invalid_voice`` when the caller sent one to ``/v1/audio/speech``.
 
     F-D05: gates on the same :func:`require_mlx_audio` probe that
     ``/v1/audio/speech`` uses so callers can't get a 200 with a
@@ -3242,4 +3300,11 @@ async def list_voices(model: str = "kokoro"):
     # via the registry and falls back to the per-family static list
     # when the snapshot isn't cached locally — same contract as the
     # speech route.
+    # ``None`` / ``""`` / ``"default"`` are all the omitted-model case — the
+    # same placeholder set ``_resolve_tts_model`` collapses — so an explicit
+    # ``?model=default`` selects the served model here exactly as it does on
+    # /v1/audio/speech, rather than being handed to ``_allowed_voices_for``
+    # verbatim.
+    if not model or model == "default":
+        model = _served_tts_default() or DEFAULT_TTS_ALIAS
     return {"voices": _allowed_voices_for(model)}
