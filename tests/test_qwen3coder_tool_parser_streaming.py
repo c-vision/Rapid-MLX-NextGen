@@ -345,10 +345,23 @@ def test_raw_call_does_not_consume_a_later_call():
     )
 
     deltas = _feed(
-        parser, ["<tool_call>", first[len("<tool_call>") :] + second], request
+        parser,
+        ["<tool_call>", first[len("<tool_call>") :] + second, "\n", "\n"],
+        request,
     )
-    fragments = _argument_fragments(deltas)
-    assert json.loads("".join(fragments)) == {"content": "first"}
+    argument_documents = [
+        tc["function"]["arguments"]
+        for delta in deltas
+        for tc in delta.get("tool_calls", [])
+        if tc.get("function", {}).get("arguments") not in (None, "", "{", "}")
+    ]
+    assert [json.loads(document) for document in argument_documents] == [
+        {"content": "first"},
+        {"content": "second"},
+    ]
+    streamed_content = "".join(delta.get("content", "") for delta in deltas)
+    assert "<tool_call>" not in streamed_content
+    assert "<function=" not in streamed_content
 
 
 def test_content_closer_after_raw_call_is_not_used_as_wrapper():

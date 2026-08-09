@@ -924,6 +924,12 @@ class Qwen3CoderToolParser(ToolParser):
             if self.current_tool_index + 1 < len(function_starts)
             else len(current_text)
         )
+        if self.current_tool_index + 1 < len(function_starts):
+            next_wrapper = current_text.rfind(
+                self.tool_call_start_token, tool_start_idx, call_limit
+            )
+            if next_wrapper >= 0:
+                call_limit = next_wrapper
         func_close_idx = self._top_level_function_close(current_text, tool_start_idx)
         param_header = current_text.find(self.parameter_prefix, tool_start_idx)
         raw_parameter = False
@@ -965,7 +971,6 @@ class Qwen3CoderToolParser(ToolParser):
                 ):
                     func_close_idx = candidate_close
                     structural_wrapper_close = candidate_wrapper
-                    break
                 search_from = candidate_close + len(self.function_end_token)
         elif raw_parameter:
             func_close_idx = -1
@@ -979,7 +984,6 @@ class Qwen3CoderToolParser(ToolParser):
                 before_close = current_text[tool_start_idx:candidate_close].rstrip()
                 if before_close.endswith(self.parameter_end_token):
                     func_close_idx = candidate_close
-                    break
                 search_from = candidate_close + len(self.function_end_token)
         content_after_wrapper = ""
         if self._pending_tool_wrapped and func_close_idx != -1:
@@ -991,7 +995,8 @@ class Qwen3CoderToolParser(ToolParser):
                 )
             if structural_wrapper_close >= 0:
                 content_after_wrapper = current_text[
-                    structural_wrapper_close + len(self.tool_call_end_token) :
+                    structural_wrapper_close
+                    + len(self.tool_call_end_token) : call_limit
                 ]
         if func_close_idx == -1:
             tool_text = current_text[tool_start_idx:]
