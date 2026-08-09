@@ -411,6 +411,66 @@ class Qwen3CoderToolParser(ToolParser):
             candidates.append((body, span_start, span_end))
         return candidates
 
+    def _content_without_admitted_calls(
+        self, model_output: str, admitted_spans: list[tuple[int, int]]
+    ) -> str:
+        """Remove admitted functions without leaving half of a shared wrapper."""
+        ranges: list[tuple[int, int]] = []
+        for span_start, span_end in admitted_spans:
+            function_start = model_output.find(
+                self.tool_call_prefix, span_start, span_end
+            )
+            function_close = self._top_level_function_close(
+                model_output, function_start
+            )
+            function_end = (
+                function_close + len(self.function_end_token)
+                if function_close >= 0
+                else span_end
+            )
+            ranges.append((function_start, function_end))
+
+        # A wrapper may frame more than one function. Strip its delimiters only
+        # when every non-whitespace byte inside it is already being removed;
+        # otherwise both delimiters belong to the rejected content sibling.
+        search_from = 0
+        while True:
+            wrapper_start = model_output.find(self.tool_call_start_token, search_from)
+            if wrapper_start < 0:
+                break
+            inner_start = wrapper_start + len(self.tool_call_start_token)
+            wrapper_close = model_output.find(self.tool_call_end_token, inner_start)
+            if wrapper_close < 0:
+                break
+            residual_parts = []
+            cursor = inner_start
+            for start, end in ranges:
+                if end <= inner_start or start >= wrapper_close:
+                    continue
+                residual_parts.append(model_output[cursor : max(cursor, start)])
+                cursor = max(cursor, min(end, wrapper_close))
+            residual_parts.append(model_output[cursor:wrapper_close])
+            if not "".join(residual_parts).strip():
+                ranges.extend(
+                    [
+                        (wrapper_start, inner_start),
+                        (
+                            wrapper_close,
+                            wrapper_close + len(self.tool_call_end_token),
+                        ),
+                    ]
+                )
+            search_from = wrapper_close + len(self.tool_call_end_token)
+
+        content_parts = []
+        cursor = 0
+        for start, end in sorted(ranges):
+            if start > cursor:
+                content_parts.append(model_output[cursor:start])
+            cursor = max(cursor, end)
+        content_parts.append(model_output[cursor:])
+        return "".join(content_parts)
+
     @staticmethod
     def _named_tool_choice(request: dict[str, Any] | None) -> str | None:
         if not isinstance(request, dict):
@@ -493,13 +553,7 @@ class Qwen3CoderToolParser(ToolParser):
                     tools_called=False, tool_calls=[], content=model_output
                 )
 
-            content_parts = []
-            cursor = 0
-            for span_start, span_end in accepted_spans:
-                content_parts.append(model_output[cursor:span_start])
-                cursor = span_end
-            content_parts.append(model_output[cursor:])
-            content = "".join(content_parts)
+            content = self._content_without_admitted_calls(model_output, accepted_spans)
 
             return ExtractedToolCallInformation(
                 tools_called=len(tool_calls) > 0,

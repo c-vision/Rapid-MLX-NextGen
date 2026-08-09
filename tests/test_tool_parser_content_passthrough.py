@@ -324,6 +324,22 @@ class TestOnlyDeclaredToolsBecomeCalls:
         assert [call["name"] for call in result.tool_calls] == ["write_file"]
         assert result.content == ("Docs: <function=read_file></function> then call: ")
 
+    def test_shared_wrapper_is_preserved_for_a_rejected_sibling(self):
+        text = (
+            "<tool_call><function=read_file></function>"
+            "<function=write_file>"
+            "<parameter=path>a.md</parameter>"
+            "<parameter=content>hi</parameter>"
+            "</function></tool_call>"
+        )
+        result = _qwen3coder().extract_tool_calls(text, {"tools": DECLARED_TOOLS})
+
+        assert result.tools_called is True
+        assert [call["name"] for call in result.tool_calls] == ["write_file"]
+        assert result.content == (
+            "<tool_call><function=read_file></function></tool_call>"
+        )
+
     @pytest.mark.parametrize(
         "request_payload",
         [
