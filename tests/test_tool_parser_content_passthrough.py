@@ -480,6 +480,7 @@ class TestTruncatedCallsStillRecover:
         result = _qwen3coder().extract_tool_calls(wire, {"tools": DECLARED_TOOLS})
         assert result.tools_called is True
         assert result.tool_calls[0]["name"] == "write_file"
+        assert result.content is None
 
     def test_wrapped_zero_arg_call_truncated_after_header_recovers(self):
         request = {
@@ -498,6 +499,7 @@ class TestTruncatedCallsStillRecover:
         )
         assert result.tools_called is True
         assert result.tool_calls[0]["name"] == "ping"
+        assert result.content is None
 
         # Without canonical framing, a zero-argument span is indistinguishable
         # from prose documenting the protocol and remains non-executable.

@@ -428,6 +428,10 @@ class Qwen3CoderToolParser(ToolParser):
                 if function_close >= 0
                 else span_end
             )
+            if function_close < 0 and model_output[span_start:].startswith(
+                self.tool_call_start_token
+            ):
+                function_start = span_start
             ranges.append((function_start, function_end))
 
         ranges.sort()
