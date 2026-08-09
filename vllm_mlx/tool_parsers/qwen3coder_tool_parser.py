@@ -270,6 +270,7 @@ class Qwen3CoderToolParser(ToolParser):
         self.in_param_opened = False
         self.in_param_name: str | None = None
         self._trailing_wrapper_buffer = ""
+        self._expecting_trailing_wrapper = False
 
     def _emit_string_increment(self, param_name: str, value_text: str) -> str:
         """Return a JSON fragment for the safe (already-final) portion of an
@@ -856,22 +857,25 @@ class Qwen3CoderToolParser(ToolParser):
         # content-before-strip position is whichever opener appears first
         # in ``delta_text`` so wrapper framing never leaks to the client.
         if not self.is_tool_call_started:
-            if self._trailing_wrapper_buffer or previous_text.rstrip().endswith(
-                self.function_end_token
-            ):
+            if self._trailing_wrapper_buffer or self._expecting_trailing_wrapper:
                 candidate = self._trailing_wrapper_buffer + delta_text
                 stripped = candidate.lstrip()
                 if self.tool_call_end_token.startswith(stripped):
                     self._trailing_wrapper_buffer = (
                         "" if stripped == self.tool_call_end_token else candidate
                     )
+                    if stripped == self.tool_call_end_token:
+                        self._expecting_trailing_wrapper = False
                     return None
                 if stripped.startswith(self.tool_call_end_token):
                     self._trailing_wrapper_buffer = ""
+                    self._expecting_trailing_wrapper = False
                     remainder = stripped[len(self.tool_call_end_token) :]
                     return {"content": remainder} if remainder else None
                 self._trailing_wrapper_buffer = ""
-                return {"content": candidate}
+                self._expecting_trailing_wrapper = False
+                if not self._has_new_opener(delta_text, delta_token_ids):
+                    return {"content": candidate}
             if self._has_new_opener(delta_text, delta_token_ids):
                 self.is_tool_call_started = True
                 opener_pos = self._first_opener_pos(delta_text)
@@ -953,6 +957,7 @@ class Qwen3CoderToolParser(ToolParser):
         func_close_idx = self._top_level_function_close(current_text, tool_start_idx)
         param_header = current_text.find(self.parameter_prefix, tool_start_idx)
         raw_parameter = False
+        structural_wrapper_close = -1
         while param_header >= 0:
             param_header_end = current_text.find(">", param_header)
             if param_header_end < 0:
@@ -988,6 +993,8 @@ class Qwen3CoderToolParser(ToolParser):
                         candidate_close
                         + len(self.function_end_token) : candidate_wrapper
                     ].strip()
+                    and candidate_close > 0
+                    and current_text[candidate_close - 1] == "\n"
                 ):
                     func_close_idx = candidate_close
                     structural_wrapper_close = candidate_wrapper
@@ -1003,6 +1010,8 @@ class Qwen3CoderToolParser(ToolParser):
                 if (
                     fallback_close >= 0
                     and before_close.endswith(self.parameter_end_token)
+                    and before_close[: -len(self.parameter_end_token)].endswith("\n")
+                    and current_text[fallback_close - 1] == "\n"
                     and not after_close.strip()
                 ):
                     func_close_idx = fallback_close
@@ -1016,7 +1025,13 @@ class Qwen3CoderToolParser(ToolParser):
                 if candidate_close < 0:
                     break
                 before_close = current_text[tool_start_idx:candidate_close].rstrip()
-                if before_close.endswith(self.parameter_end_token):
+                parameter_close = before_close.rfind(self.parameter_end_token)
+                if (
+                    parameter_close > 0
+                    and before_close[parameter_close - 1] == "\n"
+                    and candidate_close > 0
+                    and current_text[candidate_close - 1] == "\n"
+                ):
                     func_close_idx = candidate_close
                 search_from = candidate_close + len(self.function_end_token)
         content_after_wrapper = ""
@@ -1114,6 +1129,9 @@ class Qwen3CoderToolParser(ToolParser):
                         }
                         if content_after_wrapper:
                             result["content"] = content_after_wrapper
+                        self._expecting_trailing_wrapper = (
+                            self._pending_tool_wrapped and structural_wrapper_close < 0
+                        )
                         return result
 
                     self.prev_tool_call_arr.append(
@@ -1407,6 +1425,9 @@ class Qwen3CoderToolParser(ToolParser):
                 }
                 if content_after_wrapper:
                     result["content"] = content_after_wrapper
+                self._expecting_trailing_wrapper = (
+                    self._pending_tool_wrapped and structural_wrapper_close < 0
+                )
                 return result
 
         return None

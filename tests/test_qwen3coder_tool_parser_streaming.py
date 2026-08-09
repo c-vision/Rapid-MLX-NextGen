@@ -362,12 +362,12 @@ def test_raw_call_does_not_consume_a_later_call():
     parser = Qwen3CoderToolParser(tokenizer=None)
     request = _request_with_tool("write_file", {"content": {"type": "string"}})
     first = (
-        "<tool_call><function=write_file><parameter=content>first</parameter>"
-        "</function></tool_call>"
+        "<tool_call>\n<function=write_file>\n<parameter=content>first\n"
+        "</parameter>\n</function>\n</tool_call>"
     )
     second = (
-        "<tool_call><function=write_file><parameter=content>second</parameter>"
-        "</function></tool_call>"
+        "<tool_call>\n<function=write_file>\n<parameter=content>second\n"
+        "</parameter>\n</function>\n</tool_call>"
     )
 
     deltas = _feed(
@@ -390,12 +390,35 @@ def test_raw_call_does_not_consume_a_later_call():
     assert "<function=" not in streamed_content
 
 
+def test_consecutive_bare_raw_calls_remain_tool_calls():
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("write_file", {"content": {"type": "string"}})
+    first = "<function=write_file>\n<parameter=content>first\n</parameter>\n</function>"
+    second = (
+        "<function=write_file>\n<parameter=content>second\n</parameter>\n</function>"
+    )
+
+    deltas = _feed(parser, [first + second, "\n", "\n"], request)
+    argument_documents = [
+        tc["function"]["arguments"]
+        for delta in deltas
+        for tc in delta.get("tool_calls", [])
+        if tc.get("function", {}).get("arguments") not in (None, "", "{", "}")
+    ]
+    assert [json.loads(document) for document in argument_documents] == [
+        {"content": "first"},
+        {"content": "second"},
+    ]
+    streamed_content = "".join(delta.get("content", "") for delta in deltas)
+    assert "<function=" not in streamed_content
+
+
 def test_content_closer_after_raw_call_is_not_used_as_wrapper():
     parser = Qwen3CoderToolParser(tokenizer=None)
     request = _request_with_tool("write_file", {"content": {"type": "string"}})
     chunks = [
-        "<tool_call><function=write_file><parameter=content>hello</parameter>"
-        "</function></tool_call>after </tool_call> prose"
+        "<tool_call>\n<function=write_file>\n<parameter=content>hello\n</parameter>\n"
+        "</function>\n</tool_call>after </tool_call> prose"
     ]
 
     deltas = _feed(parser, chunks, request)
