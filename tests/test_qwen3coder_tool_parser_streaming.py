@@ -274,6 +274,7 @@ def test_trailing_wrapper_never_leaks_across_chunk_boundaries(wrapper_chunks):
         ["</tool_call>after"],
         ["</tool_", "call>after"],
         [*"</tool_call>", "after"],
+        ["</tool_call> \n", "after"],
     ],
 )
 def test_content_after_trailing_wrapper_is_preserved(wrapper_chunks):
@@ -289,7 +290,8 @@ def test_content_after_trailing_wrapper_is_preserved(wrapper_chunks):
 
     deltas = _feed(parser, chunks, request)
     assert json.loads("".join(_argument_fragments(deltas))) == {"content": "hello"}
-    assert "".join(delta.get("content", "") for delta in deltas) == "after"
+    expected = " \nafter" if wrapper_chunks[0].endswith(" \n") else "after"
+    assert "".join(delta.get("content", "") for delta in deltas) == expected
 
 
 def test_raw_second_parameter_uses_last_function_closer():
