@@ -15,6 +15,17 @@ can actually understand.
 
 ### Added
 
+- **A new Images tab generates pictures on your Mac.** Choose an image model,
+  follow the readiness prompt to load it, type a prompt and generate. Each
+  render joins a filmstrip below the picture; selecting an earlier one brings
+  its prompt back so you can adjust and re-run. Aspect ratio is 1:1, 3:4 or
+  4:3, and the save button writes a PNG wherever you choose.
+
+- **Chat accepts image attachments.** With a model that can read images, attach
+  one to a message and ask about it. Models that cannot read images show the
+  attach button disabled with "This model doesn't support images", rather than
+  letting you attach one and failing later.
+
 - **Web-page approvals now include “Always allow.”** Choose it once to let the
   model read future public web pages without interrupting you for every URL.
   Private and local addresses remain blocked, and the permission can be turned
@@ -34,9 +45,14 @@ can actually understand.
   things a new user saw. Tools still live in Settings → Tools; the speed test
   is gone for the reason above.
 
-- **The model menu lists models.** "Refresh catalog", "Type a model name" and
-  the "N small models hidden" footer are gone; what remains is the quickstart
-  picks, the recommendations, and the full alphabetical list.
+- **The model menu focuses on models.** The "N small models hidden" footer is
+  gone, and a menu with models in it no longer ends with "Refresh catalog" and
+  "Type a model name…" — those are now offered only when there is nothing to
+  choose yet. What you get is the quickstart picks, the recommendations, and
+  the model list, with the ones you have downloaded first in each group.
+  Models under 1B stay hidden unless you turn them on in
+  Settings → Model Management, except for the one you are currently using,
+  which always shows.
 
 ### Fixed
 
@@ -53,8 +69,8 @@ can actually understand.
 - **"Browse all models" in the setup wizard opens the model catalogue.** It used
   to close the wizard instead — your chosen model was discarded and you landed
   on the chat surface pinned to a model you never picked. It now opens
-  Settings → Models with the wizard still behind it, so closing Settings puts
-  you back on your selection.
+  Settings → Model Management with the wizard still behind it, so closing
+  Settings puts you back on your selection.
 
 ## [0.12.7] — 2026-08-07
 
