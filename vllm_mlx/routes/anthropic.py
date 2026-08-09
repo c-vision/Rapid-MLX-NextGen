@@ -104,7 +104,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _should_start_in_thinking(chat_template: str, enable_thinking: bool | None) -> bool:
+def _should_start_in_thinking(
+    chat_template: str,
+    enable_thinking: bool | None,
+    *,
+    unconditional: bool = False,
+    tools_requested: bool = False,
+) -> bool:
     """Thin wrapper over the shared
     ``service.helpers._should_start_in_thinking`` predicate.
 
@@ -117,7 +123,12 @@ def _should_start_in_thinking(chat_template: str, enable_thinking: bool | None) 
     """
     from ..service.helpers import _should_start_in_thinking as _shared
 
-    return _shared(chat_template, enable_thinking)
+    return _shared(
+        chat_template,
+        enable_thinking,
+        unconditional=unconditional,
+        tools_requested=tools_requested,
+    )
 
 
 def _named_tool_choice_target(tool_choice) -> str | None:
@@ -973,6 +984,16 @@ async def create_anthropic_message(
             enable_thinking=_effective_enable_thinking(
                 resolved_thinking, cfg.model_path or cfg.model_name
             ),
+            prompt_thinking_active=_should_start_in_thinking(
+                getattr(getattr(engine, "tokenizer", None), "chat_template", "") or "",
+                resolved_thinking,
+                unconditional=bool(
+                    getattr(
+                        cfg.reasoning_parser, "implicit_reasoning_until_close", False
+                    )
+                ),
+                tools_requested=bool(openai_request.tools),
+            ),
             # Per-request reasoning cap (upstream vLLM PR #20859 / #42396
             # backport). The adapter translated ``output_config.effort``
             # or legacy ``thinking.budget_tokens`` into this field on
@@ -1022,7 +1043,12 @@ async def create_anthropic_message(
         if _tok_ns and hasattr(_tok_ns, "chat_template"):
             _chat_template_ns = _tok_ns.chat_template or ""
         prompt_thinking_active_ns = _should_start_in_thinking(
-            _chat_template_ns, resolved_thinking
+            _chat_template_ns,
+            resolved_thinking,
+            unconditional=bool(
+                getattr(cfg.reasoning_parser, "implicit_reasoning_until_close", False)
+            ),
+            tools_requested=bool(openai_request.tools),
         )
         final_content = _rescue_silent_drop_from_reasoning(
             final_content,
@@ -1033,6 +1059,13 @@ async def create_anthropic_message(
             reasoning_is_case4=reasoning_is_case4,
             matched_stop=getattr(output, "matched_stop", None),
             prompt_thinking_active=prompt_thinking_active_ns,
+            implicit_reasoning_until_close=bool(
+                getattr(
+                    cfg.reasoning_parser,
+                    "implicit_reasoning_until_close",
+                    False,
+                )
+            ),
         )
         # Issue #858: Anthropic-side mirror of the chat-route cutoff
         # sentinel. Default-on (PR #802 / H-01 semantics restored) — the
@@ -1863,7 +1896,10 @@ async def _stream_anthropic_messages(
     if _tokenizer and hasattr(_tokenizer, "chat_template"):
         _chat_template = _tokenizer.chat_template or ""
     _starts_thinking = _should_start_in_thinking(
-        _chat_template, chat_kwargs.get("enable_thinking")
+        _chat_template,
+        chat_kwargs.get("enable_thinking"),
+        unconditional=cfg.reasoning_parser_name == "deepseek_r1_distill",
+        tools_requested=bool(chat_kwargs.get("tools")),
     )
     think_router = StreamingThinkRouter(start_in_thinking=_starts_thinking)
     # D-ANTHRO-TOOL-USAGE F5: seed the running counter with the
@@ -1994,7 +2030,16 @@ async def _stream_anthropic_messages(
     if reasoning_parser:
         configure_request = getattr(reasoning_parser, "configure_request", None)
         if callable(configure_request):
-            configure_request(enable_thinking=chat_kwargs.get("enable_thinking"))
+            configure_kwargs = {"enable_thinking": chat_kwargs.get("enable_thinking")}
+            if getattr(reasoning_parser, "implicit_reasoning_until_close", False):
+                configure_kwargs["prompt_thinking_active"] = _should_start_in_thinking(
+                    getattr(getattr(engine, "tokenizer", None), "chat_template", "")
+                    or "",
+                    chat_kwargs.get("enable_thinking"),
+                    unconditional=True,
+                    tools_requested=bool(chat_kwargs.get("tools")),
+                )
+            configure_request(**configure_kwargs)
         else:
             reasoning_parser.reset_state()
 

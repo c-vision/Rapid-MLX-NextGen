@@ -78,6 +78,140 @@ class TestAnthropicThinkingStartDecision(unittest.TestCase):
         """No-thinking mode must emit direct answer tokens as text, not thinking."""
         assert _should_start_in_thinking(self.THINKING_TEMPLATE, False) is False
 
+    def test_1570_unconditional_distill_template_ignores_disabled_flag(self):
+        assert (
+            _should_start_in_thinking(self.THINKING_TEMPLATE, False, unconditional=True)
+            is True
+        )
+
+    def test_1570_conditional_distill_template_respects_disabled_flag(self):
+        conditional = (
+            "{% if add_generation_prompt and enable_thinking %}<think>{% endif %}"
+        )
+        assert (
+            _should_start_in_thinking(conditional, False, unconditional=True) is False
+        )
+
+    def test_1570_conditional_distill_template_uses_enabled_default(self):
+        conditional = (
+            "{% if add_generation_prompt and enable_thinking %}<think>{% endif %}"
+        )
+        assert _should_start_in_thinking(conditional, None, unconditional=True) is True
+
+    def test_1570_nested_conditional_distill_template_respects_disabled_flag(self):
+        conditional = (
+            "{% if enable_thinking %}"
+            "{% if add_generation_prompt %}<think>{% endif %}"
+            "{% endif %}"
+        )
+        assert (
+            _should_start_in_thinking(conditional, False, unconditional=True) is False
+        )
+
+    def test_1570_whitespace_control_condition_respects_disabled_flag(self):
+        conditional = (
+            "{%- if enable_thinking %}"
+            "{%- if add_generation_prompt %}<think>{%- endif %}"
+            "{%- endif %}"
+        )
+        assert (
+            _should_start_in_thinking(conditional, False, unconditional=True) is False
+        )
+
+    def test_1570_false_branch_can_still_prime_implicit_thinking(self):
+        conditional = (
+            "{% if enable_thinking %}plain{% else %}"
+            "{% if add_generation_prompt %}<think>{% endif %}"
+            "{% endif %}"
+        )
+        assert _should_start_in_thinking(conditional, False, unconditional=True) is True
+
+    def test_1570_inactive_false_branch_does_not_prime_when_enabled(self):
+        conditional = (
+            "{% if enable_thinking %}plain{% else %}"
+            "{% if add_generation_prompt %}<think>{% endif %}"
+            "{% endif %}"
+        )
+        assert _should_start_in_thinking(conditional, True, unconditional=True) is False
+
+    def test_1570_inactive_elif_marker_does_not_prime_thinking(self):
+        conditional = (
+            "{% if not enable_thinking %}plain"
+            "{% elif add_generation_prompt %}<think>"
+            "{% endif %}"
+        )
+        assert (
+            _should_start_in_thinking(conditional, False, unconditional=True) is False
+        )
+
+    def test_1570_jinja_assignment_can_activate_marker(self):
+        template = (
+            "{% set prime = true %}"
+            "{% if prime and add_generation_prompt %}<think>{% endif %}"
+        )
+        assert _should_start_in_thinking(template, False, unconditional=True) is True
+
+    def test_1570_marker_in_empty_loop_is_inactive(self):
+        template = (
+            "{% for item in [] %}<think>{% endfor %}"
+            "{% if add_generation_prompt %}plain{% endif %}"
+        )
+        assert _should_start_in_thinking(template, False, unconditional=True) is False
+
+    def test_1570_marker_in_unused_macro_is_inactive(self):
+        template = (
+            "{% macro prime() %}<think>{% endmacro %}"
+            "{% if add_generation_prompt %}plain{% endif %}"
+        )
+        assert _should_start_in_thinking(template, False, unconditional=True) is False
+
+    def test_1570_marker_in_jinja_comment_is_inactive(self):
+        template = "{# <think> #}{% if add_generation_prompt %}plain{% endif %}"
+        assert _should_start_in_thinking(template, False, unconditional=True) is False
+
+    def test_1570_unrenderable_template_does_not_suppress_content(self):
+        template = (
+            "{% if missing_global() %}<think>{% endif %}"
+            "{% if add_generation_prompt %}plain{% endif %}"
+        )
+        assert _should_start_in_thinking(template, False, unconditional=True) is False
+
+    def test_1570_rendered_marker_does_not_require_generation_variable(self):
+        assert _should_start_in_thinking("prefix<think>", False, unconditional=True)
+
+    def test_1570_closed_rendered_block_does_not_prime_generation(self):
+        template = "prefix<think>private</think>answer-prefix"
+        assert _should_start_in_thinking(template, False, unconditional=True) is False
+
+    def test_1570_unrelated_enable_variable_does_not_hide_unconditional_marker(self):
+        template = (
+            "{% set enable_thinking = false %}"
+            "{% if add_generation_prompt %}<think>{% endif %}"
+        )
+        assert _should_start_in_thinking(template, False, unconditional=True) is True
+
+    def test_1570_named_default_template_is_resolved(self):
+        templates = {"default": self.THINKING_TEMPLATE, "tool_use": "plain"}
+        assert _should_start_in_thinking(templates, None) is True
+
+    def test_1570_named_tool_template_is_selected_when_tools_requested(self):
+        templates = {"default": self.THINKING_TEMPLATE, "tool_use": "plain"}
+        assert (
+            _should_start_in_thinking(
+                templates, None, unconditional=True, tools_requested=True
+            )
+            is False
+        )
+
+    def test_1570_named_tool_template_can_enable_implicit_thinking(self):
+        templates = {"default": "plain", "tool_use": self.THINKING_TEMPLATE}
+        assert (
+            _should_start_in_thinking(
+                templates, None, unconditional=True, tools_requested=True
+            )
+            is True
+        )
+
     def test_plain_template_never_starts_in_thinking(self):
         """Templates without an implicit think marker should start as text."""
         assert _should_start_in_thinking("{{ add_generation_prompt }}", None) is False

@@ -4,7 +4,10 @@
 import pytest
 
 from vllm_mlx.reasoning.base import DeltaMessage, ReasoningParser
-from vllm_mlx.reasoning.deepseek_r1_parser import DeepSeekR1ReasoningParser
+from vllm_mlx.reasoning.deepseek_r1_parser import (
+    DeepSeekR1DistillReasoningParser,
+    DeepSeekR1ReasoningParser,
+)
 from vllm_mlx.reasoning.gemma4_parser import Gemma4ReasoningParser
 from vllm_mlx.reasoning.gpt_oss_parser import (
     _CHANNEL_RE,
@@ -404,6 +407,75 @@ class TestDeepSeekR1:
         self.parser.reset_state()
         result = self.parser.finalize_streaming("")
         assert result is None
+
+
+class TestDeepSeekR1Distill:
+    def setup_method(self):
+        self.parser = DeepSeekR1DistillReasoningParser()
+
+    def test_1570_no_tag_complete_output_is_reasoning(self):
+        trace = "Okay, so I need to figure out unified memory."
+        reasoning, content = self.parser.extract_reasoning(
+            trace, enable_thinking=False, prompt_thinking_active=True
+        )
+        assert reasoning == trace
+        assert content is None
+
+    def test_1570_no_tag_complete_output_promotes_tool_call(self):
+        output = (
+            "I should inspect the file.\n"
+            '<tool_call>{"name":"read_file","arguments":{"path":"a.py"}}'
+            "</tool_call>"
+        )
+        reasoning, content = self.parser.extract_reasoning(
+            output, enable_thinking=False, prompt_thinking_active=True
+        )
+        assert reasoning == "I should inspect the file."
+        assert content == (
+            '<tool_call>{"name":"read_file","arguments":{"path":"a.py"}}</tool_call>'
+        )
+
+    def test_1570_prompt_primed_stream_keeps_untagged_trace_in_reasoning(self):
+        self.parser.configure_request(
+            enable_thinking=False, prompt_thinking_active=True
+        )
+        trace = "Okay, so I need to figure out unified memory. " * 3
+        result = self.parser.extract_reasoning_streaming("", trace, trace)
+        assert result is not None
+        assert result.reasoning == trace
+        assert result.content is None
+
+    def test_1570_configure_request_clears_prior_stream_state(self):
+        self.parser._saw_any_tag = True
+        self.parser._streaming_phase = "content"
+        self.parser._reasoning_carry = "<th"
+        self.parser._in_tool_call = True
+        self.parser._tool_call_buffer = "<tool_call>{"
+
+        self.parser.configure_request(
+            enable_thinking=False, prompt_thinking_active=True
+        )
+
+        assert self.parser._saw_any_tag is False
+        assert self.parser._streaming_phase is None
+        assert self.parser._reasoning_carry == ""
+        assert self.parser._in_tool_call is False
+        assert self.parser._tool_call_buffer == ""
+        trace = "Okay, I need to reason about the next request."
+        result = self.parser.extract_reasoning_streaming("", trace, trace)
+        assert result is not None
+        assert result.reasoning == trace
+        assert result.content is None
+
+    def test_1570_custom_non_priming_template_preserves_content(self):
+        answer = "Unified memory is shared by the CPU and GPU."
+        reasoning, content = self.parser.extract_reasoning(
+            answer,
+            enable_thinking=False,
+            prompt_thinking_active=False,
+        )
+        assert reasoning is None
+        assert content == answer
 
 
 class TestThinkParserSSEBoundary:

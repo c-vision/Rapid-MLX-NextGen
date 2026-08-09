@@ -184,6 +184,7 @@ def _finalize_content_and_reasoning(
     reasoning_parser,
     engine_reasoning_text: str = "",
     enable_thinking: bool | None = None,
+    prompt_thinking_active: bool | None = None,
     reasoning_max_tokens: int | None = None,
     finish_reason: str | None = None,
 ) -> tuple[str, str | None]:
@@ -360,12 +361,12 @@ def _finalize_content_and_reasoning(
     # R1 NIT: an ``extract("")`` probe could hide a real ``TypeError``
     # raised inside the parser body OR trigger third-party parser
     # side effects on the empty-string input).
-    if _parser_accepts_enable_thinking(reasoning_parser):
-        extract = lambda text: reasoning_parser.extract_reasoning(
-            text, enable_thinking=enable_thinking
-        )
-    else:
-        extract = lambda text: reasoning_parser.extract_reasoning(text)
+    extract_kwargs = {}
+    if _parser_accepts_parameter(reasoning_parser, "enable_thinking"):
+        extract_kwargs["enable_thinking"] = enable_thinking
+    if _parser_accepts_parameter(reasoning_parser, "prompt_thinking_active"):
+        extract_kwargs["prompt_thinking_active"] = prompt_thinking_active
+    extract = lambda text: reasoning_parser.extract_reasoning(text, **extract_kwargs)
     if tool_calls:
         reasoning_text, _ = extract(raw_text)
     else:
@@ -740,7 +741,13 @@ def _apply_reasoning_cap(
     return cleaned_text, truncated
 
 
-def _should_start_in_thinking(chat_template: str, enable_thinking: bool | None) -> bool:
+def _should_start_in_thinking(
+    chat_template,
+    enable_thinking: bool | None,
+    *,
+    unconditional: bool = False,
+    tools_requested: bool = False,
+) -> bool:
     """Shared predicate: does this chat template start the assistant
     response inside an implicit ``<think>`` block?
 
@@ -767,8 +774,66 @@ def _should_start_in_thinking(chat_template: str, enable_thinking: bool | None) 
     route uses the same predicate and the contract has a single
     source of truth.
     """
-    if enable_thinking is False:
+    if isinstance(chat_template, dict):
+        if tools_requested and "tool_use" in chat_template:
+            chat_template = chat_template["tool_use"]
+        elif tools_requested and "tools" in chat_template:
+            chat_template = chat_template["tools"]
+        elif "default" in chat_template:
+            chat_template = chat_template["default"]
+        elif len(chat_template) == 1:
+            chat_template = next(iter(chat_template.values()))
+        else:
+            chat_template = ""
+    if not isinstance(chat_template, str):
         return False
+    if enable_thinking is False and not unconditional:
+        return False
+    if unconditional:
+        if "<think>" not in chat_template:
+            return False
+        # Use the same sandboxed Jinja compiler as Hugging Face tokenizers.
+        # Rendering, unlike source scanning, honors assignments, macros,
+        # loops, comments, and the active if/elif/else branch.
+        try:
+            from transformers.utils.chat_template_utils import (
+                _compile_jinja_template,
+            )
+
+            tool_probe = {
+                "type": "function",
+                "function": {
+                    "name": "probe",
+                    "description": "probe",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            # The generation path resolves an omitted flag to enabled for
+            # non-coder models. ``deepseek_r1_distill`` is such a family, so
+            # its unconditional probe must use that same effective value.
+            effective_enable_thinking = (
+                True if enable_thinking is None else enable_thinking
+            )
+            rendered = _compile_jinja_template(chat_template).render(
+                messages=[{"role": "user", "content": "probe"}],
+                tools=[tool_probe] if tools_requested else None,
+                add_generation_prompt=True,
+                enable_thinking=effective_enable_thinking,
+                bos_token="",
+                eos_token="",
+                pad_token="",
+                unk_token="",
+            )
+        except Exception:
+            # An unrenderable custom template is indeterminate. Do not claim it
+            # primed thinking: a false positive would silently discard a valid
+            # public answer. The shipped distill templates render above.
+            return False
+        # Priming means the rendered prompt ends *inside* a think block, not
+        # merely that it contains a historical closed block.
+        if rendered.rfind("<think>") <= rendered.rfind("</think>"):
+            return False
+        return True
     return "<think>" in chat_template and "add_generation_prompt" in chat_template
 
 
@@ -782,6 +847,7 @@ def _rescue_silent_drop_from_reasoning(
     reasoning_is_case4: bool = False,
     matched_stop: str | None = None,
     prompt_thinking_active: bool = False,
+    implicit_reasoning_until_close: bool = False,
 ) -> str | None:
     """Issue #569: never silently drop an assistant turn.
 
@@ -940,6 +1006,8 @@ def _rescue_silent_drop_from_reasoning(
             and prompt_thinking_active
         )
     )
+    if implicit_reasoning_until_close and reasoning_is_case4 and prompt_thinking_active:
+        return final_content
     if truncated_mid_think:
         return final_content
     # r5-D (F-DGF-V080-B-7, 2026-06-21): gemma4 channel-token analog
@@ -1447,7 +1515,7 @@ def _is_structured_output_requested(response_format) -> bool:
     return rf_type in ("json_object", "json_schema")
 
 
-def _parser_accepts_enable_thinking(reasoning_parser) -> bool:
+def _parser_accepts_parameter(reasoning_parser, name: str) -> bool:
     """Return True iff ``reasoning_parser.extract_reasoning`` declares
     an ``enable_thinking`` parameter (or ``**kwargs`` catch-all).
 
@@ -1469,9 +1537,13 @@ def _parser_accepts_enable_thinking(reasoning_parser) -> bool:
         # fall back to the 1-arg call so we don't blow up here.
         return False
     params = sig.parameters
-    if "enable_thinking" in params:
+    if name in params:
         return True
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _parser_accepts_enable_thinking(reasoning_parser) -> bool:
+    return _parser_accepts_parameter(reasoning_parser, "enable_thinking")
 
 
 def _cascade(cli_value, alias_key: str, gen_key: str | None = None):

@@ -1133,6 +1133,35 @@ class TestGemma4HarmonyEngineRouted:
 
 
 class TestRescueSilentDropFromReasoning:
+    def test_1570_natural_eos_from_prompt_primed_reasoning_stays_suppressed(self):
+        """Natural EOS does not turn an unclosed implicit thought into content."""
+        content = _rescue_silent_drop_from_reasoning(
+            final_content=None,
+            reasoning_text="Okay, so I need to figure out unified memory.",
+            tool_calls=None,
+            finish_reason="stop",
+            raw_text="Okay, so I need to figure out unified memory.",
+            reasoning_is_case4=True,
+            # The shared template probe recognizes that R1-Distill's shipped
+            # template ignores enable_thinking=False and still primes <think>.
+            prompt_thinking_active=True,
+            implicit_reasoning_until_close=True,
+        )
+        assert content is None
+
+    def test_1570_custom_non_priming_template_rescues_short_answer(self):
+        content = _rescue_silent_drop_from_reasoning(
+            final_content=None,
+            reasoning_text="Unified memory is shared by the CPU and GPU.",
+            tool_calls=None,
+            finish_reason="stop",
+            raw_text="Unified memory is shared by the CPU and GPU.",
+            reasoning_is_case4=True,
+            prompt_thinking_active=False,
+            implicit_reasoning_until_close=True,
+        )
+        assert content == "Unified memory is shared by the CPU and GPU."
+
     def test_case4_length_without_prompt_thinking_rescues_content(self):
         """A non-thinking answer truncated by max_tokens must not be
         silently dropped just because a Case-4 parser put it in reasoning."""

@@ -5693,6 +5693,14 @@ async def _create_chat_completion_impl(
         enable_thinking=_effective_enable_thinking(
             resolved_thinking, cfg.model_path or cfg.model_name
         ),
+        prompt_thinking_active=_should_start_in_thinking(
+            getattr(getattr(engine, "tokenizer", None), "chat_template", "") or "",
+            resolved_thinking,
+            unconditional=bool(
+                getattr(cfg.reasoning_parser, "implicit_reasoning_until_close", False)
+            ),
+            tools_requested=bool(request.tools),
+        ),
         # Per-request reasoning cap (upstream vLLM PR #20859 backport).
         # None → back-compat no-op. Suppressed when the generation-time
         # thinking-budget processor owns this request (#558 single mechanism).
@@ -5809,7 +5817,12 @@ async def _create_chat_completion_impl(
         if _tok and hasattr(_tok, "chat_template"):
             _chat_template_str = _tok.chat_template or ""
         prompt_thinking_active = _should_start_in_thinking(
-            _chat_template_str, resolved_thinking
+            _chat_template_str,
+            resolved_thinking,
+            unconditional=bool(
+                getattr(cfg.reasoning_parser, "implicit_reasoning_until_close", False)
+            ),
+            tools_requested=bool(request.tools),
         )
         deepseek_v4_mid_think = bool(
             _uses_deepseek_v4_reasoning(cfg)
@@ -5827,6 +5840,13 @@ async def _create_chat_completion_impl(
                 reasoning_is_case4=reasoning_is_case4,
                 matched_stop=getattr(output, "matched_stop", None),
                 prompt_thinking_active=prompt_thinking_active,
+                implicit_reasoning_until_close=bool(
+                    getattr(
+                        cfg.reasoning_parser,
+                        "implicit_reasoning_until_close",
+                        False,
+                    )
+                ),
             )
         # Issue #858: cutoff sentinel is ON by default — restores PR #802
         # (H-01) semantics after the R-01 (#815) opt-in flip produced
@@ -6908,7 +6928,12 @@ async def stream_chat_completion(
                 if _tok_stream and hasattr(_tok_stream, "chat_template"):
                     _chat_template_str_stream = _tok_stream.chat_template or ""
                 prompt_thinking_active_stream = _should_start_in_thinking(
-                    _chat_template_str_stream, _stream_resolved_thinking
+                    _chat_template_str_stream,
+                    _stream_resolved_thinking,
+                    unconditional=bool(
+                        getattr(rp, "implicit_reasoning_until_close", False)
+                    ),
+                    tools_requested=bool(request.tools),
                 )
                 # D-STOP-THINK codex round-6 BLOCKING (PR #799):
                 # prefer the per-chunk accumulator over
@@ -6938,6 +6963,13 @@ async def stream_chat_completion(
                         reasoning_is_case4=reasoning_is_case4_stream,
                         matched_stop=_effective_matched_stop,
                         prompt_thinking_active=prompt_thinking_active_stream,
+                        implicit_reasoning_until_close=bool(
+                            getattr(
+                                processor.reasoning_parser,
+                                "implicit_reasoning_until_close",
+                                False,
+                            )
+                        ),
                     )
                 # The helper returns the rescued reasoning ONLY when
                 # all four predicates pass (empty/whitespace content,
