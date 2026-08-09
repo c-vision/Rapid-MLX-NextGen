@@ -474,14 +474,11 @@ class Qwen3CoderToolParser(ToolParser):
             if not residual and model_output[cursor:wrapper_close].strip():
                 residual = True
             if not residual:
-                wrapper_ranges.extend(
-                    [
-                        (wrapper_start, inner_start),
-                        (
-                            wrapper_close,
-                            wrapper_close + len(self.tool_call_end_token),
-                        ),
-                    ]
+                wrapper_ranges.append(
+                    (
+                        wrapper_start,
+                        wrapper_close + len(self.tool_call_end_token),
+                    )
                 )
             search_from = wrapper_close + len(self.tool_call_end_token)
 
