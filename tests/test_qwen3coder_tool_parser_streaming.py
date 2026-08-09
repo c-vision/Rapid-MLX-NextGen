@@ -203,6 +203,20 @@ def test_json_encoded_string_preserves_embedded_xml_closers():
     assert json.loads("".join(fragments)) == {"content": value}
 
 
+def test_json_surrogate_pair_split_between_chunks_streams_exactly():
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("write", {"content": {"type": "string"}})
+    chunks = [
+        "<tool_call>\n<function=write>\n<parameter=content>\n",
+        '"before \\uD83D',
+        '\\uDE00 after"',
+        "\n</parameter>\n</function>\n</tool_call>",
+    ]
+
+    fragments = _argument_fragments(_feed(parser, chunks, request))
+    assert json.loads("".join(fragments)) == {"content": "before 😀 after"}
+
+
 @pytest.mark.parametrize(
     "value",
     [

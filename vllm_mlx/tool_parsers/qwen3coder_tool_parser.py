@@ -323,6 +323,20 @@ class Qwen3CoderToolParser(ToolParser):
                 digits = text[i + 2 : i + 6]
                 if any(c not in "0123456789abcdefABCDEF" for c in digits):
                     break
+                codepoint = int(digits, 16)
+                if 0xD800 <= codepoint <= 0xDBFF:
+                    # A high surrogate is not independently emit-safe: JSON
+                    # decoding combines it with a following low surrogate.
+                    if i + 12 > len(text) or text[i + 6 : i + 8] != "\\u":
+                        break
+                    low_digits = text[i + 8 : i + 12]
+                    if any(
+                        c not in "0123456789abcdefABCDEF" for c in low_digits
+                    ) or not (0xDC00 <= int(low_digits, 16) <= 0xDFFF):
+                        break
+                    i += 12
+                    safe_end = i
+                    continue
                 i += 6
             elif escape in '"\\/bfnrt':
                 i += 2
@@ -444,9 +458,19 @@ class Qwen3CoderToolParser(ToolParser):
                     and body.find(">") >= 0
                     and not body[body.find(">") + 1 :].strip()
                 )
-                if not (complete_params or wrapped_zero_arg):
-                    continue
-                function_end = len(model_output)
+                trailing_wrapper = model_output.rfind(
+                    self.tool_call_end_token, body_start
+                )
+                if trailing_wrapper >= 0:
+                    # EOS recovery for a malformed call missing inner closes.
+                    # Use the final wrapper closer so literal closer text in a
+                    # raw value remains payload (#1515).
+                    body = model_output[body_start:trailing_wrapper]
+                    function_end = trailing_wrapper
+                else:
+                    if not (complete_params or wrapped_zero_arg):
+                        continue
+                    function_end = len(model_output)
             else:
                 body = model_output[body_start:close]
                 function_end = close + len(self.function_end_token)
@@ -1005,7 +1029,6 @@ class Qwen3CoderToolParser(ToolParser):
                         self._reset_streaming_state()
                         self._streaming_request = saved_request
                         return {"content": rejected}
-                    param_start = tool_text.find(self.parameter_prefix, func_end)
                     request_tools = (
                         self._streaming_request.get("tools")
                         if isinstance(self._streaming_request, dict)
@@ -1014,23 +1037,21 @@ class Qwen3CoderToolParser(ToolParser):
                     expected_params = _get_arguments_config(
                         self.current_function_name, request_tools
                     )
-                    if expected_params and param_start < 0 and func_close_idx == -1:
-                        return None
-                    if param_start >= 0 and func_close_idx == -1:
-                        param_header_end = tool_text.find(">", param_start)
-                        if param_header_end < 0:
-                            return None
-                        visible_value = tool_text[param_header_end + 1 :].lstrip()
-                        if not visible_value:
-                            return None
-                        param_name = tool_text[
-                            param_start + len(self.parameter_prefix) : param_header_end
-                        ]
-                        if _is_string_param(param_name, expected_params) and not (
-                            visible_value.startswith('"')
-                        ):
-                            self._legacy_raw_stream = True
-                            return None
+                    if expected_params and func_close_idx == -1:
+                        for param_name in expected_params:
+                            opener = f"{self.parameter_prefix}{param_name}>"
+                            param_start = tool_text.find(opener, func_end)
+                            if param_start < 0:
+                                return None
+                            value_start = param_start + len(opener)
+                            visible_value = tool_text[value_start:].lstrip()
+                            if not visible_value:
+                                return None
+                            if _is_string_param(param_name, expected_params) and not (
+                                visible_value.startswith('"')
+                            ):
+                                self._legacy_raw_stream = True
+                                return None
                     self._current_tool_id = _generate_tool_id()
                     self.header_sent = True
                     self.in_function = True
