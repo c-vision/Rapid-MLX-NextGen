@@ -37,6 +37,12 @@ Flows: fresh-install, settings-persistence, chat-restore, restored-tools, tool-l
        update-state, no-dead-controls, catalog-integrity,
        browse-all-destination, all
 
+chat-restore, chat-depth, slow-stream-stop, model-crash-recovery,
+restored-tools and tool-loop-budget drive the app through the accessibility
+API alone. They need no peekaboo and no Screen Recording, which is what lets
+them run unattended in CI (see the gui-golden-flows job in
+.github/workflows/rapid-mac-ci.yml). Every other flow needs peekaboo.
+
 Options:
   --update-baselines  rewrite the committed AX structural baselines instead of
                       comparing against them. Intended UI changes land as a
@@ -67,6 +73,30 @@ flow_requires_screen_recording() {
     case "$FLOW" in
         all|fresh-install|low-memory-choice|browse-all-destination) return 0 ;;
         *) return 1 ;;
+    esac
+}
+# Which flows shell out to `peekaboo`, and therefore need it installed and
+# permitted. Named flows drive the app through `rapid-ax` alone; everything
+# else — including `all` — is assumed to need peekaboo.
+#
+# Default-deny is the load-bearing part. A NEW flow is treated as needing
+# peekaboo until someone says otherwise, so it cannot quietly join the
+# unattended subset and then fail somewhere unrelated on a machine that has no
+# peekaboo. Getting this backwards would be silent; getting it wrong this way
+# round is a one-line fix.
+#
+# Why it matters at all: `rapid-ax` needs only the Accessibility grant, which a
+# GitHub-hosted macOS runner already carries in its image TCC database, and it
+# is built from a source file in this repo. Peekaboo is a third-party install
+# that additionally reaches its bridge socket (`--bridge-socket`, provided by
+# the Peekaboo app rather than the `brew` CLI) and has its own permission
+# surface. The peekaboo-free flows are therefore the set that can run
+# unattended without taking on any of that.
+flow_requires_peekaboo() {
+    case "$FLOW" in
+        chat-restore|restored-tools|tool-loop-budget|chat-depth) return 1 ;;
+        slow-stream-stop|model-crash-recovery) return 1 ;;
+        *) return 0 ;;
     esac
 }
 pb_click_coords() {
@@ -123,14 +153,42 @@ trap finish EXIT
 trap 'cleanup_persona; exit 130' INT
 trap 'cleanup_persona; exit 143' TERM
 
+# The preconditions every flow depends on and none of them can observe:
+# permission to read another process's AX tree, and a session that can actually
+# put a window on screen.
+#
+# Checked BEFORE the first app launch. Both failures otherwise look identical
+# and identically wrong: the flow spends 20 s inside `wait_for_window` and dies
+# on "main window did not appear", accusing the app of never opening a window
+# when the truth is either that we were not allowed to look or that nothing can
+# be shown at all. Both were observed for real while building this — a missing
+# grant, and a Mac that locked its screen mid-run.
+#
+# Aimed at the Dock when one is running, because the grant has to work against
+# ANOTHER process and `AXIsProcessTrusted()` alone is only the system's opinion
+# about us until a real cross-process read backs it up. rapid-ax adds the lock
+# check, which that read cannot supply: the Dock reads perfectly behind a lock
+# screen.
+require_ax_trust() {
+    local dock_pid
+    dock_pid="$(pgrep -x Dock | head -1 || true)"
+    # rapid-ax prints the specific reason to stderr; do not restate it here and
+    # risk naming the wrong one of the two.
+    "$AX_DRIVER" trust ${dock_pid:+"$dock_pid"} > "$OUT_ROOT/ax-trust.json" \
+        || die "GUI preconditions not met — see the rapid-ax line above and $OUT_ROOT/ax-trust.json"
+}
+
 require_tools() {
     [[ -d "$APP_SOURCE" ]] || die "built app not found: $APP_SOURCE"
-    for tool in peekaboo jq python3; do
+    for tool in jq python3; do
         command -v "$tool" >/dev/null || die "$tool is required"
     done
     [[ -f "$BASELINE_TOOL" ]] || die "AX baseline normalizer not found: $BASELINE_TOOL"
     AX_DRIVER="$OUT_ROOT/rapid-ax"
     swiftc "$ROOT/scripts/rapid-ax.swift" -o "$AX_DRIVER"
+    require_ax_trust
+    flow_requires_peekaboo || return 0
+    command -v peekaboo >/dev/null || die "peekaboo is required for flow: $FLOW"
     pb permissions status --json > "$OUT_ROOT/permissions.json"
     jq -e '.success and any(.data.permissions[]?; .name == "Accessibility" and .isGranted == true)' \
         "$OUT_ROOT/permissions.json" >/dev/null || die "Peekaboo needs Accessibility permission"
@@ -604,13 +662,25 @@ transcript_counts() {
            | "\(.user) \(.model)"' "$tree"
 }
 
+# Counts every turn in the tree — which is only a valid completeness check
+# while the WHOLE transcript is realized.
+#
+# The transcript is a virtualized scroll view: a message scrolled far enough out
+# of view is removed from the accessibility tree, and the dump says so honestly
+# with `walk.complete == true`. Measured on a 1024x681 window, `chat-depth` at
+# turn 4 reported 3 user + 4 model with a complete walk, the first user bubble
+# sitting at y=-429. Nothing was broken; it had simply scrolled away.
+#
+# So a shortfall here means one of two things, and they are not distinguishable
+# from the counts alone: a dropped turn, or a window too short to hold them.
+# Check the window height before reading it as a product bug.
 assert_transcript_turns() {
     local tree="$1" expected="$2" counts user model
     counts="$(transcript_counts "$tree")"
     user="${counts% *}"
     model="${counts#* }"
     [[ "$user" == "$expected" && "$model" == "$expected" ]] \
-        || die "expected $expected user + $expected model message(s), tree shows ${user} + ${model}"
+        || die "expected $expected user + $expected model message(s), tree shows ${user} + ${model} (a virtualized transcript drops off-screen turns — check the window is tall enough before reading this as a dropped message)"
 }
 
 # Do these strings appear in the transcript IN THIS ORDER?
@@ -669,6 +739,12 @@ dismiss_first_run() {
     see_main "$tree"
     if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.DontShare")' "$tree" >/dev/null; then
         if ! press "$tree" TelemetryConsent.DontShare "$OUT/consent.json" 2>/dev/null; then
+            # The coordinate fallback is peekaboo's. A flow that declared
+            # itself peekaboo-free has no fallback left, and reaching for one
+            # anyway would surface as a bare "peekaboo: command not found"
+            # attached to whichever assertion happened to run next.
+            command -v peekaboo >/dev/null \
+                || die "AXPress on TelemetryConsent.DontShare failed and $FLOW has no peekaboo fallback"
             read -r x y < <(jq -r '.data.ui_elements[] | select(.identifier == "TelemetryConsent.DontShare") | [(.bounds.x + .bounds.width / 2), (.bounds.y + .bounds.height / 2)] | @tsv' "$tree")
             pb_click_coords "$x,$y" --app "PID:$APP_PID" --json > "$OUT/consent-coordinate-fallback.json"
         fi
@@ -1042,6 +1118,29 @@ flow_slow_stream_stop() {
     done
     [[ "$(element_field "$OUT/slow-streaming.json" ChatView.SendOrStopButton description)" == "Stop generating" ]] \
         || die "send button never transitioned to Stop generating"
+    # Stop a stream that is actually streaming CONTENT.
+    #
+    # The button flips to "Stop generating" on the first delta, and that delta
+    # is a REASONING token — the answer itself has not started. Pressing there
+    # leaves a bubble with no content node; pressing a moment later leaves one
+    # with. Both are legitimate app states, and the structural baseline can
+    # only pin one of them.
+    #
+    # Measured, same commit: this dev machine always had the content by then
+    # and the hosted runner never did, so whichever machine wrote the baseline
+    # made it un-enforceable on the other — three local runs were stable, which
+    # is exactly what makes this kind of race so easy to commit by accident.
+    #
+    # Waiting for the first content token removes the race and sharpens what
+    # the flow claims to test: cancelling a response that is being produced,
+    # not one that has yet to start.
+    for _ in {1..80}; do
+        see_main "$OUT/slow-streaming.json"
+        if jq -e '(.data.ui_elements | tostring) | contains("Hello")' \
+            "$OUT/slow-streaming.json" >/dev/null; then break; fi
+        sleep 0.1
+    done
+    assert_tree_text "$OUT/slow-streaming.json" "Hello"
     press "$OUT/slow-streaming.json" ChatView.SendOrStopButton "$OUT/slow-stop.json"
     for _ in {1..40}; do
         see_main "$OUT/slow-stopped.json"

@@ -9,9 +9,107 @@ func fail(_ message: String) -> Never {
     exit(1)
 }
 
+// `trust` answers the question every other command silently depends on: is
+// THIS process allowed to read another process's accessibility tree?
+//
+// Without it, a missing Accessibility grant is indistinguishable from a
+// product bug. `AXUIElementCopyAttributeValue` just fails, `dump` returns a
+// tree containing nothing but the application root, and the caller times out
+// on "main window did not appear" — which accuses the app of never opening a
+// window when the truth is that we were never allowed to look. That is the
+// same trap the window-list comment below describes, and it is the single
+// most likely way an unattended (CI) run of the golden flows would misreport
+// itself.
+//
+// `AXIsProcessTrusted()` is the gate the AX APIs actually consult, but on its
+// own it is only the system's opinion about us. When a target pid is supplied
+// the check also performs a real cross-process read, so a grant that exists on
+// paper yet does not work in practice still fails HERE, naming the permission,
+// instead of surfacing minutes later as a phantom UI regression.
+if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "trust" {
+    let trusted = AXIsProcessTrusted()
+    var payload: [String: Any] = ["trusted": trusted]
+    var readSucceeded = true
+
+    // A LOCKED screen produces the exact symptom this command exists to
+    // prevent being misread. Measured while writing this: with the screen
+    // locked, Accessibility is still granted and the Dock's AX tree still
+    // reads fine, but no application can present a window, so every golden
+    // flow dies on "main window did not appear" — indistinguishable from the
+    // app being broken. The permission check alone does NOT see it.
+    //
+    // Complementary signals, deliberately: reading another process's tree is
+    // positive evidence that a GUI session exists at all; the lock bit is the
+    // one negative signal that evidence cannot carry, because the Dock is
+    // perfectly readable behind a lock screen.
+    //
+    // Only an explicit `true` fails. An unreadable session dictionary is
+    // recorded and left to the cross-process read above to adjudicate, rather
+    // than inventing a verdict from a failed read.
+    let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+    let screenLocked = (session?["CGSSessionScreenIsLocked"] as? NSNumber)?.boolValue
+    payload["session_readable"] = session != nil
+    payload["screen_locked"] = screenLocked ?? false
+    if let onConsole = (session?["kCGSSessionOnConsoleKey"] as? NSNumber)?.boolValue {
+        payload["on_console"] = onConsole
+    }
+
+    if CommandLine.arguments.count >= 3 {
+        guard let target = pid_t(CommandLine.arguments[2]) else {
+            fail("trust: target must be a pid")
+        }
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            AXUIElementCreateApplication(target),
+            kAXChildrenAttribute as CFString,
+            &value
+        )
+        // `.noValue` / `.attributeUnsupported` mean the read itself WORKED and
+        // the target simply publishes no children. Only an outright failure is
+        // evidence that we were refused.
+        readSucceeded =
+            result == .success || result == .noValue || result == .attributeUnsupported
+        payload["target_pid"] = Int(target)
+        payload["target_read"] = readSucceeded
+        payload["target_read_error"] = Int(result.rawValue)
+    }
+
+    payload["success"] = trusted && readSucceeded && !(screenLocked ?? false)
+    let data = try! JSONSerialization.data(
+        withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+    FileHandle.standardOutput.write(data)
+    FileHandle.standardOutput.write(Data("\n".utf8))
+
+    if screenLocked == true {
+        fail(
+            "the screen is locked (CGSSessionScreenIsLocked). Accessibility is "
+            + "fine and other processes' trees still read, but no app can "
+            + "present a window while locked, so every flow would fail with "
+            + "\"main window did not appear\" and look like an app regression. "
+            + "Unlock the screen and re-run."
+        )
+    }
+    if !trusted {
+        fail(
+            "this process is NOT trusted for Accessibility "
+            + "(AXIsProcessTrusted() == false). Every AX read will fail, and the "
+            + "golden flows would report a missing window instead of a missing "
+            + "permission. Grant Accessibility to the controlling process "
+            + "(System Settings > Privacy & Security > Accessibility)."
+        )
+    }
+    if !readSucceeded {
+        fail(
+            "Accessibility is granted but reading another process's AX tree "
+            + "still failed. The grant is not effective for this process tree."
+        )
+    }
+    exit(0)
+}
+
 guard CommandLine.arguments.count >= 3,
       let pid = pid_t(CommandLine.arguments[2]) else {
-    fail("usage: rapid-ax <dump|press|set-value> <pid> [identifier] [value]")
+    fail("usage: rapid-ax <dump|press|set-value|trust> <pid> [identifier] [value]")
 }
 
 let command = CommandLine.arguments[1]
