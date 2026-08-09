@@ -3012,3 +3012,48 @@ class TestRequestForwardedToToolParser:
             if event.type == "tool_call"
         )
         assert json.loads(arguments) == {"path": "a.md", "content": value}
+
+    def test_qwen3_coder_finalize_targets_later_deferred_call(self):
+        from vllm_mlx.tool_parsers.qwen3coder_tool_parser import (
+            Qwen3CoderToolParser,
+        )
+
+        parser = Qwen3CoderToolParser(tokenizer=None)
+        cfg = _make_cfg(enable_auto_tool_choice=True, tool_parser_instance=parser)
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "echo",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                        },
+                    },
+                }
+            ]
+        }
+        first = (
+            '<tool_call><function=echo><parameter=value>"first"</parameter>'
+            "</function></tool_call>"
+        )
+        second_value = "second </parameter> value"
+        second = (
+            "<tool_call><function=echo><parameter=value>"
+            f"{second_value}</parameter></function></tool_call>"
+        )
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+        pp.reset()
+        streamed = []
+        for piece in [first, "\n", second[:45], second[45:]]:
+            streamed.extend(pp.process_chunk(_make_output(piece)))
+        final_events = pp.finalize()
+
+        by_index = {}
+        for event in [*streamed, *final_events]:
+            for call in event.tool_calls or []:
+                by_index.setdefault(call["index"], "")
+                by_index[call["index"]] += call["function"].get("arguments", "")
+        assert json.loads(by_index[0]) == {"value": "first"}
+        assert json.loads(by_index[1]) == {"value": second_value}

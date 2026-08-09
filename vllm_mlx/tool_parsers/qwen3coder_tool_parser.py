@@ -396,7 +396,10 @@ class Qwen3CoderToolParser(ToolParser):
         result = self.extract_tool_calls(model_output, request=request)
         if not result.tools_called or not result.tool_calls:
             return None
-        arguments = json.loads(result.tool_calls[0]["arguments"])
+        if self.current_tool_index >= len(result.tool_calls):
+            return None
+        current = result.tool_calls[self.current_tool_index]
+        arguments = json.loads(current["arguments"])
         remaining = list(arguments.items())[self._legacy_raw_param_count :]
         prefix = ", " if self._legacy_raw_param_count else ""
         suffix = prefix + ", ".join(
@@ -405,14 +408,28 @@ class Qwen3CoderToolParser(ToolParser):
         )
         suffix += "}"
         self._legacy_raw_stream = False
-        return {
-            "tool_calls": [
+        tool_calls = [
+            {
+                "index": self.current_tool_index,
+                "function": {"arguments": suffix},
+            }
+        ]
+        for index, call in enumerate(
+            result.tool_calls[self.current_tool_index + 1 :],
+            start=self.current_tool_index + 1,
+        ):
+            tool_calls.append(
                 {
-                    "index": self.current_tool_index,
-                    "function": {"arguments": suffix},
+                    "index": index,
+                    "id": call["id"],
+                    "type": "function",
+                    "function": {
+                        "name": call["name"],
+                        "arguments": call["arguments"],
+                    },
                 }
-            ]
-        }
+            )
+        return {"tool_calls": tool_calls}
 
     def _parse_xml_function_call(
         self, function_call_str: str, tools: list[Any] | None
