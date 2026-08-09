@@ -280,6 +280,15 @@ class Qwen3CoderToolParser(ToolParser):
         """
         keep_back = len(self.parameter_end_token)
         safe_end = len(value_text) - keep_back
+        marker_start = value_text.find("<", self.in_param_emitted_chars)
+        if marker_start != -1:
+            # Raw XML has no escaping bit. Once markup-looking bytes appear,
+            # they may be payload or structure until the full function makes
+            # the LAST-close convention decidable (#1515). Keep that suffix
+            # buffered; plain text before it can still stream incrementally.
+            if marker_start > 0 and value_text[marker_start - 1] == "\n":
+                marker_start -= 1
+            safe_end = min(safe_end, marker_start)
         if safe_end <= self.in_param_emitted_chars:
             return ""
         safe = value_text[self.in_param_emitted_chars : safe_end]
@@ -875,9 +884,16 @@ class Qwen3CoderToolParser(ToolParser):
                 # emit an empty tail. ``</function>`` is the actual tool
                 # close; ``</tool_call>`` may follow as optional framing.
                 trailing = current_text.rstrip()
-                if delta_text.strip() == "" and (
-                    trailing.endswith(self.tool_call_end_token)
-                    or trailing.endswith(self.function_end_token)
+                if (
+                    delta_text.strip() == ""
+                    and (
+                        trailing.endswith(self.tool_call_end_token)
+                        or trailing.endswith(self.function_end_token)
+                    )
+                ) or (
+                    delta_text.strip() == self.tool_call_end_token
+                    and previous_text.rstrip().endswith(self.function_end_token)
+                    and trailing.endswith(self.tool_call_end_token)
                 ):
                     return None
                 return {"content": delta_text}
@@ -1026,6 +1042,19 @@ class Qwen3CoderToolParser(ToolParser):
             param_config = _get_arguments_config(
                 self.current_function_name or "", tools
             )
+            completed_parameters: list[tuple[str, str]] = []
+            if func_close_idx != -1:
+                header_end = tool_text.find(">")
+                if header_end != -1:
+                    completed_parameters = (
+                        split_marked_parameters(
+                            tool_text[header_end + 1 : -len(self.function_end_token)],
+                            r"<parameter=([^>]+)>",
+                            self.parameter_end_token,
+                            valid_names=set(param_config) or None,
+                        )
+                        or []
+                    )
 
             json_fragments = []
 
@@ -1049,9 +1078,26 @@ class Qwen3CoderToolParser(ToolParser):
                     if value_text.startswith("\n"):
                         value_text = value_text[1:]
 
-                    end_idx = self._find_parameter_close(value_text, 0)
                     json_string_pending = value_text.lstrip().startswith('"')
-                    if end_idx == -1 and not json_string_pending:
+                    completed_value = (
+                        completed_parameters[self.param_count][1]
+                        if self.param_count < len(completed_parameters)
+                        and completed_parameters[self.param_count][0]
+                        == self.in_param_name
+                        else None
+                    )
+                    end_idx = (
+                        self._find_parameter_close(value_text, 0)
+                        if json_string_pending
+                        else -1
+                    )
+                    if completed_value is not None:
+                        pv = completed_value
+                    elif (
+                        end_idx == -1
+                        and not json_string_pending
+                        and func_close_idx != -1
+                    ):
                         # Defensive fallback: model emitted next-param-prefix,
                         # </function>, or </tool_call> without a </parameter>.
                         # Use any of those as the close to avoid hanging
@@ -1063,8 +1109,22 @@ class Qwen3CoderToolParser(ToolParser):
                         candidates = [c for c in (nxt, fe, te) if c != -1]
                         if candidates:
                             end_idx = min(candidates)
-                    if end_idx != -1:
-                        pv = value_text[:end_idx]
+                    elif end_idx == -1 and not json_string_pending:
+                        # Preserve the established truncated-stream recovery
+                        # only for a wrapper closer on its own line. An inline
+                        # ``</tool_call>`` is valid raw string data (#1515).
+                        te = value_text.find(self.tool_call_end_token)
+                        if (
+                            te > 0
+                            and value_text[te - 1] == "\n"
+                            and not value_text[
+                                te + len(self.tool_call_end_token) :
+                            ].strip()
+                        ):
+                            end_idx = te
+                    if completed_value is not None or end_idx != -1:
+                        if completed_value is None:
+                            pv = value_text[:end_idx]
                         if pv.endswith("\n"):
                             pv = pv[:-1]
                         self.accumulated_params[self.in_param_name] = pv
@@ -1101,9 +1161,25 @@ class Qwen3CoderToolParser(ToolParser):
                 if value_text.startswith("\n"):
                     value_text = value_text[1:]
 
-                param_end_idx = self._find_parameter_close(value_text, 0)
                 json_string_pending = value_text.lstrip().startswith('"')
-                if param_end_idx == -1 and not json_string_pending:
+                completed_value = (
+                    completed_parameters[self.param_count][1]
+                    if self.param_count < len(completed_parameters)
+                    and completed_parameters[self.param_count][0] == current_param_name
+                    else None
+                )
+                param_end_idx = (
+                    self._find_parameter_close(value_text, 0)
+                    if json_string_pending
+                    else -1
+                )
+                if completed_value is not None:
+                    pv = completed_value
+                elif (
+                    param_end_idx == -1
+                    and not json_string_pending
+                    and func_close_idx != -1
+                ):
                     # Try next parameter or function end as delimiter
                     next_param = value_text.find(self.parameter_prefix)
                     func_end = value_text.find(self.function_end_token)
@@ -1115,27 +1191,28 @@ class Qwen3CoderToolParser(ToolParser):
                         tool_end_in_val = value_text.find(self.tool_call_end_token)
                         if tool_end_in_val != -1:
                             param_end_idx = tool_end_in_val
-                        else:
-                            # Param not yet closed. For string params, emit
-                            # incrementally; for non-string types we can't
-                            # emit partial JSON (half an int isn't valid),
-                            # so fall through to the existing break path.
-                            if _is_string_param(current_param_name, param_config):
-                                if json_string_pending:
-                                    break
-                                frag = self._emit_string_increment(
-                                    current_param_name, value_text
-                                )
-                                if frag:
-                                    json_fragments.append(frag)
-                                self.in_param = True
-                                self.in_param_name = current_param_name
+                if param_end_idx == -1 and completed_value is None:
+                    # Param not yet structurally closed. String values can
+                    # still stream incrementally; keep enough tail buffered
+                    # that a future close marker can remain payload (#1515).
+                    if _is_string_param(current_param_name, param_config):
+                        if json_string_pending:
                             break
-
-                if param_end_idx == -1:
+                        frag = self._emit_string_increment(
+                            current_param_name, value_text
+                        )
+                        if frag:
+                            json_fragments.append(frag)
+                        self.in_param = True
+                        self.in_param_name = current_param_name
                     break
 
-                pv = value_text[:param_end_idx]
+                if param_end_idx == -1:
+                    if completed_value is None:
+                        break
+
+                if completed_value is None:
+                    pv = value_text[:param_end_idx]
                 if pv.endswith("\n"):
                     pv = pv[:-1]
 

@@ -202,6 +202,45 @@ def test_json_encoded_string_preserves_embedded_xml_closers():
 
 
 @pytest.mark.parametrize(
+    "value",
+    [
+        "A tool call block ends with </tool_call> on its own.",
+        "A parameter block ends with </parameter> here.",
+        "A function block ends with </function> here.",
+    ],
+)
+@pytest.mark.parametrize("chunking", ["after-marker", "one-byte"])
+def test_legacy_raw_string_preserves_embedded_xml_closers(value: str, chunking: str):
+    """#1515: an early closer in a raw string is payload, not structure."""
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("write_file", {"content": {"type": "string"}})
+    marker = next(
+        token
+        for token in ("</tool_call>", "</parameter>", "</function>")
+        if token in value
+    )
+    cut = value.index(marker) + len(marker)
+    value_chunks = (
+        [value[:cut], value[cut:] + "\n"]
+        if chunking == "after-marker"
+        else [*value, "\n"]
+    )
+    chunks = [
+        "<tool_call>\n",
+        "<function=write_file>\n",
+        "<parameter=content>\n",
+        *value_chunks,
+        "</parameter>\n",
+        "</function>\n",
+        "</tool_call>",
+    ]
+
+    deltas = _feed(parser, chunks, request)
+    assert json.loads("".join(_argument_fragments(deltas))) == {"content": value}
+    assert "".join(delta.get("content", "") for delta in deltas) == ""
+
+
+@pytest.mark.parametrize(
     ("tool_name", "param_name", "value"),
     [
         (
