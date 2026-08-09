@@ -430,10 +430,24 @@ class Qwen3CoderToolParser(ToolParser):
             )
             ranges.append((function_start, function_end))
 
+        ranges.sort()
+        merged_ranges: list[tuple[int, int]] = []
+        for start, end in ranges:
+            if merged_ranges and start <= merged_ranges[-1][1]:
+                merged_ranges[-1] = (
+                    merged_ranges[-1][0],
+                    max(end, merged_ranges[-1][1]),
+                )
+            else:
+                merged_ranges.append((start, end))
+        ranges = merged_ranges
+
         # A wrapper may frame more than one function. Strip its delimiters only
         # when every non-whitespace byte inside it is already being removed;
         # otherwise both delimiters belong to the rejected content sibling.
         search_from = 0
+        range_index = 0
+        wrapper_ranges: list[tuple[int, int]] = []
         while True:
             wrapper_start = model_output.find(self.tool_call_start_token, search_from)
             if wrapper_start < 0:
@@ -442,16 +456,25 @@ class Qwen3CoderToolParser(ToolParser):
             wrapper_close = model_output.find(self.tool_call_end_token, inner_start)
             if wrapper_close < 0:
                 break
-            residual_parts = []
+            while range_index < len(ranges) and ranges[range_index][1] <= inner_start:
+                range_index += 1
             cursor = inner_start
-            for start, end in ranges:
-                if end <= inner_start or start >= wrapper_close:
-                    continue
-                residual_parts.append(model_output[cursor : max(cursor, start)])
+            residual = False
+            candidate_index = range_index
+            while (
+                candidate_index < len(ranges)
+                and ranges[candidate_index][0] < wrapper_close
+            ):
+                start, end = ranges[candidate_index]
+                if model_output[cursor : max(cursor, start)].strip():
+                    residual = True
+                    break
                 cursor = max(cursor, min(end, wrapper_close))
-            residual_parts.append(model_output[cursor:wrapper_close])
-            if not "".join(residual_parts).strip():
-                ranges.extend(
+                candidate_index += 1
+            if not residual and model_output[cursor:wrapper_close].strip():
+                residual = True
+            if not residual:
+                wrapper_ranges.extend(
                     [
                         (wrapper_start, inner_start),
                         (
@@ -464,7 +487,7 @@ class Qwen3CoderToolParser(ToolParser):
 
         content_parts = []
         cursor = 0
-        for start, end in sorted(ranges):
+        for start, end in sorted([*ranges, *wrapper_ranges]):
             if start > cursor:
                 content_parts.append(model_output[cursor:start])
             cursor = max(cursor, end)
