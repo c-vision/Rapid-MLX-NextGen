@@ -2915,12 +2915,16 @@ class TestRequestForwardedToToolParser:
         streamed = [
             event for piece in pieces for event in pp.process_chunk(_make_output(piece))
         ]
-        assert [event for event in streamed if event.type == "tool_call"] == []
-
         final_events = pp.finalize()
         tool_events = [event for event in final_events if event.type == "tool_call"]
         assert len(tool_events) == 1
-        arguments = tool_events[0].tool_calls[0]["function"]["arguments"]
+        all_tool_events = [
+            event for event in [*streamed, *final_events] if event.type == "tool_call"
+        ]
+        arguments = "".join(
+            event.tool_calls[0]["function"].get("arguments", "")
+            for event in all_tool_events
+        )
         assert json.loads(arguments) == {"content": value}
 
     def test_qwen3_coder_finalize_recovers_truncated_legacy_raw_call(self):
@@ -2950,15 +2954,15 @@ class TestRequestForwardedToToolParser:
         pp.reset()
         wire = f"<tool_call>\n<function=echo>\n<parameter=value>\n{value}\n</tool_call>"
 
-        assert [
-            event
-            for event in pp.process_chunk(_make_output(wire))
-            if event.type == "tool_call"
-        ] == []
+        streamed = pp.process_chunk(_make_output(wire))
         final_events = pp.finalize()
         tool_events = [event for event in final_events if event.type == "tool_call"]
         assert len(tool_events) == 1
-        arguments = tool_events[0].tool_calls[0]["function"]["arguments"]
+        arguments = "".join(
+            event.tool_calls[0]["function"].get("arguments", "")
+            for event in [*streamed, *final_events]
+            if event.type == "tool_call"
+        )
         assert json.loads(arguments) == {"value": value}
 
     def test_qwen3_coder_later_legacy_raw_parameter_defers_whole_call(self):
@@ -2999,8 +3003,12 @@ class TestRequestForwardedToToolParser:
         streamed = [
             event for piece in pieces for event in pp.process_chunk(_make_output(piece))
         ]
-        assert [event for event in streamed if event.type == "tool_call"] == []
-        tool_events = [event for event in pp.finalize() if event.type == "tool_call"]
+        final_events = pp.finalize()
+        tool_events = [event for event in final_events if event.type == "tool_call"]
         assert len(tool_events) == 1
-        arguments = tool_events[0].tool_calls[0]["function"]["arguments"]
+        arguments = "".join(
+            event.tool_calls[0]["function"].get("arguments", "")
+            for event in [*streamed, *final_events]
+            if event.type == "tool_call"
+        )
         assert json.loads(arguments) == {"path": "a.md", "content": value}

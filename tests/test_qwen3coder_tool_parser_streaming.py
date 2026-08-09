@@ -240,12 +240,13 @@ def test_legacy_raw_closers_are_deferred_to_full_text_parser(value: str):
     ]
 
     deltas = _feed(parser, chunks, request)
-    assert _argument_fragments(deltas) == []
+    fragments = _argument_fragments(deltas)
+    assert fragments == ["{"]
     assert "".join(delta.get("content", "") for delta in deltas) == ""
 
-    final = parser.extract_tool_calls(full_text, request=request)
-    assert final.tools_called is True
-    assert json.loads(final.tool_calls[0]["arguments"]) == {"content": value}
+    final = parser.finalize_legacy_raw_stream(full_text, request=request)
+    fragments.extend(_argument_fragments([final]))
+    assert json.loads("".join(fragments)) == {"content": value}
 
 
 @pytest.mark.parametrize(

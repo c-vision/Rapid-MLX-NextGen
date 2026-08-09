@@ -270,6 +270,7 @@ class Qwen3CoderToolParser(ToolParser):
         self.in_param_opened = False
         self.in_param_name: str | None = None
         self._legacy_raw_stream = False
+        self._legacy_raw_param_count = 0
 
     def _emit_string_increment(self, param_name: str, value_text: str) -> str:
         """Return a JSON fragment for the safe (already-final) portion of an
@@ -385,6 +386,33 @@ class Qwen3CoderToolParser(ToolParser):
         tail = full_value[self.in_param_emitted_chars :]
         inner = json.dumps(tail, ensure_ascii=False)[1:-1]
         return f'{inner}"'
+
+    def finalize_legacy_raw_stream(
+        self, model_output: str, request: dict[str, Any] | None = None
+    ) -> dict | None:
+        """Return the un-emitted JSON suffix for a deferred raw parameter."""
+        if not self._legacy_raw_stream:
+            return None
+        result = self.extract_tool_calls(model_output, request=request)
+        if not result.tools_called or not result.tool_calls:
+            return None
+        arguments = json.loads(result.tool_calls[0]["arguments"])
+        remaining = list(arguments.items())[self._legacy_raw_param_count :]
+        prefix = ", " if self._legacy_raw_param_count else ""
+        suffix = prefix + ", ".join(
+            f"{json.dumps(name)}: {json.dumps(value, ensure_ascii=False)}"
+            for name, value in remaining
+        )
+        suffix += "}"
+        self._legacy_raw_stream = False
+        return {
+            "tool_calls": [
+                {
+                    "index": self.current_tool_index,
+                    "function": {"arguments": suffix},
+                }
+            ]
+        }
 
     def _parse_xml_function_call(
         self, function_call_str: str, tools: list[Any] | None
@@ -1031,38 +1059,29 @@ class Qwen3CoderToolParser(ToolParser):
                         self._reset_streaming_state()
                         self._streaming_request = saved_request
                         return {"content": rejected}
-                    request_tools = (
-                        self._streaming_request.get("tools")
-                        if isinstance(self._streaming_request, dict)
-                        else None
-                    )
-                    expected_params = _get_arguments_config(
-                        self.current_function_name, request_tools
-                    )
-                    if expected_params and func_close_idx == -1:
-                        # Any string property could appear later (JSON Schema
-                        # properties are optional unless listed as required).
-                        # Wait until every possible string parameter is visible
-                        # before emitting an irreversible header; non-string
-                        # properties cannot carry ambiguous XML closers.
-                        for param_name in (
-                            name
-                            for name in expected_params
-                            if _is_string_param(name, expected_params)
-                        ):
-                            opener = f"{self.parameter_prefix}{param_name}>"
-                            param_start = tool_text.find(opener, func_end)
-                            if param_start < 0:
-                                return None
-                            value_start = param_start + len(opener)
-                            visible_value = tool_text[value_start:].lstrip()
-                            if not visible_value:
-                                return None
-                            if _is_string_param(param_name, expected_params) and not (
-                                visible_value.startswith('"')
+                    first_param = tool_text.find(self.parameter_prefix, func_end)
+                    if first_param >= 0 and func_close_idx == -1:
+                        name_end = tool_text.find(">", first_param)
+                        if name_end >= 0:
+                            param_name = tool_text[
+                                first_param + len(self.parameter_prefix) : name_end
+                            ]
+                            visible = tool_text[name_end + 1 :].lstrip()
+                            request_tools = (
+                                self._streaming_request.get("tools")
+                                if isinstance(self._streaming_request, dict)
+                                else None
+                            )
+                            config = _get_arguments_config(
+                                self.current_function_name, request_tools
+                            )
+                            if (
+                                visible
+                                and not visible.startswith('"')
+                                and (_is_string_param(param_name, config) or not config)
                             ):
                                 self._legacy_raw_stream = True
-                                return None
+                                self._legacy_raw_param_count = 0
                     self._current_tool_id = _generate_tool_id()
                     self.header_sent = True
                     self.in_function = True
@@ -1242,6 +1261,19 @@ class Qwen3CoderToolParser(ToolParser):
                 value_text = tool_text[value_start:]
                 if value_text.startswith("\n"):
                     value_text = value_text[1:]
+
+                if not value_text.strip():
+                    break
+                is_string = _is_string_param(current_param_name, param_config)
+                if not value_text.lstrip().startswith('"') and (
+                    is_string or not param_config
+                ):
+                    # Raw XML has no escaping rule, so its first apparent close
+                    # may be payload. Freeze only the un-emitted suffix and let
+                    # EOS parsing select the final structural closer.
+                    self._legacy_raw_stream = True
+                    self._legacy_raw_param_count = self.param_count
+                    return None
 
                 param_end_idx = self._find_parameter_close(value_text, 0)
                 json_string_pending = value_text.lstrip().startswith('"')
