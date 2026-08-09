@@ -281,12 +281,32 @@ class Qwen3CoderToolParser(ToolParser):
         """
         keep_back = len(self.parameter_end_token)
         safe_end = len(value_text) - keep_back
-        marker_start = value_text.find("<", self.in_param_emitted_chars)
-        if marker_start != -1:
+        structural_tokens = (
+            self.parameter_prefix,
+            self.parameter_end_token,
+            self.function_end_token,
+            self.tool_call_end_token,
+        )
+        marker_candidates = [
+            pos
+            for token in structural_tokens
+            if (pos := value_text.find(token, self.in_param_emitted_chars)) != -1
+        ]
+        partial_start = max(
+            self.in_param_emitted_chars,
+            len(value_text) - max(map(len, structural_tokens)),
+        )
+        marker_candidates.extend(
+            pos
+            for pos in range(partial_start, len(value_text))
+            if any(token.startswith(value_text[pos:]) for token in structural_tokens)
+        )
+        if marker_candidates:
             # Raw XML has no escaping bit. Once markup-looking bytes appear,
             # they may be payload or structure until the full function makes
             # the LAST-close convention decidable (#1515). Keep that suffix
             # buffered; plain text before it can still stream incrementally.
+            marker_start = min(marker_candidates)
             if marker_start > 0 and value_text[marker_start - 1] == "\n":
                 marker_start -= 1
             safe_end = min(safe_end, marker_start)
@@ -972,6 +992,20 @@ class Qwen3CoderToolParser(ToolParser):
                     func_close_idx = candidate_close
                     structural_wrapper_close = candidate_wrapper
                 search_from = candidate_close + len(self.function_end_token)
+            if func_close_idx == -1:
+                fallback_close = current_text.rfind(
+                    self.function_end_token, tool_start_idx, call_limit
+                )
+                before_close = current_text[tool_start_idx:fallback_close].rstrip()
+                after_close = current_text[
+                    fallback_close + len(self.function_end_token) : call_limit
+                ]
+                if (
+                    fallback_close >= 0
+                    and before_close.endswith(self.parameter_end_token)
+                    and not after_close.strip()
+                ):
+                    func_close_idx = fallback_close
         elif raw_parameter:
             func_close_idx = -1
             search_from = tool_start_idx

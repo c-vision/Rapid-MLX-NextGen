@@ -244,6 +244,32 @@ def test_legacy_raw_string_preserves_embedded_xml_closers(value: str, chunking: 
     assert "".join(delta.get("content", "") for delta in deltas) == ""
 
 
+def test_one_character_raw_string_round_trips():
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("write_file", {"content": {"type": "string"}})
+    chunks = [
+        "<tool_call>\n<function=write_file>\n<parameter=content>\n",
+        "x",
+        "\n</parameter>\n</function>\n</tool_call>",
+    ]
+
+    deltas = _feed(parser, chunks, request)
+    assert json.loads("".join(_argument_fragments(deltas))) == {"content": "x"}
+
+
+def test_wrapped_raw_call_recovers_when_outer_close_is_truncated():
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("write_file", {"content": {"type": "string"}})
+    chunks = [
+        "<tool_call>\n<function=write_file>\n<parameter=content>\nhello",
+        "\n</parameter>\n",
+        "</function>",
+    ]
+
+    deltas = _feed(parser, chunks, request)
+    assert json.loads("".join(_argument_fragments(deltas))) == {"content": "hello"}
+
+
 @pytest.mark.parametrize(
     "wrapper_chunks",
     [
