@@ -332,6 +332,40 @@ def test_bare_raw_call_uses_last_function_closer():
     assert "".join(delta.get("content", "") for delta in deltas) == ""
 
 
+def test_raw_call_does_not_consume_a_later_call():
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("write_file", {"content": {"type": "string"}})
+    first = (
+        "<tool_call><function=write_file><parameter=content>first</parameter>"
+        "</function></tool_call>"
+    )
+    second = (
+        "<tool_call><function=write_file><parameter=content>second</parameter>"
+        "</function></tool_call>"
+    )
+
+    deltas = _feed(
+        parser, ["<tool_call>", first[len("<tool_call>") :] + second], request
+    )
+    fragments = _argument_fragments(deltas)
+    assert json.loads("".join(fragments)) == {"content": "first"}
+
+
+def test_content_closer_after_raw_call_is_not_used_as_wrapper():
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("write_file", {"content": {"type": "string"}})
+    chunks = [
+        "<tool_call><function=write_file><parameter=content>hello</parameter>"
+        "</function></tool_call>after </tool_call> prose"
+    ]
+
+    deltas = _feed(parser, chunks, request)
+    assert json.loads("".join(_argument_fragments(deltas))) == {"content": "hello"}
+    assert "".join(delta.get("content", "") for delta in deltas) == (
+        "after </tool_call> prose"
+    )
+
+
 @pytest.mark.parametrize(
     ("tool_name", "param_name", "value"),
     [

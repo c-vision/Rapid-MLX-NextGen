@@ -919,6 +919,11 @@ class Qwen3CoderToolParser(ToolParser):
             return None
 
         tool_start_idx = function_starts[self.current_tool_index]
+        call_limit = (
+            function_starts[self.current_tool_index + 1]
+            if self.current_tool_index + 1 < len(function_starts)
+            else len(current_text)
+        )
         func_close_idx = self._top_level_function_close(current_text, tool_start_idx)
         param_header = current_text.find(self.parameter_prefix, tool_start_idx)
         raw_parameter = False
@@ -937,36 +942,53 @@ class Qwen3CoderToolParser(ToolParser):
             # make a later literal ``</function>`` look structural. A wrapped
             # call is complete only when the LAST function closer directly
             # precedes a wrapper closer (layout whitespace is allowed).
-            wrapper_close = current_text.rfind(self.tool_call_end_token)
-            wrapped_function_close = current_text.rfind(
-                self.function_end_token, tool_start_idx, wrapper_close
-            )
-            if (
-                wrapper_close < 0
-                or wrapped_function_close < 0
-                or current_text[
-                    wrapped_function_close
-                    + len(self.function_end_token) : wrapper_close
-                ].strip()
-            ):
-                func_close_idx = -1
-            else:
-                func_close_idx = wrapped_function_close
+            func_close_idx = -1
+            structural_wrapper_close = -1
+            search_from = tool_start_idx
+            while search_from < call_limit:
+                candidate_close = current_text.find(
+                    self.function_end_token, search_from, call_limit
+                )
+                if candidate_close < 0:
+                    break
+                candidate_wrapper = current_text.find(
+                    self.tool_call_end_token,
+                    candidate_close + len(self.function_end_token),
+                    call_limit,
+                )
+                if (
+                    candidate_wrapper >= 0
+                    and not current_text[
+                        candidate_close
+                        + len(self.function_end_token) : candidate_wrapper
+                    ].strip()
+                ):
+                    func_close_idx = candidate_close
+                    structural_wrapper_close = candidate_wrapper
+                    break
+                search_from = candidate_close + len(self.function_end_token)
         elif raw_parameter:
-            bare_function_close = current_text.rfind(self.function_end_token)
-            before_close = current_text[tool_start_idx:bare_function_close].rstrip()
-            if bare_function_close < 0 or not before_close.endswith(
-                self.parameter_end_token
-            ):
-                func_close_idx = -1
-            else:
-                func_close_idx = bare_function_close
+            func_close_idx = -1
+            search_from = tool_start_idx
+            while search_from < call_limit:
+                candidate_close = current_text.find(
+                    self.function_end_token, search_from, call_limit
+                )
+                if candidate_close < 0:
+                    break
+                before_close = current_text[tool_start_idx:candidate_close].rstrip()
+                if before_close.endswith(self.parameter_end_token):
+                    func_close_idx = candidate_close
+                    break
+                search_from = candidate_close + len(self.function_end_token)
         content_after_wrapper = ""
         if self._pending_tool_wrapped and func_close_idx != -1:
-            structural_wrapper_close = current_text.find(
-                self.tool_call_end_token,
-                func_close_idx + len(self.function_end_token),
-            )
+            if not raw_parameter:
+                structural_wrapper_close = current_text.find(
+                    self.tool_call_end_token,
+                    func_close_idx + len(self.function_end_token),
+                    call_limit,
+                )
             if structural_wrapper_close >= 0:
                 content_after_wrapper = current_text[
                     structural_wrapper_close + len(self.tool_call_end_token) :
