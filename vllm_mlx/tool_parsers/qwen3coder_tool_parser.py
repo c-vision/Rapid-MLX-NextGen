@@ -1023,7 +1023,12 @@ class Qwen3CoderToolParser(ToolParser):
                         visible_value = tool_text[param_header_end + 1 :].lstrip()
                         if not visible_value:
                             return None
-                        if not visible_value.startswith('"'):
+                        param_name = tool_text[
+                            param_start + len(self.parameter_prefix) : param_header_end
+                        ]
+                        if _is_string_param(param_name, expected_params) and not (
+                            visible_value.startswith('"')
+                        ):
                             self._legacy_raw_stream = True
                             return None
                     self._current_tool_id = _generate_tool_id()

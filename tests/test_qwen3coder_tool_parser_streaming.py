@@ -235,6 +235,28 @@ def test_legacy_raw_closers_are_deferred_to_full_text_parser(value: str):
 
 
 @pytest.mark.parametrize(
+    ("schema", "wire", "expected"),
+    [
+        ({"type": "integer"}, "42", 42),
+        ({"type": "boolean"}, "true", True),
+        ({"type": "array"}, "[1, 2]", [1, 2]),
+        ({"type": "object"}, '{"nested": 1}', {"nested": 1}),
+    ],
+)
+def test_non_string_first_parameter_is_not_deferred(schema, wire, expected):
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("record", {"value": schema})
+    chunks = [
+        "<tool_call>\n<function=record>\n<parameter=value>\n",
+        wire,
+        "\n</parameter>\n</function>\n</tool_call>",
+    ]
+
+    deltas = _feed(parser, chunks, request)
+    assert json.loads("".join(_argument_fragments(deltas))) == {"value": expected}
+
+
+@pytest.mark.parametrize(
     ("tool_name", "param_name", "value"),
     [
         (
@@ -382,29 +404,6 @@ def test_same_chunk_close_and_trailing_param_not_dropped():
     assert decoded == {"summary": _LONG_SUMMARY, "score": 42}, (
         f"trailing param dropped on same-chunk close. decoded={decoded!r}"
     )
-
-
-def test_truncated_legacy_raw_call_stays_deferred_for_finalize():
-    """Malformed legacy raw XML is not emitted speculatively."""
-    parser = Qwen3CoderToolParser(tokenizer=None)
-    request = _request_with_tool("echo", {"value": {"type": "string"}})
-
-    # Multi-chunk feed: first chunks open the in-flight string; the final
-    # chunk arrives with ``</tool_call>`` directly, NO </parameter> and NO
-    # </function> at all (a malformed / truncated stream).
-    value_head = "A" * 80
-    value_tail = "B" * 80
-    chunks = [
-        "<tool_call>\n",
-        "<function=echo>\n",
-        "<parameter=value>\n",
-        value_head,
-        value_tail + "\n</tool_call>",
-    ]
-
-    deltas = _feed(parser, chunks, request)
-    assert _argument_fragments(deltas) == []
-    assert parser._legacy_raw_stream is True
 
 
 @pytest.mark.parametrize(

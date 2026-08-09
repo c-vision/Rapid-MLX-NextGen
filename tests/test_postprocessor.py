@@ -2877,9 +2877,7 @@ class TestRequestForwardedToToolParser:
             f"names_seen={names_seen}"
         )
 
-    @pytest.mark.parametrize(
-        "closer", ["</parameter>", "</function>", "</tool_call>"]
-    )
+    @pytest.mark.parametrize("closer", ["</parameter>", "</function>", "</tool_call>"])
     def test_qwen3_coder_finalize_preserves_closer_in_legacy_raw_value(self, closer):
         """#1515: ambiguous raw XML is resolved from the complete EOS buffer."""
         from vllm_mlx.tool_parsers.qwen3coder_tool_parser import (
@@ -2914,7 +2912,9 @@ class TestRequestForwardedToToolParser:
             *value,
             "\n</parameter>\n</function>\n</tool_call>",
         ]
-        streamed = [event for piece in pieces for event in pp.process_chunk(_make_output(piece))]
+        streamed = [
+            event for piece in pieces for event in pp.process_chunk(_make_output(piece))
+        ]
         assert [event for event in streamed if event.type == "tool_call"] == []
 
         final_events = pp.finalize()
