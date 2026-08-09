@@ -458,8 +458,10 @@ class Qwen3CoderToolParser(ToolParser):
                     and body.find(">") >= 0
                     and not body[body.find(">") + 1 :].strip()
                 )
+                next_wrapper = model_output.find(self.tool_call_start_token, body_start)
+                recovery_end = next_wrapper if next_wrapper >= 0 else len(model_output)
                 trailing_wrapper = model_output.rfind(
-                    self.tool_call_end_token, body_start
+                    self.tool_call_end_token, body_start, recovery_end
                 )
                 if trailing_wrapper >= 0:
                     # EOS recovery for a malformed call missing inner closes.
@@ -1038,7 +1040,16 @@ class Qwen3CoderToolParser(ToolParser):
                         self.current_function_name, request_tools
                     )
                     if expected_params and func_close_idx == -1:
-                        for param_name in expected_params:
+                        # Any string property could appear later (JSON Schema
+                        # properties are optional unless listed as required).
+                        # Wait until every possible string parameter is visible
+                        # before emitting an irreversible header; non-string
+                        # properties cannot carry ambiguous XML closers.
+                        for param_name in (
+                            name
+                            for name in expected_params
+                            if _is_string_param(name, expected_params)
+                        ):
                             opener = f"{self.parameter_prefix}{param_name}>"
                             param_start = tool_text.find(opener, func_end)
                             if param_start < 0:

@@ -249,6 +249,28 @@ def test_legacy_raw_closers_are_deferred_to_full_text_parser(value: str):
 
 
 @pytest.mark.parametrize(
+    "value",
+    [
+        "before </parameter> after",
+        "before </function> after",
+        "before </tool_call> after",
+    ],
+)
+def test_complete_legacy_raw_call_in_one_chunk_preserves_closer(value):
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("write", {"content": {"type": "string"}})
+    wire = (
+        "<tool_call>\n<function=write>\n<parameter=content>\n"
+        f"{value}\n</parameter>\n</function>\n</tool_call>"
+    )
+
+    delta = parser.extract_tool_calls_streaming("", wire, wire, request=request)
+    assert json.loads(delta["tool_calls"][0]["function"]["arguments"]) == {
+        "content": value
+    }
+
+
+@pytest.mark.parametrize(
     ("schema", "wire", "expected"),
     [
         ({"type": "integer"}, "42", 42),
