@@ -364,13 +364,13 @@ class Qwen3CoderToolParser(ToolParser):
         }
 
     def _get_function_calls(self, model_output: str) -> list[str]:
-        return [body for body, _, _ in self._function_call_candidates(model_output)]
+        return [body for body, _, _, _ in self._function_call_candidates(model_output)]
 
     def _function_call_candidates(
         self, model_output: str
-    ) -> list[tuple[str, int, int]]:
+    ) -> list[tuple[str, int, int, bool]]:
         """Return function bodies and the exact framing span each occupies."""
-        candidates: list[tuple[str, int, int]] = []
+        candidates: list[tuple[str, int, int, bool]] = []
         for start in self._function_start_positions(model_output):
             close = self._top_level_function_close(model_output, start)
             body_start = start + len(self.tool_call_prefix)
@@ -396,6 +396,10 @@ class Qwen3CoderToolParser(ToolParser):
 
             span_start = start
             wrapper_start = model_output.rfind(self.tool_call_start_token, 0, start)
+            wrapper_close_before = model_output.rfind(
+                self.tool_call_end_token, 0, start
+            )
+            is_wrapped = wrapper_start > wrapper_close_before
             if (
                 wrapper_start >= 0
                 and not model_output[
@@ -408,7 +412,7 @@ class Qwen3CoderToolParser(ToolParser):
             wrapper_end = model_output.find(self.tool_call_end_token, function_end)
             if wrapper_end >= 0 and not model_output[function_end:wrapper_end].strip():
                 span_end = wrapper_end + len(self.tool_call_end_token)
-            candidates.append((body, span_start, span_end))
+            candidates.append((body, span_start, span_end, is_wrapped))
         return candidates
 
     def _content_without_admitted_calls(
@@ -546,12 +550,10 @@ class Qwen3CoderToolParser(ToolParser):
 
             tool_calls = []
             accepted_spans: list[tuple[int, int]] = []
-            for fc_str, span_start, span_end in candidates:
+            for fc_str, span_start, span_end, is_wrapped in candidates:
                 candidate_name = fc_str.split(">", 1)[0]
                 if (
-                    not model_output[span_start:span_end].startswith(
-                        self.tool_call_start_token
-                    )
+                    not is_wrapped
                     and self.parameter_prefix not in fc_str
                     and candidate_name != selected
                 ):

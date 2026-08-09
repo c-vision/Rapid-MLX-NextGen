@@ -340,6 +340,23 @@ class TestOnlyDeclaredToolsBecomeCalls:
             "<tool_call><function=read_file></function></tool_call>"
         )
 
+    def test_shared_wrapper_admits_a_later_zero_argument_call(self):
+        ping = {
+            "type": "function",
+            "function": {"name": "ping", "parameters": {}},
+        }
+        text = (
+            "<tool_call><function=read_file></function>"
+            "<function=ping></function></tool_call>"
+        )
+        result = _qwen3coder().extract_tool_calls(text, {"tools": [ping]})
+
+        assert result.tools_called is True
+        assert [call["name"] for call in result.tool_calls] == ["ping"]
+        assert result.content == (
+            "<tool_call><function=read_file></function></tool_call>"
+        )
+
     @pytest.mark.parametrize(
         "request_payload",
         [
