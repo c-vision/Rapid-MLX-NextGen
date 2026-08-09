@@ -428,9 +428,11 @@ class Qwen3CoderToolParser(ToolParser):
                 if function_close >= 0
                 else span_end
             )
-            if function_close < 0 and model_output[span_start:].startswith(
+            owns_wrapper = model_output[span_start:].startswith(
                 self.tool_call_start_token
-            ):
+            )
+            wrapper_close = model_output.find(self.tool_call_end_token, function_end)
+            if owns_wrapper and (function_close < 0 or wrapper_close < 0):
                 function_start = span_start
             ranges.append((function_start, function_end))
 

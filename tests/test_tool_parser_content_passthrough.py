@@ -510,6 +510,18 @@ class TestTruncatedCallsStillRecover:
         )
         assert unrelated_wrapper.tools_called is False
 
+    def test_call_truncated_after_function_close_removes_open_wrapper(self):
+        wire = (
+            "<tool_call><function=write_file>"
+            "<parameter=path>a.md</parameter>"
+            "<parameter=content>hi</parameter>"
+            "</function>"
+        )
+        result = _qwen3coder().extract_tool_calls(wire, {"tools": DECLARED_TOOLS})
+
+        assert result.tools_called is True
+        assert result.content is None
+
     def test_complete_call_is_unaffected(self):
         wire = (
             "<tool_call>\n<function=write_file>\n"
