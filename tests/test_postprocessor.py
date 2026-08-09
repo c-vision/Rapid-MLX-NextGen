@@ -2876,3 +2876,49 @@ class TestRequestForwardedToToolParser:
             f"#171: tool_call emitted but function name 'read' missing; "
             f"names_seen={names_seen}"
         )
+
+    @pytest.mark.parametrize(
+        "closer", ["</parameter>", "</function>", "</tool_call>"]
+    )
+    def test_qwen3_coder_finalize_preserves_closer_in_legacy_raw_value(self, closer):
+        """#1515: ambiguous raw XML is resolved from the complete EOS buffer."""
+        from vllm_mlx.tool_parsers.qwen3coder_tool_parser import (
+            Qwen3CoderToolParser,
+        )
+
+        parser = Qwen3CoderToolParser(tokenizer=None)
+        cfg = _make_cfg(
+            enable_auto_tool_choice=True,
+            tool_parser_instance=parser,
+        )
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"content": {"type": "string"}},
+                        },
+                    },
+                }
+            ]
+        }
+        value = f"before {closer} after"
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+        pp.reset()
+
+        pieces = [
+            "<tool_call>\n<function=write>\n<parameter=content>\n",
+            *value,
+            "\n</parameter>\n</function>\n</tool_call>",
+        ]
+        streamed = [event for piece in pieces for event in pp.process_chunk(_make_output(piece))]
+        assert [event for event in streamed if event.type == "tool_call"] == []
+
+        final_events = pp.finalize()
+        tool_events = [event for event in final_events if event.type == "tool_call"]
+        assert len(tool_events) == 1
+        arguments = tool_events[0].tool_calls[0]["function"]["arguments"]
+        assert json.loads(arguments) == {"content": value}
