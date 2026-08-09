@@ -15,6 +15,7 @@ struct ContentView: View {
     @Environment(ServerManager.self) private var server
     @Environment(DownloadManager.self) private var downloads
     @Environment(ChatViewModel.self) private var chat
+    @Environment(ImageGenViewModel.self) private var imageGen
     @Environment(SamplingConfig.self) private var sampling
     @Environment(UpdateChecker.self) private var updater
     @Environment(QuickstartCoordinator.self) private var quickstart
@@ -428,6 +429,8 @@ struct ContentView: View {
         switch section {
         case .chat:
             mainArea
+        case .images:
+            ImagesView(viewModel: imageGen, server: server)
         case .launch:
             LaunchView(
                 server: server,

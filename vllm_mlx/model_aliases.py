@@ -24,13 +24,15 @@ from .model_profile import Modality, ModelProfile
 # sites keep resolving. See ``model_profile`` for why the class lives
 # there (import-light + avoids the model_auto_config↔model_aliases cycle).
 # Implemented lanes — what ``load_model`` can actually dispatch to today.
-# ``vision`` and ``image-gen`` are RESERVED in the type alias so that
-# routing code can pattern-match on them once their dispatch paths land,
-# but loading an alias that declares one MUST fail loud right now —
-# otherwise an aliases.json typo would pass schema validation and crash
-# at request time with an unrouted lane (pr_validate codex r13 NIT).
-_VALID_MODALITIES: frozenset[str] = frozenset({"text", "text-diffusion", "video-gen"})
-_RESERVED_MODALITIES: frozenset[str] = frozenset({"vision", "image-gen"})
+# ``image-gen`` routes to the mflux image lane (runtime/image_lane.py).
+# ``vision`` stays RESERVED in the type alias so routing code can pattern-match
+# on it once its dispatch path lands, but loading a ``vision`` alias MUST fail
+# loud right now — otherwise an aliases.json typo would pass schema validation
+# and crash at request time with an unrouted lane (pr_validate codex r13 NIT).
+_VALID_MODALITIES: frozenset[str] = frozenset(
+    {"text", "text-diffusion", "video-gen", "image-gen"}
+)
+_RESERVED_MODALITIES: frozenset[str] = frozenset({"vision"})
 
 # Canonical enum for ``suffix_decoding_tier``. Kept here so the contract
 # test (tests/test_aliases_contract.py) and any future loader / CLI

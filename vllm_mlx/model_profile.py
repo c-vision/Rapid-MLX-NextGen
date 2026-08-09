@@ -45,9 +45,10 @@ from typing import Literal
 # (and every external JSON snippet that pre-dates this field) keeps the
 # auto-regressive LLM lane untouched. New modalities branch the runtime
 # at startup — see ``runtime/diffusion_lane.py`` for the discrete
-# text-diffusion path used by DiffusionGemma. ``"vision"`` and
-# ``"image-gen"`` are reserved for forthcoming VLM / image-gen
-# integrations. (A vision-config checkpoint we serve text-only — e.g.
+# text-diffusion path used by DiffusionGemma; ``"image-gen"`` routes to
+# the mflux image lane (``runtime/image_lane.py``). ``"vision"`` is
+# reserved for a forthcoming VLM integration. (A vision-config checkpoint
+# we serve text-only — e.g.
 # Ternary-Bonsai-27B — stays ``modality="text"`` and sets
 # ``is_text_only=True`` instead; it is not a ``"vision"`` alias because
 # we do not serve its vision tower.)
@@ -190,8 +191,10 @@ class ModelProfile:
     # alias and keeps the auto-regressive scheduler/runtime path
     # unchanged. Non-text modalities branch into dedicated lanes:
     # ``"text-diffusion"`` → ``runtime/diffusion_lane.py`` (block
-    # denoising, no spec-decode, no DFlash); ``"vision"`` /
-    # ``"image-gen"`` reserved for upcoming integrations.
+    # denoising, no spec-decode, no DFlash); ``"image-gen"`` →
+    # ``runtime/image_lane.py`` (mflux FLUX / Qwen-Image); ``"video-gen"``
+    # → ``runtime/video_lane.py``; ``"vision"`` reserved for an upcoming
+    # VLM integration.
     modality: Modality = "text"
     # PFlash long-prompt compression eligibility (#287). Default
     # ``"unknown"`` keeps the engine's PFlash mode at ``"off"`` so a

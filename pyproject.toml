@@ -430,6 +430,14 @@ video = [
     "pillow>=10.0.0; platform_system == 'Darwin' and python_version >= '3.11'",
     "sentencepiece>=0.2.0; platform_system == 'Darwin' and python_version >= '3.11'",
 ]
+image = [
+    # MLX-native text-to-image / image-edit (FLUX.1-schnell, Qwen-Image,
+    # Qwen-Image-Edit) via mflux. mflux pins ``mlx<0.32`` — the same ceiling
+    # Rapid-MLX core already tracks — and requires Python >=3.11 (Rapid-MLX
+    # core still supports 3.10, so the image lane preflight gives 3.10 users an
+    # explicit upgrade diagnostic). Only Apache-2.0 model families are wired.
+    "mflux>=0.18.0; platform_system == 'Darwin' and python_version >= '3.11'",
+]
 
 [project.urls]
 Homepage = "https://github.com/raullenchai/Rapid-MLX"

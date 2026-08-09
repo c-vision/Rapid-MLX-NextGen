@@ -5,6 +5,7 @@ import SwiftUI
 /// ("Older" list) is a later milestone.
 enum SidebarSection: Hashable {
     case chat
+    case images
     case launch
 }
 
@@ -103,6 +104,13 @@ struct SidebarView: View {
                 action: onNewChat
             )
             .accessibilityIdentifier("Sidebar.NewChat")
+            row(
+                title: "Images",
+                systemImage: "photo",
+                isSelected: selection == .images,
+                action: { selection = .images }
+            )
+            .accessibilityIdentifier("Sidebar.Images")
             row(
                 title: "Launch",
                 systemImage: "paperplane",

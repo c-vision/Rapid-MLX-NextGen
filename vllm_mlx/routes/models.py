@@ -410,6 +410,9 @@ def _detect_capabilities(
     if profile_modality == "video-gen":
         return ["video.generation"]
 
+    if profile_modality == "image-gen":
+        return ["image.generation"]
+
     caps: list[str] = ["text"]
     if _is_vlm(model_id, profile_modality, is_text_only):
         caps.append("vision")

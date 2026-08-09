@@ -28,6 +28,16 @@ covered, and each one names the defect it would have caught:
 9. `update-state` — Settings → App must name the version the app actually is.
 10. `no-dead-controls` — every Settings panel must expose controls of its own.
 11. `catalog-integrity` — a model that cannot chat must never be offered as one.
+    Now covers **image-gen** aliases too: `rapid-mlx models` tags them
+    `[image:gen]` in their own section (mirroring `[video:gen]`), and the
+    chat catalog's `hasNonChatKindTag` drops `image` alongside `audio`/`video`,
+    so a 24 GB FLUX/Qwen-Image checkpoint can never surface in the chat picker.
+
+12. `image-generation` — the Images tab turns a text prompt into a picture and
+    lets the user iterate by re-prompting (see **Image generation** below). The
+    instruction-**edit** path exists in code but is parked as a slow, batch-only
+    lane on current hardware (~20 min/edit at q4); the interactive golden flow is
+    text→image generation.
 
 The distinction matters. A journey answers *"can someone do this?"*; an
 invariant answers *"is this still true everywhere?"*. The three defects below
@@ -172,6 +182,87 @@ The flow also waits for `Benchmark.LoadedModelResult`, proving the number made
 it back through the real sheet. This would have caught the old implementation,
 which rejected an 8B speed test for lack of memory precisely because it tried
 to load an unnecessary second 8B copy.
+
+## Image generation
+
+The Images tab is a dedicated text→image / image-edit surface, reached from
+`Sidebar.Images`. It is decoupled from chat on purpose: rapid-mlx serves **one
+model per process**, so an image-gen alias (e.g. `flux2-klein-4b`) cannot be
+loaded alongside the chat LLM — selecting one reloads the sidecar, exactly the
+stop/start path a chat model-switch already takes.
+
+**The interactive golden flow is text→image generation.** The tab imitates the
+fast half of ChatGPT's image experience: type a prompt, get a picture in
+seconds, refine by re-prompting. `image-generation` walks that through AX
+identifiers, no real diffusion weights required (the fake sidecar answers
+`/v1/images/*` with a 1×1 PNG). Demonstrated live with real weights below.
+
+1. open the Images tab via `Sidebar.Images`; assert the `Images.EmptyState`
+   hero (the cheetah mark + "Draw anything") is present;
+2. the composer's `Images.ModelPicker` lists the `[image:gen]` rows from
+   `rapid-mlx models`, never a chat alias (see `catalog-integrity`); set the
+   aspect ratio with `Images.Aspect` (1:1 / 3:4 / 4:3);
+3. **Load the model.** rapid-mlx serves one model per process, so when the
+   server is on a different (e.g. chat) model the tab shows a readiness banner
+   ("<model> isn't running"); press `Readiness.Action` to switch the server to
+   the image model. `Images.Generate` stays disabled until it is ready — the
+   same `ModelReadiness` gate chat uses;
+4. **Generate.** Type into `Images.Prompt`, press `Images.Generate`; assert the
+   in-flight progress card appears (a true `step / total` bar, elapsed, ETA, and
+   an `Images.Cancel` control), then a result appears in `Images.Stage` with a
+   thumbnail under `Images.Gallery` (and `Images.EmptyState` is gone);
+5. **Refine by re-prompting.** Adjust the prompt and press `Images.Generate`
+   again; each render lands as its own thumbnail in the `Images.Gallery`
+   filmstrip, clickable to revisit its prompt;
+6. `Images.Result.Save` (a hover control on the focal image) opens the standard
+   save panel — not asserted through the modal `NSSavePanel`, out of AX scope
+   like every other file-picker in the app.
+
+### Instruction edit — endpoint-only, parked
+
+The `/v1/images/edits` endpoint and `ImageGenViewModel.runEdit` / `beginEdit`
+exist and are hermetically tested, but the current Images tab wires **no UI
+control** to them — there is no in-app edit action. The path is parked because
+on current Apple Silicon a q4 Qwen-Image-Edit render is ~20 min (see realities
+below): a batch action, not a conversation. It stays in the tree, reachable only
+via the HTTP API, for when a distilled edit model or faster hardware makes it
+interactive; until then the product story is generation.
+
+### Model realities the UX has to design around
+
+Verified on an M2 Pro 32 GB with the 4-bit mflux checkpoints:
+
+* **Generate is fast, edit is not.** The exposed generators are step-distilled
+  (`flux2-klein-4b` lands a 512² image in ~3 s / a 1024² in ~10 s on an M3
+  Ultra). `qwen-image-edit-4bit` is a large, non-distilled 20B model and mflux
+  fixes the edit canvas to a ~1024²-area render, so each denoise step is ~1 min
+  and a default 20-step edit is
+  **~20 minutes**. The edit round is a *batch* action on this hardware, not the
+  sub-second turnaround ChatGPT has; the compose bar must show a clearly
+  long-running, cancellable in-flight state and never imply instant results.
+* **Do not send a `size` on edits.** mflux derives the edit output canvas from
+  the input image (its VAE conditioning latents are pinned to a 1024²-area
+  grid). Forcing a mismatched `width`/`height` desyncs the RoPE position ids and
+  the model returns a valid-looking PNG of **pure noise**. The engine passes
+  `None` for edit dimensions and the route accepts `size` only for OpenAI-API
+  shape, then discards it. Round 1+ therefore inherits the round-0 framing.
+* **Edit quality is checkpoint-bound, not step-bound.** The q4 edit checkpoint
+  carries a persistent VAE speckle (40 steps looks the same as 20); a clean
+  edit needs a higher-precision repo (`OsaurusAI/Qwen-Image-Edit-mflux-q6` /
+  `-q8`), which costs proportionally more RAM/disk. Raising `steps` past ~20 on
+  q4 only burns wall-clock.
+
+The **model-vs-endpoint contract** is enforced server-side and covered by
+hermetic tests rather than a live flow: a text-to-image server answers
+`/v1/images/edits` with a 409, and an edit server answers
+`/v1/images/generations` with a 409, so a mis-routed request fails loud instead
+of returning a silent wrong result. The Images tab itself only drives
+`/v1/images/generations`.
+
+> Status: the AX identifiers and states above are **defined and shipped** in
+> product code; the runnable `gui-golden-flows.sh --flow image-generation`
+> journey and its structural baseline are the next increment (added the same way
+> every other flow was — identifiers first, then the scripted journey).
 
 ## Run
 

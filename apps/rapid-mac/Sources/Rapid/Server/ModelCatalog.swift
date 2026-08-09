@@ -1,5 +1,22 @@
 import Foundation
 
+/// What a model is *for*. Drives the capability tabs in Model Management —
+/// chat models and image models are managed side by side but never mixed in
+/// one list (and are picked in different tabs). Video is reserved for when
+/// the video lane surfaces manageable aliases.
+enum ModelKind: String, Sendable, Hashable, CaseIterable, Identifiable {
+    case chat, image, video
+    var id: String { rawValue }
+    /// Tab label in Model Management.
+    var tabLabel: String {
+        switch self {
+        case .chat: return "Chat"
+        case .image: return "Image"
+        case .video: return "Video"
+        }
+    }
+}
+
 /// One model in the rapid-mlx catalog. The picker UI groups cached vs.
 /// uncached so the user knows which aliases boot instantly vs. which
 /// trigger an HF download on first ``serve``.
@@ -17,6 +34,10 @@ struct ModelEntry: Identifiable, Hashable, Sendable {
     /// Drives a green dot in the picker so the user can tell at a glance
     /// which models start in seconds vs. which trigger a 5-80 GB pull.
     let cached: Bool
+
+    /// What the model is for. Defaults to ``.chat`` so every existing
+    /// construction site keeps working; the image catalog tags ``.image``.
+    var kind: ModelKind = .chat
 
     var id: String { alias }
 }
@@ -303,6 +324,53 @@ enum ModelCatalog {
         return (parseAvailable(output), parseExcludedAliases(output))
     }
 
+    /// Image-generation aliases (``[image:gen]`` rows) for the Images tab's
+    /// model picker. Parsed from the same ``rapid-mlx models`` output the
+    /// chat catalog reads, but keeping ONLY the image rows the chat catalog
+    /// deliberately excludes. ``cached`` is resolved by cross-referencing
+    /// ``rapid-mlx ls`` on HF repo id, so the picker can show which image
+    /// models boot instantly vs. which trigger a multi-GB pull.
+    static func imageEntries(
+        binary: URL,
+        hubCacheOverride: URL? = ModelsFolderPreference.validatedOverrideURL()
+    ) async -> [ModelEntry] {
+        async let modelsOut = runRapidMlx(binary: binary, args: ["models"])
+        async let cachedTask: [(String, String?, String?)] = listCached(
+            binary: binary,
+            hubCacheOverride: hubCacheOverride
+        )
+        let rows = parseImageRows(await modelsOut)
+        let cachedRepos = Set((await cachedTask).compactMap { $0.1 })
+        return rows.map { row in
+            ModelEntry(
+                alias: row.alias,
+                hfRepo: row.hfRepo,
+                sizeOnDisk: row.size,
+                cached: row.hfRepo.map { cachedRepos.contains($0) } ?? false,
+                kind: .image
+            )
+        }
+    }
+
+    /// Parse ``[image:gen]``-tagged rows into ``(alias, hfRepo, size)``.
+    /// Row shape (see cli.py image section):
+    /// ``flux-schnell-4bit    8.9 GiB    [image:gen] dhairyashil/FLUX...``.
+    static func parseImageRows(
+        _ output: String
+    ) -> [(alias: String, hfRepo: String?, size: String?)] {
+        var rows: [(String, String?, String?)] = []
+        for rawLine in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = String(rawLine).trimmingCharacters(in: .whitespaces)
+            let fields = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard let alias = fields.first, isSafeAlias(alias),
+                  let tagIdx = fields.firstIndex(of: "[image:gen]") else { continue }
+            let hfRepo = tagIdx + 1 < fields.count ? fields[tagIdx + 1] : nil
+            let size = tagIdx > 1 ? fields[1..<tagIdx].joined(separator: " ") : nil
+            rows.append((alias, hfRepo, size))
+        }
+        return rows
+    }
+
     /// True when the line carries a non-chat Kind tag in its own column.
     ///
     /// Matching the bare substring ``"[audio:"`` would let any row whose
@@ -319,7 +387,7 @@ enum ModelCatalog {
             guard let colon = body.firstIndex(of: ":") else { continue }
             let kind = body[body.startIndex..<colon]
             let subtype = body[body.index(after: colon)...]
-            guard kind == "audio" || kind == "video" else { continue }
+            guard kind == "audio" || kind == "video" || kind == "image" else { continue }
             guard !subtype.isEmpty, subtype.allSatisfy({ $0.isLetter || $0 == "-" }) else {
                 continue
             }

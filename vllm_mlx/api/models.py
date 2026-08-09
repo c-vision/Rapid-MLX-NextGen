@@ -3145,3 +3145,85 @@ class ChatCompletionChunk(BaseModel):
     model: str
     choices: list[ChatCompletionChunkChoice]
     usage: Usage | None = None  # Included when stream_options.include_usage=true
+
+
+# Supported output dimensions: a bounded range keeps a single request from
+# pinning the whole GPU (a 2048² FLUX latent is ~4x the 1024² working set) and
+# every side is forced to a multiple of 16 because the FLUX / Qwen-Image VAE
+# down/up-samples by 8 twice — an odd dimension crashes deep inside the mflux
+# pipeline with an opaque reshape error instead of a clean 400 here.
+_IMAGE_MIN_DIM = 256
+_IMAGE_MAX_DIM = 2048
+_IMAGE_DIM_MULTIPLE = 16
+_IMAGE_SIZE_RE = re.compile(r"^\s*(\d{2,4})\s*[x×]\s*(\d{2,4})\s*$")
+
+
+def parse_image_size(value: str) -> tuple[int, int]:
+    """Parse+validate a ``WIDTHxHEIGHT`` string into a bounded ``(w, h)`` pair.
+
+    Shared by :class:`ImageGenerationRequest` (JSON body) and the multipart
+    ``/v1/images/edits`` form so both surfaces enforce the identical contract.
+    Raises ``ValueError`` on a malformed / out-of-range / non-multiple size.
+    """
+    match = _IMAGE_SIZE_RE.match(value or "")
+    if not match:
+        raise ValueError(
+            f"size must be 'WIDTHxHEIGHT' (e.g. '1024x1024'), got {value!r}"
+        )
+    width, height = int(match.group(1)), int(match.group(2))
+    for dim, side in ((width, "width"), (height, "height")):
+        if dim < _IMAGE_MIN_DIM or dim > _IMAGE_MAX_DIM:
+            raise ValueError(
+                f"{side} must be between {_IMAGE_MIN_DIM} and {_IMAGE_MAX_DIM}, got {dim}"
+            )
+        if dim % _IMAGE_DIM_MULTIPLE != 0:
+            raise ValueError(
+                f"{side} must be a multiple of {_IMAGE_DIM_MULTIPLE}, got {dim}"
+            )
+    return width, height
+
+
+class ImageGenerationRequest(BaseModel):
+    """Request for text-to-image (OpenAI ``/v1/images/generations`` compatible).
+
+    Rapid-MLX serves one image model per process (like the audio/video lanes),
+    so ``model`` is advisory — the loaded alias decides the family. ``size`` is
+    parsed and bounds-checked here so a malformed or oversized request surfaces
+    a 400 ``invalid_request_error`` BEFORE mflux loads multi-gigabyte weights.
+
+    ``steps`` / ``guidance`` / ``seed`` / ``negative_prompt`` are Rapid-MLX
+    extensions (not in the stock OpenAI schema) exposing the diffusion knobs;
+    OpenAI clients that omit them get the family's fast defaults.
+    """
+
+    model: str = ""
+    prompt: str = Field(..., min_length=1)
+    # Cap ``n`` so one call can't serialize an unbounded number of full renders
+    # behind the process generation lock.
+    n: int = Field(default=1, ge=1, le=4)
+    size: str = "1024x1024"
+    response_format: Literal["b64_json", "url"] = "b64_json"
+    # Upper bound so an arbitrarily large Python int can't reach the native
+    # MLX/mflux backend and overflow into a 500.
+    seed: int | None = Field(default=None, ge=0, le=2_147_483_647)
+    negative_prompt: str | None = None
+    # Diffusion-step count. schnell/Qwen-Image are distilled for 2-8 steps; the
+    # ceiling keeps a single request from monopolizing the GPU for minutes.
+    steps: int | None = Field(default=None, ge=1, le=50)
+    guidance: float | None = Field(default=None, ge=0.0, le=20.0)
+
+    @field_validator("size")
+    @classmethod
+    def _validate_size(cls, value: str) -> str:
+        width, height = parse_image_size(value)
+        return f"{width}x{height}"
+
+    # NOTE: ``guidance`` needs no explicit finite check — it carries ``ge=0``
+    # AND ``le=20``, and NaN/inf fail every comparison, so a non-finite value
+    # is already rejected by the bounds. The repo-wide ``math.isfinite`` guard
+    # only matters for UNBOUNDED float fields, which this model has none of.
+
+    def dimensions(self) -> tuple[int, int]:
+        """Return the validated ``(width, height)`` pair."""
+        width, height = self.size.split("x")
+        return int(width), int(height)

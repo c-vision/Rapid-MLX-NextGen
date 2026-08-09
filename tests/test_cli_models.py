@@ -27,14 +27,20 @@ def _capture_models_output() -> str:
 
 
 def _split_by_modality() -> tuple[dict, dict]:
-    """``(text_profiles, video_profiles)`` — the split the listing renders."""
+    """``(text, video, image)`` profiles — the split the listing renders."""
     profiles = list_profiles()
     video = {
         a: p
         for a, p in profiles.items()
         if getattr(p, "modality", "text") == "video-gen"
     }
-    return {a: p for a, p in profiles.items() if a not in video}, video
+    image = {
+        a: p
+        for a, p in profiles.items()
+        if getattr(p, "modality", "text") == "image-gen"
+    }
+    text = {a: p for a, p in profiles.items() if a not in video and a not in image}
+    return text, video, image
 
 
 def test_models_command_lists_all_aliases():
@@ -52,9 +58,11 @@ def test_models_command_lists_all_aliases():
     for alias in profiles:
         assert alias in out, f"alias {alias!r} missing from `rapid-mlx models` output"
 
-    text_profiles, video_profiles = _split_by_modality()
+    text_profiles, video_profiles, image_profiles = _split_by_modality()
     assert f"({len(text_profiles)} aliases)" in out
-    assert len(text_profiles) + len(video_profiles) == len(profiles)
+    assert len(text_profiles) + len(video_profiles) + len(image_profiles) == len(
+        profiles
+    )
 
 
 def test_models_command_sections_video_aliases_out_of_the_text_table():
@@ -67,7 +75,7 @@ def test_models_command_sections_video_aliases_out_of_the_text_table():
     (#1603). The section header and the ``[video:gen]`` tag are the
     contract it filters on — mirroring ``[audio:tts]`` / ``[audio:stt]``.
     """
-    _, video_profiles = _split_by_modality()
+    _, video_profiles, _ = _split_by_modality()
     if not video_profiles:
         pytest.skip("no video-gen aliases in the registry")
 
@@ -85,6 +93,34 @@ def test_models_command_sections_video_aliases_out_of_the_text_table():
     # Every video row carries the Kind tag the desktop filters on.
     tagged = [ln for ln in video_section.splitlines() if "[video:gen]" in ln]
     assert len(tagged) == len(video_profiles)
+
+
+def test_models_command_sections_image_aliases_out_of_the_text_table():
+    """Image-gen aliases must not sit in the chat table, and must carry a Kind tag.
+
+    An ``image-gen`` model (mflux FLUX / Qwen-Image) has no ``stream_chat``,
+    so it can never answer ``/v1/chat/completions``. Same catalog-integrity
+    contract as video (#1603): the ``[image:gen]`` tag + section header are
+    what the desktop catalog filters on so it never offers a multi-GB image
+    checkpoint as a chat model.
+    """
+    _, _, image_profiles = _split_by_modality()
+    if not image_profiles:
+        pytest.skip("no image-gen aliases in the registry")
+
+    out = _capture_models_output()
+    head, _, image_section = out.partition("Image models (")
+    assert image_section, "expected an 'Image models (N aliases)' section"
+    assert f"{len(image_profiles)} aliases)" in image_section.split("\n", 1)[0]
+
+    for alias in image_profiles:
+        assert alias not in head, (
+            f"image alias {alias!r} leaked into the chat table — a catalog "
+            "consumer would offer it as a chat model"
+        )
+        assert alias in image_section
+    tagged = [ln for ln in image_section.splitlines() if "[image:gen]" in ln]
+    assert len(tagged) == len(image_profiles)
 
 
 def test_models_command_shows_capability_columns():

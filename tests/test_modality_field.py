@@ -83,8 +83,12 @@ class TestModalityValidation:
         # ``load_model``. If you add a value here you MUST also
         # update the Literal in model_aliases.py AND the dispatch
         # tables in cli.py / routes/models.py. Failing this assertion
-        # is the trigger to do that work.
-        assert frozenset({"text", "text-diffusion", "video-gen"}) == _VALID_MODALITIES
+        # is the trigger to do that work. ``image-gen`` joined when the
+        # mflux image lane (runtime/image_lane.py) landed.
+        assert (
+            frozenset({"text", "text-diffusion", "video-gen", "image-gen"})
+            == _VALID_MODALITIES
+        )
 
     def test_reserved_modality_set_pinned(self) -> None:
         # Reserved lanes — declared in the type alias so routing
@@ -93,12 +97,12 @@ class TestModalityValidation:
         # (pr_validate codex r13 NIT). When you implement one of
         # these, move it from _RESERVED_MODALITIES into
         # _VALID_MODALITIES and update this test.
-        assert frozenset({"vision", "image-gen"}) == _RESERVED_MODALITIES
+        assert frozenset({"vision"}) == _RESERVED_MODALITIES
 
     def test_reserved_modality_rejected_at_load(self) -> None:
         # Loading an alias whose modality is reserved-but-not-routed
         # must fail with a clear "not yet implemented" message.
-        for reserved in ("vision", "image-gen"):
+        for reserved in ("vision",):
             with pytest.raises(ValueError, match="not yet implemented"):
                 _coerce(
                     "bad",
@@ -109,6 +113,20 @@ class TestModalityValidation:
                         "supports_dflash": False,
                     },
                 )
+
+    def test_image_gen_accepted(self) -> None:
+        # ``image-gen`` is now a routed lane (mflux) — it must coerce
+        # cleanly like any other implemented modality.
+        profile = _coerce(
+            "flux-schnell",
+            {
+                "hf_path": "black-forest-labs/FLUX.1-schnell",
+                "modality": "image-gen",
+                "supports_spec_decode": False,
+                "supports_dflash": False,
+            },
+        )
+        assert profile.modality == "image-gen"
 
 
 class TestNonTextLaneRejectsARGates:

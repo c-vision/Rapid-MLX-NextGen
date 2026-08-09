@@ -113,6 +113,10 @@ _EXCLUDED_PATHS = frozenset(
         # Multipart video uploads have a dedicated 20 MiB file / 21 MiB
         # request cap plus pre-parse authentication in routes.video.
         "/v1/videos",
+        # Multipart image-edit uploads have a dedicated 25 MB cap enforced
+        # pre-parse by ``routes.images.ImageBodyLimitMiddleware``; the generic
+        # 8 MiB JSON cap would otherwise reject a legitimate large init image.
+        "/v1/images/edits",
     }
 )
 

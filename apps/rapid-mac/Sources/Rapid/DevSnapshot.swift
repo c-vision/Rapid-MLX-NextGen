@@ -43,6 +43,10 @@ enum DevSnapshot {
         // throwaway instance is right here: the snapshot never approves
         // anything, it only needs the object to exist.
         let browseApproval = BrowseApprovalStore()
+        // ``ContentView`` also reads ``ImageGenViewModel`` from the
+        // environment (the Images tab). Same rule as ``browseApproval``: a
+        // throwaway instance so the view can be evaluated without trapping.
+        let imageGen = ImageGenViewModel(server: server)
 
         // Erase to AnyView so the long environment chain stays cheap to
         // type-check and the render call is monomorphic.
@@ -61,6 +65,18 @@ enum DevSnapshot {
                     .environment(quickstart)
                     .environment(dockPromptStore)
                     .environment(browseApproval)
+                    .environment(imageGen)
+                    .frame(width: width, height: height)
+            )
+        }
+
+        // The Images tab, rendered standalone — ``ContentView`` owns its
+        // ``SidebarSection`` privately, so (like ``launchView``) the detail
+        // surface is captured directly rather than by driving navigation.
+        func imagesView(width: CGFloat, height: CGFloat) -> AnyView {
+            AnyView(
+                ImagesView(viewModel: imageGen, server: server)
+                    .tint(RapidTheme.brandAmber)
                     .frame(width: width, height: height)
             )
         }
@@ -142,6 +158,11 @@ enum DevSnapshot {
         // whether HF_HUB_CACHE points at a populated cache).
         render(contentView(width: 900, height: 640), to: "\(dir)/content-idle.png")
         render(contentView(width: 640, height: 560), to: "\(dir)/content-min.png")
+        // Images tab (empty state — no results, catalog not yet resolved).
+        render(imagesView(width: 700, height: 640), to: "\(dir)/images-empty.png")
+        renderHosted(imagesView(width: 700, height: 640),
+                     size: CGSize(width: 700, height: 640),
+                     appearance: .darkAqua, to: "\(dir)/images-dark.png")
 
         // Scenario 1b (v1.0 visual foundation): the Light/Dark × surface
         // matrix the Phase-1 review runs on. Chat and Launch are the two

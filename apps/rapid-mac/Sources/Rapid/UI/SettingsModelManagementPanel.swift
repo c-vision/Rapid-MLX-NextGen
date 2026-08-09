@@ -46,6 +46,9 @@ struct SettingsModelManagementPanel: View {
     @State private var lastFreed: String?
 
     @State private var query: String = ""
+    /// Which capability tab is showing (Chat vs Image vs future Video). Model
+    /// Management manages every kind, but never mixes them in one list.
+    @State private var capability: ModelKind = .chat
     @State private var filterMode: ModelCacheActions.FilterMode = .all
     @State private var sortOrder: ModelCacheActions.SortOrder = .familyThenSize
 
@@ -117,9 +120,12 @@ struct SettingsModelManagementPanel: View {
             header
             modelsFolderSection
             preferencesSection
-            controlsRow
-            if showRecommendedSection {
-                recommendedSection
+            capabilityTabs
+            if capability == .chat {
+                controlsRow
+                if showRecommendedSection {
+                    recommendedSection
+                }
             }
             if loading && catalog.isEmpty {
                 loadingState
@@ -387,6 +393,23 @@ struct SettingsModelManagementPanel: View {
         Task { await refreshCatalog() }
     }
 
+    /// Capability tabs — Chat / Image (/ Video, once it has aliases). Only
+    /// shown when there's more than one kind installed, so a chat-only setup
+    /// looks exactly as it did before image models existed.
+    @ViewBuilder
+    private var capabilityTabs: some View {
+        if availableKinds.count > 1 {
+            Picker("Model type", selection: $capability) {
+                ForEach(availableKinds) { kind in
+                    Text("\(kind.tabLabel) models").tag(kind)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .accessibilityIdentifier("Settings.ModelManagement.CapabilityTabs")
+        }
+    }
+
     @ViewBuilder
     private var controlsRow: some View {
         VStack(spacing: 10) {
@@ -631,23 +654,25 @@ struct SettingsModelManagementPanel: View {
         // the number in the heading and the rows under it can never
         // describe different sets.
         let entries = visibleEntries
+        let kindEntries = catalog.filter { $0.kind == capability }
         let heading = ModelCacheActions.listHeading(
             filter: filterMode,
             query: query,
             visibleCount: entries.count,
-            totalCount: catalog.count
+            totalCount: kindEntries.count
         )
         VStack(alignment: .leading, spacing: 9) {
             ModelsTableHeading(heading: heading)
-            // The meter legend belongs HERE — these are the only rows that
-            // render the Quality · Speed bars. The recommendation cards
-            // above show the curated capability / speed stats instead, so a
-            // top-of-panel legend misattributed them.
-            meterLegend
-            columnHeader
+            // The meter legend + Quality·Speed column belong to CHAT rows only
+            // — image models have no tok/s benchmark, so their tab shows a
+            // leaner row (name · repo · size · download).
+            if capability == .chat {
+                meterLegend
+                columnHeader
+            }
             listSection(entries)
             if let footer = ModelCacheActions.diskUsageFooter(
-                ModelCacheActions.aggregateOnDiskBytes(catalog)
+                ModelCacheActions.aggregateOnDiskBytes(kindEntries)
             ) {
                 Text(footer)
                     .font(.caption)
@@ -924,9 +949,16 @@ struct SettingsModelManagementPanel: View {
     // MARK: - List
 
     private var visibleEntries: [ModelEntry] {
-        let filtered = ModelCacheActions.filter(catalog, by: filterMode, query: query)
+        let byCapability = catalog.filter { $0.kind == capability }
+        let filtered = ModelCacheActions.filter(byCapability, by: filterMode, query: query)
         let sorted = ModelCacheActions.sorted(filtered, order: sortOrder)
         return ModelFavorites.favoritesFirst(sorted, favorites: favorites)
+    }
+
+    /// Kinds that actually have models to manage — the tab bar only offers
+    /// these (Video stays hidden until the video lane surfaces aliases).
+    private var availableKinds: [ModelKind] {
+        ModelKind.allCases.filter { kind in catalog.contains { $0.kind == kind } }
     }
 
     @ViewBuilder
@@ -939,7 +971,11 @@ struct SettingsModelManagementPanel: View {
         } else {
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(entries.enumerated()), id: \.element.alias) { idx, entry in
-                    row(for: entry)
+                    if entry.kind == .image {
+                        imageRow(for: entry)
+                    } else {
+                        row(for: entry)
+                    }
                     if idx < entries.count - 1 {
                         Divider().opacity(0.5)
                     }
@@ -999,6 +1035,40 @@ struct SettingsModelManagementPanel: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             metersView(alias: entry.alias)
                 .frame(width: 158)
+            sizeAction(entry: entry, badge: badge)
+                .frame(width: ModelTableLayout.sizeColumnWidth, alignment: .trailing)
+        }
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("Settings.ModelManagement.Row.\(entry.alias)")
+    }
+
+    /// A leaner row for image models: no tok/s meters (a diffusion model has
+    /// no token throughput), just name · repo · size and the same
+    /// download/delete control the chat rows use.
+    @ViewBuilder
+    private func imageRow(for entry: ModelEntry) -> some View {
+        let badge = ModelCacheActions.statusBadge(
+            for: entry,
+            downloadJob: downloads.jobs[entry.alias],
+            servingAlias: server.servingAlias
+        )
+        HStack(spacing: 10) {
+            BrandIcon(alias: entry.alias)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.alias)
+                    .font(.body.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let repo = entry.hfRepo {
+                    Text(repo)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             sizeAction(entry: entry, badge: badge)
                 .frame(width: ModelTableLayout.sizeColumnWidth, alignment: .trailing)
         }
@@ -1252,15 +1322,34 @@ struct SettingsModelManagementPanel: View {
         if let hit = await ModelCatalogCache.shared.cached(
             binary: binary, generation: generation
         ) {
-            catalog = hit
+            catalog = hit + (await ModelCatalog.imageEntries(binary: binary))
+            reconcileCapability()
             loading = false
             return
         }
         loading = true
         defer { loading = false }
-        catalog = await ModelCatalogCache.shared.entries(
+        // Chat catalog + image-gen aliases, managed side by side. The image
+        // rows carry ``kind == .image`` so the capability tabs keep them out of
+        // the chat list (and vice-versa).
+        let chat = await ModelCatalogCache.shared.entries(
             binary: binary, generation: generation
         )
+        let image = await ModelCatalog.imageEntries(binary: binary)
+        catalog = chat + image
+        reconcileCapability()
+    }
+
+    /// Keep the selected capability tab valid after the catalog changes.
+    /// Deleting the last image model while the Image tab is active (the tab bar
+    /// then collapses because only one kind remains) would otherwise strand the
+    /// panel on an empty, un-switchable ``.image`` view even though chat models
+    /// exist — so fall back to an available kind.
+    private func reconcileCapability() {
+        let kinds = availableKinds
+        if !kinds.isEmpty, !kinds.contains(capability) {
+            capability = kinds.first ?? .chat
+        }
     }
 
     private func deleteAlias(_ entry: ModelEntry) async {

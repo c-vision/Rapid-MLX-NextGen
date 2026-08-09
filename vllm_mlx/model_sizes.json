@@ -195,6 +195,8 @@
     "unsloth/Qwen3.6-27B-UD-MLX-3bit": 24071897617,
     "unsloth/Qwen3.6-27B-UD-MLX-4bit": 26210992727,
     "unsloth/Qwen3.6-27B-UD-MLX-6bit": 30522606211,
-    "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit": 21655301364
+    "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit": 21655301364,
+    "Runpod/FLUX.2-klein-4B-mflux-4bit": 4617089843,
+    "filipstrand/Z-Image-Turbo-mflux-4bit": 5905580032
   }
 }

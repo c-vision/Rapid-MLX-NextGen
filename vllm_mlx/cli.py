@@ -5008,7 +5008,22 @@ def models_command(args):
         for alias, p in all_profiles.items()
         if getattr(p, "modality", "text") == "video-gen"
     }
-    profiles = {a: p for a, p in all_profiles.items() if a not in video_profiles}
+    # Image-generation aliases (mflux FLUX / Qwen-Image) are likewise not chat
+    # models — ``/v1/chat/completions`` on one is unrouted. Split them into
+    # their own ``[image:gen]``-tagged section for the same catalog-integrity
+    # reason as video (#1603): a GUI consumer must be able to tell an image
+    # model from a chat model without hardcoding alias names, or it will offer
+    # a multi-GB image checkpoint as a chat model that dead-ends on first send.
+    image_profiles = {
+        alias: p
+        for alias, p in all_profiles.items()
+        if getattr(p, "modality", "text") == "image-gen"
+    }
+    profiles = {
+        a: p
+        for a, p in all_profiles.items()
+        if a not in video_profiles and a not in image_profiles
+    }
     print()
     print(f"  Available models ({len(profiles)} aliases)")
 
@@ -5134,6 +5149,30 @@ def models_command(args):
                 f"{p.hf_path:<40}"
             )
         print(video_sep)
+
+    # Image-generation aliases, tagged ``[image:gen]`` — same rationale as the
+    # video section above (#1603): a chat-catalog consumer must be able to
+    # exclude them by Kind tag rather than by hardcoded name.
+    if image_profiles:
+        image_alias_width = max(
+            24, max((len(a) for a in image_profiles), default=0) + 2
+        )
+        print()
+        print(f"  Image models ({len(image_profiles)} aliases)")
+        image_sep = "  " + "─" * width
+        print(image_sep)
+        print(
+            f"  {'Alias':<{image_alias_width}} {'Size':<10} {'Kind':<11} {'HF id':<40}"
+        )
+        print(image_sep)
+        for alias in sorted(image_profiles):
+            p = image_profiles[alias]
+            print(
+                f"  {alias:<{image_alias_width}} "
+                f"{format_size(p.hf_path):<10} {'[image:gen]':<11} "
+                f"{p.hf_path:<40}"
+            )
+        print(image_sep)
 
     print()
     print(

@@ -837,6 +837,10 @@ from .routes.video import install_video_body_limit_middleware  # noqa: E402
 
 install_video_body_limit_middleware(app)
 
+from .routes.images import install_image_body_limit_middleware  # noqa: E402
+
+install_image_body_limit_middleware(app)
+
 # SECURITY: blanket request-body size cap across all /v1/* routes.
 # Defends against the DoS pattern documented in rapid-desktop#273 / #463
 # where a 10–100 MB JSON body silently runs full prefill (~60–90 s on a
@@ -1845,6 +1849,19 @@ def load_model(
         )
         _engine = VideoEngine(model_name=_video_hf_path)
         logger.info(f"Video model ready for lazy generation: {model_name}")
+    elif _profile_modality == "image-gen":
+        from .runtime.image_lane import ImageEngine, require_image_runtime_or_exit
+
+        _image_hf_path = _profile.hf_path if _profile is not None else model_name
+        # Preflight the optional image stack (Python ≥3.11 + mflux) BEFORE
+        # advertising a ready server, so a missing runtime fails at startup with
+        # an actionable diagnostic instead of a generic HTTP 500 on first request.
+        require_image_runtime_or_exit(_image_hf_path)
+        logger.info(
+            f"Loading model with ImageEngine (modality=image-gen): {_image_hf_path}"
+        )
+        _engine = ImageEngine(model_name=_image_hf_path)
+        logger.info(f"Image model ready for lazy generation: {model_name}")
     elif _profile_modality == "text-diffusion":
         from .runtime.diffusion_lane import DiffusionEngine
 
@@ -2138,6 +2155,7 @@ from .routes.embeddings import router as _embeddings_router
 from .routes.health import admin_router as _health_admin_router
 from .routes.health import probe_router as _probe_router
 from .routes.health import router as _health_router
+from .routes.images import router as _images_router
 from .routes.mcp_routes import router as _mcp_router
 from .routes.metrics import router as _metrics_router
 from .routes.models import router as _models_router
@@ -2156,6 +2174,10 @@ app.include_router(_completions_router)
 app.include_router(_anthropic_router)
 app.include_router(_responses_router)
 app.include_router(_video_router)
+# Image lane is registered unconditionally like video: a text-only server
+# answers /v1/images/generations with the 409 "image_model_not_loaded"
+# envelope (the router's own gate), never a stray 404.
+app.include_router(_images_router)
 app.include_router(_embeddings_router)
 app.include_router(_mcp_router)
 # Task #292: ``_audio_router`` is registered LAZILY (after model load) by
