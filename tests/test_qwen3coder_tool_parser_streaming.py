@@ -207,6 +207,10 @@ def test_json_encoded_string_preserves_embedded_xml_closers():
         "A tool call block ends with </tool_call> on its own.",
         "A parameter block ends with </parameter> here.",
         "A function block ends with </function> here.",
+        (
+            "Parameter </parameter>, function </function>, and tool "
+            "</tool_call> are all payload."
+        ),
     ],
 )
 @pytest.mark.parametrize("chunking", ["after-marker", "one-byte"])

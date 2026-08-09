@@ -920,6 +920,44 @@ class Qwen3CoderToolParser(ToolParser):
 
         tool_start_idx = function_starts[self.current_tool_index]
         func_close_idx = self._top_level_function_close(current_text, tool_start_idx)
+        param_header = current_text.find(self.parameter_prefix, tool_start_idx)
+        raw_parameter = False
+        if param_header >= 0:
+            param_header_end = current_text.find(">", param_header)
+            if param_header_end >= 0:
+                raw_parameter = (
+                    not current_text[param_header_end + 1 :].lstrip().startswith('"')
+                )
+        if self._pending_tool_wrapped and raw_parameter:
+            # In an escaping-free raw value, an early ``</parameter>`` can
+            # make a later literal ``</function>`` look structural. A wrapped
+            # call is complete only when the LAST function closer directly
+            # precedes a wrapper closer (layout whitespace is allowed).
+            wrapper_close = current_text.rfind(self.tool_call_end_token)
+            wrapped_function_close = current_text.rfind(
+                self.function_end_token, tool_start_idx, wrapper_close
+            )
+            if (
+                wrapper_close < 0
+                or wrapped_function_close < 0
+                or current_text[
+                    wrapped_function_close
+                    + len(self.function_end_token) : wrapper_close
+                ].strip()
+            ):
+                func_close_idx = -1
+            else:
+                func_close_idx = wrapped_function_close
+        content_after_wrapper = ""
+        if self._pending_tool_wrapped and func_close_idx != -1:
+            structural_wrapper_close = current_text.find(
+                self.tool_call_end_token,
+                func_close_idx + len(self.function_end_token),
+            )
+            if structural_wrapper_close >= 0:
+                content_after_wrapper = current_text[
+                    structural_wrapper_close + len(self.tool_call_end_token) :
+                ]
         if func_close_idx == -1:
             tool_text = current_text[tool_start_idx:]
         else:
@@ -987,7 +1025,7 @@ class Qwen3CoderToolParser(ToolParser):
                         self.prev_tool_call_arr.append(
                             {"name": self.current_function_name, "arguments": args}
                         )
-                        return {
+                        result = {
                             "tool_calls": [
                                 {
                                     "index": self.current_tool_index,
@@ -1000,6 +1038,9 @@ class Qwen3CoderToolParser(ToolParser):
                                 }
                             ]
                         }
+                        if content_after_wrapper:
+                            result["content"] = content_after_wrapper
+                        return result
 
                     self.prev_tool_call_arr.append(
                         {"name": self.current_function_name, "arguments": "{}"}
@@ -1282,7 +1323,7 @@ class Qwen3CoderToolParser(ToolParser):
 
             if json_fragments:
                 combined = "".join(json_fragments)
-                return {
+                result = {
                     "tool_calls": [
                         {
                             "index": self.current_tool_index,
@@ -1290,5 +1331,8 @@ class Qwen3CoderToolParser(ToolParser):
                         }
                     ]
                 }
+                if content_after_wrapper:
+                    result["content"] = content_after_wrapper
+                return result
 
         return None
