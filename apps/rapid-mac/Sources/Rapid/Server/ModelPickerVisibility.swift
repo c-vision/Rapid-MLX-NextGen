@@ -197,44 +197,6 @@ enum ModelPickerVisibility {
     }
 
     /// Count how many entries WOULD be hidden by the filter, given
-    /// the current state. Used by the picker footer to surface "N
-    /// small models hidden — toggle in Settings" so the filter is
-    /// discoverable.
-    static func hiddenCount(
-        _ entries: [ModelEntry],
-        selectedAlias: String,
-        includeAll: Bool
-    ) -> Int {
-        return entries.reduce(0) { acc, entry in
-            // Count ONLY size-hidden aliases: they are what the footer
-            // ("N small (<1B) models hidden · toggle in Settings")
-            // describes and what the toggle actually recovers.
-            // Denylisted aliases are hidden for a different reason, are
-            // NOT toggle-recoverable, and would make the copy lie — so
-            // they are excluded from the count and vanish silently.
-            // (When ``includeAll`` is on, nothing is size-hidden, but a
-            // denylisted alias is still hidden — so it is still excluded
-            // here rather than short-circuiting the whole count to 0.)
-            if isKnownBroken(entry.alias) { return acc }
-            return shouldShow(
-                alias: entry.alias,
-                selectedAlias: selectedAlias,
-                includeAll: includeAll
-            ) ? acc : acc + 1
-        }
-    }
-
-    /// Footer copy for the picker dropdown explaining that some
-    /// aliases are hidden. Returns ``nil`` when nothing is filtered
-    /// (the dropdown stays clean). Pulled to a helper so tests can
-    /// pin the singular / plural copy without standing up a SwiftUI
-    /// host.
-    static func hiddenFooterCopy(hiddenCount count: Int) -> String? {
-        guard count > 0 else { return nil }
-        let noun = count == 1 ? "model" : "models"
-        return "\(count) small (<1B) \(noun) hidden · toggle in Settings → Models"
-    }
-
     // MARK: - cycle-10: quality buckets / picker sticker (F9-004)
 
     /// Quality bucket for an alias, derived from its parameter count.

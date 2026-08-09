@@ -66,6 +66,25 @@ struct ChatStreamClient {
     /// the main actor so callers can mutate ``@Observable`` state without
     /// hopping.
     enum Event: Sendable {
+        /// The first generated token of the turn has arrived, on whichever
+        /// lane carried it. Emitted exactly once, before the payload event
+        /// that triggered it, and never for a turn that generates nothing.
+        ///
+        /// This exists because time-to-first-token is a property of the
+        /// STREAM, not of any one lane, and only this client sees all
+        /// three. A caller stamping the clock in its own `.content` and
+        /// `.reasoning` handlers misses a turn whose first output is a
+        /// tool-call fragment — it would then time the later prose instead
+        /// and report a decode window that excludes real generation,
+        /// inflating the rate.
+        ///
+        /// Deliberately NOT routed through the coalescer: it marks an
+        /// instant, not a payload, and batching it would move the very
+        /// measurement it exists to take. For the same reason the instant
+        /// travels *in* the event, sampled where the delta was recognised,
+        /// rather than being read by the handler once it is finally
+        /// scheduled.
+        case firstToken(ContinuousClock.Instant)
         /// A delta to the visible ``content`` lane.
         case content(String)
         /// A delta to the hybrid-thinking ``reasoning_content`` lane.
@@ -229,11 +248,11 @@ struct ChatStreamClient {
     ///
     /// Written exactly once, for the same reason `loopbackURL` is: the base
     /// URL every caller holds is `http://127.0.0.1:<port>` with NO path, so
-    /// each one has to remember to add `v1/`. The benchmark forgot, POSTed to
-    /// `/chat/completions`, got a 404 from the engine and reported "The
-    /// benchmark didn't finish" — a shipped feature that could never once have
-    /// worked (#1668). Anything that talks to the local engine's chat endpoint
-    /// goes through here.
+    /// each one has to remember to add `v1/`. One caller (since removed) did
+    /// not, POSTed to `/chat/completions`, got a 404 from the engine and
+    /// reported its own failure as the model's — a shipped feature that could
+    /// never once have worked (#1668). Anything that talks to the local
+    /// engine's chat endpoint goes through here.
     static func chatCompletionsURL(base: URL) -> URL {
         base.appendingPathComponent("v1/chat/completions")
     }
@@ -451,6 +470,8 @@ struct ChatStreamClient {
         // (shouldn't happen, but spec-tolerant beats silent loss).
         var capturedFinishReason: String?
         var finalizedTools = false
+        /// One-shot latch for ``Event/firstToken``.
+        var sawFirstGeneratedDelta = false
         // Audit P1 — SSE delta coalescing. Per-delta MainActor.run on
         // a fast stream (M3 Ultra rapid-mlx can decode 200+ tok/s)
         // burned a main-actor hop per token. Coalesce content/reasoning
@@ -535,6 +556,23 @@ struct ChatStreamClient {
             }
             for choice in chunk.choices {
                 if let delta = choice.delta {
+                    let generated = !(delta.reasoning_content ?? "").isEmpty
+                        || !(delta.content ?? "").isEmpty
+                        || !(delta.tool_calls ?? []).isEmpty
+                    if generated, !sawFirstGeneratedDelta {
+                        sawFirstGeneratedDelta = true
+                        // Sampled HERE, in the parse, and carried across —
+                        // NOT read on the far side of the hop below.
+                        // `MainActor.run` queues behind whatever else the UI
+                        // is doing, and the stream keeps filling URLSession's
+                        // buffer while it waits. A stamp taken after the hop
+                        // charges that delay to prefill instead of decode,
+                        // shrinking the decode window and inflating the rate:
+                        // the same direction of error, from the same cause,
+                        // that this event was added to remove.
+                        let at = ContinuousClock.now
+                        await MainActor.run { onEvent(.firstToken(at)) }
+                    }
                     if let r = delta.reasoning_content, !r.isEmpty {
                         await coalescer.appendReasoning(r, onEvent: onEvent)
                     }

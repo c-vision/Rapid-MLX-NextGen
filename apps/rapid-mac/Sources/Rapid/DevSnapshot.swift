@@ -406,27 +406,7 @@ enum DevSnapshot {
             to: "\(dir)/connect-tools.png"
         )
 
-        // Scenario 4: the "Speed on this Mac" benchmark card, result state.
-        let benchRunner = BenchmarkRunner()
-        benchRunner.devSeed(phase: .done(BenchmarkResult(
-            alias: "bonsai-1.7b-2bit", chip: "Apple M3 Ultra",
-            throughputTPS: 836, tokensPerSecond: 781
-        )))
-        render(
-            AnyView(
-                BenchmarkView(
-                    binary: nil, alias: "bonsai-1.7b-2bit",
-                    hardware: MacHardware.detect(), onClose: {}, runner: benchRunner
-                ).content
-                    .frame(width: 440)
-                    .padding(20)
-                    .background(RapidTheme.canvas)
-                    .tint(RapidTheme.brand)
-            ),
-            to: "\(dir)/benchmark-result.png"
-        )
-
-        // Scenario 5: the telemetry consent sheet (the privacy "gate").
+        // Scenario 4: the telemetry consent sheet (the privacy "gate").
         render(
             AnyView(
                 TelemetryConsentView(onDecision: { _ in })
@@ -526,7 +506,7 @@ enum DevSnapshot {
     /// Render at the host's current appearance via ``ImageRenderer``.
     ///
     /// Retained unchanged for the pre-v1.0 component scenes (Connect
-    /// Tools card body, Benchmark result, Consent, chat bubbles), which
+    /// Tools card body, Consent, chat bubbles), which
     /// are plain view trees that ``ImageRenderer`` rasterises correctly
     /// and which benefit from its ``scale`` support.
     ///
