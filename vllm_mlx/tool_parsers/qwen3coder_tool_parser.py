@@ -922,12 +922,16 @@ class Qwen3CoderToolParser(ToolParser):
         func_close_idx = self._top_level_function_close(current_text, tool_start_idx)
         param_header = current_text.find(self.parameter_prefix, tool_start_idx)
         raw_parameter = False
-        if param_header >= 0:
+        while param_header >= 0:
             param_header_end = current_text.find(">", param_header)
-            if param_header_end >= 0:
-                raw_parameter = (
-                    not current_text[param_header_end + 1 :].lstrip().startswith('"')
-                )
+            if param_header_end < 0:
+                break
+            if not current_text[param_header_end + 1 :].lstrip().startswith('"'):
+                raw_parameter = True
+                break
+            param_header = current_text.find(
+                self.parameter_prefix, param_header_end + 1
+            )
         if self._pending_tool_wrapped and raw_parameter:
             # In an escaping-free raw value, an early ``</parameter>`` can
             # make a later literal ``</function>`` look structural. A wrapped
@@ -948,6 +952,15 @@ class Qwen3CoderToolParser(ToolParser):
                 func_close_idx = -1
             else:
                 func_close_idx = wrapped_function_close
+        elif raw_parameter:
+            bare_function_close = current_text.rfind(self.function_end_token)
+            before_close = current_text[tool_start_idx:bare_function_close].rstrip()
+            if bare_function_close < 0 or not before_close.endswith(
+                self.parameter_end_token
+            ):
+                func_close_idx = -1
+            else:
+                func_close_idx = bare_function_close
         content_after_wrapper = ""
         if self._pending_tool_wrapped and func_close_idx != -1:
             structural_wrapper_close = current_text.find(

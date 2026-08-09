@@ -292,6 +292,44 @@ def test_content_after_trailing_wrapper_is_preserved(wrapper_chunks):
     assert "".join(delta.get("content", "") for delta in deltas) == "after"
 
 
+def test_raw_second_parameter_uses_last_function_closer():
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool(
+        "write_file",
+        {"path": {"type": "string"}, "content": {"type": "string"}},
+    )
+    value = "payload </parameter> then </function> still payload"
+    chunks = [
+        "<tool_call>\n<function=write_file>\n",
+        '<parameter=path>\n"a.md"\n</parameter>\n',
+        "<parameter=content>\n",
+        *value,
+        "\n</parameter>\n</function>\n</tool_call>",
+    ]
+
+    deltas = _feed(parser, chunks, request)
+    assert json.loads("".join(_argument_fragments(deltas))) == {
+        "path": "a.md",
+        "content": value,
+    }
+
+
+def test_bare_raw_call_uses_last_function_closer():
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("write_file", {"content": {"type": "string"}})
+    value = "payload </parameter> then </function> still payload"
+    chunks = [
+        "<function=write_file>\n<parameter=content>\n",
+        *value,
+        "\n</parameter>\n",
+        "</function>",
+    ]
+
+    deltas = _feed(parser, chunks, request)
+    assert json.loads("".join(_argument_fragments(deltas))) == {"content": value}
+    assert "".join(delta.get("content", "") for delta in deltas) == ""
+
+
 @pytest.mark.parametrize(
     ("tool_name", "param_name", "value"),
     [
