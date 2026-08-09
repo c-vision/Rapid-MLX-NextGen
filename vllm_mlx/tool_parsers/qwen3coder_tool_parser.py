@@ -846,12 +846,10 @@ class Qwen3CoderToolParser(ToolParser):
                         "" if stripped == self.tool_call_end_token else candidate
                     )
                     return None
-                if (
-                    stripped.startswith(self.tool_call_end_token)
-                    and not stripped[len(self.tool_call_end_token) :].strip()
-                ):
+                if stripped.startswith(self.tool_call_end_token):
                     self._trailing_wrapper_buffer = ""
-                    return None
+                    remainder = stripped[len(self.tool_call_end_token) :]
+                    return {"content": remainder} if remainder.strip() else None
                 self._trailing_wrapper_buffer = ""
                 return {"content": candidate}
             if self._has_new_opener(delta_text, delta_token_ids):

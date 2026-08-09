@@ -265,6 +265,30 @@ def test_trailing_wrapper_never_leaks_across_chunk_boundaries(wrapper_chunks):
 
 
 @pytest.mark.parametrize(
+    "wrapper_chunks",
+    [
+        ["</tool_call>after"],
+        ["</tool_", "call>after"],
+        [*"</tool_call>", "after"],
+    ],
+)
+def test_content_after_trailing_wrapper_is_preserved(wrapper_chunks):
+    parser = Qwen3CoderToolParser(tokenizer=None)
+    request = _request_with_tool("write_file", {"content": {"type": "string"}})
+    chunks = [
+        "<tool_call>\n",
+        "<function=write_file>\n",
+        "<parameter=content>\nhello\n</parameter>\n",
+        "</function>\n",
+        *wrapper_chunks,
+    ]
+
+    deltas = _feed(parser, chunks, request)
+    assert json.loads("".join(_argument_fragments(deltas))) == {"content": "hello"}
+    assert "".join(delta.get("content", "") for delta in deltas) == "after"
+
+
+@pytest.mark.parametrize(
     ("tool_name", "param_name", "value"),
     [
         (
