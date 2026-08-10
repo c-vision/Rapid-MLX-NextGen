@@ -634,20 +634,179 @@ def resolve_subfolder(name: str) -> str | None:
 def resolve_model(name: str) -> str:
     """Resolve a model alias to its full HuggingFace path.
 
-    If name contains '/' it's already a full path — pass through.
     If a local file/directory with the name exists, prefer that.
+    If a configured external-model root contains the repo, serve it in place.
+    If name contains '/' it's already a full Hugging Face path — pass through.
     If name is a retired, known-broken alias, raise before any download or load.
     If name matches an alias, return the mapped HF path.
     Otherwise return unchanged.
     """
-    if "/" in name:
-        return name
     if os.path.exists(name):
         return name
     if reason := _RETIRED_MODEL_ALIASES.get(name):
         raise RetiredModelAliasError(reason)
+    # Preserve the historical resolver hot path exactly unless the external
+    # feature is configured. In particular, ordinary chat/serve resolution
+    # must not introduce a cache/download-gate probe.
+    if not os.environ.get("RAPID_MLX_EXTRA_MODEL_ROOTS", "").strip():
+        if "/" in name:
+            return name
+        profile = _load().get(name)
+        return profile.hf_path if profile is not None else name
+    if "/" in name:
+        if not _managed_hub_model_is_runnable(name):
+            if external := _resolve_external_model_path(name):
+                return external
+        return name
+    if _managed_hub_model_is_runnable(name):
+        profile = _load().get(name)
+        return profile.hf_path if profile is not None else name
+    if external := _resolve_external_model_path(name):
+        return external
     profile = _load().get(name)
     return profile.hf_path if profile is not None else name
+
+
+def _managed_hub_model_is_runnable(name: str) -> bool:
+    """Apply the cached-listing's managed-hub precedence at launch too."""
+    profile = _load().get(name)
+    repo = profile.hf_path if profile is not None else name
+    try:
+        from ._download_gate import _snapshot_is_complete_split_model, is_repo_cached
+
+        return is_repo_cached(repo) or _snapshot_is_complete_split_model(repo)
+    except Exception:
+        return False
+
+
+def _resolve_external_model_path(name: str) -> str | None:
+    """Resolve a discovered external repo back to its canonical directory.
+
+    Discovery renders a stable ``publisher/repo`` identifier for the CLI and
+    desktop UI, but the loader must receive the local directory or it will
+    interpret that identifier as a Hugging Face repo and download the model
+    again.  Search the same ordered roots used by discovery and accept only
+    the one- or two-component layouts that scanner emits.
+
+    ``realpath`` + ``commonpath`` keeps ``..`` and symlinked candidates from
+    escaping the user-nominated root.  Completeness is rechecked at launch so
+    a row that became partial after catalog refresh cannot be served as ready.
+    """
+    # A root-level store may use the Rapid alias literally, while another
+    # runtime may use the profile's canonical publisher/repo layout. Probe the
+    # displayed identifier first, then that canonical fallback.
+    profile = _load().get(name)
+    external_names = [name]
+    if profile is not None and profile.hf_path != name:
+        external_names.append(profile.hf_path)
+
+    raw_roots = os.environ.get("RAPID_MLX_EXTRA_MODEL_ROOTS", "")
+    if not raw_roots:
+        return None
+
+    from ._download_gate import _snapshot_is_complete
+
+    trusted_roots = [
+        os.path.realpath(os.path.expanduser(value.strip()))
+        for value in _external_model_root_values(raw_roots)
+        if value.strip()
+    ]
+    for root in trusted_roots:
+        for external_name in external_names:
+            parts = _external_model_identifier_parts(external_name)
+            if parts is None:
+                continue
+            candidate = os.path.realpath(os.path.join(root, *parts))
+            try:
+                if os.path.commonpath((root, candidate)) != root:
+                    continue
+            except ValueError:
+                continue
+            if os.path.isdir(candidate):
+                try:
+                    if _external_model_tree_is_contained(
+                        candidate, trusted_roots
+                    ) and _snapshot_is_complete(candidate):
+                        return candidate
+                except OSError:
+                    continue
+    return None
+
+
+def _external_model_tree_is_contained(directory: str, roots: list[str]) -> bool:
+    """Require a readable tree whose links stay in explicitly trusted roots."""
+    canonical_roots = [os.path.realpath(root) for root in roots]
+
+    def contained(path: str) -> bool:
+        target = os.path.realpath(path)
+        for root in canonical_roots:
+            try:
+                if os.path.commonpath((root, target)) == root:
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
+
+    if not contained(directory):
+        return False
+    try:
+
+        def inaccessible(error: OSError) -> None:
+            raise error
+
+        for current, directories, files in os.walk(
+            directory, followlinks=False, onerror=inaccessible
+        ):
+            for name in (*directories, *files):
+                path = os.path.join(current, name)
+                if os.path.islink(path) and not contained(path):
+                    return False
+    except OSError:
+        return False
+    return True
+
+
+def _external_model_root_values(raw: str) -> list[str]:
+    """Decode the shared desktop/engine external-root environment value."""
+    raw = raw.strip()
+    if not raw:
+        return []
+    if raw.startswith("["):
+        try:
+            import json
+
+            decoded = json.loads(raw)
+            if isinstance(decoded, list):
+                return [value for value in decoded if isinstance(value, str)]
+        except (TypeError, ValueError):
+            pass
+        # A legacy path may itself begin with ``[``. Invalid/non-array JSON
+        # therefore falls through to the pathsep protocol instead of
+        # silently erasing a valid configured root.
+    return raw.split(os.pathsep)
+
+
+def _external_model_identifier_parts(name: str) -> list[str] | None:
+    """Return safe path/display components for an external model id.
+
+    The identifier crosses a terminal-oriented CLI boundary before Swift
+    parses it.  Restrict it to the same conservative alphabet Hugging Face
+    repository ids use so a directory name cannot inject a row, ANSI escape,
+    or extra whitespace-delimited columns into that protocol.
+    """
+    parts = name.split("/")
+    if len(parts) not in (1, 2):
+        return None
+    for part in parts:
+        if (
+            not part
+            or part in (".", "..")
+            or part.startswith("-")
+            or not part.isascii()
+            or not all(character.isalnum() or character in "._-" for character in part)
+        ):
+            return None
+    return parts
 
 
 def list_aliases() -> dict[str, str]:

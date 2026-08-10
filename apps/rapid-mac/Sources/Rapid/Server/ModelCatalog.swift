@@ -34,6 +34,15 @@ struct ModelEntry: Identifiable, Hashable, Sendable {
     /// Drives a green dot in the picker so the user can tell at a glance
     /// which models start in seconds vs. which trigger a 5-80 GB pull.
     let cached: Bool
+    /// True for a model another MLX runtime downloaded, found outside the
+    /// hub cache (#1718).
+    ///
+    /// Such a model is listed and usable, but must never be offered for
+    /// deletion: the delete path rebuilds ``<hub-root>/models--<repo>``,
+    /// which is not where it lives, so the delete would either miss or
+    /// remove an unrelated hub entry of the same name. We did not download
+    /// it and cannot manage it.
+    var isExternal: Bool = false
 
     /// What the model is for. Defaults to ``.chat`` so every existing
     /// construction site keeps working; the image catalog tags ``.image``.
@@ -60,6 +69,46 @@ enum ModelCatalog {
     static let maxSubprocessStdoutBytes = 1_048_576
     private static let maxSubprocessStderrBytes = 256 * 1024
     private static let pipeReadChunkBytes = 16 * 1024
+
+    /// Engine env var naming the directories to scan for models another MLX
+    /// runtime downloaded (a JSON string array; the engine also accepts the
+    /// legacy ``os.pathsep`` representation from shells and older builds).
+    ///
+    /// Kept as a named constant because it is a cross-process contract with
+    /// ``vllm_mlx.cli._external_model_roots`` — a typo on either side fails
+    /// silently as "no models found", which reads as an empty disk rather
+    /// than as a broken lookup.
+    static let extraModelRootsEnvKey = "RAPID_MLX_EXTRA_MODEL_ROOTS"
+
+    /// Merge an explicit Settings folder with any roots inherited from the
+    /// launcher. Root order is precedence order, so ambient roots stay first
+    /// and the selected folder is appended only when it is not already the
+    /// same canonical directory.
+    static func mergedExtraModelRoots(existing: String?, selected: String?) -> String? {
+        var roots: [String] = []
+        var seen: Set<String> = []
+        let inherited: [String] = {
+            guard let existing, !existing.isEmpty else { return [] }
+            if let data = existing.data(using: .utf8),
+               let decoded = try? JSONSerialization.jsonObject(with: data) as? [String] {
+                return decoded
+            }
+            return existing.split(separator: ":").map(String.init)
+        }()
+        let candidates = inherited + [selected].compactMap { $0 }
+        for candidate in candidates {
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let canonical = URL(fileURLWithPath: trimmed)
+                .standardizedFileURL.resolvingSymlinksInPath().path
+            guard seen.insert(canonical).inserted else { continue }
+            roots.append(canonical)
+        }
+        guard !roots.isEmpty,
+              let data = try? JSONSerialization.data(withJSONObject: roots),
+              let encoded = String(data: data, encoding: .utf8) else { return nil }
+        return encoded
+    }
 
     /// All known aliases plus their installation status. Empty array on
     /// any failure — the caller should fall back to a plain text field.
@@ -269,20 +318,36 @@ enum ModelCatalog {
         excluded: Set<String>
     ) -> [ModelEntry] {
         var cachedIndex: [String: (hfRepo: String?, size: String?)] = [:]
-        for (alias, hf, size) in cached where !alias.isEmpty && alias != "(unmapped)" {
+        for (alias, hf, size) in cached where !alias.isEmpty && !isStatusAlias(alias) {
             cachedIndex[alias] = (hf, size)
+        }
+        var externalIndex: [String: (hfRepo: String?, size: String?)] = [:]
+        for (alias, hf, size) in cached where alias == "(external)" {
+            guard let identifier = hf else { continue }
+            externalIndex[identifier] = (hf, size)
         }
 
         var entries: [ModelEntry] = []
         var seenAliases: Set<String> = []
+        var consumedExternal: Set<String> = []
         for (alias, hfHint) in available {
             seenAliases.insert(alias)
             let cachedHit = cachedIndex[alias]
+            let externalIdentifier: String? = {
+                if externalIndex[alias] != nil,
+                   !consumedExternal.contains(alias) { return alias }
+                if let hfHint, externalIndex[hfHint] != nil,
+                   !consumedExternal.contains(hfHint) { return hfHint }
+                return nil
+            }()
+            if let externalIdentifier { consumedExternal.insert(externalIdentifier) }
             entries.append(ModelEntry(
                 alias: alias,
-                hfRepo: cachedHit?.hfRepo ?? hfHint,
-                sizeOnDisk: cachedHit?.size,
-                cached: cachedHit != nil
+                hfRepo: cachedHit?.hfRepo ?? hfHint ?? externalIdentifier,
+                sizeOnDisk: cachedHit?.size
+                    ?? externalIdentifier.flatMap { externalIndex[$0]?.size },
+                cached: cachedHit != nil || externalIdentifier != nil,
+                isExternal: cachedHit == nil && externalIdentifier != nil
             ))
         }
         // A cached model with no row in ``rapid-mlx models`` is unusual
@@ -296,7 +361,7 @@ enum ModelCatalog {
         // here on that basis (#1603).
         for (alias, hf, size) in cached
         where !alias.isEmpty
-            && alias != "(unmapped)"
+            && !isStatusAlias(alias)
             && !seenAliases.contains(alias)
             && !excluded.contains(alias) {
             entries.append(ModelEntry(
@@ -306,7 +371,45 @@ enum ModelCatalog {
                 cached: true
             ))
         }
+
+        // Models another MLX runtime downloaded (#1718). These arrive with
+        // ``(external)`` in the alias column — a status marker, not a name —
+        // so the repo is the only identifier they have, and it is what
+        // ``serve`` accepts for them.
+        //
+        // They are admitted so the user can SEE and USE a model already on
+        // disk; that is the entire point of the issue. What they must not be
+        // is deletable, which ``isExternal`` conveys to the UI. Dropping them
+        // here instead would satisfy "not deletable" by making them invisible
+        // — and leave the user re-downloading weights they already have.
+        for (alias, hf, size) in cached
+        where alias == "(external)" {
+            guard let repo = hf,
+                  !consumedExternal.contains(repo),
+                  !seenAliases.contains(repo),
+                  !excluded.contains(repo) else { continue }
+            seenAliases.insert(repo)
+            entries.append(ModelEntry(
+                alias: repo,
+                hfRepo: repo,
+                sizeOnDisk: size,
+                cached: true,
+                isExternal: true
+            ))
+        }
         return entries
+    }
+
+    /// Whether the alias column holds a status marker rather than a name.
+    ///
+    /// These rows carry a real repo but must never become a `ModelEntry`:
+    /// an entry is addressed by alias and, once `cached`, is offered for
+    /// deletion — and deletion rebuilds `<hub-root>/models--<repo>`.
+    /// `(external)` (#1718) lives outside that root entirely, so admitting
+    /// one would offer a delete that either silently misses or removes an
+    /// unrelated hub entry of the same name.
+    static func isStatusAlias(_ alias: String) -> Bool {
+        alias.hasPrefix("(") && alias.hasSuffix(")")
     }
 
     /// Runs ``rapid-mlx models`` and returns both the chat-capable rows
@@ -570,7 +673,17 @@ enum ModelCatalog {
             let parts = splitOnMultiSpace(line)
             guard parts.count >= 2 else { continue }
             let alias = parts[0]
-            guard alias == "(unmapped)" || isSafeAlias(alias) else { continue }
+            // ``(unmapped)`` and ``(external)`` are the two status values the
+            // engine may put in the alias column that still carry a real
+            // repo. Every other parenthesized value — ``(incomplete)`` — is
+            // dropped on purpose so a half-downloaded directory never reads
+            // as ready. ``(external)`` marks a model another MLX runtime
+            // downloaded (#1718): usable, but not ours to delete, since the
+            // delete path rebuilds ``<hub-root>/models--<repo>`` and that is
+            // not where it lives.
+            guard alias == "(unmapped)" || alias == "(external)" || isSafeAlias(alias) else {
+                continue
+            }
             let hf = parts.count >= 2 ? sanitizedHuggingFaceRepo(parts[1]) : nil
             let size = parts.count >= 3 ? parts[2] : nil
             entries.append((alias, hf, size))
@@ -668,6 +781,18 @@ enum ModelCatalog {
             if let hubCacheOverride {
                 var env = ProcessInfo.processInfo.environment
                 env["HF_HUB_CACHE"] = hubCacheOverride.path
+                // Issue #1718: the same folder is also handed to the engine
+                // as an extra scan root. The picker sets where we *download*
+                // to and assumes hub-cache layout, so pointing it at a tree
+                // another MLX runtime wrote — those use
+                // ``<root>/<publisher>/<repo>/`` — surfaced nothing, and the
+                // user was asked to re-download weights already on disk.
+                // Passing it both ways means either layout is found without
+                // making the user say which kind of folder they picked.
+                env[extraModelRootsEnvKey] = mergedExtraModelRoots(
+                    existing: env[extraModelRootsEnvKey],
+                    selected: hubCacheOverride.path
+                )
                 task.environment = env
             }
             let stdout = Pipe()

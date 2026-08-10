@@ -1027,6 +1027,16 @@ def _check_env_constant(
     # RAPID_MLX_FORCE_* and MLX_FORCE_* are caught.
     if not (value.startswith("RAPID_MLX_") or value.startswith("MLX_")):
         return
+    if value == "RAPID_MLX_EXTRA_MODEL_ROOTS":
+        # Narrow, reviewed local-storage exception for #1718. It may appear
+        # only in discovery and the matching alias-to-local-path resolver;
+        # any new consumer is an unreviewed model-selection surface.
+        if rel not in {"cli.py", "model_aliases.py"}:
+            offenders.append(
+                f"{rel}:{lineno} references `{value}` outside its approved "
+                "external-model discovery/resolution boundary."
+            )
+        return
     if value in ALLOWED_RAPID_MLX_ENV_VARS:
         return
     if ENV_VAR_ROUTING_PATTERN.match(value):

@@ -11,7 +11,11 @@ from unittest.mock import patch
 import pytest
 
 from vllm_mlx import cli
-from vllm_mlx.model_aliases import list_profiles
+from vllm_mlx.model_aliases import (
+    RetiredModelAliasError,
+    list_profiles,
+    resolve_model,
+)
 
 
 def _capture_models_output() -> str:
@@ -662,3 +666,472 @@ def test_scan_hf_cache_models_reports_blob_bytes_not_double(tmp_path, monkeypatc
     rows = cli._scan_hf_cache_models()
     sizes = {repo_id: size for repo_id, size, _mtime in rows}
     assert sizes["acme/Widget-4bit"] == 8192
+
+
+# ---------------------------------------------------------------------------
+# External model discovery (#1718)
+#
+# Other MLX runtimes write ``<root>/<publisher>/<repo>/`` rather than the
+# hub's ``models--<org>--<name>/snapshots/<sha>/``, so a user who already has
+# the weights was asked to download them again.
+# ---------------------------------------------------------------------------
+
+
+def _write_mlx_model(directory, *, shard_name="model.safetensors", size=2048):
+    """Create a directory mlx-lm's loader would accept."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / shard_name).write_bytes(b"x" * size)
+    (directory / "config.json").write_text("{}")
+    return directory
+
+
+def test_external_scan_finds_publisher_repo_layout(tmp_path):
+    """The layout every other MLX runtime uses must be discoverable."""
+    root = tmp_path / "models"
+    _write_mlx_model(root / "mlx-community" / "SomeModel-4bit")
+
+    rows = cli._scan_external_model_dirs([str(root)])
+
+    assert [r[0] for r in rows] == ["mlx-community/SomeModel-4bit"]
+    assert rows[0][1] > 0, "size should be measured"
+
+
+def test_external_scan_accepts_a_model_directly_under_the_root(tmp_path):
+    """Not every tree has a publisher level."""
+    root = tmp_path / "models"
+    _write_mlx_model(root / "SoloModel-4bit")
+
+    rows = cli._scan_external_model_dirs([str(root)])
+
+    assert [r[0] for r in rows] == ["SoloModel-4bit"]
+
+
+def test_root_level_model_is_not_double_counted_with_nested_model(tmp_path):
+    root = tmp_path / "models"
+    _write_mlx_model(root / "publisher")
+    _write_mlx_model(root / "publisher" / "nested")
+
+    repos = {repo for repo, _, _ in cli._scan_external_model_dirs([str(root)])}
+
+    assert repos == {"publisher"}
+
+
+def test_external_scan_skips_incomplete_directories(tmp_path):
+    """Config without weights is not servable — offering it would hand the
+    user a model that fails on start."""
+    root = tmp_path / "models"
+    partial = root / "pub" / "NoWeights"
+    partial.mkdir(parents=True)
+    (partial / "config.json").write_text("{}")
+
+    assert cli._scan_external_model_dirs([str(root)]) == []
+
+
+@pytest.mark.parametrize(
+    "unsafe_name", ["bad name", "bad\nname", "\x1b[31m", "-option"]
+)
+def test_external_scan_rejects_identifiers_that_can_corrupt_cli_rows(
+    tmp_path, unsafe_name
+):
+    root = tmp_path / "models"
+    model = root / unsafe_name
+    model.mkdir(parents=True)
+    (model / "config.json").write_text("{}")
+    (model / "model.safetensors").write_bytes(b"x")
+
+    assert cli._scan_external_model_dirs([str(root)]) == []
+
+
+def test_external_scan_skips_gguf(tmp_path):
+    """mlx-lm can export GGUF but has no load path for it, so a GGUF store
+    must not appear — see ``_download_gate`` for the one-way note."""
+    root = tmp_path / "models"
+    gguf = root / "TheBloke" / "Model-GGUF"
+    gguf.mkdir(parents=True)
+    (gguf / "model.gguf").write_bytes(b"x" * 4096)
+
+    assert cli._scan_external_model_dirs([str(root)]) == []
+
+
+def test_external_scan_skips_hub_layout_directories(tmp_path):
+    """Hub entries belong to the hub scanner; counting them twice would
+    double-report disk usage."""
+    root = tmp_path / "models"
+    _write_mlx_model(root / "models--mlx-community--Dup" / "snapshots" / "abc")
+
+    assert cli._scan_external_model_dirs([str(root)]) == []
+
+
+def test_external_scan_does_not_descend_past_two_levels(tmp_path):
+    """An uncapped walk over a user-chosen directory could traverse a whole
+    home folder."""
+    root = tmp_path / "models"
+    _write_mlx_model(root / "a" / "b" / "TooDeep")
+
+    assert cli._scan_external_model_dirs([str(root)]) == []
+
+
+def test_external_scan_deduplicates_symlinked_roots(tmp_path):
+    """The same model reachable by two paths is still one model."""
+    root = tmp_path / "models"
+    _write_mlx_model(root / "pub" / "Model")
+    link_root = tmp_path / "link"
+    link_root.symlink_to(root)
+
+    rows = cli._scan_external_model_dirs([str(root), str(link_root)])
+
+    assert len(rows) == 1
+
+
+def test_external_scan_rejects_model_directory_symlink_outside_root(tmp_path):
+    """Discovery and launch resolution enforce the same root boundary."""
+    root = tmp_path / "models"
+    root.mkdir()
+    outside = _write_mlx_model(tmp_path / "outside" / "pub" / "Model")
+    (root / "pub").symlink_to(outside.parent, target_is_directory=True)
+
+    assert cli._scan_external_model_dirs([str(root)]) == []
+
+
+def test_external_scan_deduplicates_same_repo_across_roots(tmp_path):
+    """First configured root wins when two stores carry the same repo."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_mlx_model(first / "pub" / "Model", size=2048)
+    _write_mlx_model(second / "pub" / "Model", size=4096)
+
+    rows = cli._scan_external_model_dirs([str(first), str(second)])
+
+    assert len(rows) == 1
+    assert rows[0][0] == "pub/Model"
+    assert rows[0][1] < 4096
+
+
+def test_external_repo_resolves_to_local_model_directory(tmp_path, monkeypatch):
+    """The discovered identifier must launch in place, never re-download."""
+    root = tmp_path / "models"
+    model = _write_mlx_model(root / "mlx-community" / "Outsider-4bit")
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+
+    assert resolve_model("mlx-community/Outsider-4bit") == os.path.realpath(model)
+
+
+def test_registered_alias_resolves_to_external_hf_layout(tmp_path, monkeypatch):
+    root = tmp_path / "models"
+    profile = list_profiles()["qwen3.5-4b-4bit"]
+    model = _write_mlx_model(root.joinpath(*profile.hf_path.split("/")))
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+    monkeypatch.setattr(
+        "vllm_mlx.model_aliases._managed_hub_model_is_runnable", lambda _name: False
+    )
+
+    assert resolve_model("qwen3.5-4b-4bit") == os.path.realpath(model)
+
+
+def test_external_resolution_rejects_parent_traversal(tmp_path, monkeypatch):
+    root = tmp_path / "models"
+    root.mkdir()
+    _write_mlx_model(tmp_path / "escape")
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+
+    assert resolve_model("../escape") == "../escape"
+
+
+def test_retired_alias_cannot_be_revived_from_external_root(tmp_path, monkeypatch):
+    root = tmp_path / "models"
+    _write_mlx_model(root / "ministral-3b-4bit")
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+
+    with pytest.raises(RetiredModelAliasError):
+        resolve_model("ministral-3b-4bit")
+
+
+def test_external_scan_tolerates_missing_and_unreadable_roots(tmp_path, monkeypatch):
+    """A root on an unplugged drive must not raise — it should vanish."""
+    assert cli._scan_external_model_dirs([str(tmp_path / "gone")]) == []
+
+    unreadable = tmp_path / "unreadable"
+    unreadable.mkdir()
+    real_listdir = os.listdir
+
+    def guarded_listdir(path):
+        if os.path.realpath(path) == os.path.realpath(unreadable):
+            raise PermissionError(path)
+        return real_listdir(path)
+
+    monkeypatch.setattr(os, "listdir", guarded_listdir)
+    assert cli._scan_external_model_dirs([str(unreadable)]) == []
+
+
+def test_external_scan_skips_model_when_size_measurement_races(tmp_path, monkeypatch):
+    root = tmp_path / "models"
+    _write_mlx_model(root / "vanishing-model")
+
+    def vanished(_directory):
+        raise FileNotFoundError("weight disappeared during scan")
+
+    monkeypatch.setattr(cli, "_external_tree_size_bytes", vanished)
+
+    assert cli._scan_external_model_dirs([str(root)]) == []
+
+
+def test_external_scan_skips_model_when_completeness_probe_races(tmp_path, monkeypatch):
+    root = tmp_path / "models"
+    _write_mlx_model(root / "vanishing-model")
+
+    def vanished(_directory):
+        raise PermissionError("directory disappeared during completeness probe")
+
+    monkeypatch.setattr("vllm_mlx._download_gate._snapshot_is_complete", vanished)
+
+    assert cli._scan_external_model_dirs([str(root)]) == []
+
+
+def test_external_roots_env_is_pathsep_separated(tmp_path, monkeypatch):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", os.pathsep.join([str(a), str(b)]))
+
+    assert cli._external_model_roots() == [
+        os.path.realpath(str(a)),
+        os.path.realpath(str(b)),
+    ]
+
+
+def test_external_roots_json_preserves_path_separator_in_folder_name(
+    tmp_path, monkeypatch
+):
+    import json
+
+    root = tmp_path / "models:archive"
+    root.mkdir()
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", json.dumps([str(root)]))
+
+    assert cli._external_model_roots() == [os.path.realpath(str(root))]
+
+
+def test_external_roots_legacy_path_may_begin_with_bracket(tmp_path, monkeypatch):
+    root = tmp_path / "[models"
+    root.mkdir()
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+
+    assert cli._external_model_roots() == [os.path.realpath(str(root))]
+
+
+def test_resolve_external_model_accepts_desktop_json_roots(tmp_path, monkeypatch):
+    import json
+
+    root = tmp_path / "models:archive"
+    model = root / "local-model"
+    _write_mlx_model(model)
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", json.dumps([str(root)]))
+
+    assert resolve_model("local-model") == os.path.realpath(model)
+
+
+def test_registered_alias_prefers_root_level_external_directory(tmp_path, monkeypatch):
+    root = tmp_path / "models"
+    model = root / "qwen3.5-4b-4bit"
+    _write_mlx_model(model)
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+    monkeypatch.setattr(
+        "vllm_mlx.model_aliases._managed_hub_model_is_runnable", lambda _name: False
+    )
+
+    assert resolve_model("qwen3.5-4b-4bit") == os.path.realpath(model)
+
+
+def test_external_resolution_tolerates_completeness_race(tmp_path, monkeypatch):
+    root = tmp_path / "models"
+    _write_mlx_model(root / "local-model")
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+
+    def vanished(_directory):
+        raise PermissionError("drive unplugged during launch")
+
+    monkeypatch.setattr("vllm_mlx._download_gate._snapshot_is_complete", vanished)
+
+    assert resolve_model("local-model") == "local-model"
+
+
+def test_runnable_managed_hub_copy_wins_over_external_copy(tmp_path, monkeypatch):
+    root = tmp_path / "models"
+    _write_mlx_model(root / "local-model")
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+    monkeypatch.setattr(
+        "vllm_mlx.model_aliases._managed_hub_model_is_runnable", lambda _name: True
+    )
+
+    assert resolve_model("local-model") == "local-model"
+
+
+def test_external_roots_default_to_empty(monkeypatch):
+    """Scanning a user's disk uninvited is not ours to decide."""
+    monkeypatch.delenv("RAPID_MLX_EXTRA_MODEL_ROOTS", raising=False)
+
+    assert cli._external_model_roots() == []
+
+
+def test_external_models_render_as_external_not_deletable(
+    tmp_path, monkeypatch, capsys
+):
+    """``rm`` and the desktop delete path both rebuild a target as
+    ``<hub-root>/models--<repo>``, which is not where an external model
+    lives. Labelling one deletable would either miss or delete the wrong
+    thing, so the alias column must mark it read-only."""
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    monkeypatch.setattr(
+        "huggingface_hub.constants.HF_HUB_CACHE", str(hub), raising=False
+    )
+    root = tmp_path / "external"
+    _write_mlx_model(root / "mlx-community" / "Outsider-4bit")
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+
+    cli._print_cached_models()
+    out = capsys.readouterr().out
+
+    assert "mlx-community/Outsider-4bit" in out
+    assert "(external)" in out
+
+
+def test_runnable_hub_copy_wins_when_a_repo_exists_in_both_places(
+    tmp_path, monkeypatch, capsys
+):
+    """A model present in the hub cache and in an external root is one
+    model, and the hub copy is the one we can manage."""
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    dup = hub / "models--mlx-community--Dup"
+    dup.mkdir()
+    (dup / "blob").write_bytes(b"x" * 4096)
+    monkeypatch.setattr(
+        "huggingface_hub.constants.HF_HUB_CACHE", str(hub), raising=False
+    )
+    root = tmp_path / "external"
+    _write_mlx_model(root / "mlx-community" / "Dup")
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+    monkeypatch.setattr(
+        cli, "_cache_entry_is_runnable", lambda repo: repo.endswith("/Dup")
+    )
+
+    cli._print_cached_models()
+    out = capsys.readouterr().out
+
+    assert out.count("mlx-community/Dup") == 1
+    assert "(external)" not in out
+
+
+def test_complete_external_copy_keeps_incomplete_hub_stub_visible_for_cleanup(
+    tmp_path, monkeypatch, capsys
+):
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    stub = hub / "models--mlx-community--Dup"
+    stub.mkdir()
+    (stub / "config.json").write_text("{}")
+    monkeypatch.setattr(
+        "huggingface_hub.constants.HF_HUB_CACHE", str(hub), raising=False
+    )
+    root = tmp_path / "external"
+    _write_mlx_model(root / "mlx-community" / "Dup")
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+    monkeypatch.setattr(cli, "_cache_entry_is_runnable", lambda _repo: False)
+
+    cli._print_cached_models()
+    out = capsys.readouterr().out
+
+    assert out.count("mlx-community/Dup") == 2
+    assert "(external)" in out
+    assert "(unmapped)" in out
+
+
+def test_external_scan_measures_symlinked_weights_within_trusted_root(tmp_path):
+    root = tmp_path / "models"
+    real = root / "blobs"
+    real.mkdir(parents=True)
+    blob = real / "weights.safetensors"
+    blob.write_bytes(b"x" * 4096)
+
+    model = root / "pub" / "Linked"
+    model.mkdir(parents=True)
+    (model / "model.safetensors").symlink_to(blob)
+    (model / "config.json").write_text("{}")
+
+    rows = cli._scan_external_model_dirs([str(root)])
+
+    assert len(rows) == 1
+    assert rows[0][1] >= 4096
+
+
+def test_external_scan_rejects_weight_symlink_outside_selected_root(
+    tmp_path, monkeypatch
+):
+    outside = tmp_path / "outside.safetensors"
+    outside.write_bytes(b"x" * 4096)
+    root = tmp_path / "models"
+    model = root / "pub" / "Escaped"
+    model.mkdir(parents=True)
+    (model / "model.safetensors").symlink_to(outside)
+    (model / "config.json").write_text("{}")
+
+    assert cli._scan_external_model_dirs([str(root)]) == []
+
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+    assert resolve_model("pub/Escaped") == "pub/Escaped"
+
+
+def test_cached_row_columns_stay_split_for_a_full_width_size(
+    tmp_path, monkeypatch, capsys
+):
+    """The desktop parser splits on runs of 2+ spaces, so every value must
+    be strictly narrower than its column. A 9-char size in a 9-wide field
+    left one literal space and glued size+modified into one token, which
+    the app then failed to parse into bytes."""
+    import re
+
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    monkeypatch.setattr(
+        "huggingface_hub.constants.HF_HUB_CACHE", str(hub), raising=False
+    )
+    root = tmp_path / "external"
+    _write_mlx_model(
+        root / "mlx-community" / "LFM2.5-1.2B-Instruct-4bit",
+        size=1,
+    )
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+    # Exactly 10 characters: the old padding-dependent separator collapsed.
+    monkeypatch.setattr(cli, "_external_tree_size_bytes", lambda _path: 1_073_636_966)
+
+    cli._print_cached_models()
+    row = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "LFM2.5-1.2B-Instruct-4bit" in line
+    )
+
+    columns = re.split(r"\s{2,}", row.strip())
+    assert len(columns) == 4, f"columns merged: {columns}"
+    # The size column must be parseable on its own, not fused with the
+    # modified time.
+    assert re.fullmatch(r"[\d.]+ [KMGT]iB", columns[2]), columns[2]
+    assert columns[2] == "1023.9 MiB"
+
+
+def test_external_repo_identifier_is_never_truncated(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "external"
+    repo = "Model-" + "x" * 60
+    _write_mlx_model(root / "mlx-community" / repo, size=1)
+    monkeypatch.setenv("RAPID_MLX_EXTRA_MODEL_ROOTS", str(root))
+    monkeypatch.setattr(cli, "_snapshot_size_bytes", lambda _path: 1)
+
+    cli._print_cached_models()
+    row = next(
+        line for line in capsys.readouterr().out.splitlines() if "(external)" in line
+    )
+
+    assert f"mlx-community/{repo}" in row
+    assert "..." not in row

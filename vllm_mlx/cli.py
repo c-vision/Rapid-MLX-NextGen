@@ -4911,6 +4911,176 @@ def _scan_hf_cache_models() -> list[tuple[str, int, float]]:
     return out
 
 
+def _external_model_roots() -> list[str]:
+    """Directories to scan for models another MLX runtime downloaded.
+
+    Read from ``RAPID_MLX_EXTRA_MODEL_ROOTS`` (``os.pathsep``-separated,
+    same convention as ``PATH``). Empty by default: scanning a user's
+    disk uninvited is not ours to decide, and a wrong guess costs a slow
+    recursive walk on every ``ls``.
+
+    The desktop app populates this from the folder the user picked in
+    Settings, which is why the env var is the interface rather than a
+    hardcoded list of every MLX tool's default location.
+    """
+    raw = os.environ.get("RAPID_MLX_EXTRA_MODEL_ROOTS", "").strip()
+    if not raw:
+        return []
+    from vllm_mlx.model_aliases import _external_model_root_values
+
+    roots: list[str] = []
+    for part in _external_model_root_values(raw):
+        path = os.path.expanduser(part.strip())
+        if path and os.path.isdir(path):
+            roots.append(os.path.realpath(path))
+    return roots
+
+
+def _scan_external_model_dirs(
+    roots: list[str] | None = None,
+) -> list[tuple[str, int, float]]:
+    """Find MLX-servable models sitting outside the HF hub cache.
+
+    Other MLX runtimes write ``<root>/<publisher>/<repo>/`` rather than
+    the hub's ``models--<org>--<name>/snapshots/<sha>/``, so
+    :func:`_scan_hf_cache_models` cannot see them and a user who already
+    has the weights is asked to download them again — on a machine where
+    disk is usually the scarce resource.
+
+    Returns the same ``(repo, size_bytes, mtime)`` triples as the hub
+    scanner so both feed one renderer.
+
+    What counts as a model is decided by
+    :func:`vllm_mlx._download_gate._snapshot_is_complete`, the same check
+    ``serve`` uses. That matters for two reasons: it mirrors mlx-lm's
+    actual loader glob (``model*.safetensors``), so we never advertise a
+    directory the loader would then refuse; and it excludes GGUF
+    structurally rather than by blacklist — mlx-lm can *export* GGUF but
+    has no load path for it, so listing one would offer a model that
+    fails on start.
+
+    Depth is capped at two levels (``<root>/<a>/<b>``). Every MLX tool
+    lays models out as publisher/repo, and an uncapped walk over a
+    directory the user pointed at could descend into an entire home
+    folder.
+    """
+    from vllm_mlx._download_gate import _snapshot_is_complete
+    from vllm_mlx.model_aliases import (
+        _external_model_identifier_parts,
+        _external_model_tree_is_contained,
+    )
+
+    if roots is None:
+        roots = _external_model_roots()
+
+    out: list[tuple[str, int, float]] = []
+    seen_paths: set[str] = set()
+    seen_repos: set[str] = set()
+
+    def _complete(directory: str) -> bool:
+        try:
+            return _snapshot_is_complete(directory)
+        except OSError:
+            return False
+
+    def _looks_like_model_root(directory: str) -> bool:
+        try:
+            with os.scandir(directory) as entries:
+                return any(
+                    entry.name == "model.safetensors.index.json"
+                    or (
+                        entry.name.startswith("model")
+                        and entry.name.endswith(".safetensors")
+                    )
+                    for entry in entries
+                )
+        except OSError:
+            return False
+
+    canonical_roots = [os.path.realpath(root) for root in roots]
+
+    def _record(directory: str, repo: str, canonical_root: str) -> None:
+        real = os.path.realpath(directory)
+        try:
+            if os.path.commonpath((canonical_root, real)) != canonical_root:
+                return
+        except (OSError, ValueError):
+            return
+        # Ordered root precedence: the first configured occurrence of a repo
+        # wins.  Dedup by both identity and display/launch identifier so two
+        # separate roots cannot print duplicate rows or double-count bytes.
+        if real in seen_paths or repo in seen_repos:
+            return
+        try:
+            # The loader probe is root-only and bounded. Run it before the
+            # recursive symlink audit/size walk so a broad selected folder
+            # does not turn every ordinary directory into a deep traversal.
+            if not _looks_like_model_root(real):
+                return
+            if not _external_model_tree_is_contained(real, canonical_roots):
+                return
+            if not _complete(real):
+                return
+            mtime = os.path.getmtime(real)
+        except OSError:
+            return
+        try:
+            size = _external_tree_size_bytes(real)
+        except OSError:
+            # External trees are owned by another process and may disappear,
+            # lose permission, or contain a broken link while we scan. One
+            # racy entry must not take down the entire ``rapid-mlx ls`` view.
+            return
+        seen_paths.add(real)
+        seen_repos.add(repo)
+        out.append((repo, size, mtime))
+
+    for root in roots:
+        canonical_root = os.path.realpath(root)
+
+        def _contained(path: str, *, _root: str = canonical_root) -> bool:
+            try:
+                return os.path.commonpath((_root, os.path.realpath(path))) == _root
+            except (OSError, ValueError):
+                return False
+
+        try:
+            first_level = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for publisher in first_level:
+            if _external_model_identifier_parts(publisher) is None:
+                continue
+            # Skip the hub layout: those belong to the hub scanner, and
+            # listing them twice would double-count disk usage.
+            if publisher.startswith(("models--", "datasets--", "spaces--")):
+                continue
+            pub_dir = os.path.join(root, publisher)
+            if not os.path.isdir(pub_dir):
+                continue
+
+            # A model may sit directly at <root>/<name>/ as well as at
+            # <root>/<publisher>/<name>/ — accept both.
+            if _contained(pub_dir):
+                _record(pub_dir, publisher, canonical_root)
+                if publisher in seen_repos:
+                    continue
+
+            try:
+                second_level = sorted(os.listdir(pub_dir))
+            except OSError:
+                continue
+            for name in second_level:
+                repo = f"{publisher}/{name}"
+                if _external_model_identifier_parts(repo) is None:
+                    continue
+                model_dir = os.path.join(pub_dir, name)
+                if os.path.isdir(model_dir) and _contained(model_dir):
+                    _record(model_dir, repo, canonical_root)
+
+    return out
+
+
 def _cache_entry_is_runnable(repo: str) -> bool:
     """Whether a cache directory contains a complete runnable snapshot.
 
@@ -4950,8 +5120,18 @@ def _print_cached_models() -> None:
     from vllm_mlx.model_aliases import list_profiles
 
     rows = _scan_hf_cache_models()
+    external_rows = _scan_external_model_dirs()
+    # A RUNNABLE hub copy wins because it is managed by Rapid. Keep an
+    # incomplete same-named hub row alongside the external copy: it is a real,
+    # independently removable cache entry, and hiding it makes `rm <repo>` look
+    # like it targets the read-only external row.
+    runnable_hub_repos = {repo for repo, _, _ in rows if _cache_entry_is_runnable(repo)}
+    external_rows = [r for r in external_rows if r[0] not in runnable_hub_repos]
+    tagged_rows = [(*row, False) for row in rows] + [
+        (*row, True) for row in external_rows
+    ]
     print()
-    if not rows:
+    if not tagged_rows:
         print(
             "  No models cached yet. Run 'rapid-mlx pull <alias>' or "
             "'rapid-mlx chat <alias>' to download one."
@@ -4969,13 +5149,17 @@ def _print_cached_models() -> None:
     cols = (
         ("Alias", 22),
         ("HF repo", 50),
-        ("Size", 9),
+        # Width is presentation only. Rows use an explicit two-space
+        # delimiter below because the desktop parser splits on 2+ spaces;
+        # padding alone cannot guarantee that invariant for a value that
+        # exactly fills (or exceeds) its field.
+        ("Size", 10),
         ("Modified", 12),
     )
-    width = sum(w for _, w in cols) + len(cols) - 1
+    width = sum(w for _, w in cols) + 2 * (len(cols) - 1)
     sep = "  " + "─" * width
-    header = "  " + " ".join(f"{name:<{w}}" for name, w in cols)
-    print(f"  Cached models ({len(rows)} on disk)")
+    header = "  " + "  ".join(f"{name:<{w}}" for name, w in cols)
+    print(f"  Cached models ({len(tagged_rows)} on disk)")
     print(sep)
     print(header)
     print(sep)
@@ -4984,14 +5168,27 @@ def _print_cached_models() -> None:
     total_bytes = 0
     # Sort by size descending so the biggest-disk-hog row is first — the
     # most useful ordering for "what do I rm to free space?".
-    for repo, size, mtime in sorted(rows, key=lambda r: -r[1]):
+    for repo, size, mtime, is_external_row in sorted(
+        tagged_rows, key=lambda row: -row[1]
+    ):
         total_bytes += size
         alias = hf_to_alias.get(repo, "(unmapped)")
+        # Models found outside the hub cache are listed but never labelled
+        # with an alias, and the desktop parser drops every parenthesized
+        # alias except ``(unmapped)``. That is deliberate: ``rm`` and the
+        # app's delete path both rebuild a target as
+        # ``<hub-root>/models--<repo>``, which is not where these live.
+        # Advertising one as deletable would either miss (nothing at that
+        # path) or, worse, delete an unrelated hub entry that happens to
+        # share the name. Read-only is the honest state — we did not
+        # download them and we cannot manage them.
+        if is_external_row:
+            alias = "(external)"
         # Keep partial directories visible for disk cleanup, but never label
         # a known alias as downloaded/runnable. The desktop parser deliberately
         # rejects parenthesized status rows, so this also prevents a 61 MiB
         # metadata stub for a 26B model from receiving a green checkmark.
-        if alias != "(unmapped)" and not _cache_entry_is_runnable(repo):
+        elif alias != "(unmapped)" and not _cache_entry_is_runnable(repo):
             alias = "(incomplete)"
         # Render modified as a human delta: "2 days ago" beats raw epoch.
         if mtime <= 0:
@@ -5006,12 +5203,24 @@ def _print_cached_models() -> None:
                 mod = f"{delta // 86400}d ago"
         # Truncate over-long HF paths so the row doesn't wrap on a
         # narrow terminal; the alias column carries the canonical name.
-        repo_disp = repo if len(repo) <= 50 else (repo[:47] + "...")
-        print(f"  {alias:<22} {repo_disp:<50} {_format_bytes(size):<9} {mod:<12}")
+        # External identifiers are machine-consumed by the desktop and must
+        # remain byte-for-byte launchable. Hub rows may still be truncated for
+        # interactive display because their registered alias is the canonical
+        # launch identity; external rows have no independent alias channel.
+        repo_disp = repo if is_external_row or len(repo) <= 50 else (repo[:47] + "...")
+        print(f"  {alias:<22}  {repo_disp:<50}  {_format_bytes(size):<10}  {mod:<12}")
     print(sep)
     print(f"  Total: {_format_bytes(total_bytes)}")
+    if external_rows:
+        print(
+            "  Note: total is logical model size; shared external weights may repeat."
+        )
     print()
-    print("  Tip: `rapid-mlx rm <hf-repo>` to free disk space")
+    if external_rows:
+        print("  Tip: `rapid-mlx rm` only removes Rapid-managed cache entries.")
+        print("       Remove external models in the app that downloaded them.")
+    else:
+        print("  Tip: `rapid-mlx rm <hf-repo>` to free disk space")
     print()
 
 
@@ -5273,6 +5482,27 @@ def _snapshot_size_bytes(path) -> int:
                 continue
     except OSError:
         pass
+    return total
+
+
+def _external_tree_size_bytes(path: str) -> int:
+    """Logical external-tree bytes, following shared files only once."""
+    total = 0
+    seen: set[tuple[int, int]] = set()
+
+    def inaccessible(error: OSError) -> None:
+        raise error
+
+    for current, _directories, files in os.walk(
+        path, followlinks=False, onerror=inaccessible
+    ):
+        for name in files:
+            stat = os.stat(os.path.join(current, name), follow_symlinks=True)
+            identity = (stat.st_dev, stat.st_ino)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            total += stat.st_size
     return total
 
 
