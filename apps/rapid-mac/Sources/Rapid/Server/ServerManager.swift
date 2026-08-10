@@ -459,6 +459,13 @@ final class ServerManager {
 
     private var expectedStop: Bool = false
 
+    /// ``stop()`` normally represents an explicit user request and clears
+    /// the resume alias. Internal model replacement is also an expected
+    /// process exit, but it must preserve that alias while the next model is
+    /// starting; otherwise first-run eligibility briefly becomes true and
+    /// can present Quickstart in the middle of another workflow.
+    private var preservingLastServedAliasDuringStop: Bool = false
+
     /// Issue #270: the current spawn cycle observed at least one
     /// ``.ready`` transition. Drives the auto-respawn decision in
     /// ``handleChildExit`` — a child that crashed BEFORE it ever
@@ -749,11 +756,24 @@ final class ServerManager {
     ///   installs the bytes-on-disk progress monitor; without it the
     ///   user watches a featureless spinner for the whole download.
     func ensureServing(alias: String, hfPath: String? = nil) async -> Bool {
+        await ensureServing(alias: alias, hfPath: hfPath, residencyEligible: true)
+    }
+
+    /// Residency-aware convenience. ``residencyEligible`` is non-defaulted so
+    /// this never shadows the two-argument form that ``ReadinessServing``
+    /// requires; audio/video-gen callers pass ``false`` to force a process
+    /// swap instead of the in-process ``/v1/models/load`` path.
+    func ensureServing(
+        alias: String,
+        hfPath: String?,
+        residencyEligible: Bool
+    ) async -> Bool {
         await ensureServing(
             alias: alias,
             hfPath: hfPath,
             estimatedMemoryGB: nil,
-            replacementGroup: nil
+            replacementGroup: nil,
+            residencyEligible: residencyEligible
         )
     }
 
@@ -761,7 +781,8 @@ final class ServerManager {
         alias: String,
         hfPath: String?,
         estimatedMemoryGB: Double?,
-        replacementGroup: ResidentModelReplacementGroup? = nil
+        replacementGroup: ResidentModelReplacementGroup? = nil,
+        residencyEligible: Bool = true
     ) async -> Bool {
         let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
@@ -779,7 +800,14 @@ final class ServerManager {
         // process. Only a 404/405 from an older bundled server falls back to
         // the legacy stop/start path; capacity and load failures stay failures
         // so we never hide a rejected ceiling by unloading the primary model.
-        if case .ready = state, child != nil {
+        //
+        // Audio (and video-gen) aliases opt out via ``residencyEligible: false``:
+        // the engine's residency loader rejects those modalities with a 500,
+        // not a 404/405, so an in-process ``/v1/models/load`` attempt would
+        // surface as a hard failure instead of the process swap they actually
+        // need — audio runs as its own ``serve <alias>`` (audio-mode) process.
+        let readyWithChild: Bool = { if case .ready = state, child != nil { return true }; return false }()
+        if Self.residencyLoadApplies(residencyEligible: residencyEligible, readyWithChild: readyWithChild) {
             let estimate = estimatedMemoryGB ?? ModelSizing.estimate(alias: trimmed).totalGB
             let result = await residencyClient.load(
                 alias: trimmed,
@@ -828,7 +856,7 @@ final class ServerManager {
         // the idle/stopped/missing cases just fall through to
         // ``start(alias:)``.
         if child != nil {
-            await stop()
+            await stop(preservingLastServedAlias: true)
         }
         let memoryRequestID = UUID()
         await start(alias: trimmed, hfPath: hfPath, memoryRequestID: memoryRequestID)
@@ -1644,6 +1672,13 @@ final class ServerManager {
     /// SIGKILL if still alive. State transitions to `.stopped` on
     /// success.
     func stop() async {
+        await stop(preservingLastServedAlias: false)
+    }
+
+    /// Shared expected-stop path. Model replacement keeps the previous
+    /// known-good alias until the replacement reaches ``.ready`` and writes
+    /// its own alias; a user-facing Stop continues to clear it immediately.
+    private func stop(preservingLastServedAlias: Bool) async {
         // Issue #270: the user clicked Stop. A pending auto-respawn
         // racing them would defeat the click — cancel it AND reset
         // the retry budget so a subsequent user-driven Start gets a
@@ -1655,6 +1690,7 @@ final class ServerManager {
         guard child != nil else { return }
         isOperating = true
         defer { isOperating = false }
+        preservingLastServedAliasDuringStop = preservingLastServedAlias
         await terminateChild(reason: nil)
     }
 
@@ -1881,7 +1917,9 @@ final class ServerManager {
             cancelRuntimeHealthMonitor()
         }
         let wasExpected = expectedStop
+        let preservedLastServedAlias = preservingLastServedAliasDuringStop
         expectedStop = false
+        preservingLastServedAliasDuringStop = false
         child = nil
         // #17: the child owns the secret; the secret is meaningless
         // (and a leak vector) once the child is gone.
@@ -1918,7 +1956,12 @@ final class ServerManager {
             // below) and INTENTIONALLY keep the persisted value so
             // the user can hit Restart against the last-known-good
             // alias without picker re-selection.
-            UserDefaults.standard.removeObject(forKey: Self.lastServedAliasKey)
+            if Self.shouldClearLastServedAlias(
+                expectedStop: wasExpected,
+                preservingLastServedAlias: preservedLastServedAlias
+            ) {
+                UserDefaults.standard.removeObject(forKey: Self.lastServedAliasKey)
+            }
             return
         }
         if process.isProcessGroupAlive {
@@ -1966,6 +2009,30 @@ final class ServerManager {
         ) {
             scheduleAutoRespawn(alias: alias)
         }
+    }
+
+    /// Pure policy used by the child-exit path and its regression tests.
+    nonisolated static func shouldClearLastServedAlias(
+        expectedStop: Bool,
+        preservingLastServedAlias: Bool
+    ) -> Bool {
+        expectedStop && !preservingLastServedAlias
+    }
+
+    /// Pure gate for the in-process residency-load attempt in
+    /// ``ensureServing``, extracted so its regression test can run without a
+    /// live sidecar. The residency ``/v1/models/load`` path only works for
+    /// modalities the engine can admit as a non-primary resident (chat/VLM,
+    /// image-gen, text-diffusion). Audio and video-gen aliases raise a 500
+    /// there — which does NOT trigger ``ensureServing``'s 404/405 stop/start
+    /// fallback — so their callers pass ``residencyEligible: false`` and this
+    /// returns ``false`` even when a model is already resident, sending them
+    /// straight to the process-replacement path.
+    nonisolated static func residencyLoadApplies(
+        residencyEligible: Bool,
+        readyWithChild: Bool
+    ) -> Bool {
+        residencyEligible && readyWithChild
     }
 
     /// Pure decision helper for the auto-respawn budget reset gate in
