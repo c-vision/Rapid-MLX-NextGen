@@ -1206,7 +1206,7 @@ struct QuickstartView: View {
 
         if let fallback {
             Button {
-                server.cancelPendingMemoryLoad()
+                server.cancelPendingMemoryLoad(warning)
                 coordinator.returnToChooser()
                 coordinator.select(fallback)
                 startQuickstart()
@@ -1239,7 +1239,7 @@ struct QuickstartView: View {
         Button {
             // Drop the parked load and leave ``.starting`` for the chooser
             // so the sheet stops waiting on a serve that will never come.
-            server.cancelPendingMemoryLoad()
+            server.cancelPendingMemoryLoad(warning)
             coordinator.returnToChooser()
         } label: {
             Text("Cancel")

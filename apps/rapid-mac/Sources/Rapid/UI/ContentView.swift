@@ -55,6 +55,10 @@ struct ContentView: View {
     @AppStorage(AutoStartPreference.storageKey) private var autoStartOnLaunch: Bool = AutoStartPreference.defaultValue
 
     var body: some View {
+        // Capture the identity owned by this alert render. A delayed dismiss
+        // callback must not cancel a newer warning that has reached the queue
+        // head in the meantime (#1463).
+        let displayedMemoryWarning = server.pendingMemoryWarning
         // Ollama-style layout: a left sidebar (New Chat / Launch / — later —
         // history) + a detail pane. No top model-control bar; the model
         // picker lives inline in the compose box (see ChatView) and the
@@ -136,7 +140,7 @@ struct ContentView: View {
             }
         }
         .alert(
-            server.pendingMemoryWarning?.title ?? "",
+            displayedMemoryWarning?.title ?? "",
             isPresented: Binding(
                 // #1503: when the Quickstart sheet is up it renders its OWN
                 // in-sheet copy of this decision (this alert is anchored on
@@ -154,16 +158,16 @@ struct ContentView: View {
                 // Only treat this as a dismissal when nothing resolved it
                 // (Esc, click-outside).
                 set: {
-                    if !$0, server.pendingMemoryWarning != nil {
-                        server.cancelPendingMemoryLoad()
+                    if !$0, let warning = displayedMemoryWarning {
+                        server.cancelPendingMemoryLoad(warning)
                     }
                 }
             ),
-            presenting: server.pendingMemoryWarning
+            presenting: displayedMemoryWarning
         ) { warning in
             Button("Cancel", role: .cancel) {
                 if let running = runningAlias { alias = running }
-                server.cancelPendingMemoryLoad()
+                server.cancelPendingMemoryLoad(warning)
             }
             Button(warning.confirmTitle, role: .destructive) {
                 server.confirmPendingMemoryLoad(warning)

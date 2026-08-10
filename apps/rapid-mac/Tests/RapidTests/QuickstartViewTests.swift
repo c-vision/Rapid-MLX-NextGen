@@ -768,9 +768,12 @@ struct QuickstartMemoryWiringSourceGuardTests {
             src.contains("server.confirmPendingMemoryLoad(warning)"),
             "The in-sheet card's confirm button no longer calls server.confirmPendingMemoryLoad — 'Load anyway' would be inert (#1503)."
         )
+        let cancellationCallCount = src.components(
+            separatedBy: "server.cancelPendingMemoryLoad(warning)"
+        ).count - 1
         #expect(
-            src.contains("server.cancelPendingMemoryLoad()"),
-            "The in-sheet card's cancel button no longer calls server.cancelPendingMemoryLoad — the parked load is never dropped (#1503)."
+            cancellationCallCount == 2,
+            "Both the low-memory fallback and Cancel actions must cancel their exact displayed warning; expected 2 identity-bound calls, found \(cancellationCallCount) (#1463)."
         )
         #expect(
             src.contains("coordinator.returnToChooser()"),
