@@ -482,6 +482,7 @@ struct ContentView: View {
             coordinator: quickstart,
             downloads: downloads,
             server: server,
+            cachedModels: catalogEntries,
             onSkip: { quickstartDismissedThisSession = true },
             onBrowseAll: { quickstartDismissedThisSession = true },
             onSeedWelcome: { true }
