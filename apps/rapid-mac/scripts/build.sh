@@ -136,6 +136,25 @@ if [[ ! -d "$SWIFTMATH_FONTS" ]]; then
 fi
 cp -R "$SWIFTMATH_FONTS" "$CONTENTS/Resources/mathFonts.bundle"
 
+# Third-party license texts (#1596). BSD-2-Clause (swift-cmark) and the MIT
+# licenses of the other linked Swift packages ask their notice to travel "with
+# the distribution" — and a downloaded .app IS that distribution. Assembling
+# only the repo's THIRD_PARTY.md does not satisfy that; the notice has to be
+# inside the bundle. `stage-licenses.sh` copies each into
+# Contents/Resources/Licenses/, driven off the resolved pins in
+# Package.resolved (so stale checkouts are ignored) plus the in-tree vendored
+# SwiftMath notice, and FAILS the build if any linked package has no license
+# file — in the same spirit as the offline link-target test from #1595. It is a
+# separate script so the test suite can exercise it against fixtures. The Python
+# payload's licenses already travel via pip's `*.dist-info/licenses/` under the
+# staged sidecar and are not re-copied.
+echo "==> staging third-party license texts"
+"$ROOT/scripts/stage-licenses.sh" \
+    "$ROOT/Package.resolved" \
+    "$ROOT/.build/checkouts" \
+    "$ROOT/Vendor/SwiftMath/LICENSE" \
+    "$CONTENTS/Resources/Licenses"
+
 # App accent colour. AppKit paints NSMenu highlights, checkboxes and focus
 # rings with the app's accent colour, and nothing in SwiftUI reaches those:
 # ``.tint()`` styles SwiftUI's own views only, so without this the ··· row
