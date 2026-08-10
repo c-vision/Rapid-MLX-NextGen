@@ -86,6 +86,20 @@ class MLLMSchedulerConfig:
     # prompt, not KV state). Operators who want admission tied to
     # ``max_num_seqs`` pass ``--max-concurrent-requests`` explicitly.
     max_concurrent_requests: int = 256
+    # Correctness-first compatibility lane for hybrid language backbones.
+    # This may only be enabled together with all three batch limits set to 1.
+    allow_arrays_cache: bool = False
+
+    def __post_init__(self) -> None:
+        if self.allow_arrays_cache and (
+            self.max_num_seqs != 1
+            or self.prefill_batch_size != 1
+            or self.completion_batch_size != 1
+        ):
+            raise ValueError(
+                "ArraysCache MLLM compatibility requires max_num_seqs, "
+                "prefill_batch_size, and completion_batch_size to all be 1"
+            )
 
 
 @dataclass
@@ -431,6 +445,7 @@ class MLLMScheduler:
                 sampler=sampler,
                 prefill_batch_size=self.config.prefill_batch_size,
                 completion_batch_size=self.config.completion_batch_size,
+                allow_arrays_cache=self.config.allow_arrays_cache,
                 prefill_step_size=self.config.prefill_step_size,
             )
 

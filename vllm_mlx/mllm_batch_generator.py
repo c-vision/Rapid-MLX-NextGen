@@ -415,6 +415,7 @@ class MLLMBatchGenerator:
         sampler: Callable[[mx.array], mx.array] | None = None,
         prefill_batch_size: int = 4,  # Smaller for MLLM due to vision overhead
         completion_batch_size: int = 16,  # Can be larger for text generation
+        allow_arrays_cache: bool = False,
         prefill_step_size: int = 1024,
         enable_vision_cache: bool = True,
         vision_cache_size: int = 100,
@@ -431,6 +432,7 @@ class MLLMBatchGenerator:
             sampler: Sampling function (default: argmax)
             prefill_batch_size: Max requests to prefill together
             completion_batch_size: Max requests for completion batching
+            allow_arrays_cache: Permit mlx-lm ArraysCache in serialized mode
             prefill_step_size: Tokens to process per prefill step
             enable_vision_cache: Enable vision embedding caching
             vision_cache_size: Max entries in vision cache
@@ -460,6 +462,14 @@ class MLLMBatchGenerator:
 
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
+        self.allow_arrays_cache = allow_arrays_cache
+        if allow_arrays_cache and (
+            self.prefill_batch_size != 1 or self.completion_batch_size != 1
+        ):
+            raise ValueError(
+                "ArraysCache MLLM compatibility requires prefill and completion "
+                "batch sizes of 1"
+            )
         self.prefill_step_size = prefill_step_size
 
         # Request management
@@ -1095,13 +1105,12 @@ class MLLMBatchGenerator:
         # alignment, so all requests share a single batched cache for
         # subsequent generation steps.
         incompatible_cache_type = first_incompatible_mllm_cache_type(
-            per_request_caches[0]
+            per_request_caches[0], allow_arrays_cache=self.allow_arrays_cache
         )
         if incompatible_cache_type is not None:
             # Two distinct causes land here:
-            #   1. Hybrid/linear-attention backbone (ArraysCache /
-            #      MambaCache) — see GitHub #352. Should be caught at
-            #      startup by the probe in BatchedEngine._start_mllm.
+            #   1. A hybrid/linear-attention cache other than the explicitly
+            #      serialized ArraysCache lane — see GitHub #352/#1796.
             #   2. --kv-cache-quantization explicitly enabled on a
             #      non-hybrid MLLM.
             # Name both so the runtime message isn't misleading when

@@ -14,11 +14,13 @@ from __future__ import annotations
 import builtins
 from unittest.mock import MagicMock
 
+import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
-from vllm_mlx.engine.batched import _probe_mllm_cache_type
+from vllm_mlx.engine.batched import _probe_mllm_cache_type, _resolve_mllm_cache_policy
 from vllm_mlx.mllm_cache_compat import first_incompatible_mllm_cache_type
+from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig
 
 
 class _FakeArraysCache:
@@ -30,6 +32,13 @@ class _FakeArraysCache:
 
 
 _FakeArraysCache.__name__ = "ArraysCache"
+
+
+class _FakeMambaCache:
+    pass
+
+
+_FakeMambaCache.__name__ = "MambaCache"
 
 
 def _model_with_cache(cache_obj):
@@ -90,6 +99,78 @@ def test_compatibility_check_inspects_every_cache_layer():
     assert (
         first_incompatible_mllm_cache_type([KVCache(), _FakeArraysCache()])
         == "ArraysCache"
+    )
+
+
+def test_arrayscache_is_accepted_only_for_serialized_compatibility():
+    """The runtime allowlist is explicit; startup probing stays fail-closed."""
+    cache = _FakeArraysCache()
+    assert first_incompatible_mllm_cache_type([cache]) == "ArraysCache"
+    # A name-only stand-in is deliberately not enough to enter the allowlist.
+    # Production accepts only mlx-lm's concrete ArraysCache class.
+    assert (
+        first_incompatible_mllm_cache_type([cache], allow_arrays_cache=True)
+        == "ArraysCache"
+    )
+
+    real_cache = ArraysCache(2)
+    assert (
+        first_incompatible_mllm_cache_type(
+            [KVCache(), real_cache], allow_arrays_cache=True
+        )
+        is None
+    )
+
+
+def test_arrayscache_scheduler_mode_requires_singleton_limits():
+    config = MLLMSchedulerConfig(
+        max_num_seqs=1,
+        prefill_batch_size=1,
+        completion_batch_size=1,
+        allow_arrays_cache=True,
+    )
+    assert config.allow_arrays_cache is True
+
+    with pytest.raises(ValueError, match="all be 1"):
+        MLLMSchedulerConfig(
+            max_num_seqs=2,
+            prefill_batch_size=1,
+            completion_batch_size=1,
+            allow_arrays_cache=True,
+        )
+
+
+def test_engine_policy_serializes_only_arrayscache():
+    assert _resolve_mllm_cache_policy("ArraysCache", 16, 8, 32) == (1, 1, 1, True)
+    assert _resolve_mllm_cache_policy(None, 16, 8, 32) == (16, 8, 32, False)
+    assert _resolve_mllm_cache_policy("MambaCache", 16, 8, 32) == (
+        16,
+        8,
+        32,
+        False,
+    )
+
+
+def test_arrayscache_singleton_primitives_preserve_recurrent_state():
+    """The admitted cache supports the lifecycle used by MLLMBatch."""
+    first = ArraysCache(2)
+    first[0] = mx.array([[1.0, 2.0]])
+    first[1] = mx.array([[3.0]])
+
+    merged = ArraysCache.merge([first])
+    assert merged.batch_size == 1
+    assert merged[0].tolist() == [[1.0, 2.0]]
+
+    merged.filter(mx.array([0], mx.int32))
+    extracted = merged.extract(0)
+    assert extracted.batch_size == 1
+    assert extracted[1].tolist() == [[3.0]]
+
+
+def test_serialized_mode_does_not_admit_other_hybrid_caches():
+    assert (
+        first_incompatible_mllm_cache_type([_FakeMambaCache()], allow_arrays_cache=True)
+        == "MambaCache"
     )
 
 

@@ -5,18 +5,23 @@ from collections.abc import Iterable
 from typing import Any
 
 
-def first_incompatible_mllm_cache_type(caches: Iterable[Any]) -> str | None:
+def first_incompatible_mllm_cache_type(
+    caches: Iterable[Any], *, allow_arrays_cache: bool = False
+) -> str | None:
     """Return the first cache type that MLLM batching cannot merge.
 
     mlx-vlm 0.6.4 split its cache classes from mlx-lm's parallel classes.
     Models loaded by mlx-vlm therefore return native ``KVCache`` /
     ``RotatingKVCache`` instances that fail an mlx-lm-only ``isinstance``
     check despite exposing the supported batching API. Accept both namespaces
-    while continuing to reject ArraysCache, MambaCache, and quantized caches.
+    ``ArraysCache`` is accepted only for the explicitly serialized hybrid
+    compatibility lane. Mamba and quantized/unknown caches remain fail-closed.
     """
-    from mlx_lm.models.cache import KVCache, RotatingKVCache
+    from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
     supported_types: tuple[type, ...] = (KVCache, RotatingKVCache)
+    if allow_arrays_cache:
+        supported_types += (ArraysCache,)
     try:
         from mlx_vlm.models import cache as vlm_cache
     except ImportError:

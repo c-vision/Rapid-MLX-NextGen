@@ -555,6 +555,18 @@ def _probe_mllm_cache_type(language_model: Any) -> str | None:
     return first_incompatible_mllm_cache_type(test_cache)
 
 
+def _resolve_mllm_cache_policy(
+    cache_type: str | None,
+    max_num_seqs: int,
+    prefill_batch_size: int,
+    completion_batch_size: int,
+) -> tuple[int, int, int, bool]:
+    """Return safe MLLM batch limits and ArraysCache admission policy."""
+    if cache_type == "ArraysCache":
+        return 1, 1, 1, True
+    return max_num_seqs, prefill_batch_size, completion_batch_size, False
+
+
 _CHANNEL_TO_STRING = {
     Channel.CONTENT: "content",
     Channel.REASONING: "reasoning",
@@ -1117,19 +1129,17 @@ class BatchedEngine(BaseEngine):
         self._model = self._mllm_instance.model
         self._processor = self._mllm_instance.processor
 
-        # Fail fast at startup if the language backbone is a hybrid model
-        # (linear-attention or recurrent layers, producing ArraysCache /
-        # MambaCache). MLLM continuous batching builds a BatchKVCache via
-        # KVCache.merge(), which requires standard KVCache or RotatingKVCache;
-        # otherwise the first request raises ValueError mid-prefill.
-        # Catching it now means a clear startup error instead of the user
-        # seeing "Batch generation failed" on their very first image request
-        # (GitHub #352, Qwen3.6-35B-A3B + --mllm).
+        # Probe the language-backbone cache before the port reports ready.
+        # ArraysCache has the merge/filter/extract primitives needed for a
+        # correctness-first serialized lane (#1796), but concurrent hybrid
+        # batching is intentionally not enabled. Mamba, quantized, and unknown
+        # cache types continue to fail at startup with the #352 diagnostic.
         language_model = getattr(self._model, "language_model", self._model)
         cache_type = self._model_load_executor.submit(
             _probe_mllm_cache_type, language_model
         ).result()
-        if cache_type is not None:
+        arrays_cache_compat = cache_type == "ArraysCache"
+        if cache_type is not None and not arrays_cache_compat:
             raise RuntimeError(
                 f"Model '{self._model_name}' uses a hybrid/linear-attention "
                 f"language backbone ({cache_type}), which is incompatible "
@@ -1152,6 +1162,23 @@ class BatchedEngine(BaseEngine):
         completion_batch_size = getattr(
             self._scheduler_config, "completion_batch_size", 32
         )
+        (
+            max_num_seqs,
+            prefill_batch_size,
+            completion_batch_size,
+            arrays_cache_compat,
+        ) = _resolve_mllm_cache_policy(
+            cache_type,
+            max_num_seqs,
+            prefill_batch_size,
+            completion_batch_size,
+        )
+        if arrays_cache_compat:
+            logger.warning(
+                "Model '%s' uses ArraysCache; enabling serialized hybrid MLLM "
+                "compatibility (one active request, additional requests queued).",
+                self._model_name,
+            )
         # ``prefill_step_size`` for MLLM is the per-request budget that
         # caps total prompt tokens (vision + text). See
         # ``_resolve_mllm_prefill_step_size`` for the bump-policy
@@ -1186,6 +1213,7 @@ class BatchedEngine(BaseEngine):
             enable_vision_cache=True,
             vision_cache_size=100,
             max_concurrent_requests=max_concurrent_requests,
+            allow_arrays_cache=arrays_cache_compat,
         )
 
         # Create and start MLLM scheduler — pass the model-owning executor so
