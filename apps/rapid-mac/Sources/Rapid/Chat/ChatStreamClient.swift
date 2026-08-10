@@ -475,11 +475,15 @@ struct ChatStreamClient {
         // Audit P1 — SSE delta coalescing. Per-delta MainActor.run on
         // a fast stream (M3 Ultra rapid-mlx can decode 200+ tok/s)
         // burned a main-actor hop per token. Coalesce content/reasoning
-        // deltas into a single hop per ~16 ms window (one display
-        // frame at 60 Hz) so a 500-token response that previously cost
-        // ~500 hops collapses to ~30 — while the first delta of each
-        // type still surfaces immediately so the typing indicator
-        // appears without perceptible delay.
+        // deltas into a single hop per window so a 500-token response
+        // that previously cost ~500 hops collapses to ~30 — while the
+        // first delta of each type still surfaces immediately so the
+        // typing indicator appears without perceptible delay.
+        //
+        // The window is 16 ms (one display frame at 60 Hz) and widens
+        // with the length already sent, to 250 ms — see
+        // ``SSEDeltaCoalescer/currentWindowNs()`` for why a fixed
+        // window leaves the turn quadratic (#1743).
         //
         // Invariants the coalescer preserves:
         //   * First content/reasoning delta flushes BEFORE any
@@ -986,9 +990,14 @@ enum Wire {
 /// Per-token MainActor hops on a fast stream (M3 Ultra rapid-mlx
 /// at 200+ tok/s) burned a hop per emitted delta. This coalescer
 /// accumulates ``content`` and ``reasoning_content`` deltas inside
-/// a 16 ms window (one display frame at 60 Hz) and emits ONE
-/// MainActor callback per window — collapsing a 500-token stream
-/// from ~500 hops to ~30.
+/// a coalescing window and emits ONE MainActor callback per window
+/// — collapsing a 500-token stream from ~500 hops to ~30.
+///
+/// The window starts at 16 ms (one display frame at 60 Hz) and, past
+/// ``adaptiveThresholdChars``, widens in proportion to the text already
+/// flushed, up to ``maxWindowNs``. A fixed window would leave the turn
+/// quadratic: each repaint re-parses the whole message, so an O(length)
+/// parse at a fixed rate costs O(length²) over the turn (#1743).
 ///
 /// Held as a reference type so the captured mutable state survives
 /// the ``await`` boundary the SSE loop crosses on every line
@@ -999,8 +1008,9 @@ enum Wire {
 ///     SINGLE ordered queue keyed by kind, merging into the
 ///     trailing entry when the kind matches. The first call of
 ///     each kind surfaces IMMEDIATELY (first-token visibility —
-///     the typing indicator must not wait 16 ms). Subsequent calls
-///     flush when the 16 ms coalesce window has elapsed.
+///     the typing indicator must not wait a frame). Subsequent
+///     calls flush once the current window (see
+///     ``currentWindowNs()``) has elapsed.
 ///   * ``flush`` emits the pending queue IN ORDER, so a
 ///     content→reasoning interleave preserves the server's wire
 ///     order — there is no cross-kind reordering.
@@ -1008,8 +1018,10 @@ enum Wire {
 ///     (usage, tool_calls, finish_reason, [DONE]) AND before
 ///     throwing on cancellation or transport error. The send()
 ///     scope guarantees the latter via a `defer` block.
-///   * The 16 ms window is opportunistic (checked on each
-///     append), not timed: if a delta burst stops mid-window,
+///   * The window is opportunistic (checked on each append), not
+///     timed, and its length is adaptive — 16 ms until the message
+///     passes ``adaptiveThresholdChars``, then proportional to the
+///     text so far up to ``maxWindowNs`` (#1743): if a delta burst stops mid-window,
 ///     the trailing text is held until the next event of any
 ///     kind or until send()'s defer flush. Real backends emit
 ///     a continuous stream of deltas terminated by
@@ -1024,7 +1036,73 @@ final class SSEDeltaCoalescer: @unchecked Sendable {
     /// 16 ms = 1 frame at 60 Hz. Tight enough that the user
     /// perceives a smooth typing effect; loose enough to amortise
     /// MainActor hop cost.
+    ///
+    /// This is the FLOOR, not the whole story — see ``currentWindowNs``.
     private static let coalesceWindowNs: UInt64 = 16_000_000
+
+    /// Above this many flushed characters the window starts to widen.
+    /// Chosen so an ordinary reply never changes behaviour at all: the
+    /// median chat answer is a few hundred characters and the long tail
+    /// of "write me a function" answers still lands under 2 000.
+    private static let adaptiveThresholdChars: Int = 2_000
+
+    /// Ceiling on the widened window. At 250 ms a very long message
+    /// still repaints four times a second, which reads as "streaming"
+    /// rather than "frozen", at about a sixteenth of the callback rate a
+    /// flat 16 ms cadence costs (250 / 16).
+    private static let maxWindowNs: UInt64 = 250_000_000
+
+    /// Total characters handed to the UI so far this turn.
+    private var flushedCharacters: Int = 0
+
+    /// How long to coalesce before the next flush, given how much text
+    /// the message already holds.
+    ///
+    /// Every flush makes the chat view rebuild its body, and
+    /// ``LaTeXMarkdownView`` re-parses the ENTIRE accumulated message
+    /// through MarkdownUI on each rebuild — parsing is O(length), and a
+    /// fixed 16 ms cadence therefore costs O(length²) across a turn. On a
+    /// long answer that saturates the main thread: measured on a fake
+    /// stream, main-thread CPU climbed 47 % → 68 % → 94 % → 100 % as the
+    /// message grew, and a real 9-minute answer left the app pinned at
+    /// 100 % with the window gone and RSS climbing ~11 MB/s until it was
+    /// force-killed (#1743).
+    ///
+    /// Widening the window in proportion to the text bounds the repaint
+    /// RATE, which is the term that makes the cost quadratic. Below the
+    /// threshold the arithmetic is a no-op and short replies stream
+    /// exactly as they did before.
+    ///
+    /// This does not make a single parse cheaper — that is #1624, and it
+    /// is the real fix. This stops the app melting while that is done.
+    private func currentWindowNs() -> UInt64 {
+        guard flushedCharacters > Self.adaptiveThresholdChars else {
+            return Self.coalesceWindowNs
+        }
+        // Multiply BEFORE dividing so the growth is actually linear. Dividing
+        // first floors the ratio to an integer, which makes the window a
+        // staircase — flat from 2 000 to 3 999 characters and then jumping
+        // straight from 16 ms to 32 ms — rather than the smooth ramp the
+        // comment above promises.
+        //
+        // `characters` is clamped to the value that already yields the cap, so
+        // the multiplication cannot overflow no matter how long the message
+        // gets, and no masking operators are needed.
+        //
+        // Derive that clamp by solving for it, not by scaling the window
+        // ratio: `maxWindowNs / coalesceWindowNs` is 250/16, which floors to
+        // 15, capping at 30 000 characters and a 240 ms window — so
+        // `maxWindowNs` would never actually be reached and the ceiling the
+        // rest of this file talks about would not exist. The exact answer is
+        // 31 250. (250e6 * 2000 fits in UInt64 with ~7 orders of magnitude to
+        // spare, so the numerator here is safe.)
+        let capCharacters = Int(
+            Self.maxWindowNs * UInt64(Self.adaptiveThresholdChars) / Self.coalesceWindowNs
+        )
+        let characters = UInt64(min(flushedCharacters, capCharacters))
+        let widened = Self.coalesceWindowNs * characters / UInt64(Self.adaptiveThresholdChars)
+        return min(max(widened, Self.coalesceWindowNs), Self.maxWindowNs)
+    }
 
     /// Codex r2 BLOCKING (unbounded queue): force-flush when the
     /// pending queue would exceed this many segments. An adversarial
@@ -1036,6 +1114,16 @@ final class SSEDeltaCoalescer: @unchecked Sendable {
     /// into one flush, but tight enough that a runaway stream gets
     /// drained promptly.
     private static let maxPendingSegments: Int = 32
+
+    /// How many times ``flush`` has applied a batch on the main actor — one
+    /// per flush, by construction.
+    ///
+    /// Exposed because the emitted event stream cannot distinguish one hop
+    /// carrying N segments from N hops carrying one each, and that difference
+    /// is the whole point: it is what decides whether the view rebuilds once
+    /// or N times per flush. A test asserting only on events would pass just
+    /// as happily against the per-segment version this replaced.
+    private(set) var mainActorApplications: Int = 0
 
     enum Kind { case content, reasoning }
 
@@ -1080,7 +1168,7 @@ final class SSEDeltaCoalescer: @unchecked Sendable {
         // Codex r2 BLOCKING: cap pending segments to bound queue
         // growth on adversarial alternating-kind streams.
         let overCap = pending.count > Self.maxPendingSegments
-        if !contentEverFlushed || elapsed >= Self.coalesceWindowNs || overCap {
+        if !contentEverFlushed || elapsed >= currentWindowNs() || overCap {
             await flush(onEvent: onEvent)
         }
     }
@@ -1093,7 +1181,7 @@ final class SSEDeltaCoalescer: @unchecked Sendable {
         appendSegment(kind: .reasoning, text: r)
         let elapsed = nowNs() &- lastFlushNs
         let overCap = pending.count > Self.maxPendingSegments
-        if !reasoningEverFlushed || elapsed >= Self.coalesceWindowNs || overCap {
+        if !reasoningEverFlushed || elapsed >= currentWindowNs() || overCap {
             await flush(onEvent: onEvent)
         }
     }
@@ -1104,17 +1192,45 @@ final class SSEDeltaCoalescer: @unchecked Sendable {
         guard !pending.isEmpty else { return }
         let toEmit = pending
         pending.removeAll(keepingCapacity: true)
+        // Count `toEmit`, NOT `pending` — `pending` was just emptied, so
+        // counting it leaves the total at zero forever and the adaptive
+        // window silently never widens.
+        // Saturating, not wrapping: a wrapped total would silently drop the
+        // window back to its 16 ms floor, which is the bug this bounds.
+        let batch = toEmit.reduce(0) { $0 + $1.text.count }
+        flushedCharacters = (flushedCharacters > Int.max - batch)
+            ? Int.max
+            : flushedCharacters + batch
         lastFlushNs = nowNs()
         for segment in toEmit {
             switch segment.kind {
-            case .content:
-                contentEverFlushed = true
-                let s = segment.text
-                await MainActor.run { onEvent(.content(s)) }
-            case .reasoning:
-                reasoningEverFlushed = true
-                let s = segment.text
-                await MainActor.run { onEvent(.reasoning(s)) }
+            case .content: contentEverFlushed = true
+            case .reasoning: reasoningEverFlushed = true
+            }
+        }
+        // ONE hop for the whole batch, in wire order.
+        //
+        // Hopping per segment defeats the point of coalescing on an
+        // alternating content/reasoning stream: the `overCap` force-flush
+        // fires at 33 segments regardless of the adaptive window, and if each
+        // segment then gets its own MainActor mutation the view rebuilds —
+        // and re-parses the whole message — about once per delta again, which
+        // is exactly the #1743 failure the window is meant to bound. Applying
+        // them in a single hop keeps the queue bound AND the repaint bound,
+        // and order is preserved because the closure runs the array in
+        // sequence.
+        await MainActor.run {
+            // Counted INSIDE the hop, not beside it. Incrementing once per
+            // flush would measure flushes, and the thing worth measuring is
+            // main-actor applications: restore the per-segment version and a
+            // flush-side counter still reports 1, so the test that watches it
+            // would stay green through the exact regression it exists for.
+            self.mainActorApplications += 1
+            for segment in toEmit {
+                switch segment.kind {
+                case .content: onEvent(.content(segment.text))
+                case .reasoning: onEvent(.reasoning(segment.text))
+                }
             }
         }
     }

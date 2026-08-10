@@ -143,6 +143,132 @@ struct SSEDeltaCoalescerTests {
         #expect(collapsed == ["C", "R", "C"], "kind order leaked: got \(kindOrder)")
     }
 
+    /// #1743: the repaint RATE has to fall as the message grows.
+    ///
+    /// Every flush makes the chat view rebuild, and that rebuild re-parses
+    /// the WHOLE accumulated message through MarkdownUI. Parsing is
+    /// O(length), so a fixed 16 ms cadence costs O(length²) over a turn.
+    /// Measured on a fake stream before the fix, main-thread CPU climbed
+    /// 47 % → 68 % → 94 % → 100 % as the answer grew and stayed pinned;
+    /// a real 9-minute answer left the app at 100 % with its window gone
+    /// and RSS climbing ~11 MB/s until it was force-killed.
+    ///
+    /// This pins the two halves of the contract that matter:
+    ///
+    ///   1. a SHORT message is untouched — 16 ms still flushes, so the
+    ///      overwhelming majority of replies stream exactly as before;
+    ///   2. a LONG message does not, because the window has widened.
+    ///
+    /// Both directions are asserted deliberately. A "fix" that simply
+    /// slowed everything down would pass (2) and fail (1), and would be
+    /// a visible regression on every ordinary answer.
+    @Test("#1743: the coalescing window widens once the message is long")
+    @MainActor
+    func window_widens_with_accumulated_length() async {
+        // (1) Short message: 16 ms is still enough to flush.
+        let short = SSEDeltaCoalescer()
+        let shortRec = EventRecorder()
+        await short.appendContent("seed") { shortRec.capture($0) }   // first flush
+        let afterSeed = shortRec.events.count
+        try? await Task.sleep(for: .milliseconds(40))
+        await short.appendContent("more") { shortRec.capture($0) }
+        #expect(
+            shortRec.events.count > afterSeed,
+            "a short message must still flush on the 16 ms cadence — widening it unconditionally would slow every normal reply"
+        )
+
+        // (2) Long message: the same 40 ms pause is no longer enough.
+        //
+        // Seed past the point where the window has reached its 250 ms
+        // ceiling in ONE flush, rather than creeping up to it over several.
+        // Creeping leaves the assertion comparing ~120 ms of sleeps against a
+        // ~128 ms window — 8 ms of slack, which a loaded CI runner eats, and
+        // the test then fails against correct code. From the ceiling the
+        // margin is 250 ms against 40 ms.
+        let long = SSEDeltaCoalescer()
+        let longRec = EventRecorder()
+        await long.appendContent(String(repeating: "x", count: 64_000)) { longRec.capture($0) }
+        let afterBulk = longRec.events.count
+        #expect(afterBulk > 0, "the first delta must flush immediately regardless of size")
+        try? await Task.sleep(for: .milliseconds(40))
+        await long.appendContent("tail") { longRec.capture($0) }
+        #expect(
+            longRec.events.count == afterBulk,
+            "a 40 ms gap still flushed after 64k characters — the window did not widen, so the repaint rate is still O(length²) (#1743)"
+        )
+    }
+
+    /// The `overCap` force-flush path, which exists to bound the QUEUE, must
+    /// not also un-bound the repaint rate.
+    ///
+    /// It fires at 33 pending segments regardless of the window, so an
+    /// alternating content/reasoning stream reaches it constantly. If that
+    /// flush then hopped to the main actor once per segment, the view would
+    /// rebuild — and re-parse the whole message — about once per delta again,
+    /// which is the #1743 failure with extra steps. One flush must produce one
+    /// batch of events delivered together, in wire order.
+    @Test("#1743: an alternating stream still flushes as batches, in order")
+    @MainActor
+    func alternating_stream_flushes_in_ordered_batches() async {
+        let coalescer = SSEDeltaCoalescer()
+        let recorder = EventRecorder()
+        // Get both kinds past their first-delta immediate flush.
+        await coalescer.appendContent("c0") { recorder.capture($0) }
+        await coalescer.appendReasoning("r0") { recorder.capture($0) }
+        // Now alternate hard enough to trip the 32-segment cap, with no
+        // sleeps, so the window never expires and `overCap` is the only
+        // thing that can flush.
+        for i in 0..<40 {
+            await coalescer.appendContent("c\(i)") { recorder.capture($0) }
+            await coalescer.appendReasoning("r\(i)") { recorder.capture($0) }
+        }
+        await coalescer.flush { recorder.capture($0) }
+
+        // (1) The batching itself. Asserting on the events cannot show this —
+        // one hop carrying N segments and N hops carrying one each produce an
+        // identical event list — so ask the coalescer how many times it
+        // actually touched the main actor. 82 deltas went in; the per-segment
+        // version this replaced would report ~82 applications, one repaint
+        // each, which is #1743 all over again.
+        let hops = coalescer.mainActorApplications
+        #expect(
+            hops < 12,
+            "\(hops) main-actor applications for 82 deltas — flush is hopping per segment again, so the view rebuilds (and re-parses the whole message) about once per delta"
+        )
+
+        // (2) Wire order across kinds, as the sequence it actually is, not as
+        // two payloads checked separately: concatenating per kind would pass
+        // even if every reasoning delta arrived after every content delta.
+        let arrived = recorder.events.compactMap { event -> String? in
+            switch event {
+            case .content(let t): return "c:\(t)"
+            case .reasoning(let t): return "r:\(t)"
+            default: return nil
+            }
+        }
+        var expected = ["c:c0", "r:r0"]
+        for i in 0..<40 {
+            expected.append("c:c\(i)")
+            expected.append("r:r\(i)")
+        }
+        // Adjacent same-kind deltas merge into one segment, so compare the
+        // merged form: fold neighbours of equal kind together on both sides.
+        func merged(_ items: [String]) -> [String] {
+            items.reduce(into: [String]()) { acc, item in
+                let kind = item.prefix(2)
+                if let last = acc.last, last.hasPrefix(kind) {
+                    acc[acc.count - 1] = last + item.dropFirst(2)
+                } else {
+                    acc.append(item)
+                }
+            }
+        }
+        #expect(
+            merged(arrived) == merged(expected),
+            "the batched flush reordered, dropped, or cross-mixed the stream"
+        )
+    }
+
     @Test("flush on empty buffers is a no-op")
     @MainActor
     func empty_flush_emits_nothing() async {
