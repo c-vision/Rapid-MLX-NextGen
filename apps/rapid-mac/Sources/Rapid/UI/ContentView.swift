@@ -425,7 +425,10 @@ struct ContentView: View {
 
     private func startModel(_ target: String) {
         let hfPath = catalogEntries.first(where: { $0.alias == target })?.hfRepo
-        Task { await server.start(alias: target, hfPath: hfPath) }
+        // ``ensureServing`` via the shared helper, NOT ``server.start``: start is
+        // cold-start only and no-ops while a different model (e.g. an Images
+        // checkpoint) is resident, silently dropping the switch (#1739).
+        Task { await ReadinessModelStart.perform(server, alias: target, hfPath: hfPath) }
     }
 
     private func restartModel(_ target: String) {
