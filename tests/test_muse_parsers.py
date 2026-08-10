@@ -649,3 +649,171 @@ def test_streaming_never_leaks_header_or_terminator_bytes():
         prev = curr
     assert "".join(reasoning_parts) == "thinking"
     assert "".join(content_parts) == "answer"
+
+
+def test_reasoning_parser_survives_thinking_disabled():
+    """The muse parser must stay in the demux path when a request
+    resolves ``enable_thinking=False`` (R12-T2F casual-chat auto-disable).
+
+    Muse's template has no thinking switch — the model always emits
+    channel plumbing. Without ``sanitize_when_thinking_disabled`` the
+    postprocessor bypassed the parser and ``strip_special_tokens`` ate
+    the wire markers while leaking `` to=self`` header bytes into
+    ``delta.content`` (observed on real 30B weights, 2026-08-10 smoke).
+    """
+    parser = _reasoning_parser()
+    assert parser.sanitize_when_thinking_disabled is True
+
+
+def test_postprocessor_demuxes_with_thinking_disabled():
+    """End-to-end postprocessor regression for the mini smoke failure:
+    exact per-token deltas observed from the real 30B checkpoint, with
+    ``enable_thinking=False`` as injected by the casual-chat auto-disable."""
+    from unittest.mock import MagicMock
+
+    from vllm_mlx.service.postprocessor import StreamingPostProcessor
+
+    cfg = MagicMock()
+    cfg.engine = None
+    cfg.reasoning_parser = None
+    cfg.reasoning_parser_name = "muse"
+    cfg.enable_auto_tool_choice = False
+    cfg.tool_call_parser = None
+    cfg.tool_parser_instance = None
+
+    pp = StreamingPostProcessor(cfg, enable_thinking=False)
+    pp.reset()
+
+    deltas = [
+        " to",
+        "=self",
+        "<|message|>",
+        "hi",
+        "\n\n",
+        "We",
+        " need",
+        " to",
+        " respond",
+        ".",
+        "<|eom|>",
+        "<|start|>",
+        "assistant",
+        " to",
+        "=user",
+        "<|message|>",
+        "Hello",
+        "!",
+        "<|eot|>",
+    ]
+    reasoning_parts: list[str] = []
+    content_parts: list[str] = []
+    for i, ch in enumerate(deltas):
+        out = MagicMock()
+        out.new_text = ch
+        out.finished = i == len(deltas) - 1
+        out.channel = None
+        out.finish_reason = "stop" if out.finished else None
+        out.prompt_tokens = 10
+        out.completion_tokens = 5
+        out.tokens = []
+        out.logprobs = None
+        out.tool_calls = None
+        for e in pp.process_chunk(out):
+            if e.type == "content" and e.content:
+                content_parts.append(e.content)
+            if getattr(e, "reasoning", None):
+                reasoning_parts.append(e.reasoning)
+
+    assert "".join(reasoning_parts) == "hi\n\nWe need to respond."
+    assert "".join(content_parts) == "Hello!"
+
+
+def test_finalize_uses_raw_wire_content_for_muse():
+    """Non-streaming counterpart of the demux regression: the route's
+    ``clean_output_text`` strips channel markers WITHOUT extracting
+    channels, so ``_finalize_content_and_reasoning``'s first parse sees
+    markerless mush. The raw-text retry must supply BOTH halves for
+    muse — before the fix the mush (header bytes + duplicated
+    reasoning) shipped as ``content`` (real-weights mini smoke,
+    2026-08-10, non-streaming surface).
+    """
+    from vllm_mlx.api.utils import clean_output_text
+    from vllm_mlx.service.helpers import _finalize_content_and_reasoning
+
+    raw = (
+        " to=self<|message|>We need to respond.<|eom|>"
+        "<|start|>assistant to=user<|message|>Hello!<|eot|>"
+    )
+    cleaned = clean_output_text(raw)
+    assert "<|message|>" not in cleaned  # the generic regex ate the wire
+
+    content, reasoning = _finalize_content_and_reasoning(
+        raw_text=raw,
+        cleaned_text=cleaned,
+        tool_calls=[],
+        reasoning_parser=_reasoning_parser(),
+    )
+    assert reasoning == "We need to respond."
+    assert content == "Hello!"
+
+
+def test_finalize_truncated_all_reasoning_muse():
+    """finish_reason=length mid-reasoning: everything is to=self, no
+    content channel ever opened — content must be empty, not the mush."""
+    from vllm_mlx.api.utils import clean_output_text
+    from vllm_mlx.service.helpers import _finalize_content_and_reasoning
+
+    raw = " to=self<|message|>Thinking hard about the answer"
+    cleaned = clean_output_text(raw)
+
+    content, reasoning = _finalize_content_and_reasoning(
+        raw_text=raw,
+        cleaned_text=cleaned,
+        tool_calls=[],
+        reasoning_parser=_reasoning_parser(),
+        finish_reason="length",
+    )
+    assert reasoning == "Thinking hard about the answer"
+    assert content == ""
+
+
+def test_clean_output_text_extracts_muse_channels():
+    """``clean_output_text`` must demux muse wire (harmony-precedent
+    branch), not regex-strip it into header mush — its output feeds the
+    non-streaming tool parser and the finalize first-parse."""
+    from vllm_mlx.api.utils import clean_output_text
+
+    raw = (
+        " to=self<|message|>plan the call<|eom|>"
+        "<|start|>assistant to=user<|message|>Done.<|eot|>"
+    )
+    assert clean_output_text(raw, muse_wire=True) == "Done."
+    # Without the model-identity gate the branch must NOT engage, even
+    # on structurally perfect wire (codex r6 #1: gate on the serving
+    # model, never on output bytes).
+    assert "to=self" in clean_output_text(raw)
+
+    # Tool-addressed segments pass through as content so the ATEM
+    # block reaches the tool parser.
+    raw_tool = (
+        " to=self<|message|>need weather<|eom|>"
+        "<|start|>assistant to=get_weather<|message|>"
+        '<atem:function_calls><atem:invoke name="get_weather">'
+        '<atem:parameter name="city">Tokyo</atem:parameter>'
+        "</atem:invoke></atem:function_calls><|eot|>"
+    )
+    cleaned = clean_output_text(raw_tool, muse_wire=True)
+    assert "<atem:invoke" in cleaned
+    assert "to=self" not in cleaned
+    assert "<|message|>" not in cleaned
+
+    # Non-muse text with a literal mid-prose mention must NOT enter
+    # the muse branch: only the generic token strip applies, the
+    # surrounding prose survives byte-exact (codex r5 #3).
+    prose = "The wire uses <|message|> as a separator."
+    assert clean_output_text(prose, muse_wire=True) == "The wire uses  as a separator."
+    prose2 = "Historically <|start|>assistant marked a header."
+    assert (
+        clean_output_text(prose2, muse_wire=True)
+        == "Historically assistant marked a header."
+    )

@@ -88,6 +88,31 @@ def _segments(text: str) -> list[tuple[str, str]]:
 class MuseReasoningParser(ReasoningParser):
     """Routes ``to=self`` segments to reasoning, the rest to content."""
 
+    # This parser is a WIRE DEMULTIPLEXER, not an optional cosmetic:
+    # Muse's chat template has no thinking on/off switch — the model
+    # ALWAYS emits recipient-routed channel plumbing. When a request
+    # resolves ``enable_thinking=False`` (e.g. the R12-T2F casual-chat
+    # auto-disable), the postprocessor's default policy bypasses the
+    # reasoning parser and routes the raw stream through
+    # ``_process_standard``, whose ``strip_special_tokens`` regex eats
+    # ``<|start|>/<|message|>/<|eot|>`` while leaking the textual
+    # `` to=self`` header bytes into ``delta.content`` (observed on
+    # real 30B weights, 2026-08-10 mini smoke). Same contract as the
+    # DeepSeek V4 parser: keep the parser in the path regardless of
+    # the thinking flag — channel routing is unambiguous and the flag
+    # is honoured by the model, not by us.
+    sanitize_when_thinking_disabled = True
+
+    # Non-streaming counterpart (``_finalize_content_and_reasoning``):
+    # ``clean_output_text`` regex-strips the channel markers without
+    # extracting channels, so the first parse (on ``cleaned_text``)
+    # sees markerless mush and the raw-text retry is the ONLY parse
+    # that sees the real wire. This flag makes the retry's content
+    # half authoritative — without it the mush (header bytes + the
+    # reasoning duplicated) ships as ``content`` (observed on real
+    # 30B weights, 2026-08-10 mini smoke, non-streaming surface).
+    raw_parse_content_authoritative = True
+
     def extract_reasoning(
         self,
         model_output: str,
