@@ -539,6 +539,10 @@ def test_a_stolen_port_during_boot_aborts_the_sweep(g12, monkeypatch, tmp_path):
     report = tmp_path / "report.log"
 
     monkeypatch.setattr(g12.subprocess, "Popen", _popen)
+    # This is a unit test of takeover handling after launch. Do not let an
+    # unrelated local Rapid-MLX instance on the default port short-circuit
+    # ``main`` before the mocked boot path runs.
+    monkeypatch.setattr(g12, "_port_free", lambda port: True)
     monkeypatch.setattr(g12, "_free_disk_gb", lambda path: 10_000.0)
     # The stranger arrives while the FIRST model is booting.
     monkeypatch.setattr(
@@ -878,6 +882,7 @@ def test_the_bench_transcript_is_wired_to_the_bench_log_not_the_server_log(
     aliases.write_text(json.dumps(_fake_aliases()))
 
     monkeypatch.setattr(g12.subprocess, "Popen", lambda cmd, **kw: _Proc())
+    monkeypatch.setattr(g12, "_port_free", lambda port: True)
     monkeypatch.setattr(g12, "_free_disk_gb", lambda path: 10_000.0)
     monkeypatch.setattr(
         g12, "_wait_for_server", lambda proc, port, timeout, log: (True, False)
@@ -927,6 +932,7 @@ def test_the_report_defaults_into_the_private_directory(
     """An unspecified --report must not land on a fixed name in /tmp."""
     aliases = tmp_path / "aliases.json"
     aliases.write_text(json.dumps(_fake_aliases()))
+    monkeypatch.setattr(g12, "_port_free", lambda port: True)
     monkeypatch.setattr(g12, "_free_disk_gb", lambda path: 10_000.0)
     monkeypatch.setattr(
         g12, "_wait_for_server", lambda proc, port, timeout, log: (False, False)

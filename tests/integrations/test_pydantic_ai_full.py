@@ -70,12 +70,22 @@ if __name__ == "__main__":
             age: int
 
         # Keep the output-tool assertion deterministic and bound any retry.
+        # Be explicit about every required field: this test runs after the
+        # stress and two other agent suites in the PR lane, while a failure is
+        # confirmed against a fresh base server.  The terse "Extract" prompt
+        # made Qwen3.5 occasionally emit only ``age`` in the warmed lane even
+        # at temperature=0, producing a repeatable false PR/base differential.
+        # The contract under test is schema transport, not whether the model
+        # can infer which details to copy from an underspecified instruction.
         agent = Agent(
             model,
             output_type=Person,
             model_settings={"temperature": 0.0, "max_tokens": 256},
         )
-        r = agent.run_sync("Extract: 'Alice is 30 years old'")
+        r = agent.run_sync(
+            "Call the final_result output tool with both required fields: "
+            "name='Alice' and age=30. Do not omit either field."
+        )
         assert isinstance(r.output, Person), type(r.output)
         assert r.output.name.lower() == "alice", r.output.name
         assert r.output.age == 30, r.output.age
