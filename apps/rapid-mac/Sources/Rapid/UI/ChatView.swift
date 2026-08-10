@@ -493,8 +493,15 @@ struct ChatView: View {
             .disabled(!supportsImageInput || viewModel.isStreaming)
             .help(supportsImageInput ? "Add photos" : "This model doesn't support images")
             .accessibilityLabel("Add photos")
-            .accessibilityHint(supportsImageInput ? "" : "This model doesn't support images")
+            // Identifier BEFORE hint, matching ChatView.SendOrStopButton. On
+            // macOS 26 a disabled .buttonStyle(.plain) button whose hint is
+            // applied after the identifier drops out of the AX tree entirely
+            // (the enabled Send button, ordered the other way, survives) — so
+            // the "Add photos" control became unreachable to VoiceOver and
+            // invisible to the golden-flow harness whenever the model is
+            // text-only. Ordering identifier first keeps it addressable.
             .accessibilityIdentifier("ChatView.AddPhotos")
+            .accessibilityHint(supportsImageInput ? "" : "This model doesn't support images")
             Spacer(minLength: 0)
             ModelPickerBar(
                 server: server,
