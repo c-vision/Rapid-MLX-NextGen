@@ -82,6 +82,7 @@ struct ImagesView: View {
             .buttonStyle(.plain)
             .padding(10)
             .help("Save image")
+            .accessibilityHint("Save image")
             .accessibilityIdentifier("Images.Result.Save")
         }
     }
@@ -216,6 +217,7 @@ struct ImagesView: View {
                         .buttonStyle(.plain)
                         .disabled(viewModel.cancelling)
                         .help("Cancel")
+                        .accessibilityHint("Cancel")
                         .accessibilityIdentifier("Images.Cancel")
                     }
 
@@ -522,6 +524,11 @@ struct ImagesView: View {
         .fixedSize()
         .onHover { pickerHovering = $0 }
         .help(viewModel.selectedAlias.isEmpty ? "Choose a model" : "Model: \(viewModel.selectedAlias)")
+        // Mirror the tooltip into an accessibility hint: SwiftUI's `.help(_)`
+        // reaches AXHelp on macOS 15 but not on macOS 26 for a `Menu` styled as
+        // a button, so without this the model the picker resolved to is
+        // invisible to VoiceOver and to the golden-flow harness on 26.
+        .accessibilityHint(viewModel.selectedAlias.isEmpty ? "Choose a model" : "Model: \(viewModel.selectedAlias)")
         .accessibilityIdentifier("Images.ModelPicker")
     }
 
@@ -547,6 +554,7 @@ struct ImagesView: View {
             .buttonStyle(.plain)
             .disabled(viewModel.cancelling)
             .help("Cancel")
+            .accessibilityHint("Cancel")
             .accessibilityIdentifier("Images.Generate")
         } else {
             Button(action: runSubmit) {
@@ -563,6 +571,12 @@ struct ImagesView: View {
             .buttonStyle(.plain)
             .disabled(!sendEnabled)
             .help(readiness.isReady ? "Generate" : "Load the model first")
+            // `.help(_)` does not reach AXHelp on macOS 26 for this button
+            // (it publishes an identifier but no accessibilityLabel), so mirror
+            // the readiness tooltip into a hint — the only signal that
+            // distinguishes "ready" from "load the model first" while the
+            // button is disabled for an empty prompt on both.
+            .accessibilityHint(readiness.isReady ? "Generate" : "Load the model first")
             .accessibilityIdentifier("Images.Generate")
         }
     }
