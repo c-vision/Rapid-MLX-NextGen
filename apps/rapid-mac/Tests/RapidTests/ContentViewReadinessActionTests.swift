@@ -19,18 +19,38 @@ struct ContentViewReadinessActionTests {
         let source = CapabilityChipRenderGateSourceGuardTests
             .stripCommentsAndWhitespace(body)
 
-        guard let functionStart = source.range(
+        guard let signature = source.range(
             of: "privatefuncstartModel(_target:String){"
-        )?.lowerBound else {
+        ) else {
             Issue.record("ContentView.startModel could not be found")
             return
         }
-        let suffix = source[functionStart...]
-        guard let functionEnd = suffix.firstIndex(of: "}") else {
+        // Balance braces from the function's opening ``{`` — a plain
+        // ``firstIndex(of: "}")`` stops at the ``}`` of the
+        // ``catalogEntries.first(where: { $0.alias == target })`` closure,
+        // truncating the body before the ``ensureServing`` call and failing
+        // the assertion on correct code.
+        var depth = 1
+        var index = signature.upperBound
+        var functionEnd: String.Index?
+        while index < source.endIndex {
+            switch source[index] {
+            case "{": depth += 1
+            case "}":
+                depth -= 1
+                if depth == 0 {
+                    functionEnd = index
+                }
+            default: break
+            }
+            if functionEnd != nil { break }
+            index = source.index(after: index)
+        }
+        guard let functionEnd else {
             Issue.record("ContentView.startModel has no closing brace")
             return
         }
-        let function = String(suffix[...functionEnd])
+        let function = String(source[signature.lowerBound...functionEnd])
 
         #expect(
             function.contains("server.ensureServing(alias:target,hfPath:hfPath)"),
