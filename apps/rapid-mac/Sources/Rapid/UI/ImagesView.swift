@@ -119,7 +119,18 @@ struct ImagesView: View {
             sizeText: viewModel.imageModels
                 .first { $0.alias == viewModel.selectedAlias }?.sizeOnDisk,
             progress: startupProgress,
-            failure: nil
+            // A rejected resident load (e.g. the sidecar cannot serve this
+            // model) must surface the engine's reason HERE, on the surface
+            // that initiated the load, not only in the log pane (#1838). The
+            // resolve precedence rules keep `.ready`/`.starting`/`.downloading`
+            // winning over a stale rejection, and `failureApplies` scopes it to
+            // the model that actually failed. Failures are keyed per alias in
+            // ``ServerManager``, so we read only the outcome for the model
+            // this surface asked to load (#1838 follow-up: concurrent loads of
+            // different models cannot clobber one another).
+            failure: server.residentLoadFailure(for: viewModel.selectedAlias).map {
+                ModelReadiness.Failure(message: $0.message, alias: $0.alias)
+            }
         )
     }
 

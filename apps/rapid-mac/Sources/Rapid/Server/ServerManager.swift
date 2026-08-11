@@ -232,6 +232,46 @@ final class ServerManager {
     /// Bounded to `logBufferCapacity` entries.
     private(set) var logLines: [String] = []
 
+    /// Most recent in-process residency load rejections, keyed by the alias
+    /// that failed. Per-alias rather than a single global slot so two
+    /// concurrent loads of DIFFERENT models cannot clobber each other across
+    /// an `await` (#1838 follow-up): model B's rejection published while
+    /// model A is still loading will not be wiped by A's later success, and
+    /// an older request's rejection cannot overwrite a newer request's
+    /// result for a different model. Each key owns its own outcome, so the
+    /// surface that asked to load that model reads exactly that model's
+    /// result.
+    ///
+    /// This is *published* (an `@Observable` property), not log-only: the
+    /// surface that initiated the load reads it and presents the engine's
+    /// reason verbatim, so a rejected resident load is an actionable message
+    /// instead of a silent no-op (#1838).
+    private(set) var residentLoadFailures: [String: ResidentLoadFailure] = [:]
+
+    /// The most recent rejection for `alias`, or `nil` if the last attempt
+    /// for that model succeeded or no rejection has been recorded. Read by
+    /// the surface that initiated the load so it can present the engine's
+    /// reason verbatim rather than only writing it to the log pane (#1838).
+    func residentLoadFailure(for alias: String) -> ResidentLoadFailure? {
+        residentLoadFailures[alias]
+    }
+
+    /// Per-alias monotonically-increasing attempt generation. Guards the
+    /// *return-time* failure writes/clears so that, for the SAME alias, only
+    /// the attempt that began most recently may record its outcome.
+    ///
+    /// ``ensureServing`` is an `async` ``@MainActor`` method: two calls for
+    /// the same alias can interleave across the ``await residencyClient.load``
+    /// hop. Without this, an OLDER attempt that returns after a NEWER one can
+    /// clobber the newer result — an old rejection overwriting a newer
+    /// success, or an old success clearing a newer rejection. Each attempt
+    /// captures the token it minted up front; when it resumes it writes only
+    /// if that token is still the latest issued for its alias. The
+    /// ``residentLoadFailures`` dictionary alone cannot express this — it
+    /// fixes cross-*alias* clobbering but not cross-attempt clobbering within
+    /// one alias (#1838 follow-up).
+    private var residentLoadAttemptTokens: [String: UUID] = [:]
+
     /// True while a start or stop is in flight. The UI disables both
     /// buttons during this window so a second click cannot race the
     /// first into spawning a duplicate child.
@@ -653,6 +693,15 @@ final class ServerManager {
         self.state = newState
     }
 
+    /// Issue #1838 test seam — swap in a ``ServerResidencyClient`` whose
+    /// transport reads from a ``URLProtocol`` stub, so a test can drive the
+    /// in-process resident-load path and observe the published rejection
+    /// without a live sidecar. Production code never calls this; the client
+    /// is created fresh in ``init``.
+    internal func _testSetResidencyClient(_ client: ServerResidencyClient) {
+        self.residencyClient = client
+    }
+
     /// Issue #270 test seam — observe the current auto-respawn attempt
     /// counter so the auto-respawn-retry-cap test can assert how many
     /// times ``runScheduledAutoRespawn`` actually incremented it.
@@ -814,6 +863,20 @@ final class ServerManager {
         }
         if replacementGroup == nil, isModelResident(trimmed) { return true }
 
+        // Any fresh load attempt — resident, cold start, or the legacy
+        // stop/start fallback — supersedes a stale rejection for THIS alias so
+        // the surface stops showing last round's result while this load is in
+        // flight (or about to succeed). Clearing here (not only inside the
+        // resident branch) means an early-return path can never leave the old
+        // banner up once the user asked to load the model again (#1838).
+        residentLoadFailures[trimmed] = nil
+        // This attempt becomes the NEWEST for its alias. When its async load
+        // returns it may only write/clear the failure if it is still the
+        // newest — a concurrently-issued, later attempt owns the slot from
+        // here on (#1838 follow-up).
+        let attemptToken = UUID()
+        residentLoadAttemptTokens[trimmed] = attemptToken
+
         // A healthy sidecar can admit another engine without replacing the
         // process. Only a 404/405 from an older bundled server falls back to
         // the legacy stop/start path; capacity and load failures stay failures
@@ -853,11 +916,33 @@ final class ServerManager {
                 if replacementGroup != nil {
                     state = .ready(alias: trimmed)
                 }
+                // A successful in-process load confirms the model is fine, so
+                // drop any (possibly concurrent) rejection recorded for it —
+                // but only if THIS attempt is still the newest for the alias.
+                // An older attempt resuming after a newer one already
+                // succeeded must not wipe a newer attempt's outcome
+                // (#1838 follow-up).
+                if residentLoadAttemptTokens[trimmed] == attemptToken {
+                    residentLoadFailures[trimmed] = nil
+                }
                 return true
             case .unsupported:
                 break
             case .rejected(let message):
                 appendLogLines(["Resident model load declined: \(message)"])
+                // Mirror the same redaction the log pane applies so a
+                // serialized/token-bearing `detail` never reaches the surface
+                // unsanitized, while keeping the engine's actionable reason
+                // verbatim otherwise (audit P1 parity with `appendLogLines`).
+                // Only the newest attempt may publish a rejection: a stale
+                // attempt's failure must not overwrite a newer attempt's
+                // success for the same alias (#1838 follow-up).
+                if residentLoadAttemptTokens[trimmed] == attemptToken {
+                    residentLoadFailures[trimmed] = ResidentLoadFailure(
+                        alias: trimmed,
+                        message: LogScrubber.scrub(message)
+                    )
+                }
                 return false
             }
         }
