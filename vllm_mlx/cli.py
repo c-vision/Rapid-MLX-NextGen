@@ -3557,11 +3557,12 @@ def serve_command(args):
         # the boolean ``kv_cache_turboquant`` for downstream callers;
         # the mode string rides on the dedicated ``_mode`` field.
         **_turboquant_scheduler_kwargs(args),
-        # R15-P1 (task #296): disk-backed KV checkpointing at 256-tok
-        # boundaries. ``0`` disables; the runtime module guards every
-        # hot-path call with ``should_checkpoint`` so the cost when off
-        # is one int comparison.
-        kv_disk_checkpoint_interval=getattr(args, "kv_disk_checkpoint_interval", 256),
+        # R15-P1 (task #296): disk-backed KV checkpointing. ``0``
+        # (default) disables; each snapshot blocks the decode thread for
+        # O(context) so the feature is opt-in (#1853). The runtime module
+        # guards every hot-path call with ``should_checkpoint`` so the
+        # cost when off is one int comparison.
+        kv_disk_checkpoint_interval=getattr(args, "kv_disk_checkpoint_interval", 0),
         # PFlash long-prompt compression (#287)
         pflash_config=pflash_config,
         # D-METAL-CAP: thread the user's --gpu-memory-utilization into
@@ -4668,11 +4669,10 @@ def bench_command(args):
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
             # R15-P1 (task #296): disk-backed KV checkpointing. Bench
-            # path mirrors serve so a regression in the boundary trigger
-            # surfaces in `rapid-mlx bench` numbers too.
-            kv_disk_checkpoint_interval=getattr(
-                args, "kv_disk_checkpoint_interval", 256
-            ),
+            # path mirrors serve (0 = off by default, #1853) so a
+            # regression in the boundary trigger surfaces in
+            # `rapid-mlx bench` numbers too.
+            kv_disk_checkpoint_interval=getattr(args, "kv_disk_checkpoint_interval", 0),
             # PFlash long-prompt compression (#287)
             pflash_config=bench_pflash_config,
         )
@@ -7989,13 +7989,20 @@ def _parse_args_with_share_passthrough(
     return args
 
 
-def main():
+def _resolve_cli_version() -> str:
     from importlib.metadata import version as pkg_version
 
     try:
-        _version = pkg_version("rapid-mlx")
+        return pkg_version("rapid-mlx")
     except Exception:
-        _version = "dev"
+        return "dev"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the full CLI parser (extracted from ``main`` so tests
+    can assert effective flag defaults on the parsed namespace instead
+    of scraping source or help text)."""
+    _version = _resolve_cli_version()
 
     parser = argparse.ArgumentParser(
         description="Rapid-MLX: AI inference for Apple Silicon",
@@ -8282,32 +8289,33 @@ Examples:
         ),
     )
     # KV cache quantization options
-    # ``--kv-cache-dtype`` (R15 task #300) is the canonical knob: int4 is
-    # the new default because Apple Silicon decode is memory-bandwidth-
-    # bound and a 4×-smaller KV cache cuts bandwidth proportionally
-    # (mlx#3134 UMA discussion, Feb 2026 — Phi-3.5-mini +1.1%
-    # throughput, 3.2× more context room on Qwen2.5-14B). The
-    # safelist in :mod:`vllm_mlx.kv_cache_dtype` auto-downgrades
-    # sliding-window (Gemma 3, GPT-OSS) and MLA (DeepSeek V3+,
-    # Kimi-K2.5) families to bf16 where int4 breaks decode quality.
-    # ``--reasoning`` pins to int8 for AIME-class hard math where
-    # sub-4-bit drops -20pt on thinking variants.
-    #
-    # Qwen3.5-9B-4bit bench (M3, 292-tok prompt, 5×400-tok decode median):
-    # int4 113.6 tok/s / 119 ms TTFT / 5388 MB RSS vs bf16 113.7 tok/s /
-    # 120 ms TTFT / 5392 MB RSS — int4 is a free swap at this size; the
-    # +1.1 % / 3.2× headroom land at multi-k contexts (PR #910 comment).
+    # ``--kv-cache-dtype`` (R15 task #300) is the canonical knob. Default
+    # is bf16 (#1853): the R15 int4 default was justified by "4×-smaller
+    # KV cuts decode bandwidth proportionally", but the live serve path
+    # (QuantizedBatchKVCache, #1197) implements quantization as
+    # dequant-on-read — it MATERIALIZES full-precision K/V on every
+    # decode step, so per-token cost grows with context instead of
+    # shrinking. Measured on qwen3.5-4b, 16k context, N=2 (parity
+    # server, disk checkpoints off): bf16 134.6 tok/s, int4 98.2
+    # (-27%), int8 86.1 (-36%); at 128-ctx: bf16 167, int4 161,
+    # int8 160. The #910 numbers that motivated the int4 default were
+    # short-context (292-tok prompt), where the regression is invisible.
+    # int4/int8 remain available as explicit opt-ins for
+    # memory-constrained hosts (KV is 4×/2× smaller); ``--reasoning``
+    # still pins to int8.
     serve_parser.add_argument(
         "--kv-cache-dtype",
         type=str,
-        default="int4",
+        default="bf16",
         choices=["bf16", "int8", "int4"],
         help=(
-            "KV cache dtype (R15 #300, default: int4). Apple Silicon decode "
-            "is memory-bandwidth-bound; int4 yields ~4× less bandwidth per "
-            "decode step with 97-98%% quality retention. Sliding-window "
-            "(Gemma 3, GPT-OSS) and MLA (DeepSeek V3+, Kimi K2.5) models "
-            "auto-downgrade to bf16. Use --reasoning for AIME / hard math."
+            "KV cache dtype (R15 #300, default: bf16). int8/int4 shrink the "
+            "KV cache 2x/4x for memory-constrained hosts, but the live-cache "
+            "dequant-on-read costs O(context) per decode step — measured "
+            "-27%% (int4) / -36%% (int8) at 16k context (#1853). "
+            "Sliding-window (Gemma 3, GPT-OSS) and MLA (DeepSeek V3+, "
+            "Kimi K2.5) models auto-downgrade to bf16. Use --reasoning "
+            "for AIME / hard math."
         ),
     )
     serve_parser.add_argument(
@@ -8391,21 +8399,28 @@ Examples:
         default=32,
         help="Group size for TurboQuant V-side quantization (default: 32)",
     )
-    # R15-P1 (task #296): disk-backed KV checkpointing at 256-tok boundaries.
-    # 0 disables the feature entirely (no scheduler-hot-path cost, no
-    # ~/.cache/rapid-mlx/kv_checkpoints/ directory creation); the default
-    # 256 matches MLX-LM's KVCache.step and LMCache's external-chunk size
-    # so the on-disk shape aligns with the in-memory shape on reload.
+    # R15-P1 (task #296): disk-backed KV checkpointing. 0 (default)
+    # disables the feature entirely (no scheduler-hot-path cost, no
+    # ~/.cache/rapid-mlx/kv_checkpoints/ directory creation). Opt-in
+    # only: each snapshot serializes the full KV cache synchronously on
+    # the decode thread — O(context) per boundary, which degraded 16k
+    # decode by up to 45% when this defaulted to 256 (#1853). When
+    # enabling, use a multiple of 256 to match MLX-LM's KVCache.step and
+    # LMCache's external-chunk size so the on-disk shape aligns with the
+    # in-memory shape on reload.
     serve_parser.add_argument(
         "--kv-disk-checkpoint-interval",
         type=int,
-        default=256,
+        default=0,
         help=(
             "Token interval at which the scheduler snapshots KV state to "
-            "~/.cache/rapid-mlx/kv_checkpoints/ for resume / shared-prefix "
-            "reload (R15 #296, default 256). 0 disables. Pairs with the "
-            "RAPID_MLX_KV_CHECKPOINT_MAX_BYTES env var (default 20 GiB) "
-            "for the oldest-first disk-cap eviction policy."
+            "~/.cache/rapid-mlx/kv_checkpoints/ (R15 #296). 0 (default) "
+            "disables. Write-only today: no engine path reloads the "
+            "snapshots yet, and each one blocks decode for O(context) — "
+            "enable only for external tooling that consumes the files "
+            "(#1853). Pairs with the RAPID_MLX_KV_CHECKPOINT_MAX_BYTES "
+            "env var (default 20 GiB) for the oldest-first disk-cap "
+            "eviction policy."
         ),
     )
     serve_parser.add_argument(
@@ -9682,6 +9697,19 @@ Examples:
     from vllm_mlx.launch.cli import register as _register_launch
 
     _register_launch(subparsers)
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    _version = _resolve_cli_version()
+    # The subcommand help printer below needs the subparsers action;
+    # recover it from the parser rather than keeping it as a shared
+    # local across the build/parse split.
+    subparsers = next(
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    )
 
     # Shell tab completion via argcomplete. Must fire before parse_args:
     # when the shell completion handler invokes us with the

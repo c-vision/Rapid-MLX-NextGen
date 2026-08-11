@@ -338,3 +338,37 @@ def test_safe_disk_checkpoint_records_silent_failure(
     # double-check the second call ticked again, so a "swallows but
     # forgets to record" regression also fails here.
     assert _dkc.get_stats()["hook_errors"] == after + 1
+
+
+# ---------------------------------------------------------------------------
+# #1853 — the disk checkpoint must be OPT-IN.
+# ---------------------------------------------------------------------------
+
+
+def test_disk_checkpoint_default_is_opt_in():
+    """Default interval must be 0 — checkpointing is opt-in (#1853).
+
+    When this defaulted to 256, every server synchronously serialized
+    the FULL KV cache to disk every 256 generated tokens — an
+    O(context) stall on the decode thread (~0.6s per snapshot at 16k
+    on a 4B model) that degraded 16k-context decode from 150 to
+    82 tok/s, and nothing in the engine ever read the checkpoints
+    back. Anyone flipping the default back on must come armed with an
+    async writer and a wired-up load path.
+    """
+    assert SchedulerConfig().kv_disk_checkpoint_interval == 0
+
+
+def test_disk_checkpoint_cli_default_is_opt_in():
+    """The serve CLI must parse to interval 0 by default (#1853).
+
+    Asserts the EFFECTIVE default on the parsed namespace (not source
+    or help text), so a stray ``set_defaults`` or a re-added parser
+    default cannot silently re-enable the decode stall for every
+    ``rapid-mlx serve`` user while a config-level test stays green.
+    """
+    pytest.importorskip("websockets")  # share subcommand import, no-MLX lane
+    from vllm_mlx.cli import build_parser
+
+    args = build_parser().parse_args(["serve", "some/model"])
+    assert args.kv_disk_checkpoint_interval == 0

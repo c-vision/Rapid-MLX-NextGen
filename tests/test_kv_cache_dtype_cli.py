@@ -12,6 +12,8 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import pytest
+
 from vllm_mlx import cli
 
 
@@ -45,11 +47,28 @@ def test_serve_help_advertises_kv_cache_dtype_flag_with_choices():
     assert "--kv-cache-dtype {bf16,int8,int4}" in text
 
 
-def test_serve_help_advertises_int4_as_default():
-    """The R15 #300 contract — int4 is the *default*, not just a choice."""
+def test_serve_parses_bf16_as_effective_default():
+    """The parsed namespace must carry bf16 when the flag is omitted
+    (#1853) — locks the effective default, not just the help text."""
+    # build_parser registers the share subcommand → imports websockets,
+    # absent from the no-MLX CI lane.
+    pytest.importorskip("websockets")
+    from vllm_mlx.cli import build_parser
+
+    args = build_parser().parse_args(["serve", "some/model"])
+    assert args.kv_cache_dtype == "bf16"
+
+
+def test_serve_help_advertises_bf16_as_default():
+    """#1853 — bf16 is the *default*, not just a choice.
+
+    The R15 #300 int4 default was reverted: the live-cache
+    dequant-on-read implementation makes quantized KV O(context)
+    slower per decode step (-27% at 16k), so quantization is opt-in.
+    """
     text = _serve_help()
-    # The flag's help string explicitly carries ``default: int4``.
-    assert "default: int4" in text
+    # The flag's help string explicitly carries ``default: bf16``.
+    assert "default: bf16" in text
 
 
 def test_serve_help_advertises_reasoning_flag():
