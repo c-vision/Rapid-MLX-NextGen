@@ -9,11 +9,18 @@ text-only request to those models, so ``_run_vision_encoding`` must always
 pass it through — including when it's ``None``.
 """
 
+import base64
+import io
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+from vllm_mlx.mllm_batch_generator import (
+    MLLMBatchGenerator,
+    MLLMBatchRequest,
+    _model_supports_vision_feature_cache,
+)
 
 
 class _RecordingModel:
@@ -1181,3 +1188,351 @@ def test_per_batch_cap_does_not_fail_at_default_on_typical_screenshot(
         f"with the production MLLM default (8192), a 2292-token "
         f"single-request batch must pass the cap; got: {err_msg}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Vision-feature cache — issue #1854
+# ---------------------------------------------------------------------------
+#
+# rapid's MLLM continuous-batching prefill re-ran the vision encoder on every
+# request, so a *repeated* image (the common multi-turn "ask again about the
+# same screenshot" case) paid the full ~0.3-0.4s vision cost each time — making
+# vision TTFT ~2.4x stock mlx-vlm, whose server caches projected image features
+# across requests. The fix forwards mlx-vlm's own ``vision_cache`` / ``_image_key``
+# contract into the model forward so ``get_input_embeddings`` reuses the cached
+# ``vision_tower + embed_vision`` output. It is gated to model families that
+# actually honour the contract (gemma-4 today) and only engages when the
+# request carries images.
+
+
+class _VisionCacheModel(_RecordingModel):
+    """Supported-model stub whose ``get_input_embeddings`` honours the mlx-vlm
+    ``vision_cache`` / ``_image_key`` contract (detected by source inspection).
+    ``__call__`` is inherited from ``_RecordingModel`` so tests can read the
+    kwargs the generator forwarded."""
+
+    def get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        # The literal ``vision_cache`` in the body is the marker
+        # ``_model_supports_vision_feature_cache`` inspects for.
+        vision_cache = kwargs.get("vision_cache")  # noqa: F841
+        image_key = kwargs.get("_image_key")  # noqa: F841
+        return None
+
+
+def _make_vision_request(*, pixel_values, vision_feature_key):
+    return MLLMBatchRequest(
+        uid=0,
+        request_id="r0",
+        prompt="describe",
+        max_tokens=8,
+        input_ids=mx.array([1, 2, 3], dtype=mx.int32),
+        pixel_values=pixel_values,
+        vision_feature_key=vision_feature_key,
+        extra_kwargs={},
+    )
+
+
+def test_model_supports_vision_feature_cache_detects_contract():
+    """Detection is by ``get_input_embeddings`` source: a model that reads
+    ``vision_cache`` is supported; a plain VLM stub is not."""
+    assert _model_supports_vision_feature_cache(_VisionCacheModel()) is True
+    assert _model_supports_vision_feature_cache(_RecordingModel()) is False
+
+
+def test_model_supports_vision_feature_cache_false_without_get_input_embeddings():
+    class _NoEmbed:
+        def __call__(self, *a, **k):
+            return None
+
+    assert _model_supports_vision_feature_cache(_NoEmbed()) is False
+
+
+def test_mllm_batch_request_vision_feature_key_defaults_none():
+    req = MLLMBatchRequest(uid=0, request_id="r", prompt="p")
+    assert req.vision_feature_key is None
+
+
+def test_supported_model_enables_feature_cache():
+    """A supported model + ``enable_vision_cache=True`` wires a live feature
+    cache; an unsupported model leaves it off (no behaviour change)."""
+    pytest.importorskip("mlx_vlm.vision_cache")
+
+    supported = MLLMBatchGenerator(
+        model=_VisionCacheModel(),
+        processor=object(),
+        mm_processor=None,
+        enable_vision_cache=True,
+    )
+    assert supported._supports_vision_feature_cache is True
+    assert supported._vision_feature_cache is not None
+
+    unsupported = MLLMBatchGenerator(
+        model=_RecordingModel(),
+        processor=object(),
+        mm_processor=None,
+        enable_vision_cache=True,
+    )
+    assert unsupported._supports_vision_feature_cache is False
+    assert unsupported._vision_feature_cache is None
+
+
+def test_feature_cache_disabled_when_vision_cache_off():
+    """``enable_vision_cache=False`` disables the feature cache even for a
+    supported model."""
+    gen = MLLMBatchGenerator(
+        model=_VisionCacheModel(),
+        processor=object(),
+        mm_processor=None,
+        enable_vision_cache=False,
+    )
+    assert gen._supports_vision_feature_cache is False
+    assert gen._vision_feature_cache is None
+
+
+def test_run_vision_encoding_injects_vision_cache_for_image_request():
+    """A supported model with an image request forwards ``vision_cache`` +
+    ``_image_key`` so ``get_input_embeddings`` can reuse projected features."""
+    pytest.importorskip("mlx_vlm.vision_cache")
+    model = _VisionCacheModel()
+    gen = MLLMBatchGenerator(
+        model=model,
+        processor=object(),
+        mm_processor=None,
+        enable_vision_cache=True,
+    )
+    request = _make_vision_request(
+        pixel_values=mx.zeros((1, 3, 4, 4)), vision_feature_key="deadbeef"
+    )
+
+    gen._run_vision_encoding(request, cache=None)
+
+    assert model.last_call_kwargs.get("_image_key") == "deadbeef"
+    assert model.last_call_kwargs.get("vision_cache") is gen._vision_feature_cache
+
+
+def test_run_vision_encoding_no_vision_cache_for_text_only():
+    """A text-only request (no pixel_values, no key) never carries the cache
+    kwargs even on a supported model."""
+    pytest.importorskip("mlx_vlm.vision_cache")
+    model = _VisionCacheModel()
+    gen = MLLMBatchGenerator(
+        model=model,
+        processor=object(),
+        mm_processor=None,
+        enable_vision_cache=True,
+    )
+    request = _make_vision_request(pixel_values=None, vision_feature_key=None)
+
+    gen._run_vision_encoding(request, cache=None)
+
+    assert "vision_cache" not in model.last_call_kwargs
+    assert "_image_key" not in model.last_call_kwargs
+
+
+def test_run_vision_encoding_no_vision_cache_for_unsupported_model():
+    """An unsupported model keeps the unchanged full-forward path — the cache
+    kwargs are never injected even when the request carries images."""
+    model = _RecordingModel()
+    gen = MLLMBatchGenerator(
+        model=model,
+        processor=object(),
+        mm_processor=None,
+        enable_vision_cache=True,
+    )
+    request = _make_vision_request(
+        pixel_values=mx.zeros((1, 3, 4, 4)), vision_feature_key="deadbeef"
+    )
+
+    gen._run_vision_encoding(request, cache=None)
+
+    assert "vision_cache" not in model.last_call_kwargs
+    assert "_image_key" not in model.last_call_kwargs
+
+
+class _CachingBehaviorModel:
+    """Model stub that mirrors mlx-vlm's real forward contract: ``__call__``
+    binds ``pixel_values`` as a named arg (as rapid passes it via kwargs) and
+    delegates to ``get_input_embeddings``, forwarding the remaining kwargs —
+    exactly like gemma-4. The cache lookup + "encode" (``encode_count`` bump)
+    happens INSIDE ``get_input_embeddings`` on a miss, so the test proves the
+    real forwarding path, not a shortcut in ``__call__``."""
+
+    def __init__(self):
+        self.encode_count = 0
+        self.language_model = object()
+
+    def get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        # Mirror gemma-4: read the quoted contract keys "vision_cache" /
+        # "_image_key" from kwargs; on a miss, "encode" (count) and store.
+        vision_cache = kwargs.get("vision_cache")
+        image_key = kwargs.get("_image_key")
+        if pixel_values is None:
+            return None
+        if vision_cache is not None and image_key is not None:
+            if vision_cache.get(image_key) is None:
+                self.encode_count += 1
+                vision_cache.put(image_key, mx.zeros((1, 4)))
+        else:
+            # No cache forwarded → the encoder always runs (pre-fix behaviour).
+            self.encode_count += 1
+        return None
+
+    def __call__(self, input_ids, pixel_values=None, cache=None, **kwargs):
+        # ``pixel_values`` is bound from rapid's kwargs; forward the rest
+        # (incl. vision_cache/_image_key) into get_input_embeddings.
+        self.get_input_embeddings(input_ids, pixel_values, **kwargs)
+        return mx.zeros((1, 1, 8))
+
+
+def test_repeated_image_skips_encoder_distinct_image_reencodes():
+    """The wiring dedups the vision encoder: a repeated image reuses cached
+    features (no re-encode); a distinct image encodes again."""
+    pytest.importorskip("mlx_vlm.vision_cache")
+    model = _CachingBehaviorModel()
+    gen = MLLMBatchGenerator(
+        model=model,
+        processor=object(),
+        mm_processor=None,
+        enable_vision_cache=True,
+    )
+    assert gen._supports_vision_feature_cache is True
+
+    def run(key):
+        gen._run_vision_encoding(
+            _make_vision_request(
+                pixel_values=mx.zeros((1, 3, 4, 4)), vision_feature_key=key
+            ),
+            cache=None,
+        )
+
+    run("image-A")  # miss → encode
+    run("image-A")  # hit  → skip
+    assert model.encode_count == 1, "repeated image must not re-run the encoder"
+
+    run("image-B")  # distinct → encode
+    assert model.encode_count == 2, "a distinct image must encode again"
+
+
+class _NoContractCachingModel(_CachingBehaviorModel):
+    """Same delegating ``__call__`` as ``_CachingBehaviorModel`` but its
+    ``get_input_embeddings`` omits the quoted contract markers, so the gate
+    does NOT detect it as cache-capable. It still counts an encode per call
+    (there is no cache to consult), which is exactly the pre-fix behaviour the
+    negative control asserts."""
+
+    def get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is not None:
+            self.encode_count += 1
+        return None
+
+
+def test_unsupported_model_always_encodes_repeated_image():
+    """Negative control: a model that does not honour the contract keeps the
+    unchanged path — the (stubbed) encoder runs on every request even for a
+    repeated image, because no cache kwargs are forwarded."""
+    model = _NoContractCachingModel()
+    gen = MLLMBatchGenerator(
+        model=model,
+        processor=object(),
+        mm_processor=None,
+        enable_vision_cache=True,
+    )
+    assert gen._supports_vision_feature_cache is False
+
+    for _ in range(3):
+        gen._run_vision_encoding(
+            _make_vision_request(
+                pixel_values=mx.zeros((1, 3, 4, 4)), vision_feature_key="image-A"
+            ),
+            cache=None,
+        )
+    assert model.encode_count == 3
+
+
+def _png_data_uri(color):
+    """A tiny deterministic PNG data-URI (16x16, solid ``color``)."""
+    from PIL import Image
+
+    im = Image.new("RGB", (16, 16), color)
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def test_preprocess_request_derives_stable_content_key(monkeypatch):
+    """``_preprocess_request`` derives ``vision_feature_key`` from image
+    *content* (not the temp-file path): the same image yields the same key
+    across requests so the cache hits, and different content yields a
+    different key. This exercises the real request path (not a manually
+    supplied key)."""
+    pytest.importorskip("mlx_vlm.vision_cache")
+    import mlx_vlm.utils as _vlm_utils
+
+    # Stub only the heavy processor call — we test key derivation, not
+    # tokenization. ``_preprocess_request`` imports it as
+    # ``from mlx_vlm.utils import prepare_inputs`` at call time, so patching
+    # the module attribute takes effect.
+    monkeypatch.setattr(
+        _vlm_utils,
+        "prepare_inputs",
+        lambda *a, **k: {
+            "input_ids": mx.array([1, 2, 3]),
+            "pixel_values": mx.zeros((1, 3, 4, 4)),
+        },
+    )
+
+    gen = MLLMBatchGenerator(
+        model=_VisionCacheModel(),
+        processor=object(),
+        mm_processor=None,
+        enable_vision_cache=True,
+    )
+    assert gen._supports_vision_feature_cache is True
+
+    def key_for(uri):
+        req = MLLMBatchRequest(
+            uid=0, request_id="r", prompt="p", images=[uri], max_tokens=8
+        )
+        gen._preprocess_request(req)
+        return req.vision_feature_key
+
+    uri_a = _png_data_uri((10, 20, 30))
+    key_a1 = key_for(uri_a)
+    key_a2 = key_for(_png_data_uri((10, 20, 30)))  # identical content
+    key_b = key_for(_png_data_uri((200, 100, 50)))  # different content
+
+    assert key_a1, "a request with an image must get a vision_feature_key"
+    assert key_a1 == key_a2, "same image content must yield the same key"
+    assert key_a1 != key_b, "different image content must yield a different key"
+
+
+def test_preprocess_request_no_key_for_unsupported_model(monkeypatch):
+    """An unsupported model leaves ``vision_feature_key`` None (the key is only
+    computed when the feature is actually wired in)."""
+    import mlx_vlm.utils as _vlm_utils
+
+    monkeypatch.setattr(
+        _vlm_utils,
+        "prepare_inputs",
+        lambda *a, **k: {
+            "input_ids": mx.array([1, 2, 3]),
+            "pixel_values": mx.zeros((1, 3, 4, 4)),
+        },
+    )
+    gen = MLLMBatchGenerator(
+        model=_RecordingModel(),
+        processor=object(),
+        mm_processor=None,
+        enable_vision_cache=True,
+    )
+    assert gen._supports_vision_feature_cache is False
+
+    req = MLLMBatchRequest(
+        uid=0,
+        request_id="r",
+        prompt="p",
+        images=[_png_data_uri((10, 20, 30))],
+        max_tokens=8,
+    )
+    gen._preprocess_request(req)
+    assert req.vision_feature_key is None
