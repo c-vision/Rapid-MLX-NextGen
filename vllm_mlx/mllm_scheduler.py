@@ -1222,7 +1222,19 @@ class MLLMScheduler:
                     if req_output.finished:
                         queue.put_nowait(None)  # Signal end
                 except asyncio.QueueFull:
-                    pass
+                    if req_output.finished:
+                        # A terminal result must never be dropped behind stale
+                        # deltas in a bounded/custom queue. Discard buffered
+                        # partial output and reserve the available slot for the
+                        # terminal object. ``stream_outputs`` stops (or raises
+                        # on ``error``) after reading it, so the optional None
+                        # sentinel is not required in this fallback path.
+                        while not queue.empty():
+                            try:
+                                queue.get_nowait()
+                            except asyncio.QueueEmpty:  # pragma: no cover - race
+                                break
+                        queue.put_nowait(req_output)
 
         # Signal queues for requests aborted during this step
         while self._aborted_queue_ids:
@@ -1233,6 +1245,76 @@ class MLLMScheduler:
                     queue.put_nowait(None)
                 except asyncio.QueueFull:
                     pass
+
+    def _fail_all_inflight(self, exc: Exception) -> MLLMSchedulerOutput:
+        """Fail and detach every request after an unexpected step exception.
+
+        A model/processor exception can escape before ``_step_no_queue`` has
+        produced an output.  Retrying that same batch is both unsafe (the
+        generator may already be partially mutated) and leaves every HTTP
+        waiter blocked.  Reset the poisoned batch and return terminal outputs
+        for event-loop-thread delivery instead.
+        """
+        # ``running`` is keyed by request ID (see ``_schedule_waiting``), not
+        # by the generator UID.  Include it explicitly because a partially
+        # failed scheduling step may have moved a request there before it was
+        # committed to every other bookkeeping map.
+        request_ids = set(self.requests) | set(self.running)
+        request_ids.update(request.request_id for request in self.waiting)
+        # A step can fail between generator admission and the scheduler-map
+        # commit. Include both sides of the UID translation so even that
+        # partially transitioned request gets its terminal queue signal.
+        request_ids.update(self.request_id_to_uid)
+        request_ids.update(self.uid_to_request_id.values())
+        # An abort can be accepted after the request has otherwise been
+        # detached. Its queue still needs a terminal signal before the pending
+        # ledger is cleared below.
+        request_ids.update(self._pending_abort_ids)
+        # Third-party exceptions can contain paths, prompt fragments, or model
+        # internals. The detailed traceback is logged by the caller; clients
+        # receive only this stable 500-class message.
+        err_text = "MLLM inference failed due to an internal engine error"
+
+        output = MLLMSchedulerOutput(
+            finished_request_ids=request_ids,
+            outputs=[
+                RequestOutput(
+                    request_id=request_id,
+                    output_text="",
+                    finished=True,
+                    # RequestOutput/OpenAI schemas do not admit an "error"
+                    # finish reason. ``stream_outputs`` raises ``error``
+                    # before yielding this object, so clients cannot mistake
+                    # this compatibility literal for a successful truncation.
+                    finish_reason="length",
+                    error=err_text,
+                )
+                for request_id in request_ids
+            ],
+        )
+
+        for request_id in request_ids:
+            request = self.requests.get(request_id)
+            if request is not None:
+                request.status = RequestStatus.FINISHED_ABORTED
+        if self.batch_generator is not None:
+            try:
+                self.batch_generator.close()
+            except Exception:
+                logger.debug("Failed to close poisoned MLLM batch", exc_info=True)
+            self.batch_generator = None
+        self.waiting.clear()
+        self.running.clear()
+        self.requests.clear()
+        self.request_id_to_uid.clear()
+        self.uid_to_request_id.clear()
+        self._detokenizer_pool.clear()
+        self._pending_abort_ids.clear()
+        # Do not clear ``_aborted_queue_ids`` here. ``_distribute_outputs``
+        # runs immediately after this helper and must still signal requests
+        # that completed an abort just before the fatal step exception.
+        self.finished_req_ids.update(request_ids)
+        return output
 
     def step(self) -> MLLMSchedulerOutput:
         """
@@ -1491,8 +1573,11 @@ class MLLMScheduler:
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    logger.error(f"Error in MLLM process loop: {e}")
-                    await asyncio.sleep(0.1)
+                    logger.exception(
+                        "Error in MLLM process loop; failing in-flight requests"
+                    )
+                    self._distribute_outputs(self._fail_all_inflight(e))
+                    await asyncio.sleep(0)
         finally:
             cancel_to_reraise: asyncio.CancelledError | None = None
             if self._step_executor is not None:
