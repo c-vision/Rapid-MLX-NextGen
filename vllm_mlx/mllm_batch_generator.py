@@ -127,6 +127,63 @@ def _attention_mask_is_droppable(mask) -> bool:
     return bool(mx.all(mask != 0))
 
 
+def _is_text_only_request(request: "MLLMBatchRequest") -> bool:
+    """Whether ``request`` carries no vision payload at all.
+
+    A text-only request has ``pixel_values is None`` and
+    ``image_grid_thw is None`` after ``_preprocess_request`` (there are no
+    images/videos, so no vision tokens are produced). Such a request does
+    *not* consume per-forward vision-token memory and is safely prefilled
+    on the chunked text-only path (``_run_vision_encoding``), so it is
+    exempt from the per-batch cap that exists purely to bound vision-merge
+    memory (#682 / #1848).
+    """
+    return request.pixel_values is None and request.image_grid_thw is None
+
+
+def _prefill_cap_violation(requests, prefill_step_size: int):
+    """Return the "exceeds the per-batch cap" error message when a batch of
+    requests violates the per-batch prefill cap, else ``None``.
+
+    The cap (issue #682) exists to bound merge-time memory for *vision*
+    prompts: each image request can embed thousands of vision-patch tokens
+    into the prompt, so a batch of them can blow past a single forward.
+    Text-only requests (``_is_text_only_request``) are prefilled in chunks
+    and do not contribute vision tokens, so only vision-bearing requests
+    count toward the cap, and their aggregate token count is compared
+    against ``prefill_step_size × num_vision`` (#1848). A batch with no
+    vision requests can never violate the cap.
+
+    The returned string MUST keep the ``exceeds the per-batch cap`` phrase:
+    ``MLLMScheduler._step_no_queue`` matches on it to classify the error as
+    client-actionable (#682) and ``routes/chat.py`` maps it to HTTP 400 with
+    the actionable message. If the phrase ever drifts, the soft-truncation
+    regression comes back (route returns HTTP 200 with empty content +
+    ``finish_reason="length"``).
+    """
+    vision_requests = [r for r in requests if not _is_text_only_request(r)]
+    if not vision_requests:
+        # All requests are text-only: the chunked text-only prefill path
+        # bounds per-forward memory, so there is no vision-merge budget to
+        # exceed (#1848).
+        return None
+    num_vision = len(vision_requests)
+    vision_tokens = sum(
+        r.input_ids.size if r.input_ids is not None else 1 for r in vision_requests
+    )
+    max_batch_tokens = prefill_step_size * num_vision
+    if vision_tokens > max_batch_tokens:
+        return (
+            f"Vision-request prompt tokens ({vision_tokens}) exceeds the "
+            f"per-batch cap ({max_batch_tokens} = prefill_step_size "
+            f"{prefill_step_size} × {num_vision} vision request(s)). "
+            f"For image inputs, downscale the image; for text inputs, "
+            f"shorten the prompt or restart the server with "
+            f"--prefill-step-size set higher."
+        )
+    return None
+
+
 @dataclass
 class MLLMBatchRequest:
     """
@@ -1071,7 +1128,7 @@ class MLLMBatchGenerator:
         # them. The chunking only engages once the un-chunked activations +
         # full-sequence logits would actually spike memory (long contexts).
         chunk = max(1, min(self.prefill_step_size, _MLLM_PREFILL_CHUNK_TOKENS))
-        is_text_only = request.pixel_values is None and request.image_grid_thw is None
+        is_text_only = _is_text_only_request(request)
         no_extra_kwargs = not request.extra_kwargs
         if (
             cache is not None
@@ -1169,29 +1226,14 @@ class MLLMBatchGenerator:
         # Guard against excessive memory usage during cache merge.
         # Each token in the batch requires KV entries across all layers.
         #
-        # The error string MUST keep the ``exceeds the per-batch cap``
-        # phrase — ``MLLMScheduler._step_no_queue`` matches on it to
-        # classify the error as client-actionable (#682) and ``routes/
-        # chat.py`` maps it to HTTP 400 with the actionable message.
-        # If the phrase ever drifts, the soft-truncation regression
-        # comes back: the route would return HTTP 200 with empty
-        # content + ``finish_reason="length"`` and the Desktop client
-        # would render "Reached max_tokens before any output".
-        #
-        # The message also calls out image-downscale as a lever
-        # explicitly, because vision tokens dominate the prompt budget
-        # on a typical screenshot and "shorten the prompt" is not a
-        # useful instruction when the prompt is mostly image patches.
-        max_batch_tokens = self.prefill_step_size * len(requests)
-        if total_prompt_tokens > max_batch_tokens:
-            raise ValueError(
-                f"Total prompt tokens ({total_prompt_tokens}) exceeds the "
-                f"per-batch cap ({max_batch_tokens} = prefill_step_size "
-                f"{self.prefill_step_size} × {len(requests)} request(s)). "
-                f"For image inputs, downscale the image; for text inputs, "
-                f"shorten the prompt or restart the server with "
-                f"--prefill-step-size set higher."
-            )
+        # The cap exists to bound vision-merge memory for image-heavy
+        # prompts (#682). Text-only requests are prefilled in chunks on the
+        # vision-encoding path and do not contribute vision tokens, so they
+        # are exempt from the cap (#1848) — a >8k text-only prompt must not
+        # be rejected just because ``prefill_step_size`` defaults to 8192.
+        _cap_help = _prefill_cap_violation(requests, self.prefill_step_size)
+        if _cap_help is not None:
+            raise ValueError(_cap_help)
 
         # Run vision encoding for each request with its own KVCache.
         # Vision encoding cannot be batched because each request may have
