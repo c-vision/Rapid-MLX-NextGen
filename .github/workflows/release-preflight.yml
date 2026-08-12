@@ -13,6 +13,8 @@ name: Release pre-flight
 #   G10  MLX upstream cross-chip-family scan   advisory
 #   G11  auto-routing escape-hatch registry    macOS-14 (needs MLX)
 #   PF-1 squash subject regex pre-check        ubuntu-latest
+#   PF-2 release secret + var presence         ubuntu-latest
+#        + Cloudflare credential probe (expiry blocks; scope gaps advise)
 #
 # What this workflow does NOT cover (M3-only, runs locally — see
 # releasing.md):
@@ -83,6 +85,49 @@ jobs:
             echo "::error::PR title says v$TITLE_VER but pyproject.toml is $PYPROJECT_VER. Bump pyproject.toml or rename the PR."
             exit 1
           fi
+
+  pf2-release-secrets:
+    # PF-2 — every secret and var that rapid-mac-release.yml references must
+    # already be configured. Actions evaluates a missing secret to the empty
+    # string rather than erroring, so the gap surfaces only on the tag, after
+    # the notarised build, with the GitHub Release already published (#1851).
+    # Checking on the bump PR moves that discovery before the tag exists.
+    #
+    # Skipped on fork PRs: Actions withholds secrets from them by design, so
+    # an empty context there would fail every name without proving anything.
+    needs: detect-bump-pr
+    if: >-
+      needs.detect-bump-pr.outputs.is_bump == 'true' &&
+      github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - name: Install PyYAML
+        run: python -m pip install --upgrade pip pyyaml
+      - name: PF-2 — release workflow secrets and vars are configured
+        env:
+          # Actions exposes no way to enumerate configured names, so the whole
+          # context is passed as JSON. The script reads KEYS only and never
+          # prints a value.
+          AVAILABLE_SECRETS_JSON: ${{ toJSON(secrets) }}
+          AVAILABLE_VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          python scripts/check_release_secrets.py \
+            .github/workflows/rapid-mac-release.yml
+
+      - name: PF-2 — release credentials are usable, not just present
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          # Read into the environment rather than interpolated into the shell,
+          # so a repository-variable value can never be parsed as script.
+          R2_BUCKET: ${{ vars.RAPID_MAC_DIST_R2_BUCKET }}
+        run: |
+          python scripts/probe_release_credentials.py --bucket "$R2_BUCKET"
 
   g1-release-smoke:
     # G1 — clean-room install + import smoke on macOS-14. Catches the
@@ -159,6 +204,7 @@ jobs:
     needs:
       - detect-bump-pr
       - pf1-subject-regex
+      - pf2-release-secrets
       - g1-release-smoke
       - g10-upstream-mlx-scan
       - g11-escape-hatch
@@ -168,15 +214,23 @@ jobs:
       - name: Aggregate gate results
         env:
           PF1: ${{ needs.pf1-subject-regex.result }}
+          PF2: ${{ needs.pf2-release-secrets.result }}
           G1: ${{ needs.g1-release-smoke.result }}
           G10: ${{ needs.g10-upstream-mlx-scan.result }}
           G11: ${{ needs.g11-escape-hatch.result }}
         run: |
           echo "PF-1 subject regex:   $PF1"
+          echo "PF-2 release secrets: $PF2  (skipped on fork PRs)"
           echo "G1   release-smoke:   $G1"
           echo "G10  upstream MLX:    $G10  (advisory — never fails)"
           echo "G11  escape-hatch:    $G11"
-          # G10 is advisory — never blocks. Others must pass.
+          # G10 is advisory — never blocks. Others must pass. PF-2 is allowed
+          # to be "skipped" because a fork PR cannot see secrets at all; every
+          # other skip path is already excluded by the is_bump guard above.
+          if [ "$PF2" != "success" ] && [ "$PF2" != "skipped" ]; then
+            echo "::error::PF-2 failed: the release workflow references a secret or var that is not configured. A release cut now would fail on the tag with the release already published (#1851)."
+            exit 1
+          fi
           if [ "$PF1" != "success" ] || [ "$G1" != "success" ] || [ "$G11" != "success" ]; then
             echo "::error::One or more release pre-flight gates failed. See docs/development/releasing.md for the gate definitions."
             exit 1
