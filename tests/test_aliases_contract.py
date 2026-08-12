@@ -187,6 +187,30 @@ def test_alias_reasoning_parser_is_registered(alias: str) -> None:
 # =============================================================================
 
 
+def test_nemotron_3_5_lightning_profile() -> None:
+    """Pin the NVIDIA Nemotron 3.5 Lightning 30B A3B profile.
+
+    This is a ``nemotron_h`` hybrid MoE (Mamba-2 + MoE + sparse attention),
+    already implemented by mlx-lm and served through the standard hybrid path
+    (smoke-verified: load, streaming + non-streaming, tool-calling, prefix cache
+    across turns). Two choices are load-bearing and easy to "fix" wrong:
+
+    - ``tool_call_parser == "nemotron"`` (NOT ``hermes`` like the older
+      Nemotron-3-Nano entry): the model's chat template emits the
+      ``<tool_call><function=name><parameter=p>v</parameter></function></tool_call>``
+      XML form that ``NemotronToolParser`` handles, not hermes JSON.
+    - ``is_hybrid`` / ``is_moe`` true and ``supports_spec_decode`` false — a
+      Mamba/attention mix breaks the spec-decode drafter state.
+    """
+    profile = list_profiles()["nemotron-3.5-lightning-30b-4bit"]
+    assert profile.hf_path == "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit"
+    assert profile.tool_call_parser == "nemotron"
+    assert profile.reasoning_parser == "qwen3"
+    assert profile.is_hybrid is True
+    assert profile.is_moe is True
+    assert profile.supports_spec_decode is False
+
+
 @pytest.mark.parametrize("alias", _alias_ids())
 def test_hybrid_disables_spec_decode(alias: str) -> None:
     """``is_hybrid=true`` and ``supports_spec_decode=true`` cannot both

@@ -1338,6 +1338,14 @@
     "supports_spec_decode": false,
     "is_moe": true
   },
+  "nemotron-3.5-lightning-30b-4bit": {
+    "hf_path": "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit",
+    "tool_call_parser": "nemotron",
+    "reasoning_parser": "qwen3",
+    "is_hybrid": true,
+    "supports_spec_decode": false,
+    "is_moe": true
+  },
   "bonsai-1.7b-2bit": {
     "hf_path": "prism-ml/Ternary-Bonsai-1.7B-mlx-2bit",
     "tool_call_parser": "hermes",
