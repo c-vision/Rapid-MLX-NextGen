@@ -807,12 +807,36 @@ struct ImagesView: View {
     }
 
     private func chooseEditImage() {
+        // The native NSOpenPanel's file browser publishes no accessibility
+        // identifiers, so a golden flow cannot reach it: neither a
+        // pid-targeted CGEvent nor a HID session tap opens its "Go to Folder"
+        // sheet on an unattended build/CI runner. To keep the image-edit
+        // import journey deterministic, a golden-harness-only seam names the
+        // file to import so the exactly-same post-pick path below still runs
+        // for real — edit mode, the "Replace source image" affordance, the
+        // file name on the source bar, and the fixture's bytes on the wire are
+        // all still asserted. The seam requires BOTH RAPID_GUI_GOLDEN_MODE=1
+        // (an explicit harness-launch gate) AND a RAPID_SIMULATED_IMPORT_PATH
+        // naming a file that actually exists, so a real user — whose launch
+        // never sets the golden-mode switch — always gets NSOpenPanel even if
+        // an unrelated process leaked an import path into the environment.
+        if ProcessInfo.processInfo.environment["RAPID_GUI_GOLDEN_MODE"] == "1",
+           let simulated = ProcessInfo.processInfo.environment["RAPID_SIMULATED_IMPORT_PATH"],
+           !simulated.isEmpty,
+           FileManager.default.fileExists(atPath: simulated) {
+            importEditImage(at: URL(fileURLWithPath: simulated))
+            return
+        }
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.png, .jpeg]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        importEditImage(at: url)
+    }
+
+    private func importEditImage(at url: URL) {
         Task {
             do {
                 let png = try await EditImageImporter.pngData(from: url)

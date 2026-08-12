@@ -2160,7 +2160,17 @@ flow_image_generation() {
     # No diffusion weights: the fake answers /v1/images/* with a real 1x1 PNG
     # whose bytes differ per render, after a scripted number of steps so the
     # in-flight card is observable rather than a frame between two polls.
-    start_persona image-generation FAKE_IMAGE_STEPS=8 FAKE_IMAGE_STEP_MS=300
+    # RAPID_GUI_GOLDEN_MODE=1 + RAPID_SIMULATED_IMPORT_PATH together activate
+    # the app's import test seam: when both are set, Images.Edit.Import imports
+    # exactly this file through the same post-pick path a real picker would (see
+    # ImagesView.chooseEditImage) instead of opening a native NSOpenPanel, whose
+    # file browser publishes no AX identifiers and cannot be driven by injected
+    # key events on an unattended CI runner. The golden-mode gate means a real
+    # user's launch — which never sets it — always gets the picker even if an
+    # unrelated process leaked an import path into the environment.
+    start_persona image-generation FAKE_IMAGE_STEPS=8 FAKE_IMAGE_STEP_MS=300 \
+        RAPID_GUI_GOLDEN_MODE=1 \
+        RAPID_SIMULATED_IMPORT_PATH="$ROOT/Tests/RapidTests/__Snapshots__/cheetah-logo-96.png"
 
     dismiss_first_run
 
@@ -2457,6 +2467,129 @@ flow_image_generation() {
         || die "exiting edit mode did not restore generation controls"
 
     baseline image-generation.generated "$OUT/ig-edit-exited.json"
+
+    # 7. Import from disk — the SECOND door into /v1/images/edits, and the one
+    #    the journey above never opens.
+    #
+    #    The generated-result edit walks in through Images.Result.Edit. This
+    #    section drives the other entry: Images.Edit.Import -> an edit keyed to
+    #    the imported file's own name. It exists because "import an image then
+    #    edit it" is a distinct user contract: nothing below can pass unless the
+    #    app really turns the picked file into an editable source (edit mode,
+    #    "Replace source image" affordance, the file name on the source bar, and
+    #    the fixture's bytes on the wire).
+    #
+    #    The app's own AX tree cannot reach a native NSOpenPanel — it publishes
+    #    no kAXIdentifierAttribute — and injected key events cannot drive its
+    #    file browser on an unattended CI runner (see the RAPID_SIMULATED_IMPORT
+    #    note in start_persona). So the harness has told the app, via that seam,
+    #    exactly which file Images.Edit.Import should pick. The press below goes
+    #    through the app-level post-pick path for real, and every user-visible
+    #    contract is still asserted here: edit mode, the replace-source
+    #    affordance, the file name, and the fixture's bytes on the wire. The old
+    #    filename is static; assert it landed.
+    local fixture="$ROOT/Tests/RapidTests/__Snapshots__/cheetah-logo-96.png"
+    [[ -f "$fixture" ]] || die "import fixture not found: $fixture"
+    local file_basename
+    file_basename="$(basename "$fixture" .png)"
+    # The seam path never opens a modal, so the press completes normally; keep
+    # the CannotComplete tolerance anyway (like a real pick, the composer can be
+    # momentarily busy) and let the edit-mode wait below be the judge: if the
+    # imported source never appears the import button is genuinely broken.
+    press "$OUT/ig-edit-exited.json" Images.Edit.Import "$OUT/ig-import-press.json" \
+        2>/dev/null || true
+
+    # Entering edit mode from an import must be observably different from the
+    # generated-result entry: the source is keyed to the FILE NAME, the import
+    # affordance flips to "Replace source image", and the edit source bar
+    # appears.
+    local imported=0
+    for ((i=0; i<120; i++)); do
+        see_main "$OUT/ig-import-entered.json"
+        if jq -e '.success == true and .data.walk.complete == true
+                  and (([.data.ui_elements[]? | .identifier // ""] | index("Images.Edit.Source")) != null)
+                  and (([.data.ui_elements[]? | .identifier // ""] | index("Images.Edit.Import")) != null)
+                  and ([.data.ui_elements[]? | select(.identifier == "Images.Edit.Import")
+                        | (.help // .description // "")] | any(. == "Replace source image"))' \
+               "$OUT/ig-import-entered.json" >/dev/null; then
+            imported=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$imported" == 1 ]] \
+        || die "importing the fixture did not enter edit mode with a replace-source affordance"
+    assert_tree_text "$OUT/ig-import-entered.json" "$file_basename" \
+        || die "the imported source does not carry the file name ($file_basename) on the edit source bar"
+
+    # 8. Edit the imported image — the rest of the contract after a real
+    #    import: type an instruction, generate, and the multipart edit request
+    #    must carry the fixture bytes.
+    local import_prompt="give the logo a blue background"
+    type_prompt "$import_prompt" ig-import-draft
+    press "$OUT/ig-import-draft.json" Images.Generate "$OUT/ig-import-submit.json" \
+        || die "Images.Generate is not pressable after importing an image"
+    wait_fake_event '.event == "image_request" and .operation == "edit" and .has_image == true' \
+        "no multipart edit request carrying an image reached the sidecar after import"
+    wait_fake_event '.event == "image_response" and .cancelled == false and .index == 4' \
+        "the imported edit never completed"
+    local import_done=0
+    for ((i=0; i<200; i++)); do
+        see_main "$OUT/ig-import-result.json"
+        if jq -e '.success == true and .data.walk.complete == true
+                  and (([.data.ui_elements[]? | .identifier // ""] | index("Images.Gallery.Thumb.4")) != null)
+                  and (([.data.ui_elements[]? | .identifier // ""] | index("Images.Edit.Source")) != null)
+                  and (([.data.ui_elements[]? | .identifier // ""] | index("Images.Cancel")) == null)' \
+               "$OUT/ig-import-result.json" >/dev/null; then
+            import_done=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$import_done" == 1 ]] \
+        || die "the imported edit did not land as a new thumbnail and remain the edit source"
+    jq -s -e --arg alias "$FAKE_IMAGE_ALIAS" --arg prompt "$import_prompt" \
+        '[.[] | select(.event == "image_request" and .operation == "edit" and .prompt == $prompt)
+              | {model, n, operation, has_image}] ==
+         [{model:$alias, n:1, operation:"edit", has_image:true}]' "$OUT/fake-events.jsonl" >/dev/null \
+        || die "the imported edit request did not carry the exact prompt, model, and the fixture image: $(jq -s -c '[.[] | select(.event == "image_request" and .operation == "edit")]' "$OUT/fake-events.jsonl")"
+    # The uploaded image must be the picked fixture. has_image only proves a
+    # multipart part named "image" existed; a regression that submits the
+    # previously generated image — or any other arbitrary PNG — would still
+    # pass it. But the fixture cannot be compared by raw bytes: the app's
+    # EditImageImporter decodes and re-encodes every import, so ancillary
+    # chunks (iCCP, eXIf ...) and the IDAT stream can legitimately differ
+    # across macOS encoder versions. Compare the DECODED RGBA pixel hash
+    # instead, which is the user contract that matters. The fake's
+    # png-rgba-sha subcommand runs the exact same decoder the request fake
+    # uses, so expectation and upload can never drift.
+    local expected_sha
+    expected_sha="$("$ROOT/scripts/fake-rapid-mlx.sh" png-rgba-sha "$fixture")"
+    [[ -n "$expected_sha" ]] \
+        || die "could not compute the fixture's pixel hash: $fixture"
+    jq -s -e --arg sha "$expected_sha" --arg prompt "$import_prompt" \
+        '[.[] | select(.event == "image_request" and .operation == "edit" and .prompt == $prompt)
+              | .image_rgba_sha256] == [$sha]' \
+        "$OUT/fake-events.jsonl" >/dev/null \
+        || die "the uploaded image pixels do not match the fixture ($fixture, rgba sha256 $expected_sha)"
+
+    # Exit restores generation controls — the same exit contract as the
+    # generated-result journey, now after an import.
+    press "$OUT/ig-import-result.json" Images.Edit.Exit "$OUT/ig-import-exit.json" \
+        || die "Images.Edit.Exit is not pressable after an imported edit"
+    local import_exited=0
+    for ((i=0; i<40; i++)); do
+        see_main "$OUT/ig-import-exited.json"
+        if jq -e '.success == true and .data.walk.complete == true
+                  and ([.data.ui_elements[]? | .identifier // ""] as $ids
+                       | ($ids | index("Images.Edit.Source")) == null
+                         and ($ids | index("Images.Aspect")) != null)' \
+               "$OUT/ig-import-exited.json" >/dev/null; then
+            import_exited=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$import_exited" == 1 ]] \
+        || die "exiting edit mode after an import did not restore generation controls"
+
     log "  image-generation OK"
 }
 flow_resident_load_rejected() {
