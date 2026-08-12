@@ -315,14 +315,19 @@ def test_warns_when_2_or_more_patch_behind(isolated_cache, monkeypatch):
     assert "rapid-mlx upgrade" in msg
 
 
-def test_silent_when_only_1_patch_behind(isolated_cache, monkeypatch):
-    """1 patch behind is normal noise — minor bug-fix releases happen.
-    We only want to nag when feature releases are missed (≥2 lag).
+def test_warns_when_1_patch_behind(isolated_cache, monkeypatch):
+    """Any newer release warns — including a single patch. There is no
+    ≥2-lag threshold anymore: we nudge on every update so no straggler is
+    silently left behind.
     """
     monkeypatch.setattr(vc, "_installed_version", lambda: "0.6.15")
     _seed_cache(isolated_cache, "0.6.16")
 
-    assert vc.staleness_warning() is None
+    msg = vc.staleness_warning()
+    assert msg is not None
+    assert "0.6.15" in msg
+    assert "0.6.16" in msg
+    assert "rapid-mlx upgrade" in msg
 
 
 def test_silent_when_current(isolated_cache, monkeypatch):
@@ -341,14 +346,42 @@ def test_silent_when_dev_ahead(isolated_cache, monkeypatch):
     assert vc.staleness_warning() is None
 
 
-def test_silent_across_minor_boundary(isolated_cache, monkeypatch):
-    """If user is on 0.6.x and 0.7.x is out, that's a minor bump — they
-    might be intentionally pinning the 0.6 line. Don't auto-suggest a
-    cross-minor upgrade."""
+def test_warns_across_minor_boundary(isolated_cache, monkeypatch):
+    """Cross-minor lag now warns. Users pinned on an old minor are exactly
+    the fragmentation we want to nudge; the passive one-liner is opt-out
+    (``RAPID_MLX_DISABLE_VERSION_CHECK``) for anyone deliberately staying."""
     monkeypatch.setattr(vc, "_installed_version", lambda: "0.6.10")
     _seed_cache(isolated_cache, "0.7.0")
 
-    assert vc.staleness_warning() is None
+    msg = vc.staleness_warning()
+    assert msg is not None
+    assert "0.6.10" in msg
+    assert "0.7.0" in msg
+
+
+@pytest.mark.parametrize(
+    "installed,latest",
+    [
+        ("0.10.8", "0.12.10"),  # the real straggler cohort (0.10.x panel bucket)
+        ("0.11.0", "0.12.10"),  # the real straggler cohort (0.11.x panel bucket)
+        ("0.9.9", "1.0.0"),  # behind by a whole major — still warns
+    ],
+)
+def test_warns_for_cross_line_stragglers(
+    isolated_cache, monkeypatch, installed, latest
+):
+    """Regression for the fragmentation goal: an install several minors
+    (or a major) behind the latest release MUST get the banner. The old
+    same-major.minor gate returned None for exactly these users, leaving
+    the fragmented base un-nudged on every non-``serve`` command."""
+    monkeypatch.setattr(vc, "_installed_version", lambda: installed)
+    _seed_cache(isolated_cache, latest)
+
+    msg = vc.staleness_warning()
+    assert msg is not None
+    assert installed in msg
+    assert latest in msg
+    assert "rapid-mlx upgrade" in msg
 
 
 def test_silent_when_offline(tmp_path, monkeypatch):
@@ -705,8 +738,8 @@ def test_prompt_returns_true_and_runs_upgrade_on_accept(monkeypatch, interactive
 
 
 def test_prompt_crosses_minor_boundary(monkeypatch, interactive):
-    """``staleness_warning`` stays silent across minor bumps, but the
-    interactive prompt opts in — user can still say no."""
+    """The interactive prompt fires across minor bumps (as does the passive
+    banner now) — user can still say no."""
     monkeypatch.setattr(vc, "_installed_version", lambda: "0.6.62")
     monkeypatch.setattr(vc, "get_latest_version", lambda force_refresh=False: "0.7.0")
     monkeypatch.setattr(

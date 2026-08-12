@@ -2,10 +2,14 @@
 """Background check for newer ``rapid-mlx`` releases on GitHub.
 
 Surfaces a one-line warning at the top of ``rapid-mlx models``,
-``rapid-mlx serve`` and ``rapid-mlx chat`` when the installed version
-is at least 2 patch versions behind the latest GitHub release. Designed
-to fail completely silently on network / parse / sandbox errors —
-staleness warnings should never break the CLI.
+``rapid-mlx serve`` and ``rapid-mlx chat`` whenever the installed
+version is behind the latest GitHub release — ANY newer release,
+regardless of how far behind (patch, minor, or major). There is no
+version-distance threshold: the whole point is that stragglers stuck on
+an old line (the version fragmentation we care about) actually see the
+nudge on every command, not only the ones a patch or two behind inside
+the same minor. Designed to fail completely silently on network / parse
+/ sandbox errors — staleness warnings should never break the CLI.
 
 Cache: ``~/.cache/rapid-mlx/version_check.json`` with 24h TTL. Network
 fetch is opt-out via ``RAPID_MLX_DISABLE_VERSION_CHECK=1`` or any
@@ -13,8 +17,14 @@ non-interactive context (``CI=1``, missing TTY).
 
 Behaviour matrix:
 
-  installed = 0.6.14, latest = 0.6.16 (2 patch behind)
+  installed = 0.6.15, latest = 0.6.16 (1 patch behind)
     → warns, suggests ``rapid-mlx upgrade``
+
+  installed = 0.10.8, latest = 0.12.10 (behind by minors)
+    → warns (cross-minor stragglers are exactly who we want to reach)
+
+  installed = 0.9.9, latest = 1.0.0 (behind by a major)
+    → warns
 
   installed = 0.6.16, latest = 0.6.16 (current)
     → silent
@@ -64,10 +74,6 @@ GITHUB_RELEASES_ENDPOINT = (
 USER_AGENT = "rapid-mlx-cli"
 CACHE_TTL_SECONDS = 24 * 3600  # 24h
 NETWORK_TIMEOUT_SECONDS = 2  # tight — staleness check is best-effort
-# Minimum patch lag before warning. Bumping by 1 patch happens often
-# enough that a one-version lag is normal noise; 2+ means a feature
-# release was missed.
-MIN_LAG_PATCH = 2
 _REMOTE_ENGINE_TAG_RE = re.compile(r"^v(\d{1,6})\.(\d{1,6})\.(\d{1,6})$")
 _CACHED_VERSION_RE = re.compile(r"^\d{1,6}\.\d{1,6}\.\d{1,6}$")
 
@@ -243,9 +249,9 @@ def get_latest_version(force_refresh: bool = False) -> str | None:
 
 
 def staleness_warning() -> str | None:
-    """Return a one-line warning string if the installed version is
-    ``MIN_LAG_PATCH`` or more patch versions behind the latest release.
-    Returns None when no warning is warranted (or check is disabled).
+    """Return a one-line warning string if the installed version is behind
+    the latest release by ANY amount (patch, minor, or major). Returns
+    None when no warning is warranted (current/ahead, or check disabled).
     """
     if _disabled():
         return None
@@ -263,12 +269,17 @@ def staleness_warning() -> str | None:
     if latest is None:
         return None
 
-    # Only warn for patch-level lag inside the same major.minor — across
-    # minors there might be intentional API changes the user is staying
-    # on for stability. Across majors, definitely silent.
-    if (installed[0], installed[1]) != (latest[0], latest[1]):
-        return None
-    if latest[2] - installed[2] < MIN_LAG_PATCH:
+    # Warn on ANY newer release — no version-distance gate. One patch, a
+    # whole minor, or a major behind all get the banner: cross-line
+    # stragglers (e.g. 0.10.x while 0.12.x ships) are precisely who we
+    # want to reach, and they'd never see a same-minor-only warning.
+    # This is a passive one-liner (it only *suggests* ``rapid-mlx
+    # upgrade``), so unlike the interactive ``prompt_upgrade_if_available``
+    # — which auto-runs an upgrade and therefore conservatively skips
+    # dev / pre-release builds — it can safely fire for anyone behind.
+    # Developers on builds AHEAD of latest still stay silent via the
+    # comparison below.
+    if latest <= installed:
         return None
 
     return (
