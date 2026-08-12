@@ -511,6 +511,47 @@ async def _warmup_tool_grammar(engine) -> None:
         )
 
 
+def _detect_hybrid_for_warmup(engine) -> bool:
+    """Whether the loaded model is hybrid for warmup-gating purposes.
+
+    Hybrid (GatedDeltaNet/Mamba + Transformer) models must SKIP the bare
+    ``generate_warmup`` (it contaminates compiled kernel state that
+    interferes with batched inference) and take the full-request warmup
+    path instead. Two independent signals, either sufficing:
+
+    1. The engine's fail-closed ``_is_hybrid_model()`` profile probe
+       (BatchedEngine). This replaced the old ``_hybrid_throttle`` read,
+       which stopped implying is-hybrid when the #115 admission throttle
+       default flipped OFF (codex review on the retirement PR).
+    2. The pre-existing ``make_cache()``/``ArraysCache`` structural
+       detection through the wrapper layers — retained unchanged as the
+       fallback for engine wrappers that do not expose the probe.
+
+    MLLM engines are excluded FIRST, before either signal (their warmup
+    path is separate). Today the combination cannot arise — hybrid VLMs
+    auto-downgrade to the text lane because the MLLM engine cannot build
+    a BatchKVCache over an ArraysCache backbone (#352) — but if the MLLM
+    lane ever gains hybrid support, warmup must fail closed to the bare
+    path rather than silently entering the hybrid one.
+    """
+    if getattr(engine, "_is_mllm", False):
+        return False
+    probe = getattr(engine, "_is_hybrid_model", None)
+    if callable(probe) and bool(probe()):
+        return True
+    model = getattr(engine, "_model", None) or getattr(engine, "_shared_model", None)
+    if model and hasattr(model, "model") and not hasattr(model, "make_cache"):
+        model = model.model
+    if model and hasattr(model, "make_cache"):
+        try:
+            from mlx_lm.models.cache import ArraysCache
+
+            return any(isinstance(c, ArraysCache) for c in model.make_cache())
+        except Exception:
+            pass
+    return False
+
+
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
     global _engine, _mcp_manager
@@ -585,34 +626,7 @@ async def lifespan(app: FastAPI):
         logger.info("Warming up (compiling Metal shaders)...")
         _warmup_start = _time.monotonic()
         try:
-            # Skip warmup for hybrid models (GatedDeltaNet) to avoid
-            # contaminating compiled kernel state that interferes with
-            # batched inference.  Check multiple engine wrappers:
-            # BatchedEngine sets _hybrid_throttle via EngineCore,
-            # Check model for hybrid cache
-            _is_hybrid = getattr(_engine, "_hybrid_throttle", False)
-            if not _is_hybrid and not getattr(_engine, "_is_mllm", False):
-                # Try to find the raw model through wrapper layers
-                _model = getattr(_engine, "_model", None) or getattr(
-                    _engine, "_shared_model", None
-                )
-                # Unwrap model wrapper if needed
-                if (
-                    _model
-                    and hasattr(_model, "model")
-                    and not hasattr(_model, "make_cache")
-                ):
-                    _model = _model.model
-                if _model and hasattr(_model, "make_cache"):
-                    try:
-                        from mlx_lm.models.cache import ArraysCache
-
-                        _test_cache = _model.make_cache()
-                        _is_hybrid = any(
-                            isinstance(c, ArraysCache) for c in _test_cache
-                        )
-                    except Exception:
-                        pass
+            _is_hybrid = _detect_hybrid_for_warmup(_engine)
             if not _is_hybrid:
                 _engine.generate_warmup()
                 # NOTE: do NOT call `mx.eval(mx.zeros(1))` here — that
