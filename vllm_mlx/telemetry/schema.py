@@ -27,6 +27,21 @@ from vllm_mlx.telemetry.redact import (
     platform_info,
 )
 
+# The wire-envelope version: the shape of the common envelope (client_id,
+# session_id, timestamp, platform, event, + one event-specific payload).
+#
+# The new ``activation`` event does NOT bump this, on purpose. The envelope
+# shape is unchanged — ``activation`` is a new *value* of the existing ``event``
+# field with its own additive payload slot, exactly like ``session_start`` /
+# ``request`` / ``error``. Consumers dispatch on ``event`` and drop unknown
+# ones; they do not misparse. Concretely, the deployed telemetry-worker
+# STRICTLY rejects any event whose ``schema_version`` != its own
+# ``SCHEMA_VERSION`` (index.js: ``schema_version_mismatch``), so bumping this to
+# 2 unilaterally would make the live worker reject EVERY event (not just
+# activation) until a coordinated redeploy — strictly worse than the additive
+# path. The worker was already extended (rapidmlx.com PR #81) to allowlist the
+# ``activation`` event at schema_version 1. The activation CONTRACT is versioned
+# separately by ``activation_spec.ACTIVATION_SPEC_VERSION`` (dashboard + tests).
 SCHEMA_VERSION = 1
 
 
@@ -116,6 +131,20 @@ class ErrorPayload:
 
 
 @dataclass(frozen=True)
+class ActivationPayload:
+    """A once-per-install funnel milestone (see docs/telemetry-activation.md).
+
+    Two enums only — no prompt, no completion, no content — the same privacy
+    class as the ``first_session`` / ``auto_selected`` booleans. Emitted
+    UNSAMPLED (unlike ``request``) but low-frequency by construction: at most
+    once per install per ``activation_kind``.
+    """
+
+    activation_kind: str  # "first_inference" | "model_pull" | "agent_setup"
+    surface: str  # "cli" | "api"
+
+
+@dataclass(frozen=True)
 class TelemetryPayload:
     """The complete on-the-wire envelope.
 
@@ -128,20 +157,21 @@ class TelemetryPayload:
     session_id: str
     rapid_mlx_version: str
     platform: PlatformInfo
-    event: str  # "session_start" | "session_end" | "request" | "error"
+    event: str  # "session_start"|"session_end"|"request"|"error"|"activation"
     timestamp: str  # ISO-8601 UTC, "Z" suffix
     session: SessionPayload | None = None
     request: RequestPayload | None = None
     error: ErrorPayload | None = None
+    activation: ActivationPayload | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Render the envelope as a JSON-ready dict.
 
         ``None`` event-payload fields are dropped so the payload doesn't
-        carry empty placeholders for the two events it isn't.
+        carry empty placeholders for the events it isn't.
         """
         d = asdict(self)
-        for key in ("session", "request", "error"):
+        for key in ("session", "request", "error", "activation"):
             if d.get(key) is None:
                 d.pop(key, None)
         return d
@@ -235,6 +265,7 @@ def sample_request_preview_payload(
 
 
 __all__ = [
+    "ActivationPayload",
     "ErrorPayload",
     "PlatformInfo",
     "RequestPayload",

@@ -53,9 +53,70 @@ def test_consent_round_trip(fake_home):
     assert state is not None
     assert state.consent is True
     assert state.prompted_version == "0.6.33"
-    assert state.schema_version == 1
+    from vllm_mlx.telemetry.state import CURRENT_CONSENT_SCHEMA_VERSION
+
+    assert state.schema_version == CURRENT_CONSENT_SCHEMA_VERSION
     assert state.prompted_at.endswith("Z")
     assert is_enabled() is True
+
+
+def test_prior_v1_consent_is_reprompted_after_activation_added(fake_home):
+    """v1 opt-ins predate the ``activation`` disclosure. Bumping the consent
+    schema to 2 must make a stored v1 record read as "never prompted" so the
+    user re-sees and re-accepts before any activation event can be emitted —
+    adding a new collected data type under stale consent would be a breach."""
+    import yaml
+
+    from vllm_mlx.telemetry.state import (
+        consent_path,
+        get_consent_state,
+        is_enabled,
+    )
+
+    # Hand-write a legacy v1 consent record (consent=yes under old copy).
+    p = consent_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        yaml.safe_dump(
+            {
+                "consent": True,
+                "prompted_at": "2026-01-01T00:00:00Z",
+                "prompted_version": "0.11.0",
+                "schema_version": 1,
+            }
+        )
+    )
+    # Treated as unprompted -> None -> telemetry stays OFF until re-accepted.
+    assert get_consent_state() is None
+    assert is_enabled() is False
+
+
+def test_reset_state_raises_when_a_path_cannot_be_removed(fake_home):
+    """`reset_state` must not silently claim success when state survives on disk
+    (that would leave telemetry enabled while the CLI prints "removed"). It
+    attempts every path, still clears the in-process latch, then raises an
+    aggregated OSError naming what it could not remove."""
+    import pytest
+
+    from vllm_mlx.telemetry import emit, state
+
+    # A normally-removable consent file...
+    state.record_consent(True, rapid_mlx_version="0.0.0+test")
+    assert state.consent_path().exists()
+    # ...and a marker path that is a NON-EMPTY DIRECTORY, so unlink() raises
+    # OSError (IsADirectoryError) — the glob picks it up like any marker.
+    stuck = state.activation_marker_path("first_inference")
+    stuck.mkdir(parents=True, exist_ok=True)
+    (stuck / "child").write_text("x")
+    # Latch a kind so we can assert the latch is cleared despite the failure.
+    emit._activation_latched.add("model_pull")
+
+    with pytest.raises(OSError):
+        state.reset_state()
+
+    # Removable state was still removed and the latch was still cleared.
+    assert not state.consent_path().exists()
+    assert "model_pull" not in emit._activation_latched
 
 
 def test_env_kill_switch_wins_over_consent(fake_home, monkeypatch):

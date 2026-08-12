@@ -5655,6 +5655,19 @@ def _print_pull_summary(repo_id: str, snapshot_dir, elapsed: float) -> None:
         f"{_format_pull_duration(elapsed)}"
     )
 
+    # Activation funnel (docs/telemetry-activation.md): a successful pull is
+    # the ``model_pull`` milestone (an activation, NOT inference-engaged).
+    # This helper is only reached on the two success exits of ``pull_command``,
+    # so it is the single "pull succeeded" chokepoint. Fired once per install,
+    # consent-gated + ``@_safe``, so it is a no-op when telemetry is off and
+    # can never affect the pull.
+    from vllm_mlx.telemetry import emit as _telemetry_emit
+    from vllm_mlx.telemetry.activation_spec import ACTIVATION_MODEL_PULL, SURFACE_CLI
+
+    _telemetry_emit.activation(
+        activation_kind=ACTIVATION_MODEL_PULL, surface=SURFACE_CLI
+    )
+
 
 def pull_command(args):
     """Download a model to the HuggingFace cache without serving."""
@@ -7946,7 +7959,17 @@ def telemetry_command(args) -> None:
         return
 
     if action == "reset":
-        reset_state()
+        try:
+            reset_state()
+        except OSError as exc:
+            print()
+            print(f"  Reset incomplete — some files could not be removed: {exc}")
+            print("  Telemetry state may still be present; check ~/.rapid-mlx/.")
+            print()
+            # Non-zero exit so automation (`rapid-mlx telemetry reset` in a
+            # script) sees the failure instead of a false success — state may
+            # still be on disk and telemetry may still be enabled.
+            sys.exit(1)
         print()
         print("  Removed consent + client-id files. Next interactive run re-prompts.")
         print()

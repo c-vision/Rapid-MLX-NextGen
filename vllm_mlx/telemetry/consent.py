@@ -73,6 +73,11 @@ WHAT WE SEND (only after you say yes):
     from this machine, and -- for `chat` with no model named -- whether we
     auto-picked the starter model for you. Metadata only: no prompt, no
     output, no content.
+  - An "activation" marker the first time this machine does real work: the
+    KIND (first successful inference / model pull / agent setup) and the
+    SURFACE ("cli" or "api"). Two labels only, normally once per machine per
+    kind (a rare duplicate is possible -- it carries the same two labels and
+    nothing more). Metadata: no prompt, no output, no content.
   - The NAMES (only) of CLI flags you passed, sorted and de-duplicated
     (`--api-key sk-XXX` becomes the literal string "api-key"; the value
     "sk-XXX" is never even read).

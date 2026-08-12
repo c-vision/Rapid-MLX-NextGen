@@ -5952,11 +5952,31 @@ async def _create_chat_completion_impl(
         output_degenerate=_output_degenerate,
     )
 
-    return Response(
+    # Serialize the response FIRST so a serialization failure surfaces as an
+    # error the client sees — not as a "successful inference" we already
+    # counted. ``model_dump_json`` can raise; the activation emit below must be
+    # reached only when the 2xx body is actually built.
+    response = Response(
         content=chat_response.model_dump_json(exclude_none=True),
         media_type="application/json",
         headers=response_headers or None,
     )
+
+    # Activation funnel (docs/telemetry-activation.md): a successful, non-empty
+    # inference is the ``first_inference`` engagement milestone. Fired once per
+    # install and UNSAMPLED — distinct from the 10%-sampled ``request`` event
+    # above — so the engaged baseline can't be reconstructed-from-sample. A
+    # 2xx with zero completion tokens (empty generation) does NOT count. Emitted
+    # only after the response above is successfully constructed.
+    from vllm_mlx.telemetry.activation_spec import is_successful_inference
+
+    if is_successful_inference(200, output.completion_tokens):
+        _telemetry_emit.activation(
+            activation_kind="first_inference",
+            surface=_telemetry_emit.server_surface(),
+        )
+
+    return response
 
 
 async def stream_chat_completion(
@@ -7236,6 +7256,25 @@ async def stream_chat_completion(
             caller_agent=caller_agent,
             output_degenerate=_output_degenerate,
         )
+
+        # Activation funnel (docs/telemetry-activation.md): the streaming
+        # analogue of the non-streaming site above. A successful, non-empty
+        # stream is the ``first_inference`` milestone — once per install,
+        # unsampled. An empty stream (zero completion tokens) does NOT count.
+        #
+        # Placement is intentional: we emit only after the generator drains
+        # normally (all tokens flushed). A stream the client disconnects or
+        # cancels mid-generation raises out before here and is deliberately NOT
+        # counted — under-counting is conservative and never inflates the
+        # engaged funnel, whereas emitting at the first yielded token would
+        # over-count streams that then error out (contradicting "successful").
+        from vllm_mlx.telemetry.activation_spec import is_successful_inference
+
+        if is_successful_inference(200, completion_tokens):
+            _telemetry_emit.activation(
+                activation_kind="first_inference",
+                surface=_telemetry_emit.server_surface(),
+            )
     finally:
         if cfg.gc_control and gc_was_enabled:
             gc.enable()

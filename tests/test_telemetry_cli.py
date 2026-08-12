@@ -140,6 +140,24 @@ def test_reset_removes_consent(fake_home):
     assert "never prompted" in status.stdout.lower()
 
 
+def test_reset_exits_nonzero_when_removal_fails(fake_home):
+    """A failed reset must NOT report success: automation running
+    ``rapid-mlx telemetry reset`` needs a non-zero exit when state survives on
+    disk (else it assumes telemetry is off when it may still be on)."""
+    import pathlib
+
+    _run_cli("telemetry", "enable", home=fake_home)
+    # Make one marker path unremovable: a NON-EMPTY directory where reset expects
+    # a file, so unlink() raises inside reset_state.
+    stuck = pathlib.Path(fake_home) / ".rapid-mlx" / "activation_seen_first_inference"
+    stuck.mkdir(parents=True, exist_ok=True)
+    (stuck / "child").write_text("x")
+
+    r = _run_cli("telemetry", "reset", home=fake_home)
+    assert r.returncode != 0
+    assert "reset incomplete" in (r.stdout + r.stderr).lower()
+
+
 def test_status_with_no_action_defaults_to_status(fake_home):
     """``rapid-mlx telemetry`` (no action) should be a friendly status,
     not an argparse error — users will type the bare command first."""

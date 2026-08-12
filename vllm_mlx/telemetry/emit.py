@@ -99,6 +99,15 @@ _session_end_hook_lock = threading.Lock()
 _session_end_hook: Any | None = None  # callable: () -> None
 _session_end_hook_fired = False
 
+# Activation events fire at most once per install per kind. The persistent
+# ``O_EXCL`` marker in ``state.claim_activation_marker`` is the source of
+# truth across processes; this in-process latch is a cheap short-circuit so
+# that after the first successful request the per-request emit is a set
+# lookup, not a filesystem syscall. Holds the kinds this process has already
+# resolved (claimed OR observed already-claimed).
+_activation_lock = threading.Lock()
+_activation_latched: set[str] = set()
+
 
 def register_session_end_hook(hook: Any) -> None:
     """Register a callable that emits ``session_end`` + drains the
@@ -239,8 +248,24 @@ def _reset_for_tests() -> None:
     with _session_end_hook_lock:
         _session_end_hook = None
         _session_end_hook_fired = False
+    # Clear the activation in-process latch so a test that just cleaned its
+    # HOME/marker dir sees a fresh "not yet claimed this process" state.
+    _reset_activation_latch()
     if q is not None:
         q.shutdown(timeout=0.1)
+
+
+def _reset_activation_latch() -> None:
+    """Drop the in-process ``activation`` latch.
+
+    Focused counterpart to ``_reset_for_tests`` used by ``state.reset_state``:
+    after ``telemetry reset`` wipes the persistent markers, the stale in-memory
+    latch must go too or a reset-then-re-enable in the SAME process would stay
+    silently suppressed. Kept minimal (latch only, no queue/session teardown)
+    so ``reset_state`` doesn't tear down an active session as a side effect.
+    """
+    with _activation_lock:
+        _activation_latched.clear()
 
 
 # ---------------------------------------------------------------- envelope
@@ -607,3 +632,136 @@ def error(
         "phase": _normalize_error_field(phase, _ALLOWED_ERROR_PHASES),
     }
     get_queue().enqueue(payload)
+
+
+def server_surface() -> str:
+    """Resolve the activation ``surface`` for a running server process.
+
+    ``cli`` when this process is a ``rapid-mlx chat``-spawned server (it sets
+    ``RAPID_MLX_CHAT_SPAWN=1`` on the child), else ``api``. Used by the
+    request-success call sites so a chat-driven first inference is attributed
+    to ``cli`` and a standalone ``serve`` to ``api`` — from a single emission
+    site. See ``docs/telemetry-activation.md``.
+    """
+    from vllm_mlx.telemetry.activation_spec import (
+        CHAT_SPAWN_ENV,
+        SURFACE_API,
+        SURFACE_CLI,
+    )
+
+    # The chat front-end sets the marker to "1". Recognize only an EXPLICIT
+    # truthy allowlist as CLI and default everything else — unset, "0"/"false",
+    # AND typos like "treu" — to ``api``. An allowlist (vs. "anything not falsy")
+    # means a malformed value degrades to the standalone-server surface instead
+    # of silently corrupting attribution toward ``cli``.
+    raw = os.environ.get(CHAT_SPAWN_ENV)
+    if raw is not None and raw.strip().lower() in ("1", "true", "yes", "on"):
+        return SURFACE_CLI
+    return SURFACE_API
+
+
+@_safe
+def activation(*, activation_kind: str, surface: str) -> None:
+    """Emit a once-per-install ``activation`` milestone (funnel signal).
+
+    Unlike ``request`` this is NEVER sampled — a first-touch milestone can't
+    be reconstructed from a 1-in-10 sample — but it stays low-frequency by
+    construction: at most one emission per install per ``activation_kind`` in
+    the common case, suppressed by the local marker in
+    ``state.claim_activation_marker`` and the in-process ``_activation_latched``
+    set (a plain membership test on the steady-state per-request path).
+
+    Delivery is **at-least-once, not exactly-once**: see the ordering note in
+    the body. The collector is the authoritative de-duplicator — it counts
+    DISTINCT ``client_id``, so a rare duplicate collapses to one engaged
+    install. This is deliberate; see ``docs/telemetry-activation.md``.
+
+    Consent-gated like every emit. Both ``activation_kind`` AND ``surface`` are
+    validated against the allowlists in ``telemetry.activation_spec``; an
+    off-list value in EITHER drops the event entirely (rather than coercing a
+    bad surface to ``api``, which would silently mislabel data and hide an
+    instrumentation bug). So no caller-controlled free-form text ever reaches
+    the payload. Two enums only: no prompt, no completion, no content. See
+    ``docs/telemetry-activation.md``.
+    """
+    from vllm_mlx.telemetry.activation_spec import (
+        ACTIVATION_KINDS,
+        ACTIVATION_SURFACES,
+    )
+    from vllm_mlx.telemetry.state import (
+        activation_marker_path,
+        claim_activation_marker,
+    )
+
+    if activation_kind not in ACTIVATION_KINDS:
+        return
+    # An off-allowlist surface is an instrumentation bug, not user input; drop
+    # the event (like an unknown kind) so it surfaces as "missing data" rather
+    # than data silently misattributed to ``api``.
+    if surface not in ACTIVATION_SURFACES:
+        return
+    # Cheap, lock-free short-circuit once this process has resolved the kind.
+    # This is the steady-state path: the synchronous marker filesystem work
+    # below (exists / mkdir / O_EXCL create under ``_activation_lock``) runs at
+    # most ONCE per process per kind — the very first successful inference —
+    # after which every later call returns here without touching disk or the
+    # lock. A one-time marker touch on the request path is an acceptable cost
+    # even on a slow HOME; it is not a per-request stall.
+    if activation_kind in _activation_latched:
+        return
+    # Consent is checked BEFORE touching the marker so a disabled install
+    # doesn't burn its once-ever marker — if the user enables telemetry
+    # later, their next successful inference still emits.
+    if not is_enabled():
+        return
+    surface_norm = surface  # already validated against ACTIVATION_SURFACES above
+    with _activation_lock:
+        if activation_kind in _activation_latched:
+            return
+        # If any process already committed this milestone, suppress and latch.
+        try:
+            if activation_marker_path(activation_kind).exists():
+                _activation_latched.add(activation_kind)
+                return
+        except OSError:
+            pass
+        # Ordering: enqueue FIRST, then claim the marker. Delivery is
+        # at-least-once by design. Two processes can race the marker check above
+        # and both enqueue, but the collector counts DISTINCT client_id, so a
+        # duplicate collapses to one engaged install. The inverse
+        # (claim-before-enqueue) would let a single envelope/enqueue failure —
+        # swallowed by @_safe — permanently suppress the milestone and silently
+        # drop the install from the funnel, a strictly worse error for a growth
+        # signal than a harmless dedup-able duplicate. Both the envelope build
+        # and the enqueue sit before the claim so ANY failure here leaves the
+        # marker unclaimed and the next successful inference simply retries.
+        #
+        # ``surface`` under this duplicate is a best-effort SECONDARY label: a
+        # same-install cli+api double-serve race could send both, and the
+        # client_id dedup then picks one order-dependently. The engaged COUNT is
+        # unaffected (deduped to one install); only the cli/api attribution of
+        # that one install may vary. See docs/telemetry-activation.md
+        # ("Surface under the at-least-once duplicate").
+        payload = _envelope("activation")
+        payload["activation"] = {
+            "activation_kind": activation_kind,
+            "surface": surface_norm,
+        }
+        get_queue().enqueue(payload)
+        # Persist "sent" only AFTER the durable enqueue.
+        claimed = claim_activation_marker(activation_kind)
+        if not claimed:
+            # The marker could not be persisted — either another process already
+            # claimed it (normal race; nothing more to do) or the state dir went
+            # read-only after consent was recorded. We latch below regardless so
+            # THIS process never re-enqueues on later requests. The cross-process
+            # duplicate this allows is harmless: activation is only reachable with
+            # consent on disk, which means ~/.rapid-mlx was writable and the
+            # persistent client_id was already created (reads keep working on a
+            # now-read-only dir), so the collector's DISTINCT-client_id dedup
+            # still folds every duplicate into one engaged install. (If the
+            # client_id had ALSO never persisted, no consent could exist and we
+            # would never reach here — so the "rotating client_id inflates the
+            # metric" case cannot occur.)
+            pass
+        _activation_latched.add(activation_kind)
