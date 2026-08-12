@@ -2561,6 +2561,10 @@ def register_audio_routes_if_enabled() -> bool:
 
 def main():
     """Run the server."""
+    if os.environ.get("RAPID_PYSAMPLE"):
+        from ._pysample import install as _pysample_install
+
+        _pysample_install()
     parser = argparse.ArgumentParser(
         description="Rapid-MLX OpenAI-compatible server for LLM and MLLM inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,

@@ -2454,6 +2454,11 @@ def serve_command(args):
     import os
     import sys
 
+    if os.environ.get("RAPID_PYSAMPLE"):
+        from ._pysample import install as _pysample_install
+
+        _pysample_install()
+
     # Parent-PID watchdog (rapid-desktop issue #449): if the supervisor
     # passed its own PID via ``--watchdog-ppid`` or
     # ``$RAPID_MLX_WATCHDOG_PPID``, spawn a daemon thread that polls

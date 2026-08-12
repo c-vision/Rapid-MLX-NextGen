@@ -2843,6 +2843,11 @@ class Scheduler:
     continuous batching at the token level, so we use it as the backend.
     """
 
+    # Class-level default so ``__new__``-built test stubs that bypass
+    # __init__ still step cleanly; __init__ resolves the real value once
+    # (an os.environ lookup per step would sit on the decode hot path).
+    _step_timing_enabled = False
+
     def __init__(
         self,
         model: Any,
@@ -2871,6 +2876,13 @@ class Scheduler:
         self.config = config or SchedulerConfig()
         self._tool_logits_processor_factory = tool_logits_processor_factory
         self.model_config = model_config
+        if os.environ.get("RAPID_DUMP_SCHED_CONFIG"):
+            import dataclasses as _dc
+
+            logger.warning(
+                "[SCHEDCONFIG] %s",
+                {k: v for k, v in sorted(_dc.asdict(self.config).items())},
+            )
 
         # Detect if tokenizer is a processor (MLLM) and get the actual tokenizer
         self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
@@ -2894,6 +2906,10 @@ class Scheduler:
         self.running: dict[str, Request] = {}  # Running requests by ID
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
+        # Debug aid (#1878): resolved ONCE — an os.environ lookup per
+        # step would put dict access on the decode hot path advertised
+        # as zero-cost when off.
+        self._step_timing_enabled = bool(os.environ.get("RAPID_STEP_TIMING"))
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: dict[str, int] = {}
@@ -6476,9 +6492,13 @@ class Scheduler:
             # Wrap in try/except: if cache shapes are incompatible
             # (e.g. stale entry after BatchGenerator recreation),
             # fall back to no-cache insert instead of crashing.
-            # Create per-request logits processors
+            # Create per-request logits processors. The tool-bias factory is
+            # gated on ``has_tools``: a per-token Python processor on every
+            # row is pure decode overhead for plain-chat requests (minimax/
+            # gpt-oss attached one unconditionally before, ~every request on
+            # a --tool-call-parser minimax server).
             request_processors: list = []
-            if self._tool_logits_processor_factory:
+            if self._tool_logits_processor_factory and request.has_tools:
                 processor = self._tool_logits_processor_factory()
                 if processor is not None:
                     request_processors.append(processor)
@@ -7482,7 +7502,38 @@ class Scheduler:
                     # Tighten that chunk before dispatch when a long cold or
                     # cache-miss prefill is approaching the unified-memory cap.
                     self._apply_adaptive_prefill_size()
-                    raw_next = self.batch_generator.next()
+                    if self._step_timing_enabled:
+                        st = getattr(self, "_steptime", None)
+                        if st is None:
+                            # [next_samples, outside_samples, count, end_stamp]
+                            st = self._steptime = [[], [], 0, 0.0]
+                        _t0 = time.perf_counter()
+                        if st[3]:
+                            st[1].append(_t0 - st[3])
+                            st[3] = 0.0
+                        raw_next = self.batch_generator.next()
+                        st[0].append(time.perf_counter() - _t0)
+                        st[2] += 1
+                        if st[2] % 256 == 0:
+                            _nx = sorted(st[0])
+                            _ou = sorted(st[1]) or [0.0]
+                            logger.warning(
+                                "[STEPTIME] n=%d next mean=%.2f p50=%.2f "
+                                "p90=%.2f max=%.1f | outside mean=%.2f "
+                                "p50=%.2f p90=%.2f max=%.1f (ms, window)",
+                                st[2],
+                                sum(_nx) / len(_nx) * 1e3,
+                                _nx[len(_nx) // 2] * 1e3,
+                                _nx[int(len(_nx) * 0.9)] * 1e3,
+                                _nx[-1] * 1e3,
+                                sum(_ou) / len(_ou) * 1e3,
+                                _ou[len(_ou) // 2] * 1e3,
+                                _ou[int(len(_ou) * 0.9)] * 1e3,
+                                _ou[-1] * 1e3,
+                            )
+                            st[0], st[1] = [], []
+                    else:
+                        raw_next = self.batch_generator.next()
                     # Bound functional recurrent-state graphs without forcing
                     # a host synchronization on every token. Step zero arms
                     # the barrier for a newly-created scheduler; thereafter a
@@ -7574,6 +7625,9 @@ class Scheduler:
                     )
                 output.finished_request_ids = aborted_ids
                 break
+
+        if self._step_timing_enabled and hasattr(self, "_steptime"):
+            self._steptime[3] = time.perf_counter()
 
         # Clear finished tracking for next step
         self.finished_req_ids = set()

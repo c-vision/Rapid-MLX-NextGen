@@ -563,6 +563,66 @@ class EngineCore:
                 ticks,
             )
 
+    def _coalesce_budget(self, active: int, memory_check_interval: int) -> int:
+        """Steps the next dispatch may coalesce: scales with batch depth
+        but never crosses the next memory-check boundary — otherwise a
+        boundary crossed on the batch's first step would tolerate up to
+        three extra Metal allocations before the pressure check fires
+        (codex r4 on #1878). Worst case one dispatch in ``interval`` is
+        truncated; the check keeps its exact pre-coalescing cadence.
+        """
+        depth = min(4, max(2, active // 2))
+        to_boundary = memory_check_interval - (
+            self._steps_executed % memory_check_interval
+        )
+        return min(depth, to_boundary)
+
+    def _step_coalesced(self, max_steps: int) -> tuple[list, Exception | None]:
+        """Run up to ``max_steps`` scheduler steps on the mlx-step thread.
+
+        Breaks early the moment a step finishes a request (its event must
+        fire promptly), reports no work, or new requests are waiting for
+        admission — so coalescing only ever batches the steady mid-stream
+        decode ticks where the executor round-trip is pure overhead.
+
+        Returns ``(outputs, error)``: a later step can raise AFTER
+        earlier steps already advanced scheduler state, and those steps'
+        outputs must still reach the collectors — dropping them loses
+        tokens and leaves finish events unset (codex r1 on #1878). The
+        caller delivers ``outputs`` first, then handles ``error`` with
+        the same failure accounting as a single-step exception.
+
+        The waiting-queue early exit only covers work already pending at
+        dispatch time: an admission arriving MID-batch queues its
+        ``add_request`` behind this very executor call, so
+        ``get_num_waiting()`` cannot observe it — such a request waits
+        at most the remaining coalesced steps (bounded by max_steps=4).
+        """
+        outs: list = []
+        err: Exception | None = None
+        for _ in range(max_steps):
+            # Snapshot BEFORE stepping: step() itself admits waiting
+            # requests into the batch, so a post-step check reads 0 for
+            # exactly the request whose first output must not wait out
+            # the rest of a coalesced batch (codex r3 on #1878).
+            waiting_before = self.scheduler.get_num_waiting()
+            try:
+                out = self.scheduler.step()
+            except Exception as exc:  # deliver partial outputs first;
+                # process-control exceptions (SystemExit/KI) propagate
+                # immediately (codex r4 NIT).
+                err = exc
+                break
+            outs.append(out)
+            if (
+                out.finished_request_ids
+                or not out.has_work
+                or waiting_before > 0
+                or self.scheduler.get_num_waiting() > 0
+            ):
+                break
+        return outs, err
+
     def _run_pressure_evict_tick(self) -> None:
         """D-METAL-PFX: drive the scheduler pressure-eviction loop once.
 
@@ -688,12 +748,47 @@ class EngineCore:
                     # work (pr_validate codex r2).
                     if not self.scheduler.has_requests():
                         continue
-                    output = await loop.run_in_executor(_executor, self.scheduler.step)
-                    self._steps_executed += 1
-                    _consecutive_step_failures = 0
+                    # Step coalescing (bench-tuning 2026-08-12): at high
+                    # aggregate token rates the per-step executor round-trip
+                    # plus GIL contention with the stream tasks costs ~10ms
+                    # per step (35B-A3B conc_8: in-process 375 agg tok/s vs
+                    # 253 live). Deep batches run up to 4 steps per dispatch
+                    # — _step_coalesced breaks early on finishes, pending
+                    # admissions, or no-work so request lifecycle latency is
+                    # unchanged; mid-stream tokens buffer at most ~3 extra
+                    # steps.
+                    # Defensive getattr: duck-typed scheduler stubs in the
+                    # engine-loop tests predate this method; absent -> 0 ->
+                    # no coalescing, i.e. the pre-coalescing behavior.
+                    _active = getattr(self.scheduler, "get_num_running", lambda: 0)()
+                    _step_exc: Exception | None = None
+                    if _active >= 4:
+                        step_outputs, _step_exc = await loop.run_in_executor(
+                            _executor,
+                            self._step_coalesced,
+                            self._coalesce_budget(_active, _memory_check_interval),
+                        )
+                    else:
+                        step_outputs = [
+                            await loop.run_in_executor(_executor, self.scheduler.step)
+                        ]
+                    self._steps_executed += len(step_outputs)
+                    if step_outputs:
+                        # Any successful step resets the streak — the
+                        # pre-coalescing loop zeroed the counter on every
+                        # OK step, so ok,ok,FAIL batches must not let
+                        # non-consecutive failures accumulate into the
+                        # fatal handler (codex r5 on #1878). A trailing
+                        # _step_exc then counts as the FIRST failure of a
+                        # new streak via the except path below.
+                        _consecutive_step_failures = 0
 
-                    # Emergency memory pressure check
-                    if self._steps_executed % _memory_check_interval == 0:
+                    # Emergency memory pressure check. With coalescing the
+                    # counter can jump past an exact multiple, so fire when
+                    # the interval boundary falls anywhere in this batch.
+                    if self._steps_executed % _memory_check_interval < len(
+                        step_outputs
+                    ):
                         try:
                             active_mem = mx.get_active_memory()
                             if active_mem > _memory_pressure_threshold:
@@ -726,56 +821,66 @@ class EngineCore:
                             self._run_pressure_evict_tick()
 
                     # Fast path: distribute outputs to collectors
-                    outputs = output.outputs
-                    if outputs:
-                        collectors = self._output_collectors
-                        states = self._stream_states
-                        events = self._finished_events
+                    for output in step_outputs:
+                        outputs = output.outputs
+                        if outputs:
+                            collectors = self._output_collectors
+                            states = self._stream_states
+                            events = self._finished_events
 
-                        for req_output in outputs:
-                            rid = req_output.request_id
-                            collector = collectors.get(rid)
+                            for req_output in outputs:
+                                rid = req_output.request_id
+                                collector = collectors.get(rid)
 
-                            if collector is not None:
-                                # Optimized: skip stream_interval check when interval=1
-                                if use_simple_streaming:
-                                    collector.put(req_output)
-                                else:
-                                    state = states.get(rid)
-                                    # Merge this step's delta into the buffer so
-                                    # tokens that fall between should_send() hits
-                                    # are not silently discarded. new_text,
-                                    # new_token_ids, and logprobs are all
-                                    # per-step deltas (scheduler emits one
-                                    # token's worth per step) and must
-                                    # accumulate; cumulative status fields take
-                                    # the latest value.
-                                    buf = self._stream_buffers.get(rid)
-                                    self._stream_buffers[rid] = (
-                                        self._merge_stream_buffer(buf, req_output)
-                                    )
-                                    if state and state.should_send(
-                                        req_output.completion_tokens,
-                                        req_output.finished,
-                                    ):
-                                        flushed = self._stream_buffers.pop(rid)
-                                        collector.put(flushed)
-                                        state.mark_sent(req_output.completion_tokens)
+                                if collector is not None:
+                                    # Optimized: skip stream_interval check when interval=1
+                                    if use_simple_streaming:
+                                        collector.put(req_output)
+                                    else:
+                                        state = states.get(rid)
+                                        # Merge this step's delta into the buffer so
+                                        # tokens that fall between should_send() hits
+                                        # are not silently discarded. new_text,
+                                        # new_token_ids, and logprobs are all
+                                        # per-step deltas (scheduler emits one
+                                        # token's worth per step) and must
+                                        # accumulate; cumulative status fields take
+                                        # the latest value.
+                                        buf = self._stream_buffers.get(rid)
+                                        self._stream_buffers[rid] = (
+                                            self._merge_stream_buffer(buf, req_output)
+                                        )
+                                        if state and state.should_send(
+                                            req_output.completion_tokens,
+                                            req_output.finished,
+                                        ):
+                                            flushed = self._stream_buffers.pop(rid)
+                                            collector.put(flushed)
+                                            state.mark_sent(
+                                                req_output.completion_tokens
+                                            )
 
-                            if req_output.finished:
-                                event = events.get(rid)
-                                if event:
-                                    event.set()
+                                if req_output.finished:
+                                    event = events.get(rid)
+                                    if event:
+                                        event.set()
 
-                        # Free Metal buffers after distributing finished outputs
-                        if output.finished_request_ids:
-                            mx.clear_cache()
+                            # Free Metal buffers after distributing finished outputs
+                            if output.finished_request_ids:
+                                mx.clear_cache()
 
-                        # Always yield to prevent event loop starvation.
-                        # Without this, orphaned requests (client disconnected but
-                        # request still in scheduler) block the entire event loop,
-                        # making the server unresponsive to all HTTP requests.
-                        await asyncio.sleep(0)
+                            # Always yield to prevent event loop starvation.
+                            # Without this, orphaned requests (client disconnected but
+                            # request still in scheduler) block the entire event loop,
+                            # making the server unresponsive to all HTTP requests.
+                            await asyncio.sleep(0)
+
+                    # A later coalesced step may have failed AFTER the
+                    # outputs above were produced — surface it only now
+                    # that they are delivered, through the same failure
+                    # accounting as a single-step exception.
+                    if _step_exc is not None:
+                        raise _step_exc
                 else:
                     # No work — block until ``add_request`` sets the
                     # event, with a long fallback timeout for
