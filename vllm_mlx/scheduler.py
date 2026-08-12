@@ -71,6 +71,21 @@ logger = logging.getLogger(__name__)
 # barrier. Eight steps bounds that graph to a few hundred live Metal handles on
 # current 40-layer families while amortizing the synchronization cost.
 _RECURRENT_CACHE_MATERIALIZE_INTERVAL = 8
+# Handle-budget for the recurrent-state barrier (#1834/#1827). The lazy
+# graph retains at most ``active_seqs × interval`` un-materialized updates
+# between barriers, so the Metal handle count scales with that product, NOT
+# with the interval alone. The flat every-8 barrier holds it at ``B × 8``;
+# at batch 8 that is 64 handle-units, a load the engine already sustains in
+# production. A single stream pays the barrier's ``mx.eval`` host sync as a
+# visible decode-rate tax (≈3% at B=1), so at low batch we widen the interval
+# to keep ``active_seqs × interval`` at that same 64-unit steady-state budget
+# — far fewer host stalls. A batch-GROWTH boundary (e.g. B=1 depth 63 → B=8)
+# can transiently reach ``MAX_INTERVAL + active − 1`` units for the single
+# step before the depth-keyed barrier fires; that spike is bounded and cleared
+# in one step, and even at its worst (~71 units → a few thousand handles) sits
+# ~150× below the 499000-handle ceiling — only UNBOUNDED chains exhaust Metal.
+_RECURRENT_MATERIALIZE_HANDLE_BUDGET = 64
+_RECURRENT_MATERIALIZE_MAX_INTERVAL = 64
 
 
 def _pflash_compressed(request: Request) -> bool:
@@ -2847,6 +2862,18 @@ class Scheduler:
     # __init__ still step cleanly; __init__ resolves the real value once
     # (an os.environ lookup per step would sit on the decode hot path).
     _step_timing_enabled = False
+    # Decode steps accumulated since the last recurrent-state barrier. The
+    # barrier fires off THIS depth (not the global step counter) so a batch
+    # size change re-evaluates the interval against the actual live chain:
+    # a deep low-batch chain materializes immediately when concurrency rises
+    # instead of waiting for the next global-step multiple.
+    _recurrent_chain_depth = 0
+    # Running-sequence count at the previous barrier check. An idle->active
+    # edge (this was 0, now >0) arms the barrier so a sequence admitted to a
+    # fresh OR long-idle scheduler materializes its prefill-inherited graph
+    # on its first decode step — the #1834 step-zero barrier generalized to
+    # every activation, not just construction (codex #1895 r2+r3).
+    _recurrent_prev_running = 0
 
     def __init__(
         self,
@@ -2910,6 +2937,11 @@ class Scheduler:
         # step would put dict access on the decode hot path advertised
         # as zero-cost when off.
         self._step_timing_enabled = bool(os.environ.get("RAPID_STEP_TIMING"))
+        # prev_running = 0 means the first activation is an idle->active edge,
+        # so the first decode step arms the barrier (materializes any
+        # prefill-inherited recurrent graph) — see the class-level comment.
+        self._recurrent_chain_depth = 0
+        self._recurrent_prev_running = 0
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: dict[str, int] = {}
@@ -7535,11 +7567,34 @@ class Scheduler:
                     else:
                         raw_next = self.batch_generator.next()
                     # Bound functional recurrent-state graphs without forcing
-                    # a host synchronization on every token. Step zero arms
-                    # the barrier for a newly-created scheduler; thereafter a
-                    # live chain can retain at most eight decode updates.
-                    if self._step_count % _RECURRENT_CACHE_MATERIALIZE_INTERVAL == 0:
+                    # a host synchronization on every token. The barrier fires
+                    # off the live chain DEPTH (steps since the last barrier),
+                    # evaluated against an interval that widens at low batch so
+                    # a single stream stops paying the host sync ~8× more often
+                    # than a batch of eight. Keying off depth (not the global
+                    # step counter) makes a batch-size change re-check the
+                    # accumulated chain immediately: a deep B=1 chain that
+                    # meets the tighter high-concurrency interval materializes
+                    # on the very next step instead of drifting to the next
+                    # global-step multiple (codex #1895).
+                    _active_seqs = len(self.running) if self.running else 1
+                    _raw_running = len(self.running) if self.running else 0
+                    if self._recurrent_prev_running == 0 and _raw_running > 0:
+                        # Idle -> active edge: a sequence just entered an empty
+                        # batch and may carry an unmaterialized prefill graph.
+                        # Seed the depth to the interval so THIS step arms the
+                        # barrier (fresh scheduler or long-idle one alike).
+                        self._recurrent_chain_depth = (
+                            self._recurrent_materialize_interval(_active_seqs)
+                        )
+                    self._recurrent_prev_running = _raw_running
+                    self._recurrent_chain_depth += 1
+                    if (
+                        self._recurrent_chain_depth
+                        >= self._recurrent_materialize_interval(_active_seqs)
+                    ):
                         self._materialize_active_recurrent_cache()
+                        self._recurrent_chain_depth = 0
                     output.has_work = True
 
                     # mlx-lm 0.31+ returns (prompt_responses, generation_responses) tuple
@@ -7672,6 +7727,27 @@ class Scheduler:
                 pass
 
         return output
+
+    def _recurrent_materialize_interval(self, active_seqs: int) -> int:
+        """Steps between recurrent-state barriers for the current batch depth.
+
+        The barrier's cost is a host ``mx.eval`` sync that cannot overlap
+        the decode pipeline; at B=1 it is a visible ~3% decode-rate tax.
+        Its *purpose* is to cap the lazy-graph handle count, which grows as
+        ``active_seqs × steps_since_barrier``. Holding that product at the
+        same 64-unit budget the flat every-8 barrier already sustains at
+        batch 8 lets a single stream materialize every 64 steps instead of
+        every 8 — 8× fewer stalls, identical peak handles. Concurrency keeps
+        the #1834 every-8 floor.
+        """
+        if active_seqs < 1:
+            active_seqs = 1
+        interval = _RECURRENT_MATERIALIZE_HANDLE_BUDGET // active_seqs
+        if interval < _RECURRENT_CACHE_MATERIALIZE_INTERVAL:
+            return _RECURRENT_CACHE_MATERIALIZE_INTERVAL
+        if interval > _RECURRENT_MATERIALIZE_MAX_INTERVAL:
+            return _RECURRENT_MATERIALIZE_MAX_INTERVAL
+        return interval
 
     def _materialize_active_recurrent_cache(self) -> int:
         """Detach lazy recurrent-cache updates from prior decode steps.

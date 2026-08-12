@@ -150,23 +150,56 @@ def test_legacy_active_batch_surface_is_covered(monkeypatch):
     assert evaluations == [[[recurrent.head]]]
 
 
-def test_step_bounds_barrier_interval_and_preserves_event_order(monkeypatch):
-    events = []
-    response = object()
+def test_recurrent_materialize_interval_is_batch_adaptive():
+    """The barrier widens at low batch and holds the #1834 every-8 floor
+    under concurrency."""
+    s = Scheduler.__new__(Scheduler)
+    assert s._recurrent_materialize_interval(1) == 64
+    assert s._recurrent_materialize_interval(2) == 32
+    assert s._recurrent_materialize_interval(4) == 16
+    assert s._recurrent_materialize_interval(8) == 8
+    assert s._recurrent_materialize_interval(16) == 8
+    assert s._recurrent_materialize_interval(0) == 64  # guarded lower bound
+
+
+def test_recurrent_materialize_interval_never_raises_steadystate_handles():
+    """Steady-state safety: at a FIXED batch depth, ``active × interval``
+    never exceeds what the flat every-8 barrier already tolerated
+    (``active × 8`` under concurrency, the 64-unit budget below it). Batch
+    TRANSITIONS are covered by the step-driven test below — a constant
+    depth cannot exercise the drift codex #1895 flagged."""
+    s = Scheduler.__new__(Scheduler)
+    for active in range(1, 65):
+        interval = s._recurrent_materialize_interval(active)
+        flat_every_8 = active * scheduler_module._RECURRENT_CACHE_MATERIALIZE_INTERVAL
+        budget = scheduler_module._RECURRENT_MATERIALIZE_HANDLE_BUDGET
+        assert active * interval <= max(budget, flat_every_8)
+
+
+def _make_step_scheduler(monkeypatch, running, events):
+    """A ``__new__`` scheduler wired so ``step()`` runs only the barrier /
+    response bookkeeping, appending 'next' / 'barrier' / 'responses' markers
+    to ``events``. ``_clear_cache_interval`` is parked high so the unrelated
+    cache-clear path never fires within these short runs."""
+    scheduler = Scheduler.__new__(Scheduler)
 
     class _StepGenerator:
         def next(self):
             events.append("next")
-            return [response]
+            return [object()]
 
-    scheduler = Scheduler.__new__(Scheduler)
     scheduler.batch_generator = _StepGenerator()
-    scheduler.running = {"request": object()}
+    scheduler.running = running
     scheduler.finished_req_ids = set()
     scheduler._stateful_tombstones = set()
-    scheduler._clear_cache_interval = 32
+    scheduler._clear_cache_interval = 100_000
     scheduler._step_count = 0
-    scheduler._memory_log_interval = 256
+    scheduler._recurrent_chain_depth = 0
+    # Default: already-active scheduler, so the idle->active arm does NOT
+    # fire on step 1 — cadence tests exercise the depth counter in isolation.
+    # The arm test overrides this to 0.
+    scheduler._recurrent_prev_running = 1
+    scheduler._memory_log_interval = 100_000
     scheduler.config = SimpleNamespace()
 
     monkeypatch.setattr(scheduler, "_process_pending_aborts", lambda: None)
@@ -181,17 +214,109 @@ def test_step_bounds_barrier_interval_and_preserves_event_order(monkeypatch):
     )
 
     def process(responses):
-        assert responses == [response]
         events.append("responses")
         return [], set()
 
     monkeypatch.setattr(scheduler, "_process_batch_responses", process)
     monkeypatch.setattr(scheduler, "_cleanup_finished", lambda finished: None)
+    return scheduler
 
-    for _ in range(9):
+
+def test_step_barrier_fires_off_chain_depth_at_b1(monkeypatch):
+    """At B=1 the barrier widens to its 64-step max interval: 64 steps span
+    exactly one barrier, landing on the step the chain depth reaches the
+    interval, with event order next -> barrier -> responses preserved."""
+    events = []
+    scheduler = _make_step_scheduler(monkeypatch, {"r0": object()}, events)
+
+    for _ in range(64):
         scheduler.step()
 
-    assert events[:3] == ["next", "barrier", "responses"]
+    assert events.count("barrier") == 1
     assert events[-3:] == ["next", "barrier", "responses"]
-    assert events.count("barrier") == 2
-    assert events.count("next") == events.count("responses") == 9
+    assert events.count("next") == events.count("responses") == 64
+
+
+def test_step_barrier_fires_immediately_when_batch_grows(monkeypatch):
+    """codex #1895: the barrier keys off live chain DEPTH, not the global
+    step counter, so a deep B=1 chain materializes the moment concurrency
+    rises past its (now tighter) interval — it never drifts to the next
+    global-step multiple and overshoots the handle budget."""
+    events = []
+    running = {"r0": object()}
+    scheduler = _make_step_scheduler(monkeypatch, running, events)
+
+    # 45 steps at B=1 (interval 64): chain depth grows to 45, no barrier.
+    # 45 is deliberately NOT a multiple of the every-8 floor, so the old
+    # ``_step_count % interval`` logic would drift to step 48 here — this
+    # is the exact case codex #1895 flagged.
+    for _ in range(45):
+        scheduler.step()
+    assert "barrier" not in events
+
+    # Batch jumps to 8 -> interval drops to 8. Depth (45) already exceeds
+    # it, so the barrier MUST fire on the very next step, not drift to a
+    # later global-step multiple.
+    for i in range(1, 8):
+        running[f"r{i}"] = object()
+    before = len(events)
+    scheduler.step()
+    assert "barrier" in events[before:], (
+        "deep B=1 chain did not materialize when the batch grew to 8"
+    )
+
+    # Depth reset -> it now cadences at the #1834 every-8 floor.
+    tail = len(events)
+    for _ in range(8):
+        scheduler.step()
+    assert events[tail:].count("barrier") == 1
+
+
+def test_barrier_transient_bounded_at_depth63_growth_boundary(monkeypatch):
+    """codex #1895 r4 — the tightest boundary: a B=1 chain at depth 63 that
+    grows to B=8. ``next()`` advances all 8 rows before the barrier check, so
+    the transient peaks at 64 + 7 = 71 handle-units for ONE step before the
+    barrier fires (depth 64 >= interval(8)=8) and clears it.
+
+    The invariant this proves is the real safety property — the transient is
+    bounded to a SINGLE step and cleared immediately, never unbounded growth.
+    Its absolute size (~71 units, i.e. ~3.4k Metal handles on a 48-layer
+    hybrid) sits ~150x below the 499000-handle ceiling #1827 guards, so the
+    bounded spike is not a resource risk; only unbounded chains are."""
+    events = []
+    running = {"r0": object()}
+    scheduler = _make_step_scheduler(monkeypatch, running, events)
+
+    for _ in range(63):
+        scheduler.step()
+    assert "barrier" not in events
+    assert scheduler._recurrent_chain_depth == 63  # deepest a B=1 chain reaches
+
+    for i in range(1, 8):
+        running[f"r{i}"] = object()
+    before = len(events)
+    scheduler.step()  # depth 64 with 8 rows live -> barrier fires THIS step
+    assert "barrier" in events[before:], "depth-63 growth boundary did not barrier"
+    assert scheduler._recurrent_chain_depth == 0  # transient cleared in one step
+
+
+def test_step_arms_barrier_on_idle_to_active_edge(monkeypatch):
+    """codex #1895 r2+r3: a sequence entering an EMPTY batch (fresh scheduler
+    or one that went idle) may carry a prefill-inherited recurrent graph, so
+    the idle->active edge arms the barrier on that first decode step — the
+    #1834 step-zero barrier generalized to every activation, not just
+    construction."""
+    events = []
+    scheduler = _make_step_scheduler(monkeypatch, {"r0": object()}, events)
+    scheduler._recurrent_prev_running = 0  # scheduler was idle
+
+    scheduler.step()
+    assert events[:3] == ["next", "barrier", "responses"]  # armed on activation
+
+    # After the arm the depth resets and cadences at interval(1)=64.
+    tail = len(events)
+    for _ in range(63):
+        scheduler.step()
+    assert "barrier" not in events[tail:]  # depth 63 < 64, no second barrier yet
+    scheduler.step()  # depth reaches 64
+    assert events[-3:] == ["next", "barrier", "responses"]
