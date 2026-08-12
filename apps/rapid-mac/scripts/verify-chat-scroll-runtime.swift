@@ -20,6 +20,17 @@ final class ScrollCapture {
     weak var scrollView: NSScrollView?
 }
 
+@MainActor
+final class ScrollEventCounter: NSObject {
+    private(set) var boundsChanges = 0
+
+    @objc func changed(_ notification: Notification) {
+        boundsChanges += 1
+    }
+
+    func reset() { boundsChanges = 0 }
+}
+
 private struct HarnessView: View {
     @ObservedObject var model: HarnessModel
     let capture: ScrollCapture
@@ -201,6 +212,30 @@ struct ChatScrollRuntimeCheck {
 
         model.rowCount = 120
         pump(0.4)
+
+        // A streaming burst may trigger several SwiftUI document-frame
+        // notifications per row. Following must converge without generating a
+        // matching storm of clip-view bounds changes/layout transactions.
+        let scrollEvents = ScrollEventCounter()
+        NotificationCenter.default.addObserver(
+            scrollEvents,
+            selector: #selector(ScrollEventCounter.changed(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: scroll.contentView
+        )
+        scrollEvents.reset()
+        for _ in 0..<60 {
+            model.rowCount += 1
+            pump(0.005)
+        }
+        pump(0.2)
+        guard scrollEvents.boundsChanges <= 4 else {
+            fputs(
+                "FAIL: streaming burst caused \(scrollEvents.boundsChanges) scroll adjustments\n",
+                stderr
+            )
+            exit(1)
+        }
 
         var bottomY = bottomTargetY(scroll, document: document)
         move(scroll, toY: bottomY)

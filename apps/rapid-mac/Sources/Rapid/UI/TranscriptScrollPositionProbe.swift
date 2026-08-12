@@ -42,6 +42,7 @@ struct TranscriptScrollPositionProbe: NSViewRepresentable {
         private weak var scrollView: NSScrollView?
         private weak var documentView: NSView?
         private var isLiveScrolling = false
+        private var bottomScrollScheduled = false
 
         init(
             isPinnedToBottom: Binding<Bool>,
@@ -61,13 +62,20 @@ struct TranscriptScrollPositionProbe: NSViewRepresentable {
 
         func attach(to probe: NSView) {
             guard let enclosingScrollView = probe.enclosingScrollView else { return }
+            var attachmentChanged = false
             if enclosingScrollView !== scrollView {
                 detach()
                 scrollView = enclosingScrollView
                 observeScrollView(enclosingScrollView)
+                attachmentChanged = true
             }
-            observeDocumentViewIfNeeded()
-            if isPinnedToBottom.wrappedValue { scrollToBottom() }
+            attachmentChanged = observeDocumentViewIfNeeded() || attachmentChanged
+            // updateNSView runs for every streamed mutation. Document-frame
+            // notifications own steady-state following; only a new attachment
+            // needs an explicit initial anchor (#1877).
+            if attachmentChanged, isPinnedToBottom.wrappedValue {
+                requestScrollToBottom()
+            }
         }
 
         func detach() {
@@ -75,6 +83,7 @@ struct TranscriptScrollPositionProbe: NSViewRepresentable {
             scrollView = nil
             documentView = nil
             isLiveScrolling = false
+            bottomScrollScheduled = false
         }
 
         @objc private func liveScrollWillStart(_ notification: Notification) {
@@ -117,16 +126,12 @@ struct TranscriptScrollPositionProbe: NSViewRepresentable {
         /// to be following it. Re-anchor.
         @objc private func clipFrameDidChange(_ notification: Notification) {
             guard isPinnedToBottom.wrappedValue else { return }
-            scrollToBottom()
+            requestScrollToBottom()
         }
 
         @objc private func documentFrameDidChange(_ notification: Notification) {
             guard isPinnedToBottom.wrappedValue else { return }
-            scrollToBottom()
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.isPinnedToBottom.wrappedValue else { return }
-                self.scrollToBottom()
-            }
+            requestScrollToBottom()
         }
 
         private func observeScrollView(_ scrollView: NSScrollView) {
@@ -158,9 +163,10 @@ struct TranscriptScrollPositionProbe: NSViewRepresentable {
             )
         }
 
-        private func observeDocumentViewIfNeeded() {
-            guard let nextDocumentView = scrollView?.documentView else { return }
-            guard nextDocumentView !== documentView else { return }
+        @discardableResult
+        private func observeDocumentViewIfNeeded() -> Bool {
+            guard let nextDocumentView = scrollView?.documentView else { return false }
+            guard nextDocumentView !== documentView else { return false }
 
             if let documentView {
                 NotificationCenter.default.removeObserver(
@@ -177,6 +183,7 @@ struct TranscriptScrollPositionProbe: NSViewRepresentable {
                 name: NSView.frameDidChangeNotification,
                 object: nextDocumentView
             )
+            return true
         }
 
         private var isAtBottom: Bool {
@@ -198,6 +205,21 @@ struct TranscriptScrollPositionProbe: NSViewRepresentable {
         /// bounds notification it emits is not mistaken for the user moving.
         private var isProgrammaticScroll = false
 
+        /// SwiftUI can resize the document several times for one streamed
+        /// token. Collapse those notifications into one end-of-run-loop scroll.
+        private func requestScrollToBottom() {
+            guard !bottomScrollScheduled else { return }
+            bottomScrollScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.bottomScrollScheduled = false
+                guard self.isPinnedToBottom.wrappedValue, !self.isLiveScrolling else {
+                    return
+                }
+                self.scrollToBottom()
+            }
+        }
+
         private func scrollToBottom() {
             guard let scrollView, let documentView else { return }
             isProgrammaticScroll = true
@@ -217,6 +239,10 @@ struct TranscriptScrollPositionProbe: NSViewRepresentable {
             } else {
                 targetY = documentView.bounds.minY - scrollView.contentInsets.bottom
             }
+            // Scrolling to the current origin still emits AppKit notifications
+            // and schedules SwiftUI layout. At streaming cadence that no-op can
+            // become a self-sustaining AttributeGraph loop (#1877).
+            guard abs(clipView.bounds.minY - targetY) > 0.5 else { return }
             clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: targetY))
             scrollView.reflectScrolledClipView(clipView)
         }
@@ -225,7 +251,7 @@ struct TranscriptScrollPositionProbe: NSViewRepresentable {
             if pinned != isPinnedToBottom.wrappedValue {
                 isPinnedToBottom.wrappedValue = pinned
             }
-            if pinned { scrollToBottom() }
+            if pinned { requestScrollToBottom() }
         }
     }
 }
