@@ -8377,7 +8377,17 @@ Examples:
         ),
     )
     serve_parser.add_argument(
-        "--prefill-batch-size", type=int, default=8, help="Prefill batch size"
+        "--prefill-batch-size",
+        type=int,
+        default=8,
+        help=(
+            "Max prompts prefilled together in one cold wave (default: 8). "
+            "Lower it to cut first-token latency under concurrent cold load — "
+            "requests start decoding sooner instead of all sharing one "
+            "full-wave prefill — at an aggregate-throughput cost on large MoE "
+            "models, where staggered rows carry ragged offsets that push "
+            "batched attention onto a slower path (see #1861)."
+        ),
     )
     serve_parser.add_argument(
         "--completion-batch-size", type=int, default=32, help="Completion batch size"
