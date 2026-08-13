@@ -338,6 +338,172 @@ enum DevSnapshot {
         renderHosted(sidebarOnly(), size: sidebarSize,
                      appearance: .darkAqua, to: "\(dir)/sidebar-dark.png")
 
+        // MARK: UI-2 Slice 1 — the core-workspace review matrix
+        //
+        // The captures above review Chat and Launch at 900x640 and at the
+        // 640x560 window floor, which were the sizes the v1.0 pass was
+        // signed off at. Slice 1 is reviewed at three DIFFERENT widths —
+        // 1440, 1000 and 720 — because that is where the lifecycle band
+        // changes shape, and a 900pt capture would silently review only
+        // its middle step.
+        //
+        // Chat and Images are captured at every width in both
+        // appearances. The band is captured separately at all three
+        // widths: a live ``ContentView`` can only show whichever state
+        // the harness is actually in, and staging a real multi-gigabyte
+        // download is not something a capture run can do.
+        let ui2Widths: [CGFloat] = [1440, 1000, 720]
+        let ui2Appearances: [(NSAppearance.Name, String)] = [(.aqua, "light"), (.darkAqua, "dark")]
+
+        for windowWidth in ui2Widths {
+            // 900 tall at every width: the point of the sweep is the
+            // horizontal behaviour, and holding height fixed makes the
+            // three images directly comparable.
+            let size = CGSize(width: windowWidth, height: 900)
+            for (appearance, mode) in ui2Appearances {
+                renderHosted(
+                    contentView(width: windowWidth, height: 900), size: size,
+                    appearance: appearance,
+                    to: "\(dir)/ui2-chat-\(Int(windowWidth))-\(mode).png"
+                )
+                renderHosted(
+                    imagesView(width: windowWidth, height: 900), size: size,
+                    appearance: appearance,
+                    to: "\(dir)/ui2-images-result-\(Int(windowWidth))-\(mode).png"
+                )
+            }
+        }
+
+        // Images again with the stage cleared, because the capture above
+        // inherits the edit-mode seeding from Scenario 1 and therefore
+        // only ever shows a RESULT. The empty stage is the surface this
+        // slice actually changed — it is where the mascot was replaced by
+        // the aspect preview — so it needs its own sweep.
+        //
+        // Safe to mutate here: every other Images capture has already
+        // been taken by this point in the run.
+        imageGen.cancelEdit()
+        imageGen.prompt = ""
+        // ``activeImage`` is derived from ``results``, so clearing the
+        // list is what empties the stage.
+        imageGen.results = []
+        for windowWidth in ui2Widths {
+            let size = CGSize(width: windowWidth, height: 900)
+            for (appearance, mode) in ui2Appearances {
+                renderHosted(
+                    imagesView(width: windowWidth, height: 900), size: size,
+                    appearance: appearance,
+                    to: "\(dir)/ui2-images-empty-\(Int(windowWidth))-\(mode).png"
+                )
+            }
+        }
+        // The aspect preview tracks the live selection, so sweep the
+        // three aspects too — a square-only capture would not show that
+        // the frame actually changes shape.
+        for aspect in ImageGenViewModel.Aspect.allCases {
+            imageGen.aspect = aspect
+            renderHosted(
+                imagesView(width: 1000, height: 900),
+                size: CGSize(width: 1000, height: 900),
+                appearance: .aqua,
+                to: "\(dir)/ui2-images-aspect-\(aspect.rawValue).png"
+            )
+        }
+        imageGen.aspect = .square
+
+        // The band, driven directly by the two states that open it, at
+        // each of its three heights. Rendered over a stub transcript so
+        // the graphite-against-canvas separation is reviewable rather
+        // than the band floating on nothing.
+        func bandProof(_ readiness: ModelReadiness, width: CGFloat) -> AnyView {
+            AnyView(
+                VStack(spacing: 0) {
+                    LifecycleBand(readiness: readiness, width: width)
+                    Spacer(minLength: 0)
+                }
+                .frame(width: width, height: LifecycleBand.height(for: width) + 80)
+                .background(RapidTheme.surfaceCanvas)
+                .tint(RapidTheme.brandAmber)
+            )
+        }
+        let bandStates: [(String, ModelReadiness)] = [
+            ("downloading", .downloading(
+                alias: "qwen3.5-9b-4bit",
+                detail: "1.2 GB of 5.0 GB · 8.4 MB/s · 7 min left",
+                fraction: 0.24
+            )),
+            // No fraction: the indeterminate case, which must render an
+            // honest bare track rather than a bar pinned at zero.
+            ("starting", .starting(
+                alias: "bonsai-1.7b-2bit",
+                detail: "Loading the model into memory…"
+            )),
+        ]
+        let ui2DetailWidths: [(window: CGFloat, detail: CGFloat)] = [
+            (1440, RapidTheme.Layout.Breakpoint.wide),
+            (1000, RapidTheme.Layout.Breakpoint.mid),
+            (720, RapidTheme.Layout.Breakpoint.floor),
+        ]
+        for (label, state) in bandStates {
+            for widths in ui2DetailWidths {
+                let size = CGSize(
+                    width: widths.detail,
+                    height: LifecycleBand.height(for: widths.detail) + 80
+                )
+                for (appearance, mode) in ui2Appearances {
+                    renderHosted(
+                        bandProof(state, width: widths.detail), size: size,
+                        appearance: appearance,
+                        to: "\(dir)/ui2-band-\(label)-\(Int(widths.window))-\(mode).png"
+                    )
+                }
+            }
+        }
+
+        // NOTE ON REDUCE MOTION. There is deliberately no capture for it
+        // here, and the reason is a real constraint rather than an
+        // oversight: `\.accessibilityReduceMotion` is a READ-ONLY
+        // environment key on macOS — it mirrors the system setting, and
+        // SwiftUI offers no writable keypath — so a harness cannot stage
+        // the reduced rendering the way it stages an appearance or a
+        // width. Injecting it would need a seam through every call site,
+        // which is a refactor this visual slice has no business making.
+        //
+        // The contract is held instead by ``RapidMotion.shouldPulse`` and
+        // by the source guard asserting both perpetual loops in the
+        // Images HUD route through it. Whether the reduced frame LOOKS
+        // right stays a manual check against the system setting.
+
+        // The rail with a MID-LIST row selected, which the capture above
+        // cannot show: it selects ``.launch``, the last row, so it proves
+        // the bar renders but not that the bar leaves its neighbours
+        // alone. Selecting Images puts a marked row between two unmarked
+        // ones, which is where a leading bar that took layout width —
+        // rather than overlaying it — would visibly step the labels in
+        // and out.
+        //
+        // ``.chat`` is deliberately NOT used here: it marks no nav row at
+        // all (it highlights a conversation row, and this fixture seeds
+        // no history), so it would capture an empty rail and look like
+        // the selection had regressed.
+        func sidebarSelectionProof() -> AnyView {
+            AnyView(
+                SidebarView(
+                    selection: .constant(.images),
+                    chat: chat,
+                    onNewChat: {},
+                    onSelectConversation: { _ in }
+                )
+                .frame(width: SidebarView.columnIdealWidth, height: 640)
+                .background(RapidTheme.surfaceSidebar)
+                .tint(RapidTheme.brandAmber)
+            )
+        }
+        renderHosted(sidebarSelectionProof(), size: sidebarSize,
+                     appearance: .aqua, to: "\(dir)/ui2-sidebar-selected-light.png")
+        renderHosted(sidebarSelectionProof(), size: sidebarSize,
+                     appearance: .darkAqua, to: "\(dir)/ui2-sidebar-selected-dark.png")
+
         // Settings → Model Management. The panel seeds its catalog
         // synchronously from ``ModelCatalogCache``'s mirror, so warm the
         // cache first or every capture is the spinner.
