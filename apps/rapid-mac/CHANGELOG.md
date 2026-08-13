@@ -13,6 +13,35 @@ can actually understand.
 
 ## [Unreleased]
 
+## [0.12.12] — 2026-08-13
+
+A vision and reliability release. Images get their first response noticeably
+sooner, a class of image chats that used to come back empty now answer
+correctly, and the app can update itself in the background.
+
+### Added
+
+- Signed background updates: the app now checks for, downloads, and installs
+  new versions on its own, so you stay current without visiting a download
+  page.
+- Support for a new small model, Ling 3.0 tiny.
+
+### Changed
+
+- Sending an image now gets its first words back much faster — on the Gemma
+  vision models the wait before the reply starts is now on par with, and
+  often ahead of, every other way to run them on a Mac.
+
+### Fixed
+
+- Some image chats (the Gemma 3 family) could reply with nothing at all;
+  they now answer normally.
+- Starting a model no longer stalls when the network is slow or a lookup
+  hangs — the app falls back to what it already has on disk.
+- Image and video models no longer pile up in memory; only one stays
+  resident at a time.
+
+
 ## [0.12.11] — 2026-08-12
 
 A speed release. The engine underneath the app got a full tuning pass
