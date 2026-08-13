@@ -752,6 +752,12 @@ jobs:
         # automated bypass is the thing that let #1851 survive three releases.
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job has no ``actions/checkout`` (it only downloads artifacts),
+          # so there is no ``.git`` for ``gh release`` to infer the repo from —
+          # every ``gh release`` call died with "fatal: not a git repository"
+          # once this step moved here from ``build`` (which does check out).
+          # ``GH_REPO`` lets gh resolve the repo without a working tree.
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
           SIGNED: ${{ needs.build.outputs.signed }}
         run: |
