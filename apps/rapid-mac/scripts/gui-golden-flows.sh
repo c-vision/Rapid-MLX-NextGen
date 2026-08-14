@@ -340,6 +340,20 @@ wait_identifier() {
     die "timed out waiting for AX identifier $identifier"
 }
 
+wait_tree_text() {
+    local needle="$1" destination="$2" attempts="${3:-80}"
+    for ((i=0; i<attempts; i++)); do
+        see_main "$destination"
+        if jq -e --arg needle "$needle" \
+            '(.data.ui_elements | tostring) | contains($needle)' \
+            "$destination" >/dev/null; then
+            return
+        fi
+        sleep 0.25
+    done
+    die "timed out waiting for AX text: $needle"
+}
+
 # Is a window with this title in the app's OWN accessibility tree?
 #
 # ``peekaboo list windows`` is NOT an oracle for this. It reports a window that
@@ -1189,8 +1203,10 @@ flow_download_progress() {
     fi
     wait_identifier Quickstart.GetStarted "$OUT/welcome.json"
     press "$OUT/welcome.json" Quickstart.GetStarted "$OUT/get-started.json"
-    wait_identifier Quickstart.Footer.Primary "$OUT/chooser.json"
-    assert_tree_text "$OUT/chooser.json" "~633 MB"
+    # The footer exists while Step 2 is still asynchronously reading the
+    # catalogue. Waiting for that shared identifier can capture the transient
+    # "Matching models" state before the recommendation and its size land.
+    wait_tree_text "~633 MB" "$OUT/chooser.json"
     press "$OUT/chooser.json" Quickstart.Footer.Primary "$OUT/review-open.json"
     wait_identifier Quickstart.Review.Alias "$OUT/review.json"
     assert_tree_text "$OUT/review.json" "Download & start"
