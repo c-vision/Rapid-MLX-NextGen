@@ -13,12 +13,34 @@ can actually understand.
 
 ## [Unreleased]
 
+## [0.12.13] — 2026-08-14
+
+Adds Qwen's newest 27B model and document attachments in chat, plus a round of
+Mac app reliability and polish fixes.
+
 ### Added
 
+- **Qwen3.8-27B** — Qwen's latest 27B model is now one click/command away
+  (`rapid-mlx chat qwen3.8-27b-4bit`). It's a strong general-purpose and
+  tool-using model, and it can also describe images when you start it with the
+  vision option turned on.
 - Normal chats now accept PDF, CSV, and TXT attachments. Rapid extracts document
   text locally, keeps it with the conversation for follow-up questions, and
   clearly marks large partial extracts. Scanned PDFs without selectable text
   report that OCR is required instead of sending an empty prompt.
+
+### Fixed
+
+- The model list no longer shows a phantom "No" model on a machine that has
+  nothing downloaded yet.
+- The Launch page's Codex and Hermes buttons, which did nothing when clicked,
+  now start the right thing.
+- Hovering a button no longer covers its label with a grey block.
+- Long answers no longer slow the app down as their links pile up.
+- The message-box placeholder text now stays out of the way while you type in
+  another language.
+- Audio models are downloaded and checked before the app tries to use them, so
+  they no longer fail at the moment you press play.
 
 ## [0.12.12] — 2026-08-13
 
