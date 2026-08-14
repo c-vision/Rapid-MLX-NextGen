@@ -1651,6 +1651,11 @@ struct ComposeField: View {
     /// NSTextView balloon to a giant centred textarea).
     @State private var contentHeight: CGFloat = 22
 
+    /// True while an input method is showing pre-edit text. ``text`` is
+    /// empty for that whole phase, so this is what keeps the placeholder
+    /// from rendering underneath a half-typed pinyin / kana run.
+    @State private var isComposing = false
+
     var body: some View {
         // v0.5 (Phase 5b): explicit height. The editor measures its own
         // text and reports it; we clamp and apply it via `.frame(height:)`.
@@ -1673,6 +1678,7 @@ struct ComposeField: View {
                 axIdentifier: axIdentifier,
                 axLabel: axLabel,
                 axRoleDescription: axRoleDescription,
+                onComposingChange: { isComposing = $0 },
                 onMeasuredHeight: { measured in
                     let clamped = min(max(measured, minHeight), maxHeight)
                     if abs(clamped - contentHeight) > 0.5 {
@@ -1680,7 +1686,7 @@ struct ComposeField: View {
                     }
                 }
             )
-            if text.isEmpty {
+            if text.isEmpty, !isComposing {
                 Text(placeholder)
                     // Overlays the 15pt NSTextView — must match its
                     // size or the placeholder visibly shrinks the
@@ -1708,6 +1714,47 @@ final class AutosizingTextView: NSTextView {
     /// view's width changes. The receiver owns the clamping; this only
     /// reports what the layout manager actually used.
     var onMeasuredHeight: ((CGFloat) -> Void)?
+
+    /// Called when input-method pre-edit text (marked text) appears or
+    /// clears.
+    ///
+    /// AppKit does NOT post a text-did-change notification while an IME
+    /// is composing, so ``text`` stays empty through the whole pinyin /
+    /// kana / jamo phase. ``ComposeField`` keyed its placeholder off
+    /// that binding alone, so "Send a message…" kept rendering
+    /// underneath the candidate text the user was typing. Marked text is
+    /// the only signal that the field is non-empty here.
+    var onComposingChange: ((Bool) -> Void)?
+    private var lastReportedCompositionState = false
+
+    private func reportCompositionState() {
+        let isComposing = hasMarkedText()
+        guard isComposing != lastReportedCompositionState else { return }
+        lastReportedCompositionState = isComposing
+        onComposingChange?(isComposing)
+    }
+
+    override func setMarkedText(
+        _ string: Any,
+        selectedRange: NSRange,
+        replacementRange: NSRange
+    ) {
+        super.setMarkedText(
+            string,
+            selectedRange: selectedRange,
+            replacementRange: replacementRange
+        )
+        reportCompositionState()
+        // Pre-edit text occupies real lines — a long pinyin run wraps
+        // and must grow the field like committed text does.
+        remeasure()
+    }
+
+    override func unmarkText() {
+        super.unmarkText()
+        reportCompositionState()
+        remeasure()
+    }
 
     /// Height of the laid-out text plus the editor's vertical insets.
     var measuredHeight: CGFloat {
@@ -1807,9 +1854,25 @@ struct ComposeTextEditor: NSViewRepresentable {
     var axIdentifier: String = AutosizingTextView.composeAccessibilityIdentifier
     var axLabel: String = AutosizingTextView.composeAccessibilityLabel
     var axRoleDescription: String = AutosizingTextView.composeAccessibilityRoleDescription
+    /// Reports whether an input method is currently showing pre-edit
+    /// text, so the placeholder can yield to it. Defaults to a no-op:
+    /// call sites that don't draw a placeholder don't need to care.
+    var onComposingChange: (Bool) -> Void = { _ in }
     /// Reports the editor's laid-out content height so ``ComposeField``
     /// can size the field to the draft.
     var onMeasuredHeight: (CGFloat) -> Void
+
+    /// Keep this decision pure so the IME regression stays testable without
+    /// constructing SwiftUI's private representable context. Marked text is
+    /// owned by AppKit until the input method commits it; the binding must not
+    /// overwrite that temporary editor value.
+    static func shouldApplyBindingText(
+        viewHasMarkedText: Bool,
+        editorText: String,
+        bindingText: String
+    ) -> Bool {
+        !viewHasMarkedText && editorText != bindingText
+    }
 
     func makeNSView(context: Context) -> NSScrollView {
         let tv = AutosizingTextView()
@@ -1842,6 +1905,7 @@ struct ComposeTextEditor: NSViewRepresentable {
             width: 0, height: CGFloat.greatestFiniteMagnitude
         )
         tv.onMeasuredHeight = onMeasuredHeight
+        tv.onComposingChange = onComposingChange
         // Bug 3-A residual P2: NSTextView already advertises role
         // ``.textArea`` by default, but with no label / identifier
         // AppleScript and cliclick can't tell which text area is the
@@ -1869,7 +1933,18 @@ struct ComposeTextEditor: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let view = scroll.documentView as? AutosizingTextView else { return }
-        if view.string != text {
+        // Never write over an in-flight IME composition. While marked
+        // text is up, ``view.string`` holds the pre-edit run and ``text``
+        // is still empty (AppKit posts no text-did-change until the user
+        // commits), so this branch would look like a stale draft and
+        // assigning ``text`` would erase the pinyin mid-word. Any
+        // unrelated SwiftUI update landing on this view — including the
+        // placeholder's own state change — is enough to trigger it.
+        if Self.shouldApplyBindingText(
+            viewHasMarkedText: view.hasMarkedText(),
+            editorText: view.string,
+            bindingText: text
+        ) {
             view.string = text
             // A programmatic assignment does not fire ``didChangeText``,
             // so the parent would keep the height of the previous draft
@@ -1877,6 +1952,7 @@ struct ComposeTextEditor: NSViewRepresentable {
             view.remeasure()
         }
         view.onMeasuredHeight = onMeasuredHeight
+        view.onComposingChange = onComposingChange
         context.coordinator.onSubmit = onSubmit
         context.coordinator.onCancel = onCancel
         context.coordinator.onPasteImages = onPasteImages
