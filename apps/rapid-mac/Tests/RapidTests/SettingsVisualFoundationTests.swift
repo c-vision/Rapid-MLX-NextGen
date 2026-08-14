@@ -131,7 +131,7 @@ struct SettingsVisualFoundationTests {
                 "@Environment(SettingsRouter.self)",
                 "@Environment(ServerManager.self)",
                 "@Environment(UpdateChecker.self)",
-                "@Environment(Installer.self)",
+                "@Environment(SparkleUpdateController.self)",
                 "@Environment(DockVisibilityPromptStore.self)",
             ]),
             ("Sources/Rapid/UI/SettingsToolsPanel.swift", [

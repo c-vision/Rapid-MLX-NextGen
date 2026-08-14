@@ -77,10 +77,10 @@ though the manifest does not name them.
 `Sources/RapidCrashHandler` is first-party C in this repository, not a
 third-party package.
 
-The in-tree `UpdateChecker.swift` + `Installer.swift` pair remains temporarily
-as a migration fallback for builds without an injected Sparkle public key and
-as the existing UI's read-only release-status source. Signed production builds
-delegate archive verification and installation to Sparkle.
+The in-tree `UpdateChecker.swift` is the read-only release-status source behind
+the version pill and the Settings panel. It does not download or install
+anything: Sparkle owns archive verification and installation, and builds without
+an injected Sparkle public key have no in-app update path at all.
 
 ## Assets
 
