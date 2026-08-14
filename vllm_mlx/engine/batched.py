@@ -1183,6 +1183,18 @@ class BatchedEngine(BaseEngine):
         self._model = self._mllm_instance.model
         self._processor = self._mllm_instance.processor
 
+        vision_min_pixels = getattr(self._scheduler_config, "vision_min_pixels", 0)
+        vision_max_pixels = getattr(self._scheduler_config, "vision_max_pixels", 0)
+        if vision_min_pixels or vision_max_pixels:
+            from ..mllm_batch_generator import _supports_dynamic_vision_bounds
+
+            if not _supports_dynamic_vision_bounds(self._processor):
+                raise RuntimeError(
+                    "--vision-min-pixels/--vision-max-pixels require a "
+                    "dynamic-resolution image processor (for example, "
+                    "Qwen2.5-VL or Qwen3-VL)"
+                )
+
         # Probe the language-backbone cache before the port reports ready.
         # ArraysCache has the merge/filter/extract primitives needed for a
         # correctness-first serialized lane (#1796), but concurrent hybrid
@@ -1258,7 +1270,6 @@ class BatchedEngine(BaseEngine):
         max_concurrent_requests = getattr(
             self._scheduler_config, "max_concurrent_requests", 256
         )
-
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
             prefill_batch_size=prefill_batch_size,
@@ -1268,6 +1279,8 @@ class BatchedEngine(BaseEngine):
             vision_cache_size=100,
             max_concurrent_requests=max_concurrent_requests,
             allow_arrays_cache=arrays_cache_compat,
+            vision_min_pixels=vision_min_pixels,
+            vision_max_pixels=vision_max_pixels,
         )
 
         # Create and start MLLM scheduler — pass the model-owning executor so
@@ -1283,7 +1296,9 @@ class BatchedEngine(BaseEngine):
         logger.info(
             f"MLLM Scheduler started with continuous batching: "
             f"max_num_seqs={max_num_seqs}, prefill_batch={prefill_batch_size}, "
-            f"completion_batch={completion_batch_size}"
+            f"completion_batch={completion_batch_size}, vision_min_pixels="
+            f"{vision_min_pixels or 'model-default'}, vision_max_pixels="
+            f"{vision_max_pixels or 'model-default'}"
         )
 
     async def _start_llm(self) -> None:

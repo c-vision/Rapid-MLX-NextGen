@@ -87,6 +87,24 @@ def test_prefill_step_size_is_plumbed_in_server_main():
     )
 
 
+def test_vision_pixel_bounds_are_plumbed_in_both_server_entrypoints():
+    for source, function in (
+        (CLI_SOURCE, "serve_command"),
+        (SERVER_SOURCE, "main"),
+    ):
+        kwargs = _function_scheduler_config_kwargs(source, function)
+        assert {"vision_min_pixels", "vision_max_pixels"} <= kwargs
+
+
+def test_vision_pixel_bounds_cross_validation():
+    from vllm_mlx.cli import _vision_pixel_bounds_error
+
+    assert _vision_pixel_bounds_error(0, 0) is None
+    assert _vision_pixel_bounds_error(65_536, 1_048_576) is None
+    error = _vision_pixel_bounds_error(1_048_576, 65_536)
+    assert error is not None and "must not exceed" in error
+
+
 # ---------------------------------------------------------------------------
 # Layer 2: the audit script behavior
 # ---------------------------------------------------------------------------

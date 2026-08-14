@@ -20,6 +20,7 @@ import inspect
 import logging
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -46,6 +47,94 @@ from .vision_embedding_cache import (  # noqa: E402
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _dynamic_vision_size_values(processor: Any) -> dict[str, int] | None:
+    image_processor = getattr(processor, "image_processor", None)
+    size = getattr(image_processor, "size", None)
+    if size is None:
+        return None
+    try:
+        values = dict(size)
+    except (TypeError, ValueError):
+        return None
+    if "shortest_edge" not in values or "longest_edge" not in values:
+        return None
+    return values
+
+
+def _supports_dynamic_vision_bounds(processor: Any) -> bool:
+    image_processor = getattr(processor, "image_processor", None)
+    native_min = getattr(image_processor, "min_pixels", None)
+    native_max = getattr(image_processor, "max_pixels", None)
+    return (
+        isinstance(native_min, int)
+        and isinstance(native_max, int)
+        and native_min > 0
+        and native_max > 0
+    ) or _dynamic_vision_size_values(processor) is not None
+
+
+@contextmanager
+def _temporary_vision_pixel_bounds(processor: Any, min_pixels: int, max_pixels: int):
+    """Apply native dynamic-resolution bounds for one serialized preprocess.
+
+    ``mlx_vlm.prepare_inputs`` filters arbitrary kwargs against the processor's
+    explicit signature, so Qwen's ``max_pixels``/``size`` kwargs do not reach
+    its image processor. Replace its size descriptor while its own
+    ``smart_resize`` runs, then restore the exact object even on failure.
+    MLLM preprocessing is serialized on the scheduler worker.
+    """
+    image_processor = getattr(processor, "image_processor", None)
+    native_min = getattr(image_processor, "min_pixels", None)
+    native_max = getattr(image_processor, "max_pixels", None)
+    if (
+        isinstance(native_min, int)
+        and isinstance(native_max, int)
+        and native_min > 0
+        and native_max > 0
+    ):
+        effective_min = min_pixels or native_min
+        effective_max = max_pixels or native_max
+        if max_pixels and not min_pixels:
+            effective_min = min(effective_min, effective_max)
+        if min_pixels and not max_pixels:
+            effective_max = max(effective_max, effective_min)
+        image_processor.min_pixels = effective_min
+        image_processor.max_pixels = effective_max
+        try:
+            yield True
+        finally:
+            image_processor.min_pixels = native_min
+            image_processor.max_pixels = native_max
+        return
+
+    original = getattr(image_processor, "size", None)
+    if not (min_pixels or max_pixels) or original is None:
+        yield False
+        return
+
+    values = _dynamic_vision_size_values(processor)
+    if values is None:
+        yield False
+        return
+
+    effective_min = min_pixels or values["shortest_edge"]
+    effective_max = max_pixels or values["longest_edge"]
+    if max_pixels and not min_pixels:
+        effective_min = min(effective_min, effective_max)
+    if min_pixels and not max_pixels:
+        effective_max = max(effective_max, effective_min)
+    values["shortest_edge"] = effective_min
+    values["longest_edge"] = effective_max
+
+    replacement = values if isinstance(original, dict) else type(original)(**values)
+    image_processor.size = replacement
+    try:
+        yield True
+    finally:
+        image_processor.size = original
+
 
 # Upper bound on the per-forward chunk size used when prefilling a long
 # text-only prompt on the MLLM path (issue #1187, Problem B). The actual
@@ -536,6 +625,8 @@ class MLLMBatchGenerator:
         prefill_step_size: int = 1024,
         enable_vision_cache: bool = True,
         vision_cache_size: int = 100,
+        vision_min_pixels: int = 0,
+        vision_max_pixels: int = 0,
     ):
         """
         Initialize MLLM batch generator.
@@ -553,6 +644,8 @@ class MLLMBatchGenerator:
             prefill_step_size: Tokens to process per prefill step
             enable_vision_cache: Enable vision embedding caching
             vision_cache_size: Max entries in vision cache
+            vision_min_pixels: Optional processor-side minimum image pixels
+            vision_max_pixels: Optional processor-side maximum image pixels
         """
         self.model = model
         self.processor = processor
@@ -611,6 +704,14 @@ class MLLMBatchGenerator:
                 "batch sizes of 1"
             )
         self.prefill_step_size = prefill_step_size
+        if (vision_min_pixels or vision_max_pixels) and not (
+            _supports_dynamic_vision_bounds(processor)
+        ):
+            raise ValueError(
+                "vision pixel bounds require a dynamic-resolution image processor"
+            )
+        self.vision_min_pixels = vision_min_pixels
+        self.vision_max_pixels = vision_max_pixels
 
         # Request management
         self.unprocessed_requests: list[MLLMBatchRequest] = []
@@ -982,12 +1083,17 @@ class MLLMBatchGenerator:
         # propagating as server errors so the caller sees HTTP 500
         # instead of a misleading HTTP 400 "Failed to process image".
         try:
-            inputs = prepare_inputs(
+            with _temporary_vision_pixel_bounds(
                 self.processor,
-                images=all_images if all_images else None,
-                prompts=request.prompt,
-                image_token_index=image_token_index,
-            )
+                self.vision_min_pixels,
+                self.vision_max_pixels,
+            ):
+                inputs = prepare_inputs(
+                    self.processor,
+                    images=all_images if all_images else None,
+                    prompts=request.prompt,
+                    image_token_index=image_token_index,
+                )
         except (OSError, ValueError) as e:
             # Do not reflect decoder text: PIL / mlx-vlm messages can contain
             # server-side temporary paths. Keep the public diagnostic useful

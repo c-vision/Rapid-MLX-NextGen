@@ -43,7 +43,11 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+from vllm_mlx.mllm_batch_generator import (
+    MLLMBatchGenerator,
+    MLLMBatchRequest,
+    _temporary_vision_pixel_bounds,
+)
 
 
 class _StubModel:
@@ -58,12 +62,19 @@ class _StubModel:
         self.config = _Cfg()
 
 
-def _make_generator() -> MLLMBatchGenerator:
+def _make_generator(
+    *,
+    vision_min_pixels: int = 0,
+    vision_max_pixels: int = 0,
+    processor=None,
+) -> MLLMBatchGenerator:
     return MLLMBatchGenerator(
         model=_StubModel(),
-        processor=object(),
+        processor=processor or object(),
         mm_processor=None,
         enable_vision_cache=False,
+        vision_min_pixels=vision_min_pixels,
+        vision_max_pixels=vision_max_pixels,
     )
 
 
@@ -107,6 +118,73 @@ def _install_prepare_inputs_stub(monkeypatch, raiser):
     monkeypatch.setattr(mlx_vlm_utils, "prepare_inputs", raiser)
     if hasattr(gen_mod, "prepare_inputs"):
         monkeypatch.setattr(gen_mod, "prepare_inputs", raiser)
+
+
+def test_preprocess_forwards_opt_in_dynamic_resolution_bounds(monkeypatch):
+    _bypass_process_image(monkeypatch)
+    captured = {}
+
+    class _ImageProcessor:
+        size = {"shortest_edge": 65_536, "longest_edge": 16_777_216}
+
+    class _Processor:
+        image_processor = _ImageProcessor()
+
+    def _prepare(*args, **kwargs):
+        captured.update(args[0].image_processor.size)
+        return {"input_ids": None, "pixel_values": None, "attention_mask": None}
+
+    _install_prepare_inputs_stub(monkeypatch, _prepare)
+    processor = _Processor()
+    original_size = processor.image_processor.size
+    gen = _make_generator(
+        processor=processor,
+        vision_min_pixels=65_536,
+        vision_max_pixels=1_048_576,
+    )
+    gen._preprocess_request(_make_request(images=["image.png"]))
+
+    assert captured["shortest_edge"] == 65_536
+    assert captured["longest_edge"] == 1_048_576
+    assert processor.image_processor.size is original_size
+
+
+def test_pixel_cap_rejects_fixed_resolution_processor():
+    with pytest.raises(ValueError, match="dynamic-resolution image processor"):
+        _make_generator(vision_max_pixels=1_048_576)
+
+
+def test_native_mlx_vlm_pixel_attributes_are_bounded_and_restored():
+    class _ImageProcessor:
+        min_pixels = 3_136
+        max_pixels = 1_003_520
+
+    class _Processor:
+        image_processor = _ImageProcessor()
+
+    processor = _Processor()
+    with _temporary_vision_pixel_bounds(processor, 0, 262_144) as applied:
+        assert applied
+        assert processor.image_processor.min_pixels == 3_136
+        assert processor.image_processor.max_pixels == 262_144
+
+    assert processor.image_processor.min_pixels == 3_136
+    assert processor.image_processor.max_pixels == 1_003_520
+
+
+def test_preprocess_default_does_not_override_processor_resolution(monkeypatch):
+    _bypass_process_image(monkeypatch)
+    captured = {}
+
+    def _prepare(*args, **kwargs):
+        captured.update(kwargs)
+        return {"input_ids": None, "pixel_values": None, "attention_mask": None}
+
+    _install_prepare_inputs_stub(monkeypatch, _prepare)
+    _make_generator()._preprocess_request(_make_request(images=["image.png"]))
+
+    assert "min_pixels" not in captured
+    assert "max_pixels" not in captured
 
 
 def test_preprocess_wraps_pil_oserror_as_failed_to_process_image(monkeypatch):

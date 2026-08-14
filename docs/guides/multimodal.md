@@ -310,5 +310,17 @@ compatible web UI (Open WebUI, LibreChat, etc.) pointed at it:
 rapid-mlx serve qwen3-vl-4b-4bit --mllm --port 8000
 ```
 
+Dynamic-resolution VLMs such as Qwen2.5-VL and Qwen3-VL can turn a large
+photo into thousands of vision tokens. To trade some fine image detail for
+lower first-token latency and memory use, set an explicit server-side cap:
+
+```bash
+rapid-mlx serve qwen3-vl-4b-4bit --mllm --vision-max-pixels 1048576
+```
+
+The cap is opt-in. A value of `0` (the default) leaves the model processor's
+resolution policy unchanged. `--vision-min-pixels` is available for operators
+who also need to preserve a minimum amount of visual detail.
+
 The shipped `rapid-mlx chat` REPL is text-only. The optional Gradio web UI
 (`pip install 'rapid-mlx[chat]'`) supports image / video uploads.

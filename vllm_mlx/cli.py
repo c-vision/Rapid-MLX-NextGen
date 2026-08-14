@@ -146,6 +146,12 @@ def non_negative_int(value: str) -> int:
     return n
 
 
+def _vision_pixel_bounds_error(min_pixels: int, max_pixels: int) -> str | None:
+    if min_pixels and max_pixels and min_pixels > max_pixels:
+        return "--vision-min-pixels must not exceed --vision-max-pixels"
+    return None
+
+
 def positive_finite_float(value: str) -> float:
     """Argparse type for positive, finite resource-budget values."""
     import math
@@ -2520,6 +2526,13 @@ def serve_command(args):
     import os
     import sys
 
+    if bounds_error := _vision_pixel_bounds_error(
+        getattr(args, "vision_min_pixels", 0),
+        getattr(args, "vision_max_pixels", 0),
+    ):
+        print(f"error: {bounds_error}", file=sys.stderr)
+        raise SystemExit(2)
+
     if os.environ.get("RAPID_PYSAMPLE"):
         from ._pysample import install as _pysample_install
 
@@ -3607,6 +3620,8 @@ def serve_command(args):
         # accepted but never used. See #400 and the CLI ↔ Config fidelity
         # audit at scripts/audit_cli_config_fidelity.py.
         prefill_step_size=args.prefill_step_size,
+        vision_min_pixels=getattr(args, "vision_min_pixels", 0),
+        vision_max_pixels=getattr(args, "vision_max_pixels", 0),
         # Speculative decoding selection.
         enable_mtp=getattr(args, "enable_mtp", False),
         mtp_num_draft_tokens=getattr(args, "mtp_num_draft_tokens", 1),
@@ -9051,6 +9066,25 @@ Examples:
         default=2048,
         help="Chunk size for prompt prefill processing. Larger values use more memory "
         "but can improve prefill throughput. (default: 2048)",
+    )
+    serve_parser.add_argument(
+        "--vision-min-pixels",
+        type=non_negative_int,
+        default=0,
+        help=(
+            "Minimum pixels used by dynamic-resolution VLM image processors. "
+            "0 keeps the model default (default: 0)."
+        ),
+    )
+    serve_parser.add_argument(
+        "--vision-max-pixels",
+        type=non_negative_int,
+        default=0,
+        help=(
+            "Maximum pixels used by dynamic-resolution VLM image processors. "
+            "Lower values trade image detail for lower TTFT and memory. "
+            "0 keeps the model default (default: 0)."
+        ),
     )
     # MCP options
     serve_parser.add_argument(

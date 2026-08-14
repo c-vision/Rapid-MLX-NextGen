@@ -418,10 +418,9 @@ class SchedulerConfig:
     adaptive_prefill_min_tokens: int = 32_768
     adaptive_prefill_min_chunk_size: int = 256
 
-    # APPENDED AT THE END DELIBERATELY: this dataclass is constructed
-    # positionally by external callers, so a field inserted mid-list
-    # silently rebinds every argument after it (see the note above
-    # ``mtp_sidecar``).
+    # APPEND-ONLY TAIL: this dataclass is constructed positionally by
+    # external callers, so every new field from here onward must stay at
+    # the end (see the note above ``mtp_sidecar``).
     #
     # Checkpoint identity for the MTP depth-controller registry, which is
     # process-global and survives a model swap. Without it the key falls
@@ -433,7 +432,21 @@ class SchedulerConfig:
     # ``rapid_mlx_spec_decode_k_cost_ms``.
     model_name: str | None = None
 
+    # Opt-in dynamic-resolution bounds for MLLM image preprocessing.
+    # Appended to preserve positional SchedulerConfig compatibility.
+    # Zero preserves the processor/model defaults exactly.
+    vision_min_pixels: int = 0
+    vision_max_pixels: int = 0
+
     def __post_init__(self) -> None:
+        if self.vision_min_pixels < 0 or self.vision_max_pixels < 0:
+            raise ValueError("vision pixel bounds must be non-negative")
+        if (
+            self.vision_min_pixels
+            and self.vision_max_pixels
+            and self.vision_min_pixels > self.vision_max_pixels
+        ):
+            raise ValueError("vision_min_pixels must not exceed vision_max_pixels")
         if self.response_cache_entries < 0:
             raise ValueError("response_cache_entries must be >= 0")
         if self.enable_mtp:

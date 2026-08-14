@@ -237,6 +237,16 @@ class TestMLLMBatchStats:
 class TestMLLMSchedulerConfig:
     """Tests for MLLMSchedulerConfig."""
 
+    def test_vision_pixel_bounds_default_off_and_validate(self):
+        from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig
+
+        config = MLLMSchedulerConfig()
+        assert config.vision_min_pixels == 0
+        assert config.vision_max_pixels == 0
+
+        with pytest.raises(ValueError, match="must not exceed"):
+            MLLMSchedulerConfig(vision_min_pixels=200, vision_max_pixels=100)
+
     def test_default_config(self):
         """Test default configuration."""
         from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig

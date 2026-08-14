@@ -2832,6 +2832,18 @@ Examples:
         help="Tokens to process per prefill chunk (default: 2048). "
         "Larger values may improve TTFT on Apple Silicon with sufficient memory.",
     )
+    parser.add_argument(
+        "--vision-min-pixels",
+        type=int,
+        default=0,
+        help="Minimum pixels for dynamic-resolution VLM inputs (0: model default).",
+    )
+    parser.add_argument(
+        "--vision-max-pixels",
+        type=int,
+        default=0,
+        help="Maximum pixels for dynamic-resolution VLM inputs (0: model default).",
+    )
     # Task #292: mirror the ``rapid-mlx serve`` ``--enable-audio`` flag
     # on the legacy ``python -m vllm_mlx.server`` entrypoint so the same
     # text-mode-with-audio escape hatch is available to operators who
@@ -3091,8 +3103,19 @@ Examples:
         args, model_name=args.model
     )
 
+    if args.vision_min_pixels < 0 or args.vision_max_pixels < 0:
+        parser.error("vision pixel bounds must be non-negative")
+    if (
+        args.vision_min_pixels
+        and args.vision_max_pixels
+        and args.vision_min_pixels > args.vision_max_pixels
+    ):
+        parser.error("--vision-min-pixels must not exceed --vision-max-pixels")
+
     scheduler_config = SchedulerConfig(
         prefill_step_size=args.prefill_step_size,
+        vision_min_pixels=args.vision_min_pixels,
+        vision_max_pixels=args.vision_max_pixels,
         pflash_config=server_pflash_config,
         **_server_turboquant_scheduler_kwargs(args),
     )

@@ -77,6 +77,10 @@ class MLLMSchedulerConfig:
     # carrying the text-LLM default (2048) gets bumped to 8192, while
     # any explicit operator-set value is honored as-is (#682, codex r2).
     prefill_step_size: int = 8192
+    # Optional image-resolution bounds forwarded to dynamic-resolution
+    # processors (Qwen2.5/3-VL). Zero leaves model defaults unchanged.
+    vision_min_pixels: int = 0
+    vision_max_pixels: int = 0
     # Enable vision embedding cache
     enable_vision_cache: bool = True
     # Maximum cache entries
@@ -96,6 +100,14 @@ class MLLMSchedulerConfig:
     allow_arrays_cache: bool = False
 
     def __post_init__(self) -> None:
+        if self.vision_min_pixels < 0 or self.vision_max_pixels < 0:
+            raise ValueError("vision pixel bounds must be non-negative")
+        if (
+            self.vision_min_pixels
+            and self.vision_max_pixels
+            and self.vision_min_pixels > self.vision_max_pixels
+        ):
+            raise ValueError("vision_min_pixels must not exceed vision_max_pixels")
         if self.allow_arrays_cache and (
             self.max_num_seqs != 1
             or self.prefill_batch_size != 1
@@ -465,6 +477,8 @@ class MLLMScheduler:
                 completion_batch_size=self.config.completion_batch_size,
                 allow_arrays_cache=self.config.allow_arrays_cache,
                 prefill_step_size=self.config.prefill_step_size,
+                vision_min_pixels=self.config.vision_min_pixels,
+                vision_max_pixels=self.config.vision_max_pixels,
             )
 
     # ========== Sync API (step-based) ==========
