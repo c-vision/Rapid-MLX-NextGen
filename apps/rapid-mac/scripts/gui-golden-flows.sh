@@ -2925,7 +2925,13 @@ flow_launch_integrations() {
 
 flow_audio_readiness() {
     log "flow: audio-readiness"
-    start_persona audio-readiness
+    # Keep `pull` alive long enough to prove Audio owns a real download job.
+    # The audio server reports /healthz before its lazy engine has weights, so
+    # a UI-only Ready assertion would miss the regression this flow guards.
+    start_persona audio-readiness \
+        FAKE_DOWNLOAD_OVERRUN=1 \
+        FAKE_PARTIAL_AUDIO_CACHE=1 \
+        FAKE_AUDIO_PULL_STATE="$OUT_ROOT/audio-readiness/pulled-audio.txt"
     dismiss_first_run
     see_main "$OUT/chat.json"
     press "$OUT/chat.json" Sidebar.Audio "$OUT/speech.json" \
@@ -2948,11 +2954,40 @@ flow_audio_readiness() {
         || die "Speech did not expose Chat-equivalent Download & start readiness"
     baseline audio-readiness.speech "$OUT/speech.json"
 
-    press "$OUT/speech.json" Readiness.Action "$OUT/speech-start.json" \
+    press "$OUT/speech.json" Readiness.Action "$OUT/speech-download-start.json" \
         || die "Speech Download & start is not pressable"
     wait_fake_event \
+        '.event == "command" and .subcommand == "pull" and .alias == "fake-qwen3-tts"' \
+        "Speech Download & start did not invoke pull for fake-qwen3-tts"
+
+    # Sample several fresh AX trees inside the fake's five-second pull window.
+    # An early healthy audio sidecar must never turn that window into Ready.
+    local speech_downloading=0
+    for ((i=0; i<8; i++)); do
+        see_main "$OUT/speech-downloading.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(((.description // .value // .label // "") | tostring)
+                           | startswith("Downloading fake-qwen3-tts"))' \
+                 "$OUT/speech-downloading.json" >/dev/null; then
+            speech_downloading=1
+        fi
+        if jq -e '(.data.ui_elements | tostring)
+                  | contains("Ready — fake-qwen3-tts")' \
+                 "$OUT/speech-downloading.json" >/dev/null; then
+            die "Speech reported Ready while fake-qwen3-tts was still downloading"
+        fi
+        sleep 0.25
+    done
+    [[ "$speech_downloading" == 1 ]] \
+        || die "Speech never exposed Downloading after Download & start"
+    if jq -e -s 'any(.[]; .event == "server_started" and .alias == "fake-qwen3-tts")' \
+        "$OUT/fake-events.jsonl" >/dev/null; then
+        die "Speech started fake-qwen3-tts before its pull completed and cache was verified"
+    fi
+
+    wait_fake_event \
         '.event == "server_started" and .alias == "fake-qwen3-tts"' \
-        "Speech Download & start did not start its selected model"
+        "Speech did not start after its download completed"
     local speech_loaded=0
     for ((i=0; i<80; i++)); do
         see_main "$OUT/speech-loaded.json"
@@ -2988,6 +3023,26 @@ flow_audio_readiness() {
 
     press "$OUT/transcription.json" Readiness.Action "$OUT/transcription-start.json" \
         || die "Transcription Download & start is not pressable"
+    wait_fake_event \
+        '.event == "command" and .subcommand == "pull" and .alias == "fake-whisper-small"' \
+        "Transcription Download & start did not invoke pull for fake-whisper-small"
+    local transcription_downloading=0
+    for ((i=0; i<8; i++)); do
+        see_main "$OUT/transcription-downloading.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(((.description // .value // .label // "") | tostring)
+                           | startswith("Downloading fake-whisper-small"))' \
+                 "$OUT/transcription-downloading.json" >/dev/null; then
+            transcription_downloading=1
+        fi
+        if jq -e -s 'any(.[]; .event == "server_started" and .alias == "fake-whisper-small")' \
+            "$OUT/fake-events.jsonl" >/dev/null; then
+            die "Transcription started fake-whisper-small before its pull completed"
+        fi
+        sleep 0.25
+    done
+    [[ "$transcription_downloading" == 1 ]] \
+        || die "Transcription never exposed Downloading after Download & start"
     wait_fake_event \
         '.event == "server_started" and .alias == "fake-whisper-small"' \
         "Transcription Download & start did not switch to its selected model"
