@@ -469,6 +469,7 @@ private struct ConnectToolRow: View {
                       ? "Copy this agent's one-session launch command"
                       : "Start a model to generate a valid key and launch command.")
                 .accessibilityLabel(copied ? "Copied \(tool.name) command" : "Copy \(tool.name) command")
+                .accessibilityIdentifier("Launch.Integration.Copy.\(tool.id)")
             }
 
             // Description and snippet share the title's column.
@@ -503,7 +504,6 @@ private struct ConnectToolRow: View {
         }
         .padding(.horizontal, RapidTheme.Space.xl - 4)
         .padding(.vertical, RapidTheme.Space.lg + 1)
-        .accessibilityIdentifier("Launch.Integration.\(tool.id)")
     }
 
     private func copy() {

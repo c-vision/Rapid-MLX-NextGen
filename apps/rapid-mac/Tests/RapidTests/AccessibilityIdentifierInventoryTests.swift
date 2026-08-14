@@ -454,6 +454,17 @@ struct AccessibilityIdentifierInventoryTests {
         )
     }
 
+    // MARK: - Launch integrations
+
+    @Test("Launch integration copy buttons are individually addressable")
+    func launchIntegrationCopyIdentifiers() throws {
+        try assertDeclared(
+            [#""Launch.Integration.Copy.\(tool.id)""#],
+            in: "Sources/Rapid/UI/ConnectToolsView.swift",
+            surface: "Launch integration rows"
+        )
+    }
+
     /// The positive test above would still pass if someone re-added the
     /// container identifier, bringing the propagation bug back with it. Naming
     /// the wrapper is the mistake, so the absence has to be asserted directly.

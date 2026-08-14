@@ -1775,7 +1775,7 @@ flow_no_dead_controls() {
     see_main "$OUT/dead-before.json"
 
     local category
-    for category in modelManagement tools appearance privacy app; do
+    for category in modelManagement instructions tools connectors performance appearance privacy app; do
         press "$OUT/dead-before.json" "Settings.Category.$category" \
             "$OUT/dead-open-$category.json" \
             || die "Settings category $category is not pressable"
@@ -1793,6 +1793,43 @@ flow_no_dead_controls() {
             || die "Settings > $category exposes no identified controls of its own"
         log "  $category: $count identified controls"
     done
+
+    # Presence is not behaviour. Exercise reversible controls and require the
+    # AX value/selection to round-trip after each press. This catches buttons
+    # that highlight under the pointer but never mutate their binding.
+    press "$OUT/dead-panel-app.json" Settings.Category.appearance "$OUT/dead-open-appearance-actions.json" \
+        || die "Appearance category is not pressable"
+    see_main "$OUT/dead-appearance-before.json"
+    press "$OUT/dead-appearance-before.json" Settings.Appearance.Theme.dark "$OUT/dead-appearance-dark-press.json" \
+        || die "Dark appearance option is not pressable"
+    see_main "$OUT/dead-appearance-dark.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Appearance.Theme.dark")
+           | select(.selected == true or .value == 1 or .value == "1")' \
+        "$OUT/dead-appearance-dark.json" >/dev/null \
+        || die "Dark appearance accepted AXPress but did not become selected"
+    press "$OUT/dead-appearance-dark.json" Settings.Appearance.Theme.light "$OUT/dead-appearance-light-press.json" \
+        || die "Light appearance option is not pressable"
+    see_main "$OUT/dead-appearance-light.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Appearance.Theme.light")
+           | select(.selected == true or .value == 1 or .value == "1")' \
+        "$OUT/dead-appearance-light.json" >/dev/null \
+        || die "Light appearance did not restore selection"
+
+    press "$OUT/dead-appearance-light.json" Settings.Category.privacy "$OUT/dead-open-privacy-actions.json" \
+        || die "Privacy category is not pressable"
+    see_main "$OUT/dead-privacy-before.json"
+    local telemetry_before telemetry_after
+    telemetry_before="$(element_field "$OUT/dead-privacy-before.json" Settings.Privacy.TelemetryToggle value)"
+    press "$OUT/dead-privacy-before.json" Settings.Privacy.TelemetryToggle "$OUT/dead-privacy-toggle.json" \
+        || die "Telemetry toggle is not pressable"
+    see_main "$OUT/dead-privacy-after.json"
+    telemetry_after="$(element_field "$OUT/dead-privacy-after.json" Settings.Privacy.TelemetryToggle value)"
+    [[ -n "$telemetry_before" && -n "$telemetry_after" && "$telemetry_before" != "$telemetry_after" ]] \
+        || die "Telemetry toggle accepted AXPress but its value did not change"
+    press "$OUT/dead-privacy-after.json" Settings.Privacy.TelemetryToggle "$OUT/dead-privacy-restore.json" \
+        || die "Telemetry toggle could not be restored"
 
     local ax_contracts=(
         "dead-panel-tools.json|Settings.Tools.Toggle.web_search|Web search"
@@ -2820,19 +2857,37 @@ flow_launch_integrations() {
 
     # The engine-owned registry currently resolves to fourteen distinct
     # products after the overlapping Claude Code and Continue entries are
-    # merged. Pin representatives at both ends as well as the exact count so a
-    # new YAML profile cannot silently disappear from the desktop again.
+    # merged. Count the actual per-row action, not a container: putting the id
+    # on the row propagates it to the Copy button in SwiftUI and makes the
+    # button look addressable while preventing it from having its own stable
+    # identity.
     for _ in {1..40}; do
         see_main "$OUT/launch.json"
-        count="$(jq '[.data.ui_elements[]? | (.identifier // "") | select(startswith("Launch.Integration."))] | unique | length' "$OUT/launch.json")"
+        count="$(jq '[.data.ui_elements[]? | (.identifier // "") | select(startswith("Launch.Integration.Copy."))] | unique | length' "$OUT/launch.json")"
         [[ "$count" == 14 ]] && break
         sleep 0.25
     done
     [[ "$count" == 14 ]] || die "Launch rendered $count integrations; engine registry exposes 14 (#1715)"
-    jq -e '.data.ui_elements[]? | select(.identifier == "Launch.Integration.cline")' "$OUT/launch.json" >/dev/null \
+    jq -e '.data.ui_elements[]? | select(.identifier == "Launch.Integration.Copy.cline")' "$OUT/launch.json" >/dev/null \
         || die "Launch omitted config-writing target Cline"
-    jq -e '.data.ui_elements[]? | select(.identifier == "Launch.Integration.smolagents")' "$OUT/launch.json" >/dev/null \
+    jq -e '.data.ui_elements[]? | select(.identifier == "Launch.Integration.Copy.smolagents")' "$OUT/launch.json" >/dev/null \
         || die "Launch omitted adapter profile smolagents"
+    # The card itself is not the action. Every visible row must publish a
+    # distinct Copy button so AX/keyboard users can invoke the same command a
+    # pointer user can, and every one is disabled honestly until a live model
+    # has minted a usable endpoint/key.
+    local copy_count enabled_copy_count
+    copy_count="$(jq '[.data.ui_elements[]?
+                       | (.identifier // "")
+                       | select(startswith("Launch.Integration.Copy."))]
+                      | unique | length' "$OUT/launch.json")"
+    [[ "$copy_count" == 14 ]] \
+        || die "Launch rendered $copy_count addressable Copy buttons for 14 integrations"
+    enabled_copy_count="$(jq '[.data.ui_elements[]?
+                               | select(((.identifier // "") | startswith("Launch.Integration.Copy."))
+                                        and .enabled == true)] | length' "$OUT/launch.json")"
+    [[ "$enabled_copy_count" == 0 ]] \
+        || die "Launch enabled $enabled_copy_count copy commands before a model was ready"
     baseline launch-integrations.complete "$OUT/launch.json"
     log "  launch-integrations OK"
     cleanup_persona
