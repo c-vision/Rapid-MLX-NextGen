@@ -42,11 +42,11 @@ Flows: fresh-install, cached-quickstart, download-progress, settings-persistence
        update-state, window-close-prompt, no-dead-controls, catalog-integrity,
        browse-all-destination, chat-document-attachment, image-generation, audio-readiness, all
 
-download-progress, chat-restore, chat-depth, slow-stream-stop, model-crash-recovery,
-restored-tools, tool-loop-budget and image-generation drive the app through
-the accessibility API alone. They need no peekaboo and no Screen Recording, which is what lets
-them run unattended in CI (see the gui-golden-flows job in
-.github/workflows/rapid-mac-ci.yml). Every other flow needs peekaboo.
+Most named regression flows drive the app through the accessibility API alone.
+The preflight contract tests keep the exact allowlist in sync with
+flow_requires_peekaboo below. Those flows need neither Peekaboo nor Screen
+Recording, which lets them run unattended in CI (see the gui-golden-flows job
+in .github/workflows/rapid-mac-ci.yml).
 
 Options:
   --update-baselines  rewrite the committed AX structural baselines instead of
@@ -99,7 +99,7 @@ flow_requires_screen_recording() {
 # unattended without taking on any of that.
 flow_requires_peekaboo() {
     case "$FLOW" in
-        cached-quickstart|download-progress|settings-persistence|chat-restore|restored-tools|tool-loop-budget|chat-depth|math-rendering|browse-all-destination) return 1 ;;
+        cached-quickstart|download-progress|settings-persistence|chat-restore|restored-tools|tool-loop-budget|chat-depth|math-rendering|browse-all-destination|no-dead-controls|catalog-integrity|update-state|launch-integrations) return 1 ;;
         slow-stream-stop|model-crash-recovery|chat-document-attachment|image-generation|audio-readiness|window-close-prompt|resident-load-rejected) return 1 ;;
         *) return 0 ;;
     esac
