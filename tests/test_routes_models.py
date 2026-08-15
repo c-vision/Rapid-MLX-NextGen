@@ -333,6 +333,20 @@ def test_build_model_info_prefers_live_hybrid_probe(monkeypatch):
         restore()
 
 
+def test_mllm_engine_reports_loaded_hybrid_cache_profile():
+    """MLLM has no text EngineCore; its loaded cache probe is authoritative."""
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    engine = BatchedEngine.__new__(BatchedEngine)
+    engine._is_mllm = True
+    engine._mllm_is_hybrid = True
+    engine._engine = None
+    assert engine._is_hybrid_model() is True
+
+    engine._mllm_is_hybrid = False
+    assert engine._is_hybrid_model() is False
+
+
 def test_build_model_info_keeps_static_hybrid_for_unserved_alias(monkeypatch):
     """Discovery-only aliases retain registry metadata without a live engine."""
     from vllm_mlx.routes import models as models_route
