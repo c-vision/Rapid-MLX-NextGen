@@ -1774,7 +1774,14 @@ flow_update_state() {
         .identifier == "Settings.App.AutomaticUpdatesToggle"
     )' "$OUT/update-app-panel.json" >/dev/null \
         || die "Settings > App does not expose automatic background updates"
-    baseline update-state.app-panel "$OUT/update-app-panel.json"
+    # One baseline PER STATE, for the same reason the wait loop above accepts
+    # both. The two panels are genuinely different trees — AheadOfManifest has
+    # no ``Settings.App.RecheckCTA`` and no re-check copy beside it — so a
+    # single baseline can only pin one of them, and the release window then
+    # fails the flow on a UI that is behaving correctly. Collapsing the region
+    # instead (the ``Footer.DesktopVersionPill`` treatment in ax-baseline.py)
+    # would hide a real regression in whichever panel is not being exercised.
+    baseline "update-state.app-panel.${state##*.}" "$OUT/update-app-panel.json"
     log "  update state names the running version ($expected, via ${state##*.})"
     cleanup_persona
 }
