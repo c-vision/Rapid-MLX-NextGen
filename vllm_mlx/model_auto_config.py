@@ -1104,6 +1104,14 @@ def _detect_metadata_config(model_path: str) -> ModelConfig | None:
     settings: dict[str, Any] = {}
     reasons: list[str] = []
 
+    # Qwen3.8 currently publishes through the qwen3_5 implementation class,
+    # so ``model_type`` alone cannot distinguish it from the older dense
+    # aliases whose *serving policy* is deliberately pinned non-hybrid to
+    # avoid the legacy scheduler wedge.  Qwen3.8's official aliases and MTP
+    # path use the SSM-safe engine and must retain the truthful architecture
+    # classification even when served from a local snapshot path.
+    is_qwen38 = bool(re.search(r"qwen[._-]?3[._]8", model_path, re.IGNORECASE))
+
     if "qwen3_5_moe" in model_types:
         settings.update(
             is_hybrid=True,
@@ -1112,6 +1120,13 @@ def _detect_metadata_config(model_path: str) -> ModelConfig | None:
             supports_spec_decode=False,
         )
         reasons.append("Qwen3.5 MoE architecture")
+    elif "qwen3_5" in model_types and is_qwen38:
+        settings.update(
+            is_hybrid=True,
+            is_hybrid_explicit=True,
+            supports_spec_decode=False,
+        )
+        reasons.append("Qwen3.8 hybrid GatedDeltaNet architecture")
     elif "qwen3_5" in model_types:
         # Dense Qwen3.5 caches contain linear-attention layers, but their
         # hybrid scheduler path is known to wedge on Metal.  Pinning this
@@ -1213,6 +1228,22 @@ def detect_model_config(model_path: str) -> ModelConfig | None:
     # routing): at temperature the model sometimes invents a wrong tool
     # name/schema — a model quality issue, not parser-fixable.
     name_segment = _extract_model_name_segment(model_path.lower())
+    # Qwen3.8 reuses the upstream qwen3_5 model_type but has an explicit
+    # hybrid GatedDeltaNet layout and native MTP head.  Resolve it before the
+    # legacy generic Qwen3 regex can classify a local snapshot as a plain
+    # attention Qwen3 model.  Known aliases returned above remain the SSOT;
+    # this is only the direct-HF/local-path fallback.
+    if re.search(r"qwen[._-]?3[._]8(?=$|[^0-9])", model_path, re.I):
+        metadata_cfg = _detect_metadata_config(model_path)
+        if metadata_cfg is not None:
+            return metadata_cfg
+        return ModelConfig(
+            tool_call_parser="hermes",
+            reasoning_parser="qwen3",
+            is_hybrid=True,
+            is_hybrid_explicit=True,
+            supports_spec_decode=False,
+        )
     if _is_deepseek_coder_v2_name(name_segment):
         # The Coder-V2 marker is in the canonical model-name segment, so
         # this IS a Coder-V2 checkpoint regardless of what parent

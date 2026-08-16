@@ -2398,6 +2398,108 @@ def test_generator_emits_first_token_from_backbone_then_draft():
     assert snap.tokens_saved == 1
 
 
+def test_generator_fixed_k3_accepts_three_drafts_in_one_verify():
+    """Fixed-depth mode must honor max_k=3 instead of silently using K=1."""
+    from vllm_mlx.spec_decode.mtp.accept_counter import MTPAcceptCounter
+    from vllm_mlx.spec_decode.mtp.generator import mtp_generate_step
+
+    counter = MTPAcceptCounter()
+    emitted = list(
+        mtp_generate_step(
+            mx.array([1], dtype=mx.uint32),
+            _MockedQwen35Model([7, 11, 12, 13, 14], [11, 12, 13]),
+            max_tokens=4,
+            max_k=3,
+            disable_auto_k=True,
+            accept_counter=counter,
+        )
+    )
+
+    assert [(tok, draft) for tok, _lp, draft in emitted] == [
+        (7, False),
+        (11, True),
+        (12, True),
+        (13, True),
+    ]
+    snap = counter.snapshot()
+    assert snap.attempts == 3
+    assert snap.accepts == 3
+
+
+def test_quantized_argmax_matches_materialized_qlinear_logits():
+    """The fused greedy kernel must select the exact qlinear argmax."""
+    import mlx.nn as nn
+
+    from vllm_mlx.spec_decode.mtp.quantized_argmax import quantized_argmax
+
+    dense = nn.Linear(1024, 4096, bias=False)
+    dense.set_dtype(mx.bfloat16)
+    head = nn.QuantizedLinear.from_linear(dense, group_size=64, bits=4)
+    hidden = mx.random.normal((1, 3, 1024)).astype(mx.bfloat16)
+
+    fused = quantized_argmax(head, hidden)
+    reference = mx.argmax(head(hidden), axis=-1)
+    assert fused is not None
+    mx.eval(fused, reference)
+    assert fused.tolist() == reference.tolist()
+
+
+def test_generator_k3_restores_ssm_state_at_partial_accept_boundary():
+    """Rejecting draft 2 restores GDN state after y + accepted draft 1."""
+    from vllm_mlx.spec_decode.mtp.accept_counter import MTPAcceptCounter
+    from vllm_mlx.spec_decode.mtp.generator import mtp_generate_step
+
+    class SnapshotSSMCache:
+        rollback_state = None
+
+        def __init__(self):
+            self.cache = [mx.array([0]), mx.array([0])]
+
+        def __getitem__(self, idx):
+            return self.cache[idx]
+
+        def __setitem__(self, idx, value):
+            self.cache[idx] = value
+
+        def is_trimmable(self):
+            return False
+
+    class SnapshotModel(_MockedQwen35Model):
+        def __init__(self):
+            super().__init__([7, 11, 12, 13, 14], [11, 99, 13])
+            self.layers = [object()]
+
+        def __call__(self, inputs, cache=None, **kwargs):
+            result = super().__call__(inputs, cache=cache, **kwargs)
+            if cache and inputs.shape[1] > 2:
+                c = cache[0]
+                c.rollback_state = [
+                    (mx.array([101 + i]), mx.array([201 + i]))
+                    for i in range(inputs.shape[1] - 1)
+                ]
+                c[0], c[1] = mx.array([999]), mx.array([999])
+            return result
+
+    ssm = SnapshotSSMCache()
+    emitted = list(
+        mtp_generate_step(
+            mx.array([1], dtype=mx.uint32),
+            SnapshotModel(),
+            prompt_cache=[ssm],
+            max_tokens=3,
+            max_k=3,
+            disable_auto_k=True,
+            accept_counter=MTPAcceptCounter(),
+        )
+    )
+
+    assert [tok for tok, _lp, _draft in emitted] == [7, 11, 12]
+    # keep=2 positions (y + one accepted draft) selects snapshot index 1.
+    assert ssm[0].item() == 102
+    assert ssm[1].item() == 202
+    assert ssm.rollback_state is None
+
+
 def test_generator_rolls_back_verify_round_on_early_materialization_abort(
     monkeypatch,
 ):
@@ -3133,12 +3235,9 @@ def test_fixed_k_observer_leaves_the_ceiling_to_whoever_selects_depth():
     """An observer-only fixed-K run must not fix ``max_k`` for later runs.
 
     The registry normally keeps whatever ceiling the FIRST caller set.
-    That makes an observer's ceiling a trap in both directions: seeding
-    the configured value (3 by default) would let a later auto-K run —
-    one an SSM cache forces to clamp to 1 — inherit 3 and select past its
-    clamp; seeding the 1 this mode can actually reach would cap a later
-    auto-K run at chain-of-1 forever. So the observer's ceiling is
-    provisional and the first selecting caller replaces it.
+    Fixed mode now exercises the configured K (including SSM-safe K=3),
+    but its ceiling remains provisional: the first selecting auto-K caller
+    may still replace it with its own configured ceiling.
     """
     from vllm_mlx.spec_decode.mtp.accept_counter import MTPAcceptCounter
     from vllm_mlx.spec_decode.mtp.draft_k_controller_v2 import (
@@ -3165,11 +3264,11 @@ def test_fixed_k_observer_leaves_the_ceiling_to_whoever_selects_depth():
         # the ceiling this test is trying to observe.
         return get_or_create_controller("ceiling-model", max_k=99, authoritative=False)
 
-    # The observer only ever ran K in {0, 1}, and says so provisionally.
+    # Fixed mode really ran the configured K=3, but says so provisionally.
     ctrl = _observe_only(max_k=3)
-    assert ctrl.max_k == 1
+    assert ctrl.max_k == 3
     assert ctrl.ceiling_is_authoritative is False
-    assert ctrl.pick_k() <= 1
+    assert ctrl.pick_k() <= 3
 
     # A later auto-K run clamped to 1 (the SSM case) keeps 1.
     ctrl = _observe_only(max_k=3)

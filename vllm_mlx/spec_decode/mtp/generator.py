@@ -189,10 +189,8 @@ def mtp_generate_step(
     # the process-global controller registry so cost + acceptance state
     # persists across requests for the same model+drafter combination.
     # ``max_k`` bounds the depth the controller may pick; the current
-    # generator body only implements K∈{0,1} (park + chain-of-1), so
-    # picks above 1 are clamped and logged. ``disable_auto_k=True``
-    # keeps the pre-PR-B chain-of-1 behavior unchanged — useful for
-    # A/B benching the controller against a fixed K=1 baseline.
+    # generator supports K∈[0,max_k], including per-position rollback for
+    # hybrid SSM targets. ``disable_auto_k=True`` fixes depth at max_k.
     model_id: str | None = None,
     max_k: int = 1,
     disable_auto_k: bool = False,
@@ -278,6 +276,7 @@ def mtp_generate_step(
         )
     except (TypeError, ValueError):  # pragma: no cover — non-introspectable
         _mtp_supports_hidden = False
+    _mtp_supports_fused_greedy = callable(getattr(model, "mtp_greedy", None))
 
     y = prompt.astype(mx.uint32)
     prev_tokens: mx.array | None = None
@@ -346,52 +345,50 @@ def mtp_generate_step(
             if hasattr(c, "rollback_state"):
                 c.rollback_state = None
 
-    def _rollback_draft(n_to_drop: int = 1):
+    def _rollback_draft(n_to_drop: int = 1, verify_size: int | None = None):
         """Restore caches by dropping the last ``n_to_drop`` draft tokens.
 
         SSM layers (ArraysCache): restore the conv/ssm snapshot saved
-        by GatedDeltaNet at the confirmed boundary. The snapshot is
-        taken at a SINGLE offset (``n_confirmed`` positions from end),
-        so ``n_to_drop`` MUST match that offset — chain-of-K with
-        partial accept is not representable in the current one-snapshot
-        model. The generator prevents this by clamping ``max_k`` to 1
-        when any SSM cache is present (see ``_has_ssm_cache`` at
-        decode-loop start); callers that reach this path with
-        ``n_to_drop > 1`` on an SSM cache trip an assertion because a
-        silent partial-rollback would corrupt the SSM state and break
-        the lossless contract.
+        after the accepted verify prefix. K=1 retains the legacy tuple;
+        K>1 stores one tuple per possible accepted boundary.
 
         Attention layers (KVCache): trim the last ``n_to_drop`` draft
         entries.
         """
         for c in model_cache:
             if hasattr(c, "rollback_state") and c.rollback_state is not None:
-                # SSM path: single-snapshot rollback, only n_to_drop==1
-                # is representable in the current on-disk snapshot slot.
-                # The controller-side clamp keeps chain-of-K away from
-                # this branch; assert here as a defense in depth in case
-                # a caller wires K>=2 without adjusting the SSM cache.
-                if n_to_drop != 1:
-                    raise AssertionError(
-                        f"_rollback_draft(n_to_drop={n_to_drop}) on SSM "
-                        "cache: only single-token rollback is supported. "
-                        "Chain-of-K on SSM-hybrid targets is not wired "
-                        "yet — the generator should have clamped max_k=1."
-                    )
-                conv_snap, ssm_snap = c.rollback_state
+                snapshots = c.rollback_state
+                if isinstance(snapshots, list):
+                    if verify_size is None:
+                        raise AssertionError(
+                            "verify_size is required for SSM K>1 rollback"
+                        )
+                    keep = verify_size - n_to_drop
+                    if keep < 1 or keep > len(snapshots):
+                        raise AssertionError(
+                            f"invalid SSM rollback boundary: keep={keep}, "
+                            f"snapshots={len(snapshots)}"
+                        )
+                    conv_snap, ssm_snap = snapshots[keep - 1]
+                else:
+                    if n_to_drop != 1:
+                        raise AssertionError(
+                            "legacy SSM snapshot can only roll back one token"
+                        )
+                    conv_snap, ssm_snap = snapshots
                 c[0] = conv_snap
                 c[1] = ssm_snap
                 c.rollback_state = None
             elif c.is_trimmable():
                 c.trim(n_to_drop)
 
-    def _rollback_verify_round(n_to_drop: int) -> None:
+    def _rollback_verify_round(n_to_drop: int, verify_size: int | None = None) -> None:
         """Roll back uncommitted target + MTP draft state for one verify round."""
         if n_to_drop <= 0:
             _clear_rollback()
             return
 
-        _rollback_draft(n_to_drop)
+        _rollback_draft(n_to_drop, verify_size=verify_size)
         for mc in mtp_cache:
             if mc.is_trimmable():
                 mc.trim(n_to_drop)
@@ -455,6 +452,15 @@ def mtp_generate_step(
             next_ids = main_tok.reshape(1, 1)
         drafter_hidden_last = None
         with mx.stream(generation_stream):
+            fused = None
+            if _is_greedy and _mtp_supports_fused_greedy:
+                fused = model.mtp_greedy(hidden_last, next_ids, mtp_cache)
+            if fused is not None:
+                draft_tok, mtp_hidden = fused
+                draft_tok = draft_tok[:, -1].squeeze(0)
+                drafter_hidden_last = mtp_hidden[:, -1:, :]
+                quantize_cache_fn(mtp_cache)
+                return draft_tok, None, None, None, drafter_hidden_last
             if want_hidden:
                 mtp_logits, mtp_hidden = model.mtp_forward(
                     hidden_last, next_ids, mtp_cache, return_hidden=True
@@ -611,38 +617,17 @@ def mtp_generate_step(
     # 0.9.13 PR-B Fix 3: K≥2 chain-of-K lifted. The verify path now
     # accepts K sequential drafts with a single ``(K+1)``-position
     # backbone forward, per Ollama's ``speculate.go::accept`` batching.
-    # The SSM-hybrid (ArraysCache) rollback is not compatible with the
-    # per-position snapshot Ollama uses, so any model whose cache list
-    # contains an SSM slot is clamped to K=1 at loop-start below —
-    # chain-of-K on SSM targets needs the ``PrepareSnapshots([offsets])``
-    # per-position machinery, which is a separate work item.
+    # Hybrid ArraysCache layers retain a per-position recurrent snapshot,
+    # allowing the same partial-accept semantics without replay.
     # ------------------------------------------------------------------
-    # SSM detection: patched ArraysCache carries a ``rollback_state``
-    # class attribute (see ``cache_patch.py``); KVCache does not. This
-    # is the cheapest, most stable class-level signal for the SSM path
-    # available without importing the two cache classes here.
-    _has_ssm_cache = any(hasattr(c, "rollback_state") for c in model_cache)
     if not disable_auto_k:
-        # Chain-of-K on SSM targets not implemented; clamp to K=1 with
-        # a startup log (once per generator instance is cheap enough
-        # given ``mtp_generate_step`` is called per-request).
-        _max_k_hw = 1 if _has_ssm_cache else max(0, max_k)
-        if _has_ssm_cache and max_k > 1:
-            logger.info(
-                "[MTP-chain-of-K] SSM cache detected in model_cache — "
-                "clamping max_k from %d to 1 (chain-of-K on SSM-hybrid "
-                "targets needs per-position snapshots not yet wired). "
-                "Set --mtp-max-k=1 to silence this log.",
-                max_k,
-            )
-        max_k_effective = _max_k_hw
+        max_k_effective = max(0, max_k)
         _controller: DepthController | None = get_or_create_controller(
             model_id or "__default__", max_k=max_k_effective
         )
     else:
-        # ``disable_auto_k`` keeps the pre-0.9.13 fixed-K=1 A/B-bench
-        # behavior — verbatim chain-of-1, no chain-of-K, and no depth
-        # SELECTION.
+        # Fixed-depth A/B mode: no depth selection, but the configured
+        # max_k is exercised exactly.
         #
         # The controller is still created, and still observes, because
         # fixed-K is precisely the mode an operator measures in: with
@@ -660,12 +645,9 @@ def mtp_generate_step(
         # ``authoritative=False``: the registry is process-global and
         # normally keeps whatever ceiling the FIRST caller set. This mode
         # has no business fixing that ceiling — seeding the configured
-        # ``max_k`` (3 by default) could let a later auto-K run exceed a
-        # clamp it needs, and seeding the 1 this mode can actually reach
-        # would cap a later auto-K run at chain-of-1 forever. Marking it
-        # provisional lets the first run that really selects depth set
-        # the real ceiling.
-        max_k_effective = 1
+        # ``max_k`` is provisional so the first run that really selects
+        # depth remains authoritative.
+        max_k_effective = max(0, max_k)
         _controller = get_or_create_controller(
             model_id or "__default__",
             max_k=max_k_effective,
@@ -680,7 +662,11 @@ def mtp_generate_step(
     # whether we generate a draft at end of the current round. Bootstrap
     # value is the controller's initial pick_k (0 if fresh, else the
     # scheduled depth from the previous request).
-    next_k = _controller.pick_k() if _select_k and _controller is not None else 1
+    next_k = (
+        _controller.pick_k()
+        if _select_k and _controller is not None
+        else max_k_effective
+    )
 
     # Wall time spent generating the drafts that the NEXT round will
     # consume. Drafting happens at the tail of round N — after round N's
@@ -753,7 +739,9 @@ def mtp_generate_step(
             # ``_record_round``, so the carried ``pending_draft_ms`` is always
             # charged. (codex #1441: the "abandoned drafts" case cannot occur.)
             next_k = (
-                _controller.pick_k() if _select_k and _controller is not None else 1
+                _controller.pick_k()
+                if _select_k and _controller is not None
+                else max_k_effective
             )
 
             hidden_at_main = hidden[:, -1:, :]
@@ -788,9 +776,8 @@ def mtp_generate_step(
             # greedy temp=0 because residual == verify-argmax there).
             # K>=2: batched (K+1)-position backbone forward, sequential
             # accept-reject per Ollama's ``speculate.go::accept``. The
-            # SSM path is clamped at loop-start so K>=2 only reaches
-            # this branch on pure-attention targets (KVCache.trim() is
-            # the only rollback needed).
+            # SSM targets use per-position snapshots; attention targets
+            # use KVCache.trim() for the same accepted-prefix boundary.
             # -------------------------------------------------------
             k_len = len(pending_drafts)
             draft_toks_arr = [rec[0] for rec in pending_drafts]
@@ -813,10 +800,8 @@ def mtp_generate_step(
                 y_with_drafts,
                 prev_tokens,
                 n_predict=k_len + 1,
-                # n_confirmed = k_len only matters on SSM targets (which
-                # are clamped to k_len=1 above). Passing k_len keeps the
-                # semantics uniform: "the last k_len positions are
-                # drafts, snapshot before them".
+                # Any positive value activates per-position SSM snapshots;
+                # k_len preserves the legacy K=1 boundary semantics too.
                 n_confirmed=k_len,
                 xtc_draw=first_xtc_draw,
             )
@@ -888,7 +873,7 @@ def mtp_generate_step(
                 # error fires before this round's fresh accept count is known,
                 # never let stale state leak into a fallback path: keep the
                 # committed ``y`` position and drop every uncommitted draft.
-                _rollback_verify_round(k_len - accepted_count)
+                _rollback_verify_round(k_len - accepted_count, verify_size=k_len + 1)
                 raise
 
             # Bump attempts by K (one per draft position considered).
@@ -932,7 +917,12 @@ def mtp_generate_step(
             for i in range(accepted_count):
                 accept_counter.record_accept(tokens_saved=1)
                 ntoks += 1
-                yield int(draft_ids[i]), draft_lps_arr[i], True
+                draft_lp = draft_lps_arr[i]
+                # The fused greedy drafter intentionally never builds a
+                # full-vocabulary draft logprob row.  The accepted token is
+                # also the target argmax, so its target row is the correct
+                # serving logprob surface and is already available here.
+                yield int(draft_ids[i]), lps[i] if draft_lp is None else draft_lp, True
                 if ntoks >= max_tokens:
                     return
 
@@ -964,7 +954,7 @@ def mtp_generate_step(
                 # (k_len - accepted_count) unaccepted drafts from the
                 # caches.
                 n_to_drop = k_len - accepted_count
-                _rollback_verify_round(n_to_drop)
+                _rollback_verify_round(n_to_drop, verify_size=k_len + 1)
                 accept_counter.record_reject()
                 if logits_processors and prev_tokens is not None:
                     # Discard the ``n_to_drop`` rejected positions
@@ -991,7 +981,9 @@ def mtp_generate_step(
             # Decide K for the next round BEFORE generating the
             # next chain (a park decision skips drafter cost).
             next_k = (
-                _controller.pick_k() if _select_k and _controller is not None else 1
+                _controller.pick_k()
+                if _select_k and _controller is not None
+                else max_k_effective
             )
             if next_k >= 1:
                 # Chain-carry: on all-accept the mtp_cache must

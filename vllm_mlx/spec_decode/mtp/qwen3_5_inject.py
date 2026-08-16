@@ -865,6 +865,7 @@ def inject_mtp_support(
             hidden_states,
             next_token_ids,
             mtp_cache,
+            return_hidden: bool = False,
         ):
             """Run the MTP head and project through the shared lm_head."""
             mtp_out = self.mtp(
@@ -874,8 +875,27 @@ def inject_mtp_support(
                 mtp_cache,
             )
             if self.args.tie_word_embeddings:
-                return self.model.embed_tokens.as_linear(mtp_out)
-            return self.lm_head(mtp_out)
+                logits = self.model.embed_tokens.as_linear(mtp_out)
+            else:
+                logits = self.lm_head(mtp_out)
+            return (logits, mtp_out) if return_hidden else logits
+
+        def mtp_greedy(self, hidden_states, next_token_ids, mtp_cache):
+            """Return greedy MTP ids without materializing full-vocab logits."""
+            if self.args.tie_word_embeddings:
+                return None
+            from .quantized_argmax import quantized_argmax
+
+            mtp_out = self.mtp(
+                hidden_states,
+                next_token_ids,
+                self.model.embed_tokens,
+                mtp_cache,
+            )
+            token = quantized_argmax(self.lm_head, mtp_out)
+            if token is None:
+                return None
+            return token, mtp_out
 
         def make_mtp_cache(self):
             """Return fresh ``KVCache`` entries — one per MTP layer.

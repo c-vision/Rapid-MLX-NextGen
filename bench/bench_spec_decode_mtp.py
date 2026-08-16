@@ -204,6 +204,17 @@ def _parse_args() -> argparse.Namespace:
             "previously-captured baseline number."
         ),
     )
+    parser.add_argument(
+        "--mtp-max-k",
+        type=int,
+        default=3,
+        help="Maximum chained MTP drafts per verify round (default: 3).",
+    )
+    parser.add_argument(
+        "--mtp-disable-auto-k",
+        action="store_true",
+        help="Benchmark fixed --mtp-max-k instead of the adaptive controller.",
+    )
     return parser.parse_args()
 
 
@@ -244,6 +255,8 @@ def _planned_matrix(args: argparse.Namespace) -> dict[str, Any]:
         "runs_per_condition": args.runs,
         "max_tokens": args.max_tokens,
         "temp": args.temp,
+        "mtp_max_k": args.mtp_max_k,
+        "mtp_disable_auto_k": args.mtp_disable_auto_k,
         "conditions": ["none", "mtp"],
         "prompts": list(_BENCH_PROMPTS[:n_prompts]),
         "total_generations": 2 * args.runs * n_prompts,
@@ -261,6 +274,8 @@ def _run_once(
     max_tokens: int,
     temp: float,
     mtp_sidecar: str | None = None,
+    mtp_max_k: int = 3,
+    mtp_disable_auto_k: bool = False,
 ) -> RunResult:
     """Run one generation under the requested condition.
 
@@ -324,6 +339,8 @@ def _run_once(
             max_tokens=max_tokens,
             temp=temp,
             accept_counter=counter,
+            max_k=mtp_max_k,
+            disable_auto_k=mtp_disable_auto_k,
         )
         for _ in gen:
             n += 1
@@ -437,6 +454,7 @@ def main() -> int:
     print(
         f"[bench_spec_decode_mtp] model={args.model} runs={args.runs} "
         f"prompts={n_prompts} max_tokens={args.max_tokens} temp={args.temp} "
+        f"mtp_max_k={args.mtp_max_k} fixed_k={args.mtp_disable_auto_k} "
         f"mtp_sidecar={mtp_sidecar!r} conditions={conditions}",
         file=sys.stderr,
     )
@@ -455,6 +473,8 @@ def main() -> int:
                         max_tokens=args.max_tokens,
                         temp=args.temp,
                         mtp_sidecar=mtp_sidecar,
+                        mtp_max_k=args.mtp_max_k,
+                        mtp_disable_auto_k=args.mtp_disable_auto_k,
                     )
                 except Exception as exc:  # pragma: no cover — bench
                     print(
