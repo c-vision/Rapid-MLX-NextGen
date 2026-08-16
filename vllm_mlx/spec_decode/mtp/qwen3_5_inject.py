@@ -803,6 +803,11 @@ def inject_mtp_support(
           — the GatedDeltaNet rollback patch is tracked separately.
         """
 
+        # The generic generator only enables prompt-copy speculation for
+        # backends whose MTP cache-history synchronization has been audited.
+        # This injector covers the Qwen 3.5/3.6/3.8 family.
+        mtp_prompt_lookup_supported = True
+
         def __call__(  # type: ignore[override]
             self,
             inputs,
@@ -918,6 +923,11 @@ def inject_mtp_support(
             return [KVCache() for _ in self.mtp.layers]
 
     inner.__class__ = _Qwen3_5WithMTP
+    # Some callers retain the VLM-style outer wrapper and pass it onward.
+    # Mirror the capability there so the gate follows the injected model
+    # regardless of which supported shape reaches the generator.
+    if model is not inner:
+        model.mtp_prompt_lookup_supported = True
     logger.info(
         "[mtp.inject] Patched %s with MTP surfaces "
         "(return_hidden, n_confirmed, mtp_forward, make_mtp_cache).",

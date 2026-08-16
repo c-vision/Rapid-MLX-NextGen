@@ -1359,6 +1359,7 @@ def test_inject_mtp_support_attaches_four_surfaces():
     injected = inject_mtp_support(model, allow_random_init=True)
     assert injected is True
     assert validate_mtp_support(model) is True
+    assert model.mtp_prompt_lookup_supported is True
 
 
 def test_inject_mtp_support_rejects_non_qwen35_model():
@@ -2310,6 +2311,8 @@ class _CountingKVCache:
 class _CacheAdvancingQwen35Model(_MockedQwen35Model):
     """Mock that advances supplied cache doubles on each forward."""
 
+    mtp_prompt_lookup_supported = True
+
     def __init__(self, backbone_outputs: list[int], mtp_outputs: list[int]):
         super().__init__(backbone_outputs, mtp_outputs)
         self.layers = [object()]
@@ -2663,6 +2666,25 @@ def test_generator_prompt_lookup_verifies_prompt_continuation(monkeypatch):
     assert model_cache.trim_calls == [1]
     assert mtp_cache.trim_calls == [1]
     assert mtp_cache.offset == 5
+
+
+def test_prompt_lookup_requires_an_audited_model_capability(monkeypatch):
+    """An env opt-in cannot force unaudited MTP backends into prompt lookup."""
+    from types import SimpleNamespace
+
+    from vllm_mlx.spec_decode.mtp.generator import _prompt_lookup_is_enabled
+
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP", "1")
+    assert not _prompt_lookup_is_enabled(SimpleNamespace())
+    assert not _prompt_lookup_is_enabled(
+        SimpleNamespace(mtp_prompt_lookup_supported=False)
+    )
+    assert _prompt_lookup_is_enabled(SimpleNamespace(mtp_prompt_lookup_supported=True))
+
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP", "off")
+    assert not _prompt_lookup_is_enabled(
+        SimpleNamespace(mtp_prompt_lookup_supported=True)
+    )
 
 
 def test_generator_prompt_lookup_partial_reject_keeps_mtp_cache_aligned(

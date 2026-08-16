@@ -55,6 +55,19 @@ from .cache_patch import patch_arrays_cache_rollback_state
 from .draft_k_controller_v2 import DepthController, get_or_create_controller
 from .prompt_lookup import PromptLookupIndex
 
+
+def _prompt_lookup_is_enabled(model) -> bool:
+    """Return whether this model may use audited prompt-copy speculation."""
+    if not getattr(model, "mtp_prompt_lookup_supported", False):
+        return False
+    return os.environ.get("RAPID_MLX_MTP_PROMPT_LOOKUP", "1").strip().lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 patch_arrays_cache_rollback_state()
 
 logger = logging.getLogger(__name__)
@@ -272,10 +285,10 @@ def mtp_generate_step(
     xtc_special_tokens = xtc_special_tokens or []
     if accept_counter is None:
         accept_counter = get_global_counter()
-    if timing_stats is None:
-        timing_stats = {}
 
     def _timing_add(name: str, elapsed: float) -> None:
+        if timing_stats is None:
+            return
         timing_stats[name] = timing_stats.get(name, 0.0) + elapsed
 
     # ------------------------------------------------------------------
@@ -303,8 +316,19 @@ def mtp_generate_step(
     _mtp_supports_fused_greedy = callable(getattr(model, "mtp_greedy", None))
 
     y = prompt.astype(mx.uint32)
-    prompt_token_ids = [int(token) for token in y.tolist()]
+    _prompt_lookup_enabled = _prompt_lookup_is_enabled(model)
+    # Avoid copying a potentially long prompt back to the CPU for every other
+    # MTP backend. Prompt lookup is opt-in per model because its cache-history
+    # synchronization contract must be audited for that architecture first.
+    prompt_token_ids = (
+        [int(token) for token in y.tolist()] if _prompt_lookup_enabled else []
+    )
     generated_token_ids: list[int] = []
+
+    def _remember_generated(token_id: int) -> None:
+        if _prompt_lookup_enabled:
+            generated_token_ids.append(token_id)
+
     prev_tokens: mx.array | None = None
 
     if prompt_cache is None:
@@ -319,9 +343,6 @@ def mtp_generate_step(
         mtp_cache = prompt_cache[n_main:] or model.make_mtp_cache()
 
     _is_greedy = temp == 0
-    _prompt_lookup_enabled = os.environ.get(
-        "RAPID_MLX_MTP_PROMPT_LOOKUP", "1"
-    ).strip().lower() not in {"0", "false", "off", "no"}
     _prompt_lookup_max_tokens = max(
         1, int(os.environ.get("RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_TOKENS", "24"))
     )
@@ -826,7 +847,7 @@ def mtp_generate_step(
 
             ntoks += 1
             main_tok_id = int(main_tok.item())
-            generated_token_ids.append(main_tok_id)
+            _remember_generated(main_tok_id)
             yield main_tok_id, main_lp, False
             if ntoks >= max_tokens:
                 return
@@ -1062,7 +1083,7 @@ def mtp_generate_step(
                 # also the target argmax, so its target row is the correct
                 # serving logprob surface and is already available here.
                 draft_id = int(draft_ids[i])
-                generated_token_ids.append(draft_id)
+                _remember_generated(draft_id)
                 yield draft_id, lps[i] if draft_lp is None else draft_lp, True
                 if ntoks >= max_tokens:
                     return
@@ -1083,7 +1104,7 @@ def mtp_generate_step(
                 if pending_is_prompt_lookup:
                     _sync_prompt_lookup_history(hidden, y, drafts_arr, accepted_count)
                 ntoks += 1
-                generated_token_ids.append(bonus_id)
+                _remember_generated(bonus_id)
                 yield bonus_id, lps[k_len], False
                 if ntoks >= max_tokens:
                     return
@@ -1113,7 +1134,7 @@ def mtp_generate_step(
                 verify_tok_id = int(residual_ids[accepted_count])
 
                 ntoks += 1
-                generated_token_ids.append(verify_tok_id)
+                _remember_generated(verify_tok_id)
                 yield verify_tok_id, lps[accepted_count], False
                 if ntoks >= max_tokens:
                     return
