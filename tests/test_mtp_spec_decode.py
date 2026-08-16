@@ -2674,6 +2674,11 @@ def test_prompt_lookup_requires_an_audited_model_capability(monkeypatch):
 
     from vllm_mlx.spec_decode.mtp.generator import _prompt_lookup_is_enabled
 
+    monkeypatch.delenv("RAPID_MLX_MTP_PROMPT_LOOKUP", raising=False)
+    assert not _prompt_lookup_is_enabled(
+        SimpleNamespace(mtp_prompt_lookup_supported=True)
+    )
+
     monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP", "1")
     assert not _prompt_lookup_is_enabled(SimpleNamespace())
     assert not _prompt_lookup_is_enabled(

@@ -60,7 +60,9 @@ def _prompt_lookup_is_enabled(model) -> bool:
     """Return whether this model may use audited prompt-copy speculation."""
     if not getattr(model, "mtp_prompt_lookup_supported", False):
         return False
-    return os.environ.get("RAPID_MLX_MTP_PROMPT_LOOKUP", "1").strip().lower() not in {
+    # Explicit opt-in until Qwen's hybrid SSM target path is proven
+    # token-lossless across the different verification chunk boundaries.
+    return os.environ.get("RAPID_MLX_MTP_PROMPT_LOOKUP", "0").strip().lower() not in {
         "0",
         "false",
         "off",
