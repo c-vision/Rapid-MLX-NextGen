@@ -38,6 +38,7 @@ adjustments.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Callable, Generator
 from functools import partial
@@ -52,6 +53,7 @@ import mlx.core as mx
 from .accept_counter import get_global_counter
 from .cache_patch import patch_arrays_cache_rollback_state
 from .draft_k_controller_v2 import DepthController, get_or_create_controller
+from .prompt_lookup import PromptLookupIndex
 
 patch_arrays_cache_rollback_state()
 
@@ -59,6 +61,22 @@ logger = logging.getLogger(__name__)
 
 # Match upstream PR #990 cache-clear cadence verbatim (``_CACHE_CLEAR_INTERVAL = 256``).
 _CACHE_CLEAR_INTERVAL = 256
+
+
+def _point_mass_residual_distribution(
+    target_logprobs: mx.array, proposed_tokens: mx.array
+) -> mx.array:
+    """Residual for a deterministic prompt-lookup proposal.
+
+    ``q`` is one at the copied token and zero elsewhere, so ``max(p-q, 0)``
+    is simply the shaped target distribution with that token removed.
+    """
+
+    target = mx.exp(target_logprobs)
+    token_mask = mx.arange(target.shape[-1])[None, :] != proposed_tokens.reshape(-1, 1)
+    residual = target * token_mask
+    total = residual.sum(axis=-1, keepdims=True)
+    return mx.where(total > 0, residual / mx.maximum(total, 1e-30), target)
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +223,7 @@ def mtp_generate_step(
     # caller still stops at EOS on its side); only the controller's
     # training window shrinks. ``None`` disables the holdout.
     stop_tokens: set[int] | None = None,
+    timing_stats: dict[str, float] | None = None,
 ) -> Generator[tuple[int, mx.array, bool], None, None]:
     """Generator that uses the model's native MTP head for spec decode.
 
@@ -253,6 +272,11 @@ def mtp_generate_step(
     xtc_special_tokens = xtc_special_tokens or []
     if accept_counter is None:
         accept_counter = get_global_counter()
+    if timing_stats is None:
+        timing_stats = {}
+
+    def _timing_add(name: str, elapsed: float) -> None:
+        timing_stats[name] = timing_stats.get(name, 0.0) + elapsed
 
     # ------------------------------------------------------------------
     # Chain-of-K drafter-hidden-cascade capability probe.
@@ -279,6 +303,8 @@ def mtp_generate_step(
     _mtp_supports_fused_greedy = callable(getattr(model, "mtp_greedy", None))
 
     y = prompt.astype(mx.uint32)
+    prompt_token_ids = [int(token) for token in y.tolist()]
+    generated_token_ids: list[int] = []
     prev_tokens: mx.array | None = None
 
     if prompt_cache is None:
@@ -293,6 +319,28 @@ def mtp_generate_step(
         mtp_cache = prompt_cache[n_main:] or model.make_mtp_cache()
 
     _is_greedy = temp == 0
+    _prompt_lookup_enabled = os.environ.get(
+        "RAPID_MLX_MTP_PROMPT_LOOKUP", "1"
+    ).strip().lower() not in {"0", "false", "off", "no"}
+    _prompt_lookup_max_tokens = max(
+        1, int(os.environ.get("RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_TOKENS", "24"))
+    )
+    _prompt_lookup_min_ngram = max(
+        2, int(os.environ.get("RAPID_MLX_MTP_PROMPT_LOOKUP_MIN_NGRAM", "8"))
+    )
+    _prompt_lookup_max_ngram = max(
+        _prompt_lookup_min_ngram,
+        int(os.environ.get("RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_NGRAM", "10")),
+    )
+    _prompt_lookup_index = (
+        PromptLookupIndex(
+            prompt_token_ids,
+            min_ngram=_prompt_lookup_min_ngram,
+            max_ngram=_prompt_lookup_max_ngram,
+        )
+        if _prompt_lookup_enabled
+        else None
+    )
 
     _filter_chain, _xtc_cell = (
         _make_sampler_chain(
@@ -328,16 +376,16 @@ def mtp_generate_step(
             masked = logprobs
             for f in _filter_chain:
                 masked = f(masked)
-            token = categorical_sampling(masked, temp)
             scaled = masked / temp
             lp_accept = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+            token = categorical_sampling(masked, temp)
         elif _is_greedy:
             token = mx.argmax(logprobs, axis=-1)
             lp_accept = logprobs
         else:
-            token = categorical_sampling(logprobs, temp)
             scaled = logprobs / temp
             lp_accept = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+            token = categorical_sampling(logprobs, temp)
         return token, logprobs, lp_accept
 
     def _clear_rollback():
@@ -592,6 +640,34 @@ def mtp_generate_step(
             mx.clear_cache()
         return yy
 
+    def _sync_prompt_lookup_history(
+        verify_hidden, base_token, lookup_drafts, accepted_count: int
+    ) -> None:
+        """Append only committed lookup positions to the MTP cache.
+
+        The normal MTP drafter advances this cache while proposing. Prompt
+        lookup skips the drafter, so after target verification we reconstruct
+        the equivalent history in one batched MTP call. Position ``i`` pairs
+        the target hidden after ``[base, d1, ... d{i-1}]`` with that same
+        source token; it never feeds the token being predicted.
+        """
+
+        if accepted_count <= 0:
+            return
+        started = time.perf_counter()
+        source_tokens = mx.concatenate(
+            [base_token, lookup_drafts[: accepted_count - 1]]
+        )[None]
+        lookup_logits = model.mtp_forward(
+            verify_hidden[:, :accepted_count, :], source_tokens, mtp_cache
+        )
+        quantize_cache_fn(mtp_cache)
+        mx.eval(
+            lookup_logits,
+            [c.state for c in mtp_cache if hasattr(c, "state")],
+        )
+        _timing_add("prompt_lookup_mtp_sync_seconds", time.perf_counter() - started)
+
     with mx.stream(generation_stream):
         y = _prefill(y, input_embeddings)
 
@@ -603,6 +679,7 @@ def mtp_generate_step(
     # otherwise it's a list of ``(tok, lp, accept_lp, xtc_draw)``
     # tuples of length K, one per chained MTP draft.
     pending_drafts: list | None = None
+    pending_is_prompt_lookup = False
 
     # ------------------------------------------------------------------
     # 0.9.13 PR-B: Ollama-style EV draft-K controller.
@@ -688,8 +765,35 @@ def mtp_generate_step(
         nonlocal pending_draft_ms
         _t0 = time.perf_counter()
         result = _step_mtp_chain(*args, **kwargs)
-        pending_draft_ms = (time.perf_counter() - _t0) * 1000.0
+        elapsed = time.perf_counter() - _t0
+        pending_draft_ms = elapsed * 1000.0
+        _timing_add("draft_seconds", elapsed)
         return result
+
+    def _prompt_lookup_drafts() -> list | None:
+        """Return point-mass prompt drafts, or ``None`` when no suffix matches."""
+
+        if _prompt_lookup_index is None:
+            return None
+        remaining = max_tokens - ntoks
+        if remaining <= 0:
+            return None
+        match = _prompt_lookup_index.propose(
+            generated_token_ids,
+            max_tokens=min(_prompt_lookup_max_tokens, remaining),
+        )
+        if match is None:
+            return None
+        extension = max(0, match.matched_suffix - _prompt_lookup_index.min_ngram)
+        confidence_ladder = (8, 12, 16, 24, 32)
+        confidence_cap = confidence_ladder[min(extension, len(confidence_ladder) - 1)]
+        proposed_tokens = match.tokens[:confidence_cap]
+        _timing_add("prompt_lookup_proposals", 1.0)
+        _timing_add("prompt_lookup_drafted_tokens", float(len(proposed_tokens)))
+        _timing_add("prompt_lookup_matched_suffix_tokens", float(match.matched_suffix))
+        return [
+            (mx.array(token, mx.uint32), None, None, None) for token in proposed_tokens
+        ]
 
     def _record_round(k_used: int, round_wall_ms: float, accepts: list[bool]) -> None:
         """Fold a round outcome into the controller (if enabled).
@@ -721,7 +825,9 @@ def mtp_generate_step(
             _record_round(0, round_wall_ms, [])
 
             ntoks += 1
-            yield main_tok.item(), main_lp, False
+            main_tok_id = int(main_tok.item())
+            generated_token_ids.append(main_tok_id)
+            yield main_tok_id, main_lp, False
             if ntoks >= max_tokens:
                 return
 
@@ -745,18 +851,24 @@ def mtp_generate_step(
             )
 
             hidden_at_main = hidden[:, -1:, :]
-            if next_k >= 1:
+            lookup_drafts = _prompt_lookup_drafts()
+            if lookup_drafts is not None:
+                pending_drafts = lookup_drafts
+                pending_is_prompt_lookup = True
+            elif next_k >= 1:
                 # Chain-of-K: generate ``next_k`` drafts cascaded via
                 # MTP. next_k==1 is the plain single-draft path.
                 d_toks, d_lps, d_alps, d_xtcs = _draft_chain_timed(
                     hidden_at_main, main_tok, prev_tokens, next_k
                 )
                 pending_drafts = list(zip(d_toks, d_lps, d_alps, d_xtcs))
+                pending_is_prompt_lookup = False
             else:
                 # Parking again: no draft. Next round enters this
                 # branch with ``pending_drafts is None`` and pays no
                 # drafter cost — the whole point of park.
                 pending_drafts = None
+                pending_is_prompt_lookup = False
             y = mx.array([main_tok.item()], mx.uint32)
         else:
             # -------------------------------------------------------
@@ -833,23 +945,29 @@ def mtp_generate_step(
                 # Vectorized per-position log-accept over the K draft
                 # positions with a shared draw ``u``.
                 v_alps = accept_lps[:k_len]  # (K, V)
-                d_alps_stack = mx.stack(draft_alps_arr)  # (K, V)
                 idx = drafts_i32.reshape(-1, 1)  # (K, 1)
                 v_at = mx.take_along_axis(v_alps, idx, axis=1).squeeze(-1)
-                d_at = mx.take_along_axis(d_alps_stack, idx, axis=1).squeeze(-1)
-                log_accept = v_at - d_at  # (K,)
+                if pending_is_prompt_lookup:
+                    # Prompt lookup is a deterministic (point-mass) proposal:
+                    # q(d)=1, hence log min(1, p(d)/q(d)) = log p(d).
+                    log_accept = v_at
+                    d_alps_stack = None
+                else:
+                    d_alps_stack = mx.stack(draft_alps_arr)  # (K, V)
+                    d_at = mx.take_along_axis(d_alps_stack, idx, axis=1).squeeze(-1)
+                    log_accept = v_at - d_at  # (K,)
                 accept_mask_arr = (log_accept >= 0) | (u < mx.exp(log_accept))
 
-                # Residual distribution at every position — sampled
-                # up-front so a reject at position i doesn't cost a
-                # second eval. Formula matches the prior per-reject code:
-                # ``max(p_target - p_draft, 0)``, falling back to
-                # ``p_target`` if the max clamp zeroed everything.
-                p_target = mx.exp(v_alps)  # (K, V)
-                p_draft = mx.exp(d_alps_stack)  # (K, V)
-                residual = mx.maximum(p_target - p_draft, 0.0)  # (K, V)
-                z = residual.sum(axis=-1, keepdims=True)  # (K, 1)
-                dist = mx.where(z > 0, residual, p_target)  # (K, V)
+                if pending_is_prompt_lookup:
+                    dist = _point_mass_residual_distribution(v_alps, drafts_i32)
+                else:
+                    # Existing MTP residual: max(p_target - p_draft, 0),
+                    # falling back to p_target if the clamp zeroed the row.
+                    p_target = mx.exp(v_alps)
+                    p_draft = mx.exp(d_alps_stack)
+                    residual = mx.maximum(p_target - p_draft, 0.0)
+                    z = residual.sum(axis=-1, keepdims=True)
+                    dist = mx.where(z > 0, residual, p_target)
                 residual_toks_arr = mx.random.categorical(mx.log(dist))
                 # Bonus already sampled per-position inside _step_backbone
                 # for temp>0 (categorical over target distro at position K).
@@ -858,7 +976,13 @@ def mtp_generate_step(
             # ------- SINGLE SYNC -------
             accepted_count = 0
             try:
+                _verify_sync_started = time.perf_counter()
                 mx.eval(toks, accept_mask_arr, residual_toks_arr, bonus_tok_arr, u)
+                _timing_add(
+                    "verify_sync_seconds",
+                    time.perf_counter() - _verify_sync_started,
+                )
+                _timing_add("verify_calls", 1.0)
 
                 # ------- Host-side read (all values already resident) -------
                 accept_flags = accept_mask_arr.tolist()
@@ -873,7 +997,12 @@ def mtp_generate_step(
                 # error fires before this round's fresh accept count is known,
                 # never let stale state leak into a fallback path: keep the
                 # committed ``y`` position and drop every uncommitted draft.
-                _rollback_verify_round(k_len - accepted_count, verify_size=k_len + 1)
+                if pending_is_prompt_lookup:
+                    _rollback_draft(k_len, verify_size=k_len + 1)
+                else:
+                    _rollback_verify_round(
+                        k_len - accepted_count, verify_size=k_len + 1
+                    )
                 raise
 
             # Bump attempts by K (one per draft position considered).
@@ -889,6 +1018,10 @@ def mtp_generate_step(
                     accepted_count += 1
                 else:
                     break
+            if pending_is_prompt_lookup:
+                _timing_add("prompt_lookup_accepted_tokens", float(accepted_count))
+                if accepted_count < k_len:
+                    _timing_add("prompt_lookup_rejections", 1.0)
 
             # -------- 0.9.13 PR-C: EOS holdout --------
             # When an accepted draft is a stop token, positions past it
@@ -911,7 +1044,13 @@ def mtp_generate_step(
                         break
 
             round_wall_ms = (time.perf_counter() - round_start_perf) * 1000.0
-            _record_round(k_len, round_wall_ms, accepts_for_record)
+            if pending_is_prompt_lookup:
+                # Lookup windows do not measure the MTP drafter's cost curve.
+                # Feeding K=8..24 into its K<=max_k controller would poison
+                # future depth choices.
+                pending_draft_ms = 0.0
+            else:
+                _record_round(k_len, round_wall_ms, accepts_for_record)
 
             # Emit the accepted drafts (capped at EOS position when set).
             for i in range(accepted_count):
@@ -922,7 +1061,9 @@ def mtp_generate_step(
                 # full-vocabulary draft logprob row.  The accepted token is
                 # also the target argmax, so its target row is the correct
                 # serving logprob surface and is already available here.
-                yield int(draft_ids[i]), lps[i] if draft_lp is None else draft_lp, True
+                draft_id = int(draft_ids[i])
+                generated_token_ids.append(draft_id)
+                yield draft_id, lps[i] if draft_lp is None else draft_lp, True
                 if ntoks >= max_tokens:
                     return
 
@@ -939,7 +1080,10 @@ def mtp_generate_step(
                 # All K drafts accepted → emit the bonus token
                 # (target's prediction one past the last draft).
                 _clear_rollback()
+                if pending_is_prompt_lookup:
+                    _sync_prompt_lookup_history(hidden, y, drafts_arr, accepted_count)
                 ntoks += 1
+                generated_token_ids.append(bonus_id)
                 yield bonus_id, lps[k_len], False
                 if ntoks >= max_tokens:
                     return
@@ -954,7 +1098,11 @@ def mtp_generate_step(
                 # (k_len - accepted_count) unaccepted drafts from the
                 # caches.
                 n_to_drop = k_len - accepted_count
-                _rollback_verify_round(n_to_drop, verify_size=k_len + 1)
+                if pending_is_prompt_lookup:
+                    _rollback_draft(n_to_drop, verify_size=k_len + 1)
+                    _sync_prompt_lookup_history(hidden, y, drafts_arr, accepted_count)
+                else:
+                    _rollback_verify_round(n_to_drop, verify_size=k_len + 1)
                 accept_counter.record_reject()
                 if logits_processors and prev_tokens is not None:
                     # Discard the ``n_to_drop`` rejected positions
@@ -965,6 +1113,7 @@ def mtp_generate_step(
                 verify_tok_id = int(residual_ids[accepted_count])
 
                 ntoks += 1
+                generated_token_ids.append(verify_tok_id)
                 yield verify_tok_id, lps[accepted_count], False
                 if ntoks >= max_tokens:
                     return
@@ -985,7 +1134,11 @@ def mtp_generate_step(
                 if _select_k and _controller is not None
                 else max_k_effective
             )
-            if next_k >= 1:
+            lookup_drafts = _prompt_lookup_drafts()
+            if lookup_drafts is not None:
+                pending_drafts = lookup_drafts
+                pending_is_prompt_lookup = True
+            elif next_k >= 1:
                 # Chain-carry: on all-accept the mtp_cache must
                 # advance by one extra position for the just-accepted
                 # LAST draft so the head's attention sees it before
@@ -1018,8 +1171,10 @@ def mtp_generate_step(
                     cache_commit=cache_commit,
                 )
                 pending_drafts = list(zip(d_toks, d_lps, d_alps, d_xtcs))
+                pending_is_prompt_lookup = False
             else:
                 pending_drafts = None
+                pending_is_prompt_lookup = False
 
         block = ntoks // _CACHE_CLEAR_INTERVAL
         if block > last_cache_block:

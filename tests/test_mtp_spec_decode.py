@@ -2398,6 +2398,20 @@ def test_generator_emits_first_token_from_backbone_then_draft():
     assert snap.tokens_saved == 1
 
 
+def test_prompt_lookup_point_mass_residual_removes_proposed_token():
+    from vllm_mlx.spec_decode.mtp.generator import (
+        _point_mass_residual_distribution,
+    )
+
+    target = mx.array([[0.6, 0.3, 0.1], [0.2, 0.5, 0.3]])
+    actual = _point_mass_residual_distribution(
+        mx.log(target), mx.array([0, 1], dtype=mx.int32)
+    )
+    expected = mx.array([[0.0, 0.75, 0.25], [0.4, 0.0, 0.6]])
+    mx.eval(actual)
+    assert bool(mx.allclose(actual, expected, atol=1e-6).item())
+
+
 def test_generator_fixed_k3_accepts_three_drafts_in_one_verify():
     """Fixed-depth mode must honor max_k=3 instead of silently using K=1."""
     from vllm_mlx.spec_decode.mtp.accept_counter import MTPAcceptCounter
@@ -2596,6 +2610,110 @@ def test_generator_rejection_path_does_not_count_as_accept():
     assert snap.attempts == 1
     assert snap.accepts == 0
     assert snap.tokens_saved == 0
+
+
+def test_generator_prompt_lookup_verifies_prompt_continuation(monkeypatch):
+    """A prompt suffix match bypasses MTP drafting but still uses target verify."""
+    from vllm_mlx.spec_decode.mtp.accept_counter import MTPAcceptCounter
+    from vllm_mlx.spec_decode.mtp.generator import mtp_generate_step
+
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP", "1")
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MIN_NGRAM", "2")
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_NGRAM", "2")
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_TOKENS", "2")
+
+    # The length-4 prompt prefills three positions first. Decode then emits
+    # 7, rejects MTP's 99 in favour of target token 8, and finds prompt suffix
+    # [7, 8] -> [20, 21]. The copied block is accepted only because the target
+    # independently predicts 20 and 21; 22 is its ordinary bonus token.
+    model = _CacheAdvancingQwen35Model(
+        backbone_outputs=[0, 0, 0, 7, 8, 0, 20, 21, 22],
+        mtp_outputs=[0, 0, 0, 99, 0, 0],
+    )
+    model_cache = _CountingKVCache()
+    mtp_cache = _CountingKVCache()
+    timing: dict[str, float] = {}
+
+    emitted = list(
+        mtp_generate_step(
+            mx.array([7, 8, 20, 21], dtype=mx.uint32),
+            model,
+            max_tokens=5,
+            max_k=1,
+            disable_auto_k=True,
+            prompt_cache=[model_cache, mtp_cache],
+            accept_counter=MTPAcceptCounter(),
+            timing_stats=timing,
+        )
+    )
+
+    assert [(token, drafted) for token, _lp, drafted in emitted] == [
+        (7, False),
+        (8, False),
+        (20, True),
+        (21, True),
+        (22, False),
+    ]
+    assert timing["prompt_lookup_proposals"] == 1
+    assert timing["prompt_lookup_drafted_tokens"] == 2
+    assert timing["prompt_lookup_mtp_sync_seconds"] >= 0
+    # Three prefill positions + one ordinary draft + two lookup-history sync
+    # positions. Prompt lookup itself consumed no MTP proposal.
+    assert model._mtp_cursor == 6
+    assert model_cache.trim_calls == [1]
+    assert mtp_cache.trim_calls == [1]
+    assert mtp_cache.offset == 5
+
+
+def test_generator_prompt_lookup_partial_reject_keeps_mtp_cache_aligned(
+    monkeypatch,
+):
+    """Only the accepted lookup prefix is appended to MTP history."""
+    from vllm_mlx.spec_decode.mtp.accept_counter import MTPAcceptCounter
+    from vllm_mlx.spec_decode.mtp.generator import mtp_generate_step
+
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP", "1")
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MIN_NGRAM", "2")
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_NGRAM", "2")
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_TOKENS", "2")
+
+    model = _CacheAdvancingQwen35Model(
+        # Lookup proposes [20, 21]. Target accepts 20, rejects 21 as 19.
+        backbone_outputs=[0, 0, 0, 7, 8, 0, 20, 19, 22],
+        mtp_outputs=[0, 0, 0, 77, 0],
+    )
+    model_cache = _CountingKVCache()
+    mtp_cache = _CountingKVCache()
+    timing: dict[str, float] = {}
+
+    emitted = list(
+        mtp_generate_step(
+            mx.array([7, 8, 20, 21], dtype=mx.uint32),
+            model,
+            max_tokens=4,
+            max_k=1,
+            disable_auto_k=True,
+            prompt_cache=[model_cache, mtp_cache],
+            accept_counter=MTPAcceptCounter(),
+            timing_stats=timing,
+        )
+    )
+
+    assert [(token, drafted) for token, _lp, drafted in emitted] == [
+        (7, False),
+        (8, False),
+        (20, True),
+        (19, False),
+    ]
+    assert timing["prompt_lookup_accepted_tokens"] == 1
+    assert timing["prompt_lookup_rejections"] == 1
+    # Target drops the ordinary rejected draft and then lookup's unaccepted
+    # tail. MTP drops only its ordinary draft: lookup never speculatively
+    # advanced that cache, and appends exactly one accepted history position.
+    assert model_cache.trim_calls == [1, 1]
+    assert mtp_cache.trim_calls == [1]
+    assert mtp_cache.offset == 4
+    assert model._mtp_cursor == 5
 
 
 def test_generator_runs_with_int4_quantized_kv_cache_kwargs():
