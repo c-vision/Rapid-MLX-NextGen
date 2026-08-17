@@ -1379,6 +1379,9 @@ def test_alias_profile_str_fields_are_explicitly_listed():
             "suffix_decoding_tier",  # one of VALID_SUFFIX_TIERS — non-routing data
             "dflash_draft_model",  # HF path for the spec-decode drafter
             "ddtree_draft_model",  # HF path for the DDTree/DFlash drafter
+            "mtp_draft_model",  # HF 'org/repo' path for the MTP drafter (#1987);
+            # validated as non-empty org/repo at JSON load in model_aliases.py,
+            # open-ended like the other *_draft_model paths, not a routing enum
             # PFlash long-prompt compression eligibility (#287). One of
             # VALID_PFLASH_TIERS ({"unknown", "verified"}). It IS a
             # routing decision in the sense that it flips the engine's
