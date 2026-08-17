@@ -43,6 +43,61 @@ _ANTHROPIC_REMOTE_ENV = (
     "CLAUDE_CODE_USE_FOUNDRY",
 )
 
+# Prefix of the err sentinel ``_agent_query`` returns when the agent CLI exits
+# non-zero. Sentinel-prefixed like the ``SKIP:`` one so classification stays a
+# property of the string the subprocess boundary produced, not a guess made
+# from the child's own prose.
+_EXIT_ERR_PREFIX = "EXIT:"
+
+# One separator character models actually use for thousands: comma, no-break
+# space, narrow no-break space, plain space.
+_DIGIT_GROUP_SEP = "[,\u00a0\u202f ]"
+
+
+def _grouped_number_pattern(digits: str) -> str:
+    """``777777`` → ``(?:777777|777<sep>777)`` — bare or thousands-grouped.
+
+    Only these two shapes. An earlier version stripped every separator that
+    sat between two digits before matching, which also turned malformed or
+    entirely different numbers ("7777 77") into the expected one — a fresh
+    way to pass without answering, which is the bug this module exists to
+    prevent (codex review round 2).
+    """
+    head = len(digits) % 3 or 3
+    groups = [digits[:head]] + [digits[i : i + 3] for i in range(head, len(digits), 3)]
+    return f"(?:{digits}|{_DIGIT_GROUP_SEP.join(groups)})"
+
+
+def _exact_number_re(digits: str, *, grouped: bool = False) -> re.Pattern[str]:
+    """Match `digits` as that number, not as a run of digits inside another.
+
+    Boundaries are numeric rather than merely non-digit: a leading sign or a
+    decimal point makes it a DIFFERENT number, so "-4", "0.4", "4.5",
+    "12.777777" and "777777.5" are wrong answers rather than sloppy right
+    ones. Word characters are excluded on both sides for the same reason —
+    the "4" in a request id like "a4b" is not an answer to anything. A
+    trailing period stays fine: that is a sentence ending, which is why only
+    ``.<digit>`` is rejected on the right.
+
+    A group separator with a digit on its far side is rejected as well, or
+    the tolerance for "777,777" would accept "4,000", "1,777777" and
+    "777777,000" — each a different number that merely starts or ends with
+    the expected digits.
+    """
+    body = _grouped_number_pattern(digits) if grouped else digits
+    return re.compile(
+        "(?<![\\w.\\-−–])"
+        + f"(?<!\\d{_DIGIT_GROUP_SEP})"
+        + body
+        + f"(?!{_DIGIT_GROUP_SEP}\\d)"
+        + "(?!\\w)(?!\\.\\d)"
+    )
+
+
+# `_test_plain_chat` asks for 2+2 over HTTP; see the comment at its assertion
+# for why its question stays easy while the e2e sibling's does not.
+_PLAIN_CHAT_EXPECTED_RE = _exact_number_re("4")
+
 
 # ---------------------------------------------------------------------------
 # Test result types
@@ -235,7 +290,21 @@ def _test_plain_chat(base_url: str, model_id: str) -> TestResult:
             [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
         )
         content = r["choices"][0]["message"]["content"]
-        if "4" in content:
+        # The number 4, not the digit anywhere in the string: "1234", "0.4",
+        # "-4", "4.5" and a request id ending in 4 are none of them answers to
+        # "what is 2+2" (#1981, sibling of the `_test_e2e_chat` false green).
+        # Same matcher as the e2e probe so the two cannot drift apart.
+        #
+        # The question itself stays 2+2, unlike its e2e sibling, and the
+        # threat models are why. This grades ``choices[0].message.content``
+        # from a response that already passed ``raise_for_status`` — a
+        # parsed answer field, not the raw stdout+stderr of a CLI that may
+        # never have reached the server, so there is no error prose here to
+        # be mistaken for an answer. That leaves this the cheapest possible
+        # probe of "the server answers coherently", which is what makes it
+        # a useful control: when e2e_chat fails and plain_chat passes, the
+        # fault is in the agent CLI path, not the model.
+        if _PLAIN_CHAT_EXPECTED_RE.search(content):
             return TestResult(
                 "plain_chat", TestStatus.PASS, duration_ms=(time.time() - t0) * 1000
             )
@@ -733,6 +802,41 @@ E2E_FIRST_LINE_TOKEN = "rapid-mlx-e2e-first-line-sentinel"
 E2E_FIRST_LINE = f"{E2E_FIRST_LINE_TOKEN} = true"
 
 
+# `_test_e2e_chat` grades whatever the agent CLI wrote to stdout+stderr, and
+# that text is not always an answer — a CLI that never reached the server
+# still prints something.  The old probe asked for 2+2 and accepted a bare
+# "4" anywhere in that text, so a pure launch failure reported PASS:
+#
+#     dsh: request failed: connect ECONNREFUSED 127.0.0.1:8477
+#                                                        ^ this "4"
+#
+# An HTTP 404, a timestamp, a token count or a version string does it just as
+# well (#1981).  The expected answer therefore has to be a value that cannot
+# plausibly fall out of a failure message — the same reasoning that made
+# `_test_e2e_file_read` demand a sentinel instead of the word "build".
+#
+# Why an arithmetic result rather than a sentinel word: the expected token must
+# NOT appear in the prompt, or every CLI that echoes its prompt (`codex exec`
+# does) becomes a new false green.  The operands below are chosen so that no
+# column carries — this is as easy as multi-digit arithmetic gets, so a small
+# quantized model is not being asked for a new capability — while the answer is
+# longer than any port number (max 65535) or status code, and is accepted only
+# as a standalone number so it can never be a fragment of an epoch, a request
+# id or a hash.
+E2E_CHAT_QUERY = "What is 123456 + 654321? Reply with just the number."
+E2E_CHAT_EXPECTED = "777777"
+# Grouped as well as bare: a model that writes "777,777" has answered the
+# question. `_exact_number_re` explains the boundaries.
+_E2E_CHAT_EXPECTED_RE = _exact_number_re(E2E_CHAT_EXPECTED, grouped=True)
+
+
+def _e2e_chat_answered(out: str | None) -> bool:
+    """True only when the agent came back with the expected sum itself."""
+    if not out:
+        return False
+    return bool(_E2E_CHAT_EXPECTED_RE.search(out))
+
+
 @contextlib.contextmanager
 def _e2e_workspace():
     """A throwaway directory for the agent to work in.
@@ -971,6 +1075,52 @@ def _agent_query(
                 f"SKIP: agent refused init — served model's context window "
                 f"is below the harness minimum{detail}"
             )
+        # The one signal the OS gives us that the run did not complete. A CLI
+        # that never reached the server prints its complaint and exits
+        # non-zero; without this the caller sees only the complaint text and
+        # grades it as if it were an answer (#1981).
+        #
+        # Deliberately a SOFT err — carried alongside the output, not instead
+        # of it — because exit status can neither pass nor fail a test on its
+        # own here:
+        #   * dsh exits 0 even when it fails outright (a bad provider prints
+        #     NO_ADAPTER and still returns 0; see its profile known_issues),
+        #     so a zero exit proves nothing;
+        #   * an agent may answer correctly and then exit non-zero on its way
+        #     out, which #1598 already established is not grounds for failing
+        #     a test whose evidence is on stdout.
+        # Capability evidence therefore still wins; this only decides what an
+        # evidence-LESS run gets called, and turns a silent "wrong answer"
+        # FAIL into an ERROR naming the launch failure.
+        #
+        # But a process that reported failure only gets credit for what it put
+        # on STDOUT: the returned output narrows to ``proc.stdout`` so a
+        # diagnostic that quotes the expected evidence back at us ("expected
+        # 777777; request failed", printed on stderr) cannot be mistaken for
+        # the answer and re-open this very bug from the other side. Every agent
+        # CLI the profiles drive writes its answer to stdout and its complaints
+        # to stderr; the failure text is not discarded, it is summarized into
+        # the err below, which is what gets reported.
+        #
+        # The TIMEOUT branch below applies the same rule, for the same reason:
+        # both are runs that misbehaved, and it would be incoherent for a hung
+        # CLI to get credit for stderr text a failed one does not.
+        if proc.returncode != 0:
+            tail = " ".join(output.split())[-160:]
+            detail = f" — {tail}" if tail else ""
+            return proc.stdout, (
+                f"{_EXIT_ERR_PREFIX}{proc.returncode} agent CLI exited non-zero{detail}"
+            )
+        # A CLEAN exit keeps the combined capture, and that boundary is
+        # deliberate. Narrowing every run to stdout was considered (codex
+        # review round 3) and declined: it would change grading on the normal
+        # path for all 13 profiles to defend against a failure message that
+        # contains the expected six-digit sum, which a CLI has no way to know.
+        # The cost is not hypothetical — the Hermes binary writes user-facing
+        # text to STDERR (see the hard-wrap note in the refusal detection
+        # above), so stdout-only grading could fail a Tier-1 profile that
+        # answered correctly. Suppressing evidence is only justified once the
+        # run itself has reported that it went wrong.
         return output, None
     except subprocess.TimeoutExpired as exc:
         # A headless agent can finish the capability under test, print the
@@ -983,7 +1133,12 @@ def _agent_query(
                 return ""
             return value.decode(errors="replace") if isinstance(value, bytes) else value
 
-        partial = _timeout_text(exc.stdout) + _timeout_text(exc.stderr)
+        # STDOUT only, exactly as on the non-zero-exit path: a hung CLI's
+        # diagnostics ("ERROR: expected 777777", "could not run echo <marker>")
+        # are not evidence that it did the work, and this err is one of the two
+        # that lose to evidence. Nothing is lost from the report — the timeout
+        # err carries no child text in either form.
+        partial = _timeout_text(exc.stdout)
         return partial or None, "TIMEOUT"
     except Exception as e:
         return None, str(e)
@@ -992,8 +1147,13 @@ def _agent_query(
 def _err_to_status(err: str | None) -> TestStatus:
     """Map an ``_agent_query`` err string to the right TestStatus.
 
-    Three buckets, in priority order:
+    Four buckets, in priority order:
 
+    - ``"EXIT:"`` prefix → ERROR. The agent CLI exited non-zero (#1981).
+      Checked FIRST because this err carries a tail of the child's own
+      output, and that text is not ours: a child that printed "command
+      not found" or "model not found" would otherwise be misrouted to
+      SKIP by the substring rule below and vanish from the report.
     - ``"not found"`` → SKIP. Harness binary isn't installed; we can't
       run the e2e gate and shouldn't pretend to.
     - ``"SKIP:"`` prefix → SKIP. ``_agent_query`` propagates this for
@@ -1003,11 +1163,42 @@ def _err_to_status(err: str | None) -> TestStatus:
     """
     if not err:
         return TestStatus.PASS  # caller shouldn't pass empty err but stay safe
+    if err.startswith(_EXIT_ERR_PREFIX):
+        return TestStatus.ERROR
     if "not found" in err:
         return TestStatus.SKIP
     if err.startswith("SKIP:"):
         return TestStatus.SKIP
     return TestStatus.ERROR
+
+
+def _err_loses_to_evidence(err: str | None) -> bool:
+    """True for errs that must not overrule evidence the agent already gave.
+
+    An agent can do the work, print the proof, and only *then* misbehave:
+    never terminate (#1598) or exit non-zero on its way out (#1981). Both
+    describe how the process ended, not whether the capability worked, so
+    a caller holding the expected evidence keeps its PASS. Every other err
+    — binary missing, init refusal, server error, crash — means the output
+    cannot be trusted at all and wins outright.
+
+    What counts as evidence is narrowed at the source: on a non-zero exit or
+    a timeout ``_agent_query`` returns stdout only, so a failure diagnostic
+    quoting the expected token back at us on stderr cannot buy a PASS here.
+
+    Callers may only use this where their evidence cannot be produced by
+    echoing the prompt — `_test_e2e_terminal` deliberately does not.
+    """
+    return bool(err) and (err == "TIMEOUT" or err.startswith(_EXIT_ERR_PREFIX))
+
+
+def _evidence_note(err: str | None, evidence: str) -> str:
+    """Message for a PASS whose CLI misbehaved after producing the evidence."""
+    if err == "TIMEOUT":
+        return f"{evidence} observed; agent CLI did not terminate before timeout"
+    if err and err.startswith(_EXIT_ERR_PREFIX):
+        return f"{evidence} observed; {err}"
+    return ""
 
 
 def _test_e2e_chat(
@@ -1040,12 +1231,16 @@ def _test_e2e_chat(
         out, err = _agent_query(
             binary,
             query_cmd,
-            "What is 2+2? Reply with just the number.",
+            E2E_CHAT_QUERY,
             timeout,
             workdir,
             env_overrides,
         )
-    if err:
+    # Evidence first, exactly as `_test_e2e_file_read` does: an agent that
+    # answered and then failed to terminate (#1598) or exited non-zero
+    # (#1981) still demonstrated the capability under test.
+    answered = _e2e_chat_answered(out)
+    if err and not (_err_loses_to_evidence(err) and answered):
         status = _err_to_status(err)
         return TestResult(
             "e2e_chat",
@@ -1054,18 +1249,19 @@ def _test_e2e_chat(
             message=err,
             category="e2e",
         )
-    if "4" in (out or ""):
+    if answered:
         return TestResult(
             "e2e_chat",
             TestStatus.PASS,
             duration_ms=(time.time() - t0) * 1000,
+            message=_evidence_note(err, "answer"),
             category="e2e",
         )
     return TestResult(
         "e2e_chat",
         TestStatus.FAIL,
         duration_ms=(time.time() - t0) * 1000,
-        message=f"Expected '4': {(out or '')[:80]}",
+        message=f"Expected '{E2E_CHAT_EXPECTED}': {(out or '')[:80]}",
         category="e2e",
     )
 
@@ -1108,7 +1304,9 @@ def _test_e2e_file_read(
             workdir,
             env_overrides,
         )
-    if err and not (err == "TIMEOUT" and E2E_FIRST_LINE_TOKEN in (out or "")):
+    if err and not (
+        _err_loses_to_evidence(err) and E2E_FIRST_LINE_TOKEN in (out or "")
+    ):
         status = _err_to_status(err)
         return TestResult(
             "e2e_file_read",
@@ -1124,11 +1322,7 @@ def _test_e2e_file_read(
             "e2e_file_read",
             TestStatus.PASS,
             duration_ms=(time.time() - t0) * 1000,
-            message=(
-                "file-read evidence observed; agent CLI did not terminate before timeout"
-                if err == "TIMEOUT"
-                else ""
-            ),
+            message=_evidence_note(err, "file-read evidence"),
             category="e2e",
         )
     return TestResult(
@@ -1177,6 +1371,17 @@ def _test_e2e_terminal(
             workdir,
             env_overrides,
         )
+    # NO evidence carve-out here, unlike the chat and file-read probes, and
+    # the difference is the marker itself: it is handed to the agent IN THE
+    # PROMPT ("Run 'echo <marker>'"), so any CLI that echoes its prompt prints
+    # it without having run anything. That is fine while the run is otherwise
+    # healthy — a healthy run that echoed the prompt and stopped would also
+    # have to survive `err is None` — but it is exactly what a broken CLI does
+    # on its way out, so letting a marker overrule a crash or a hang would
+    # hand a PASS to an agent that never opened a shell (codex review round 4).
+    # Chat and file-read can afford the carve-out because their evidence — a
+    # derived sum, a sentinel that lives only in the workspace file — cannot
+    # be produced by echoing the question.
     if err:
         status = _err_to_status(err)
         return TestResult(
