@@ -241,7 +241,69 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Benchmark fixed --mtp-max-k instead of the adaptive controller.",
     )
+    parser.add_argument(
+        "--require-lossless",
+        action="store_true",
+        help=(
+            "Fail unless every greedy MTP run has the exact same emitted-token "
+            "hash as its paired autoregressive run. Requires --temp 0 and a "
+            "baseline condition."
+        ),
+    )
+    parser.add_argument(
+        "--min-speedup",
+        type=float,
+        default=None,
+        help=(
+            "Fail unless pooled MTP throughput is at least this multiple of "
+            "the paired autoregressive baseline (for example 1.10)."
+        ),
+    )
     return parser.parse_args()
+
+
+def _evaluate_landing_gates(
+    results: dict[str, list[RunResult]],
+    *,
+    expected_pairs: int,
+    require_lossless: bool,
+    min_speedup: float | None,
+    speedup: float | None,
+) -> dict[str, Any]:
+    """Evaluate correctness/performance gates without hiding missing runs."""
+
+    baseline = {(r.run_idx, r.prompt_idx): r for r in results["none"]}
+    mtp = {(r.run_idx, r.prompt_idx): r for r in results["mtp"]}
+    paired_keys = sorted(baseline.keys() & mtp.keys())
+    mismatches = [
+        {"run_idx": key[0], "prompt_idx": key[1]}
+        for key in paired_keys
+        if baseline[key].token_sha256 != mtp[key].token_sha256
+    ]
+    complete = (
+        len(baseline) == expected_pairs
+        and len(mtp) == expected_pairs
+        and len(paired_keys) == expected_pairs
+    )
+    lossless_passed = (not require_lossless) or (complete and not mismatches)
+    speedup_passed = (not min_speedup) or (
+        complete and speedup is not None and speedup >= min_speedup
+    )
+    return {
+        "passed": lossless_passed and speedup_passed,
+        "complete_pairs": len(paired_keys),
+        "expected_pairs": expected_pairs,
+        "lossless": {
+            "required": require_lossless,
+            "passed": lossless_passed,
+            "mismatches": mismatches,
+        },
+        "performance": {
+            "minimum_speedup": min_speedup,
+            "observed_speedup": speedup,
+            "passed": speedup_passed,
+        },
+    }
 
 
 # Map from common base aliases / HF paths to their matching MTP sidecar.
@@ -493,6 +555,15 @@ def _summarize(
 def main() -> int:
     args = _parse_args()
 
+    if args.require_lossless and args.temp != 0:
+        raise SystemExit("--require-lossless requires --temp 0")
+    if (args.require_lossless or args.min_speedup is not None) and args.mtp_only:
+        raise SystemExit(
+            "landing gates require the paired AR baseline; remove --mtp-only"
+        )
+    if args.min_speedup is not None and args.min_speedup <= 0:
+        raise SystemExit("--min-speedup must be greater than zero")
+
     if args.dry_run:
         plan = _planned_matrix(args)
         if args.format == "markdown":
@@ -599,6 +670,13 @@ def main() -> int:
     mtp_summary = _summarize(
         "mtp", all_results["mtp"], baseline_summary.pooled_tok_per_sec
     )
+    gates = _evaluate_landing_gates(
+        all_results,
+        expected_pairs=args.runs * n_prompts,
+        require_lossless=args.require_lossless,
+        min_speedup=args.min_speedup,
+        speedup=mtp_summary.speedup_vs_baseline,
+    )
 
     out = {
         "model": args.model,
@@ -608,6 +686,7 @@ def main() -> int:
         "top_k": args.top_k,
         "seed": args.seed,
         "summaries": [asdict(baseline_summary), asdict(mtp_summary)],
+        "landing_gates": gates,
         "raw_runs": [asdict(r) for c in all_results.values() for r in c],
     }
     if args.format == "markdown":
@@ -625,6 +704,12 @@ def main() -> int:
             )
     else:
         print(json.dumps(out, indent=2))
+    if not gates["passed"]:
+        print(
+            "[bench_spec_decode_mtp] landing gate FAILED: " + json.dumps(gates),
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 
