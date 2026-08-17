@@ -4,9 +4,16 @@ Run the official [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harn
 against a local Rapid-MLX server. Rapid uses Harness's generic
 `openai-completions` provider; it does not impersonate the DeepSeek cloud API.
 
-> DeepSeek currently labels Harness a developer preview. Rapid pins the
-> configuration contract exercised by `@deepseek-ai/dsh@0.1.0-rc.6`; review
-> release notes before upgrading across incompatible preview releases.
+**DeepSeek Harness is a Tier-1 agent.** That is a release gate, not a badge:
+every version bump runs `dsh` through a real multi-step bug-fix task against a
+local 35B model in `tests/integrations/agent_smoke.sh` and asserts the repo's
+own test suite goes green afterwards. If `dsh` regresses, the release cannot
+tag or publish. See the [agent matrix](matrix.md#agent-deepseek-harness).
+
+> DeepSeek currently labels Harness a developer preview. Rapid tracks the
+> configuration contract exercised by `@deepseek-ai/dsh@0.1.0-rc.7` (verified
+> 2026-08-17; the rc.6 → rc.7 upgrade did not change the provider schema).
+> Review release notes before upgrading across incompatible preview releases.
 
 ## Setup
 
