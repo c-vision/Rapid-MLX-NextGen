@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import stat
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -290,3 +293,142 @@ def test_dsh_reports_old_node_before_opaque_plugin_boot_failure():
     assert output is None
     assert "Node 22.15+" in error
     assert run.call_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# reasoningEfforts must describe the served model, not every model.
+# --------------------------------------------------------------------------- #
+#
+# DSH renders a reasoning-effort control from this block. Advertising the
+# off/low/medium/high ladder unconditionally gave users a selector that did
+# nothing on a model with no reasoning parser. pi-ai accepts
+# ``reasoningEfforts: false`` for exactly that case.
+
+
+def _models_payload(entries: list[dict]) -> bytes:
+    return json.dumps({"object": "list", "data": entries}).encode()
+
+
+@contextlib.contextmanager
+def _serving(entries: list[dict]):
+    """Run a throwaway /v1/models server and yield its base_url.
+
+    A real socket rather than a mocked urlopen: the thing under test is
+    "what do we conclude from what the server actually sent", and a mock
+    would let a wrong field name pass.
+    """
+    payload = _models_payload(entries)
+
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler API
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args):  # keep pytest output clean
+            return
+
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_port}/v1"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=5)
+
+
+def _dsh_model_entry(plan) -> dict:
+    return plan.after["llm-pi-ai"]["providers"]["rapid-mlx"]["models"][0]
+
+
+def _dsh_provider(plan) -> dict:
+    return plan.after["llm-pi-ai"]["providers"]["rapid-mlx"]
+
+
+def test_reasoning_support_is_three_state(tmp_path, monkeypatch):
+    """True / False / None must be distinguishable at the source."""
+    from vllm_mlx.agents.adapter import fetch_reasoning_support
+
+    with _serving([{"id": "m", "reasoning_parser": "qwen3"}]) as url:
+        assert fetch_reasoning_support(url, "m") is True
+    # Explicit null — the model has no reasoning parser.
+    with _serving([{"id": "m", "reasoning_parser": None}]) as url:
+        assert fetch_reasoning_support(url, "m") is False
+    # Key absent — a rapid-mlx too old to report it. NOT the same as False.
+    with _serving([{"id": "m"}]) as url:
+        assert fetch_reasoning_support(url, "m") is None
+    # Multi-model serve with no exact match must not describe another model.
+    with _serving(
+        [{"id": "a", "reasoning_parser": None}, {"id": "b", "reasoning_parser": None}]
+    ) as url:
+        assert fetch_reasoning_support(url, "missing") is None
+    # Unreachable server.
+    assert fetch_reasoning_support("http://127.0.0.1:9/v1", "m") is None
+
+
+def test_dsh_setup_declines_reasoning_for_a_model_without_a_parser(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    plan = build_setup_plan(
+        "dsh",
+        "http://127.0.0.1:8152/v1",
+        "no-think-1b",
+        65536,
+        supports_reasoning=False,
+    )
+    assert _dsh_model_entry(plan)["reasoningEfforts"] is False
+    assert _dsh_provider(plan)["compat"]["supportsReasoningEffort"] is False
+
+
+def test_dsh_setup_keeps_the_ladder_for_a_reasoning_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    plan = build_setup_plan(
+        "dsh",
+        "http://127.0.0.1:8152/v1",
+        "qwen3.6-35b-8bit",
+        65536,
+        supports_reasoning=True,
+    )
+    assert _dsh_model_entry(plan)["reasoningEfforts"]["off"] == "none"
+    assert _dsh_provider(plan)["compat"]["supportsReasoningEffort"] is True
+
+
+def test_dsh_setup_does_not_downgrade_on_unknown(tmp_path, monkeypatch):
+    """``None`` means we could not find out — never delete a real control on a guess."""
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    for unknown in (None,):
+        plan = build_setup_plan(
+            "dsh", "http://127.0.0.1:8152/v1", "m", 65536, supports_reasoning=unknown
+        )
+        assert _dsh_model_entry(plan)["reasoningEfforts"]["high"] == "high"
+        assert _dsh_provider(plan)["compat"]["supportsReasoningEffort"] is True
+    # Default argument must behave the same as an explicit None.
+    plan = build_setup_plan("dsh", "http://127.0.0.1:8152/v1", "m", 65536)
+    assert _dsh_model_entry(plan)["reasoningEfforts"]["high"] == "high"
+
+
+def test_dsh_declined_reasoning_survives_yaml_round_trip(tmp_path, monkeypatch):
+    """``false`` must reach the file as a YAML boolean, not the string 'False'.
+
+    pi-ai validates ``reasoningEfforts`` as ``false | {level: wire}``; a
+    quoted string would fail its schema and DSH would refuse the provider.
+    """
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    plan = build_setup_plan(
+        "dsh",
+        "http://127.0.0.1:8000/v1",
+        "no-think-1b",
+        65536,
+        supports_reasoning=False,
+    )
+    apply_setup_plan(plan)
+    written = yaml.safe_load((tmp_path / "settings.yaml").read_text())
+    entry = written["llm-pi-ai"]["providers"]["rapid-mlx"]["models"][0]
+    assert entry["reasoningEfforts"] is False
+    raw = (tmp_path / "settings.yaml").read_text()
+    assert "reasoningEfforts: false" in raw, raw

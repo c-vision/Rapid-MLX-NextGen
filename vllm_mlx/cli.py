@@ -7902,12 +7902,23 @@ def agents_command(args):
                 verify_server,
             )
 
+            # DSH renders a reasoning-effort control from what we write, so
+            # it needs the model's real capability, not a blanket claim.
+            # Scoped to the one profile that consumes it — the other
+            # first-class flows don't, and this is a second HTTP round trip.
+            supports_reasoning = None
+            if profile.name == "deepseek-harness":
+                from vllm_mlx.agents.adapter import fetch_reasoning_support
+
+                supports_reasoning = fetch_reasoning_support(base_url, model_id)
+
             try:
                 plan = build_setup_plan(
                     profile.name,
                     base_url,
                     model_id,
                     context_length=context_length,
+                    supports_reasoning=supports_reasoning,
                 )
             except (OSError, ValueError) as exc:
                 print(f"\n  {profile.display_name} setup failed: {exc}\n")

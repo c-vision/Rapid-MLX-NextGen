@@ -139,6 +139,7 @@ def build_setup_plan(
     base_url: str,
     model: str,
     context_length: int | None = None,
+    supports_reasoning: bool | None = None,
 ) -> SetupPlan:
     """Build a side-effect-free setup plan for a supported client."""
     if agent in {"claude", "claude-code"}:
@@ -163,6 +164,37 @@ def build_setup_plan(
         credentials_path = path.parent / ".credentials.yaml"
         credentials_before = _load_yaml_mapping(credentials_path)
         context = context_length if context_length and context_length > 0 else 32768
+        # Report the model's ACTUAL reasoning capability rather than
+        # asserting the graded ladder for everything we serve.
+        #
+        # Harness renders a reasoning-effort control from this block, so a
+        # model with no reasoning parser used to get an off/low/medium/high
+        # selector that changed nothing the user could observe. pi-ai
+        # accepts ``reasoningEfforts: false`` for exactly this case
+        # ("set false for a non-reasoning model").
+        #
+        # Only a definite ``False`` downgrades. ``None`` means we could not
+        # find out (server unreachable, model not listed, or a rapid-mlx too
+        # old to report the field), and silently deleting a working control
+        # on a guess is worse than the cosmetic over-claim this fixes — see
+        # ``fetch_reasoning_support`` for why the three states are kept apart.
+        reasoning_capable = supports_reasoning is not False
+        model_entry: dict[str, Any] = {
+            "id": model,
+            "name": f"{model} (Rapid-MLX)",
+            "contextWindow": context,
+            "maxTokens": 8192,
+            "reasoningEfforts": (
+                {
+                    "off": "none",
+                    "low": "low",
+                    "medium": "medium",
+                    "high": "high",
+                }
+                if reasoning_capable
+                else False
+            ),
+        }
         patch = {
             "llm-pi-ai": {
                 "providers": {
@@ -173,21 +205,8 @@ def build_setup_plan(
                         "baseURL": base_url.rstrip("/"),
                         "defaultContextWindow": context,
                         "defaultMaxTokens": 8192,
-                        "compat": {"supportsReasoningEffort": True},
-                        "models": [
-                            {
-                                "id": model,
-                                "name": f"{model} (Rapid-MLX)",
-                                "contextWindow": context,
-                                "maxTokens": 8192,
-                                "reasoningEfforts": {
-                                    "off": "none",
-                                    "low": "low",
-                                    "medium": "medium",
-                                    "high": "high",
-                                },
-                            }
-                        ],
+                        "compat": {"supportsReasoningEffort": reasoning_capable},
+                        "models": [model_entry],
                     }
                 }
             },

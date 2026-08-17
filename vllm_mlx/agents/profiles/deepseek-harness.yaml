@@ -7,6 +7,14 @@ stars: 1000
 # Its generic pi-ai adapter is the correct route for Rapid-MLX: using the
 # native deepseek-official adapter would require a fake API key and claim the
 # local endpoint has the official service's model/capacity contract.
+#
+# NOTE: `agents dsh --setup` does NOT render this template — it goes through
+# the first-class plan/apply flow in ``vllm_mlx/agents/setup.py``, which also
+# adapts ``reasoningEfforts`` to the served model's real capability (a model
+# with no reasoning parser gets ``false``, not the ladder below). This
+# template is what ``agents dsh --test`` writes into its throwaway home, where
+# the model is always a reasoning-capable one, so the ladder is correct there.
+# Change both if you change the provider contract.
 config:
   type: yaml
   path: "~/.dsh/settings.yaml"
