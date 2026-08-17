@@ -4340,7 +4340,7 @@ def _run_submit_flow(
     # thread executor spins up. Without this, ``mlx_lm.load`` runs inside
     # the executor and delegates to ``huggingface_hub.snapshot_download``
     # directly, skipping the mirror entirely (bug: --submit diverged from
-    # ``serve``/``chat``/``pull``/``jlens`` which all prefetch via the
+    # ``serve``/``chat``/``pull`` which all prefetch via the
     # mirror first). Running this in the main thread — before the executor
     # is created — surfaces the mirror's per-file progress lines to the
     # contributor's terminal; if we deferred to the executor, the tqdm
@@ -4631,7 +4631,7 @@ def bench_command(args):
     # heavy bench boot. Without this, ``bench`` falls into ``mlx_lm.load``
     # → ``huggingface_hub.snapshot_download`` directly and skips the
     # mirror entirely, wasting the user's bandwidth and hitting HF rate
-    # limits (bug: bench diverged from ``serve``/``chat``/``pull``/``jlens``
+    # limits (bug: bench diverged from ``serve``/``chat``/``pull``
     # which all prefetch via the mirror first).
     # ``_ensure_model_downloaded`` is a no-op on local paths and on
     # fully-cached repos and swallows mirror errors gracefully (mlx_lm.load
@@ -9968,39 +9968,6 @@ Examples:
         help="Model alias (e.g. qwen3.5-4b-4bit) or HF repo (e.g. mlx-community/SmolLM3-3B-4bit)",
     ).completer = alias_completer
 
-    # Jlens command — read a model's internal "draft" with the Jacobian lens
-    jlens_parser = subparsers.add_parser(
-        "jlens",
-        help="Read a model's internal thoughts across layers (Jacobian lens)",
-    )
-    jlens_parser.add_argument(
-        "prompt",
-        help='Prompt to trace, e.g. "why is the sky blue"',
-    )
-    jlens_parser.add_argument(
-        "--model",
-        "-m",
-        default="qwen3-1.7b",
-        help="Model alias or HF repo to inspect (default: qwen3-1.7b)",
-    ).completer = alias_completer
-    jlens_parser.add_argument(
-        "--step",
-        type=int,
-        default=2,
-        help="Probe every Nth layer (default: 2; use 1 for full-resolution)",
-    )
-    jlens_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit machine-readable JSON instead of the rendered view",
-    )
-    jlens_parser.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Show full per-layer readouts and the answer's rank trajectory",
-    )
-
     # Agents command
     agents_parser = subparsers.add_parser(
         "agents", help="List, configure, and test agent integrations"
@@ -10482,15 +10449,7 @@ def main():
             print(f"\n  Error: {exc}", file=sys.stderr)
             raise SystemExit(1) from None
         if resolved != args.model:
-            # Keep stdout pure JSON for machine-readable modes (jlens --json);
-            # the human-facing alias banner goes to stderr there.
-            _alias_stream = (
-                sys.stderr
-                if getattr(args, "command", None) == "jlens"
-                and getattr(args, "json", False)
-                else sys.stdout
-            )
-            print(f"  Alias: {args.model} → {resolved}", file=_alias_stream)
+            print(f"  Alias: {args.model} → {resolved}")
             args._original_alias = args.model
             args.model = resolved
         elif "/" not in args.model and not os.path.exists(args.model):
@@ -10576,7 +10535,7 @@ def main():
     # NOT inherit the bypass. Codex round-2 BLOCKING #2.
     _chat_spawn_child = os.environ.pop("RAPID_MLX_CHAT_SPAWN", "") == "1"
 
-    _GATED_COMMANDS = {"chat", "run", "serve", "pull", "bench", "jlens"}
+    _GATED_COMMANDS = {"chat", "run", "serve", "pull", "bench"}
     if (
         getattr(args, "command", None) in _GATED_COMMANDS
         and hasattr(args, "model")
@@ -10669,10 +10628,6 @@ def main():
         chat_command(args)
     elif args.command == "info":
         info_command(args)
-    elif args.command == "jlens":
-        from vllm_mlx.jlens import jlens_command
-
-        jlens_command(args)
     elif args.command == "agents":
         agents_command(args)
     elif args.command == "connect":

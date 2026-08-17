@@ -311,7 +311,7 @@ rapid-mlx --help                    # top-level command list
 rapid-mlx <subcommand> --help       # per-subcommand flags
 ```
 
-Covers chat, serve, share, agents (setup / test), bench, models, pull, rm, ps, info, doctor, upgrade, telemetry, launch, and jlens.
+Covers chat, serve, share, agents (setup / test), bench, models, pull, rm, ps, info, doctor, upgrade, telemetry, and launch.
 
 → [Full CLI reference with every flag](https://rapidmlx.com/docs/cli.html)
 
