@@ -92,6 +92,13 @@ register_spec_decoder(
 )
 register_spec_decoder(
     SpecDecoderPlugin(
+        method="mtp-fast",
+        description="Throughput-oriented MTP via the mlx-vlm single-user bridge",
+        config_enabled=True,
+    )
+)
+register_spec_decoder(
+    SpecDecoderPlugin(
         method="suffix",
         description=("Explicit suffix / n-gram speculation for high-overlap workloads"),
         config_enabled=True,

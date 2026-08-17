@@ -65,6 +65,18 @@ def test_parse_dspark_speculative_config_accepts_native_depth() -> None:
     assert cfg.num_speculative_tokens == 5
 
 
+def test_parse_mtp_fast_config_accepts_sidecar_and_short_output_gate() -> None:
+    cfg = parse_speculative_config(
+        '{"method":"mtp-fast","model":"mlx-community/Qwen3.8-27B-MTP-4bit",'
+        '"min_output_tokens":96}'
+    )
+
+    assert cfg is not None
+    assert cfg.method == "mtp-fast"
+    assert cfg.model == "mlx-community/Qwen3.8-27B-MTP-4bit"
+    assert cfg.min_output_tokens == 96
+
+
 def test_parse_speculative_config_normalizes_registered_alias() -> None:
     cfg = parse_speculative_config('{"method":"ngram"}')
 
@@ -226,6 +238,7 @@ def _spec_config_args(**overrides):
         "speculative_config": None,
         "enable_ddtree": False,
         "enable_dflash": False,
+        "enable_mtp_fast": False,
         "spec_decode": "none",
         "dflash_drafter_path": "",
         "mtp_num_draft_tokens": 1,
@@ -241,6 +254,26 @@ def _spec_config_args(**overrides):
     }
     data.update(overrides)
     return SimpleNamespace(**data)
+
+
+def test_speculative_config_mtp_fast_selects_dedicated_runtime() -> None:
+    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+
+    args = _spec_config_args(
+        speculative_config=(
+            '{"method":"mtp-fast",'
+            '"model":"mlx-community/Qwen3.8-27B-MTP-4bit",'
+            '"min_output_tokens":96}'
+        )
+    )
+
+    _normalize_speculative_config_or_exit(args)
+
+    assert args.enable_mtp_fast is True
+    assert args.spec_decode == "none"
+    assert args.mtp_sidecar == "mlx-community/Qwen3.8-27B-MTP-4bit"
+    assert args.mtp_fast_min_output_tokens == 96
+    assert args.enable_dflash is False
 
 
 def test_speculative_config_mtp_normalizes_to_legacy_spec_decode() -> None:

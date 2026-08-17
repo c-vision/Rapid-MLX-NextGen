@@ -32,6 +32,7 @@ class SpeculativeConfig:
     max_suffix_len: int | None = None
     min_confidence: float | None = None
     min_draft_len: int | None = None
+    min_output_tokens: int | None = None
     raw: dict[str, Any] | None = None
 
 
@@ -46,6 +47,10 @@ _METHOD_KEYS = {
     "dflash": frozenset({"model"}),
     "dspark": frozenset({"num_speculative_tokens"}),
     "mtp": frozenset({"model", "num_speculative_tokens", "disable_auto_k"}),
+    # Explicit throughput-oriented mlx-vlm lane. Kept distinct from ``mtp``:
+    # the existing batched-engine implementation is lossless/token-identical,
+    # while this lane may take numerically different greedy decisions.
+    "mtp-fast": frozenset({"model", "min_output_tokens"}),
     "suffix": frozenset(
         {
             "num_speculative_tokens",
@@ -153,6 +158,9 @@ def parse_speculative_config(value: str | None) -> SpeculativeConfig | None:
         max_suffix_len=_positive_int(payload.get("max_suffix_len"), "max_suffix_len"),
         min_confidence=_confidence(payload.get("min_confidence"), "min_confidence"),
         min_draft_len=_positive_int(payload.get("min_draft_len"), "min_draft_len"),
+        min_output_tokens=_positive_int(
+            payload.get("min_output_tokens"), "min_output_tokens"
+        ),
         raw=dict(payload),
     )
 
