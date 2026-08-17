@@ -144,11 +144,6 @@ rapid-mlx serve <mtp-eligible-qwen-checkpoint> \
 rapid-mlx serve qwen3.6-27b-8bit \
   --speculative-config '{"method":"mtp","model":"mlx-community/Qwen3.6-27B-MTP-4bit","num_speculative_tokens":3}'
 
-# Throughput-oriented single-user MTP for the compact Qwen3.8-27B build.
-# Long outputs use mlx-vlm MTP; max_tokens <= 64 automatically uses AR.
-rapid-mlx serve rapid-mlx/Qwen3.8-27B-mixed-3.5bpw-MLX \
-  --speculative-config '{"method":"mtp-fast","model":"mlx-community/Qwen3.8-27B-MTP-4bit","min_output_tokens":64}'
-
 # SuffixDecoding for explicit high-overlap workloads
 rapid-mlx serve gemma-4-12b-4bit \
   --speculative-config '{"method":"suffix","num_speculative_tokens":8}'

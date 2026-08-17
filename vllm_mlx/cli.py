@@ -1915,8 +1915,6 @@ def _normalize_speculative_config_or_exit(args):
             "spec_decode": "none",
             "dflash_drafter_path": "",
             "enable_mtp": False,
-            "enable_mtp_fast": False,
-            "mtp_fast_min_output_tokens": 64,
             "mtp_num_draft_tokens": 1,
             "mtp_optimistic": False,
             "mtp_sidecar": None,
@@ -1943,8 +1941,6 @@ def _normalize_speculative_config_or_exit(args):
             conflicts.append("dflash_drafter_path")
         if getattr(args, "enable_mtp", False):
             conflicts.append("enable_mtp")
-        if getattr(args, "enable_mtp_fast", False):
-            conflicts.append("enable_mtp_fast")
         if (getattr(args, "mtp_sidecar", None) or "").strip():
             conflicts.append("mtp_sidecar")
         # Idempotency guard: after ``_fill_runtime_defaults(overwrite=True)``
@@ -1991,8 +1987,6 @@ def _normalize_speculative_config_or_exit(args):
             fields.append("dflash_drafter_path")
         if getattr(args, "enable_mtp", False):
             fields.append("enable_mtp")
-        if getattr(args, "enable_mtp_fast", False):
-            fields.append("enable_mtp_fast")
         if (getattr(args, "mtp_sidecar", None) or "").strip():
             fields.append("mtp_sidecar")
         if getattr(args, "mtp_max_k", None) is not None:
@@ -2226,10 +2220,6 @@ def _normalize_speculative_config_or_exit(args):
             args.mtp_max_k = 3
         if config.disable_auto_k is not None:
             args.mtp_disable_auto_k = config.disable_auto_k
-    elif config.method == "mtp-fast":
-        args.enable_mtp_fast = True
-        args.mtp_sidecar = config.model
-        args.mtp_fast_min_output_tokens = config.min_output_tokens or 64
     elif config.method == "suffix":
         args.suffix_decoding = True
         if config.num_speculative_tokens is not None:
@@ -2684,15 +2674,14 @@ def serve_command(args):
     # find_spec("mlx_vlm")`` doesn't trigger a load — safe to run on the
     # hot CLI path.
     _wants_dflash = getattr(args, "enable_dflash", False)
-    _wants_mtp_fast = getattr(args, "enable_mtp_fast", False)
-    if _wants_dflash or _wants_mtp_fast:
+    if _wants_dflash:
         from .speculative.dflash.eligibility import have_runtime
 
         if not have_runtime():
-            _mode = "DFlash" if _wants_dflash else "MTP fast"
             print(
-                f"\n  Error: {_mode} speculative decoding requires "
-                "mlx-vlm 0.5.0+ for the drafter hooks.\n"
+                "\n  Error: DFlash speculative decoding "
+                '(--speculative-config \'{"method":"dflash"}\') requires '
+                "mlx-vlm 0.5.0+ for the DFlash drafter hooks.\n"
                 "\n  Install in a Python environment with:\n"
                 "    pip install 'rapid-mlx[dflash]'\n"
                 "\n  Homebrew installs the text-only package. Homebrew users "
@@ -2701,15 +2690,6 @@ def serve_command(args):
                 "    uv tool install 'rapid-mlx[dflash]'\n"
             )
             sys.exit(1)
-    if _wants_mtp_fast and not (getattr(args, "mtp_sidecar", None) or "").strip():
-        print(
-            "\n  Error: MTP fast mode requires an explicit sidecar model, e.g. "
-            "--speculative-config "
-            '\'{"method":"mtp-fast","model":'
-            '"mlx-community/Qwen3.8-27B-MTP-4bit"}\'.\n',
-            file=sys.stderr,
-        )
-        sys.exit(2)
 
     # R10-C1: AUDIO-SERVE-MODE FORK. The boot guard above only checks
     # that the ``[audio]`` extra is installed — it doesn't route the
@@ -3377,9 +3357,9 @@ def serve_command(args):
         features.append(auth_feature)
     if args.rate_limit > 0:
         features.append(f"rate-limit: {args.rate_limit}/min")
-    if gc_control and not (args.enable_dflash or args.enable_mtp_fast):
+    if gc_control and not args.enable_dflash:
         features.append("gc-control")
-    if args.pin_system_prompt and not (args.enable_dflash or args.enable_mtp_fast):
+    if args.pin_system_prompt and not args.enable_dflash:
         features.append("pin-system-prompt")
     # Show CORS in the startup banner when CLI flag or env-var-driven
     # config produced an origin list (``configure_cors_from_env`` is what
@@ -3388,18 +3368,13 @@ def serve_command(args):
         features.append(f"cors: {', '.join(cors_origins)}")
     if args.enable_dflash:
         features.append("dflash: single-user")
-    if args.enable_mtp_fast:
-        features.append(
-            f"mtp-fast: single-user (AR for max_tokens <= "
-            f"{args.mtp_fast_min_output_tokens})"
-        )
     if args.enable_ddtree:
         features.append("ddtree: experimental single-user")
     if features:
         print(f"  Features: {', '.join(features)}")
     print(f"  Model: {args.model}")
     # Store MCP config path for FastAPI startup
-    if args.mcp_config and not (args.enable_dflash or args.enable_mtp_fast):
+    if args.mcp_config and not args.enable_dflash:
         print(f"MCP config: {args.mcp_config}")
         os.environ["RAPID_MLX_MCP_CONFIG"] = args.mcp_config
 
@@ -3448,50 +3423,6 @@ def serve_command(args):
                 args.tool_call_parser if args.enable_auto_tool_choice else None
             ),
             reasoning_parser_name=args.reasoning_parser,
-        )
-        return
-
-    # Throughput-oriented MTP uses mlx-vlm's single-user draft/verify lane.
-    # It is deliberately a separate method from the existing lossless MTP
-    # engine: callers must explicitly choose the numerical trade-off, and
-    # short outputs automatically bypass speculation because setup overhead
-    # dominates there.
-    if args.enable_mtp_fast:
-        from .speculative.dflash.server import run_dflash_server
-
-        _check_disk_space(args.model, force=getattr(args, "force_disk_check", False))
-        _check_memory_capacity(args.model)
-        server._sync_config()
-        run_dflash_server(
-            main_model_repo=args.model,
-            drafter_repo=args.mtp_sidecar,
-            host=args.host,
-            port=args.port,
-            served_model_name=(
-                args.served_model_name
-                or getattr(args, "_original_alias", None)
-                or args.model
-            ),
-            default_max_tokens=effective_max_tokens,
-            cors_origins=cors_origins,
-            uvicorn_log_level=uvicorn_log_level,
-            no_thinking=args.no_thinking,
-            api_key=server._api_key,
-            rate_limit=args.rate_limit,
-            max_request_bytes=server._max_request_bytes,
-            body_receive_timeout_seconds=server._body_receive_timeout_seconds,
-            default_timeout=server._default_timeout,
-            max_concurrent_requests=args.max_concurrent_requests,
-            cors_policy=server.get_resolved_cors_policy(),
-            tool_call_parser=(
-                args.tool_call_parser if args.enable_auto_tool_choice else None
-            ),
-            reasoning_parser_name=args.reasoning_parser,
-            draft_kind="mtp",
-            runtime_label="MTP fast",
-            allow_4bit_target=True,
-            min_speculative_output_tokens=args.mtp_fast_min_output_tokens,
-            allow_multimodal=True,
         )
         return
 

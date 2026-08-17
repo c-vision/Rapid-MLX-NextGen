@@ -74,14 +74,7 @@ into the same config path.
 | `{"method":"mtp","model":"<sidecar-head-repo>"}` | Attach a standalone MTP **sidecar head** (e.g. `mlx-community/Qwen3.6-27B-MTP-4bit`) to a full base checkpoint. The base must be MTP-eligible; the head repo goes in the `model` field — **not** in the `serve` positional. See [MTP sidecar heads are not standalone models](#mtp-sidecar-heads-are-not-standalone-models) below. Gemma 4 sidecar MTP remains disabled after its greedy-lossless A/B failed. |
 | `{"method":"mtp","num_speculative_tokens":3}` | Set the MTP max-K controller ceiling. |
 | `{"method":"mtp","disable_auto_k":true}` | Disable the MTP EV depth controller for fixed-K parity benches. |
-| `{"method":"mtp-fast","model":"<sidecar-head-repo>"}` | Enable the mlx-vlm single-user MTP throughput lane. This is distinct from the lossless batched `mtp` engine, supports image inputs, and automatically uses AR when `max_tokens` is 64 or lower. Requires `rapid-mlx[dflash]` (or `[vision]` for a full multimodal install). |
 | `{"method":"suffix","num_speculative_tokens":8}` | Enable explicit SuffixDecoding for high-overlap workloads. |
-
-`mtp-fast` is deliberately opt-in and hardware-sensitive. The audited
-Qwen3.8-27B mixed-3.5bpw pair measured about 1.5–1.6x on M3 Ultra, but was
-slightly slower than AR on M2 Pro. Use it for long, single-user generation on
-hardware where an A/B proves a win; keep the regular batched server for
-multi-user throughput.
 
 #### MTP is not free — measure before you enable it
 

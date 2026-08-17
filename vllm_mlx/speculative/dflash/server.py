@@ -625,9 +625,6 @@ def _build_app(
     cors_policy: Any | None = None,
     tool_call_parser: str | None = None,
     reasoning_parser_name: str | None = None,
-    runtime_label: str = "DFlash",
-    min_speculative_output_tokens: int = 0,
-    allow_multimodal: bool = False,
 ) -> FastAPI:
     """Create the FastAPI application for DFlash mode.
 
@@ -699,7 +696,7 @@ def _build_app(
                 ) from exc
             raise
 
-    app = FastAPI(title=f"Rapid-MLX ({runtime_label})")
+    app = FastAPI(title="Rapid-MLX (DFlash)")
     # DFlash has one GPU worker and serializes generation with
     # ``_dflash_lock``. Bound its waiting room as well so a burst cannot
     # accumulate an unbounded number of requests and their parsed bodies.
@@ -772,10 +769,9 @@ def _build_app(
     async def healthz() -> dict[str, Any]:
         return {
             "status": "ok",
-            "engine": runtime.kind,
+            "engine": "dflash",
             "mode": "single-user-serial",
             "drafter": runtime.drafter_repo,
-            "min_speculative_output_tokens": min_speculative_output_tokens,
         }
 
     @app.get(
@@ -943,22 +939,12 @@ def _build_app(
             # an uncancellable overrun can be abandoned and its admission slot
             # released immediately (round-5 #2) — nothing serial is left running
             # behind it, unlike a timed-out generation worker.
-            def _render() -> tuple[str, list[str]]:
-                if allow_multimodal:
-                    return _render_multimodal_prompt(
-                        processor,
-                        model,
-                        request,
-                        enable_thinking=effective_thinking,
-                    )
-                return (
-                    _render_prompt(
-                        processor,
-                        model,
-                        request,
-                        enable_thinking=effective_thinking,
-                    ),
-                    [],
+            def _render() -> str:
+                return _render_prompt(
+                    processor,
+                    model,
+                    request,
+                    enable_thinking=effective_thinking,
                 )
 
             # codex round-8 #1: validate the remaining budget BEFORE submitting
@@ -988,11 +974,11 @@ def _build_app(
             render_future = render_cf  # tracked for the cleanup handler
             render_awaitable = asyncio.wrap_future(render_cf)
             if request_deadline is None:
-                prompt, image_paths = await render_awaitable
+                prompt = await render_awaitable
             else:
                 render_budget = request_deadline - loop.time()
                 try:
-                    prompt, image_paths = await asyncio.wait_for(
+                    prompt = await asyncio.wait_for(
                         asyncio.shield(render_awaitable), timeout=render_budget
                     )
                 except asyncio.TimeoutError as exc:
@@ -1023,19 +1009,9 @@ def _build_app(
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                draft_model=runtime.drafter,
+                draft_kind=runtime.kind,
             )
-            if image_paths:
-                gen_kwargs["image"] = image_paths
-            # MTP has a fixed draft/verify setup cost. Paired Qwen3.8
-            # measurements show that very short answers (classification,
-            # one-token MMLU) are materially faster on plain AR. Dedicated
-            # speculative runtimes may therefore set a request-length gate;
-            # DFlash keeps its historical always-on default of zero.
-            if max_tokens > min_speculative_output_tokens:
-                gen_kwargs.update(
-                    draft_model=runtime.drafter,
-                    draft_kind=runtime.kind,
-                )
 
             # Pass the REMAINING budget (post-render) to the completion helper,
             # not the original timeout, so the single absolute deadline
@@ -1209,83 +1185,6 @@ def _render_prompt(
         messages,
         **template_kwargs,
     )
-
-
-def _render_multimodal_prompt(
-    processor: Any,
-    model: Any,
-    request: ChatCompletionRequest,
-    *,
-    enable_thinking: bool | None = None,
-) -> tuple[str, list[str]]:
-    """Render an OpenAI chat request and materialize its image inputs.
-
-    The MTP fast lane loads the full VLM through mlx-vlm, so unlike DFlash it
-    can preserve image content. Convert OpenAI ``image_url`` parts into the
-    image placeholders expected by the processor and pass the corresponding
-    local paths to generation. Unsupported media is rejected instead of being
-    silently discarded.
-    """
-    from mlx_vlm.prompt_utils import apply_chat_template
-
-    from ...models.mllm import process_image_input
-
-    messages: list[dict[str, Any]] = []
-    image_paths: list[str] = []
-    for raw_message in request.messages:
-        message = raw_message.model_dump(exclude_none=True)
-        content = raw_message.content
-        if isinstance(content, list):
-            prepared_content: list[dict[str, Any] | str] = []
-            for raw_part in content:
-                part = (
-                    raw_part.model_dump(exclude_none=True)
-                    if hasattr(raw_part, "model_dump")
-                    else raw_part
-                )
-                if not isinstance(part, dict):
-                    if isinstance(part, str):
-                        prepared_content.append(part)
-                        continue
-                    raise ValueError("Unsupported multimodal content part")
-                part_type = part.get("type", "")
-                if part_type == "text":
-                    prepared_content.append(part)
-                elif part_type in {"image_url", "image"}:
-                    source = (
-                        part.get("image_url")
-                        if part_type == "image_url"
-                        else part.get("image") or part.get("url")
-                    )
-                    image_paths.append(process_image_input(source))
-                    prepared_content.append({"type": "image"})
-                else:
-                    raise ValueError(
-                        f"MTP fast mode does not support {part_type or 'unknown'} "
-                        "content parts"
-                    )
-            content = prepared_content
-        message["content"] = content
-        messages.append(message)
-
-    effective_thinking = False if enable_thinking is None else enable_thinking
-    template_kwargs: dict[str, Any] = {
-        "num_images": len(image_paths),
-        "num_audios": 0,
-        "enable_thinking": effective_thinking,
-    }
-    if request.tools:
-        from ...api.tool_calling import convert_tools_for_template
-
-        template_kwargs["tools"] = convert_tools_for_template(request.tools)
-
-    prompt = apply_chat_template(
-        processor,
-        model.config,
-        messages,
-        **template_kwargs,
-    )
-    return prompt, image_paths
 
 
 async def _stream_with_admission(
@@ -2175,11 +2074,6 @@ def run_dflash_server(
     cors_policy: Any | None = None,
     tool_call_parser: str | None = "hermes",
     reasoning_parser_name: str | None = "qwen3",
-    draft_kind: str = "dflash",
-    runtime_label: str = "DFlash",
-    allow_4bit_target: bool = False,
-    min_speculative_output_tokens: int = 0,
-    allow_multimodal: bool = False,
 ) -> None:
     """Load the model + DFlash drafter via mlx-vlm and start uvicorn.
 
@@ -2203,7 +2097,7 @@ def run_dflash_server(
     """
     if not have_runtime():
         raise RuntimeError(
-            f"{runtime_label} mode requires mlx-vlm 0.5.0+ — install with "
+            "DFlash server requires mlx-vlm 0.5.0+ — install with "
             "pip install 'rapid-mlx[dflash]'. Homebrew installs the "
             "text-only package; switch to an isolated uv tool install "
             "for optional extras."
@@ -2217,7 +2111,7 @@ def run_dflash_server(
         _looks_like_4bit,  # noqa: PLC2701 — internal helper
     )
 
-    if _looks_like_4bit(main_model_repo) and not allow_4bit_target:
+    if _looks_like_4bit(main_model_repo):
         raise DFlashUnavailable(
             f"DFlash cannot run on a 4-bit quantized model "
             f"(main_model_repo={main_model_repo!r}); upstream PoC measured "
@@ -2243,23 +2137,11 @@ def run_dflash_server(
     def _load_all():
         t0 = time.perf_counter()
         m, p = load(main_model_repo)
-        logger.info(
-            "%s: main model loaded in %.1fs",
-            runtime_label,
-            time.perf_counter() - t0,
-        )
-        # Preserve the historical one-argument call for DFlash so external
-        # monkeypatches/wrappers around this programmatic entry point remain
-        # compatible. Other drafter families must opt in explicitly.
-        if draft_kind == "dflash":
-            rt = load_runtime(drafter_repo)
-        else:
-            rt = load_runtime(drafter_repo, kind=draft_kind)
+        logger.info("DFlash: main model loaded in %.1fs", time.perf_counter() - t0)
+        rt = load_runtime(drafter_repo)
         return m, p, rt
 
-    logger.info(
-        "%s: loading main model via mlx-vlm: %s", runtime_label, main_model_repo
-    )
+    logger.info("DFlash: loading main model via mlx-vlm: %s", main_model_repo)
     model, processor, runtime = _dflash_executor.submit(_load_all).result()
 
     app = _build_app(
@@ -2279,14 +2161,11 @@ def run_dflash_server(
         cors_policy=cors_policy,
         tool_call_parser=tool_call_parser,
         reasoning_parser_name=reasoning_parser_name,
-        runtime_label=runtime_label,
-        min_speculative_output_tokens=min_speculative_output_tokens,
-        allow_multimodal=allow_multimodal,
     )
 
     print()
     host_display = "localhost" if host == "0.0.0.0" else host
-    print(f"  Ready: http://{host_display}:{port}/v1  ({runtime_label} mode)")
+    print(f"  Ready: http://{host_display}:{port}/v1  (DFlash mode)")
     print(f"  Docs:  http://{host_display}:{port}/docs")
     print()
 

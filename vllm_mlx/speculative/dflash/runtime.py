@@ -81,6 +81,6 @@ def load_runtime(drafter_repo: str, kind: str = "dflash") -> DFlashRuntime:
     # Import here, not at module top, so the optional dep stays optional.
     from mlx_vlm.speculative.drafters import load_drafter
 
-    logger.info("Loading speculative drafter: %s (kind=%s)", drafter_repo, kind)
+    logger.info("Loading DFlash drafter: %s (kind=%s)", drafter_repo, kind)
     drafter, resolved_kind = load_drafter(drafter_repo, kind=kind)
     return DFlashRuntime(drafter=drafter, kind=resolved_kind, drafter_repo=drafter_repo)
