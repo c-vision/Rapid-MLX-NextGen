@@ -3834,21 +3834,21 @@ flow_audio_readiness() {
                   | select(.identifier == "Audio.Speech.ModelPicker")' "$OUT/speech.json" >/dev/null \
            && jq -e '.data.ui_elements[]?
                      | select(.identifier == "Readiness.Action"
-                              and (.description // .value // .label // "") == "Download & start")' \
+                              and (.description // .value // .label // "") == "Download")' \
                     "$OUT/speech.json" >/dev/null; then
             speech_ready=1; break
         fi
         sleep 0.25
     done
     [[ "$speech_ready" == 1 ]] \
-        || die "Speech did not expose Chat-equivalent Download & start readiness"
+        || die "Speech did not expose download-only readiness"
     baseline audio-readiness.speech "$OUT/speech.json"
 
     press "$OUT/speech.json" Readiness.Action "$OUT/speech-download-start.json" \
-        || die "Speech Download & start is not pressable"
+        || die "Speech Download is not pressable"
     wait_fake_event \
         '.event == "command" and .subcommand == "pull" and .alias == "fake-qwen3-tts"' \
-        "Speech Download & start did not invoke pull for fake-qwen3-tts"
+        "Speech Download did not invoke pull for fake-qwen3-tts"
 
     # Sample several fresh AX trees inside the fake's five-second pull window.
     # An early healthy audio sidecar must never turn that window into Ready.
@@ -3869,15 +3869,34 @@ flow_audio_readiness() {
         sleep 0.25
     done
     [[ "$speech_downloading" == 1 ]] \
-        || die "Speech never exposed Downloading after Download & start"
+        || die "Speech never exposed Downloading after Download"
     if jq -e -s 'any(.[]; .event == "server_started" and .alias == "fake-qwen3-tts")' \
         "$OUT/fake-events.jsonl" >/dev/null; then
         die "Speech started fake-qwen3-tts before its pull completed and cache was verified"
     fi
 
+    local speech_start_ready=0
+    for ((i=0; i<120; i++)); do
+        see_main "$OUT/speech-downloaded.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(.identifier == "Readiness.Action"
+                           and (.description // .value // .label // "") == "Start")' \
+                 "$OUT/speech-downloaded.json" >/dev/null; then
+            speech_start_ready=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$speech_start_ready" == 1 ]] \
+        || die "Speech did not become Start-ready after its download completed"
+    if jq -e -s 'any(.[]; .event == "server_started" and .alias == "fake-qwen3-tts")' \
+        "$OUT/fake-events.jsonl" >/dev/null; then
+        die "Speech loaded automatically after a download-only action"
+    fi
+    press "$OUT/speech-downloaded.json" Readiness.Action "$OUT/speech-start.json" \
+        || die "Speech Start is not pressable after download"
     wait_fake_event \
         '.event == "server_started" and .alias == "fake-qwen3-tts"' \
-        "Speech did not start after its download completed"
+        "Speech did not start after the explicit Start action"
     local speech_loaded=0
     for ((i=0; i<80; i++)); do
         see_main "$OUT/speech-loaded.json"
@@ -3889,7 +3908,7 @@ flow_audio_readiness() {
         sleep 0.25
     done
     [[ "$speech_loaded" == 1 ]] \
-        || die "Speech stayed behind Download & start after its model became ready"
+        || die "Speech stayed behind Start after its model became ready"
 
     local speech_controls_ready=0
     for ((i=0; i<120; i++)); do
@@ -4062,21 +4081,21 @@ flow_audio_readiness() {
                  "$OUT/transcription.json" >/dev/null \
            && jq -e '.data.ui_elements[]?
                      | select(.identifier == "Readiness.Action"
-                              and (.description // .value // .label // "") == "Download & start")' \
+                              and (.description // .value // .label // "") == "Download")' \
                     "$OUT/transcription.json" >/dev/null; then
             transcription_ready=1; break
         fi
         sleep 0.25
     done
     [[ "$transcription_ready" == 1 ]] \
-        || die "Transcription did not expose Chat-equivalent Download & start readiness"
+        || die "Transcription did not expose download-only readiness"
     baseline audio-readiness.transcription "$OUT/transcription.json"
 
     press "$OUT/transcription.json" Readiness.Action "$OUT/transcription-start.json" \
-        || die "Transcription Download & start is not pressable"
+        || die "Transcription Download is not pressable"
     wait_fake_event \
         '.event == "command" and .subcommand == "pull" and .alias == "fake-whisper-small"' \
-        "Transcription Download & start did not invoke pull for fake-whisper-small"
+        "Transcription Download did not invoke pull for fake-whisper-small"
     local transcription_downloading=0
     for ((i=0; i<8; i++)); do
         see_main "$OUT/transcription-downloading.json"
@@ -4093,10 +4112,30 @@ flow_audio_readiness() {
         sleep 0.25
     done
     [[ "$transcription_downloading" == 1 ]] \
-        || die "Transcription never exposed Downloading after Download & start"
+        || die "Transcription never exposed Downloading after Download"
+    local transcription_start_ready=0
+    for ((i=0; i<120; i++)); do
+        see_main "$OUT/transcription-downloaded.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(.identifier == "Readiness.Action"
+                           and (.description // .value // .label // "") == "Start")' \
+                 "$OUT/transcription-downloaded.json" >/dev/null; then
+            transcription_start_ready=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$transcription_start_ready" == 1 ]] \
+        || die "Transcription did not become Start-ready after its download completed"
+    if jq -e -s 'any(.[]; .event == "server_started" and .alias == "fake-whisper-small")' \
+        "$OUT/fake-events.jsonl" >/dev/null; then
+        die "Transcription loaded automatically after a download-only action"
+    fi
+    press "$OUT/transcription-downloaded.json" Readiness.Action \
+        "$OUT/transcription-explicit-start.json" \
+        || die "Transcription Start is not pressable after download"
     wait_fake_event \
         '.event == "server_started" and .alias == "fake-whisper-small"' \
-        "Transcription Download & start did not switch to its selected model"
+        "Transcription did not start after the explicit Start action"
     local transcription_loaded=0
     for ((i=0; i<80; i++)); do
         see_main "$OUT/transcription-loaded.json"
@@ -4108,7 +4147,7 @@ flow_audio_readiness() {
         sleep 0.25
     done
     [[ "$transcription_loaded" == 1 ]] \
-        || die "Transcription stayed behind Download & start after its model became ready"
+        || die "Transcription stayed behind Start after its model became ready"
 
     # AXPress can return success for a SwiftUI button whose backing object is
     # rebuilt before its closure runs — the Choose File button's backing churns

@@ -30,7 +30,7 @@ AXApplication title="Rapid-MLX"
             AXGroup desc="fake-whisper-small isn't downloaded yet, It downloads once (<size>), then starts in seconds." enabled=true
               AXStaticText value=text enabled=true
               AXStaticText value=text enabled=true
-              AXButton id="Readiness.Action" desc="Download & start" enabled=true
+              AXButton id="Readiness.Action" desc="Download" enabled=true
             AXGroup enabled=true
               AXStaticText value=text enabled=true
             AXButton id="Audio.Transcription.Run" desc="Transcribe" enabled=false

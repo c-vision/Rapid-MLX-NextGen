@@ -81,7 +81,8 @@ struct AudioView: View {
             progress: progress,
             failure: server.residentLoadFailure(for: selectedAlias).map {
                 .init(message: $0.message, alias: $0.alias)
-            }
+            },
+            downloadInFlight: downloads.isDownloading(selectedAlias)
         )
     }
 
@@ -659,7 +660,17 @@ struct AudioView: View {
         switch action {
         case .chooseModel:
             break
-        case .downloadAndStart(let alias), .start(let alias), .retry(let alias):
+        case .download(let alias):
+            // Download-only: fetch the weights, don't load. The banner flips
+            // to "Start" once cached (see ModelReadiness two-step).
+            guard let entry = viewModel.audioModels.first(where: { $0.alias == alias }),
+                  !downloads.isDownloading(alias) else { break }
+            _ = downloads.startDownload(
+                alias: alias,
+                hfPath: entry.hfRepo,
+                totalBytes: ModelCacheActions.parseSizeBytes(entry.sizeOnDisk)
+            )
+        case .start(let alias), .retry(let alias):
             Task { await loadAudioModel(alias) }
         case .restart(let alias):
             Task {

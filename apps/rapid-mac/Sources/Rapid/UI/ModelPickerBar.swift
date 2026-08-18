@@ -1485,7 +1485,10 @@ struct ModelPickerBar: View {
     }
 
     private var startButtonLabel: String {
-        selectedAliasIsCached ? "Start" : "Download & start"
+        // Two-step: name one action at a time. Uncached ⇒ "Download" (fetch
+        // only); once on disk the same button becomes "Start" (load). Matches
+        // the readiness banner so both controls speak the same verb.
+        selectedAliasIsCached ? "Start" : "Download"
     }
 
     private var startButtonIcon: String {
@@ -1517,7 +1520,7 @@ struct ModelPickerBar: View {
         }
         return selectedAliasIsCached
             ? "Start the model (cached locally)"
-            : "Download from Hugging Face, then start. Can take several minutes on first run."
+            : "Download the weights from Hugging Face. Start it once the download finishes. Can take several minutes on first run."
     }
 
     // MARK: - v0.6.9 tooBig Start guard
@@ -1538,6 +1541,18 @@ struct ModelPickerBar: View {
     private func handleStartTap() {
         let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // Two-step: an uncached tap only DOWNLOADS. No .tooBig / memory guard
+        // here — those belong to Start, once the weights are on disk and the
+        // user asks to load them. The button flips to "Start" when the pull
+        // lands (``selectedAliasIsCached``). Matches the readiness banner's
+        // ``download`` action.
+        if !selectedAliasIsCached {
+            let hfPath = catalog.first(where: { $0.alias == trimmed })?.hfRepo
+            if !downloads.isDownloading(trimmed) {
+                _ = downloads.startDownload(alias: trimmed, hfPath: hfPath)
+            }
+            return
+        }
         let fit = ModelSizing.classify(
             ModelSizing.estimate(alias: trimmed),
             on: hardware

@@ -90,7 +90,14 @@ enum ModelReadiness: Equatable {
     /// copy and the VoiceOver announcement can still name the step.
     enum Action: Equatable {
         case chooseModel
-        case downloadAndStart(alias: String)
+        // Download-only. Fetches the weights without loading them, so the
+        // button names exactly one step: get it onto the disk. Once it is
+        // cached the readiness state flips to ``needsStart`` and the button
+        // becomes ``start`` — the user decides when to actually load it (and
+        // pays the memory guard then, not on a "download" they may have meant
+        // only as a fetch). Two single-purpose buttons instead of the old
+        // combined "Download & start" verb.
+        case download(alias: String)
         case start(alias: String)
         case retry(alias: String)
         case restart(alias: String)
@@ -99,7 +106,7 @@ enum ModelReadiness: Equatable {
         var title: String {
             switch self {
             case .chooseModel:      return "Choose a model"
-            case .downloadAndStart: return "Download & start"
+            case .download:         return "Download"
             case .start:            return "Start"
             case .retry:            return "Retry"
             case .restart:          return "Restart"
@@ -110,7 +117,7 @@ enum ModelReadiness: Equatable {
         var systemImage: String {
             switch self {
             case .chooseModel:      return "square.stack.3d.up"
-            case .downloadAndStart: return "icloud.and.arrow.down"
+            case .download:         return "icloud.and.arrow.down"
             case .start:            return "play.fill"
             case .retry:            return "arrow.clockwise"
             case .restart:          return "arrow.clockwise"
@@ -130,7 +137,7 @@ enum ModelReadiness: Equatable {
             switch self {
             case .chooseModel, .openModelManagement:
                 return nil
-            case .downloadAndStart(let a), .start(let a), .retry(let a), .restart(let a):
+            case .download(let a), .start(let a), .retry(let a), .restart(let a):
                 return a
             }
         }
@@ -241,7 +248,12 @@ enum ModelReadiness: Equatable {
         cacheState: CacheState,
         sizeText: String? = nil,
         progress: ProgressSnapshot? = nil,
-        failure: Failure? = nil
+        failure: Failure? = nil,
+        // True while a download-only job (the ``download`` action, not a
+        // serve) is fetching this alias. Lets the banner show progress for a
+        // "Download" tap even though the server stays ``.idle`` — the serve
+        // path's progress rides ``serverState == .starting`` instead.
+        downloadInFlight: Bool = false
     ) -> ModelReadiness {
         if case .missing = serverState { return .engineMissing }
 
@@ -323,6 +335,16 @@ enum ModelReadiness: Equatable {
 
         switch cacheState {
         case .notOnDisk:
+            // A download-only job in flight shows as work, not as a fresh
+            // "Download" call to action — otherwise the button would sit
+            // unchanged while bytes stream and read as unresponsive.
+            if downloadInFlight {
+                return .downloading(
+                    alias: name,
+                    detail: progress?.subtitle,
+                    fraction: progress?.fraction
+                )
+            }
             return .needsDownload(alias: name, sizeText: normalizedSize(sizeText))
         case .notInCatalog:
             return .unknownModel(alias: name)
@@ -412,7 +434,7 @@ enum ModelReadiness: Equatable {
         switch self {
         case .engineMissing:                    return nil
         case .noModel:                          return .chooseModel
-        case .needsDownload(let a, _):          return .downloadAndStart(alias: a)
+        case .needsDownload(let a, _):          return .download(alias: a)
         case .needsStart(let a),
              .unknownModel(let a):              return .start(alias: a)
         case .downloading, .starting, .ready:   return nil

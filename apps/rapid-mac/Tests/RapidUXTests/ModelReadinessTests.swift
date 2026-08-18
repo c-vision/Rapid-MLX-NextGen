@@ -29,7 +29,8 @@ struct ModelReadinessTests {
         cached: Bool? = true,
         sizeText: String? = nil,
         progress: ModelReadiness.ProgressSnapshot? = nil,
-        failure: ModelReadiness.Failure? = nil
+        failure: ModelReadiness.Failure? = nil,
+        downloadInFlight: Bool = false
     ) -> ModelReadiness {
         ModelReadiness.resolve(
             serverState: state,
@@ -37,7 +38,8 @@ struct ModelReadinessTests {
             cacheState: cacheState(cached),
             sizeText: sizeText,
             progress: progress,
-            failure: failure
+            failure: failure,
+            downloadInFlight: downloadInFlight
         )
     }
 
@@ -326,7 +328,7 @@ struct ModelReadinessTests {
             sizeText: "5.0 GB"
         )
         XCTAssertEqual(state, .needsDownload(alias: alias, sizeText: "5.0 GB"))
-        XCTAssertEqual(state.action, .downloadAndStart(alias: alias))
+        XCTAssertEqual(state.action, .download(alias: alias))
         assertNoTraceOf(crashed, in: state)
     }
 
@@ -543,8 +545,44 @@ struct ModelReadinessTests {
     func testChosenButUncachedNeedsDownload() {
         let state = resolve(.idle, cached: false, sizeText: "5.0 GB")
         XCTAssertEqual(state, .needsDownload(alias: alias, sizeText: "5.0 GB"))
-        XCTAssertEqual(state.action, .downloadAndStart(alias: alias))
+        XCTAssertEqual(state.action, .download(alias: alias))
         XCTAssertTrue(state.detail?.contains("5.0 GB") == true)
+    }
+
+    // MARK: - Two-step Download / Start (button names one step at a time)
+
+    /// The uncached action names a download only — not the old combined
+    /// "Download & start" verb. The Start step arrives after the bytes land.
+    @Test
+    func testUncachedActionIsDownloadOnly() {
+        let action = resolve(.idle, cached: false, sizeText: "5.0 GB").action
+        XCTAssertEqual(action, .download(alias: alias))
+        XCTAssertEqual(action?.title, "Download")
+    }
+
+    /// A cached model is one tap from running: the action is Start, so a
+    /// model already on disk never shows a "Download" button.
+    @Test
+    func testCachedActionIsStart() {
+        let action = resolve(.idle, cached: true).action
+        XCTAssertEqual(action, .start(alias: alias))
+        XCTAssertEqual(action?.title, "Start")
+    }
+
+    /// While a download-only job is fetching, the banner shows work — not a
+    /// fresh "Download" call to action that would read as unresponsive.
+    @Test
+    func testUncachedWithDownloadInFlightShowsDownloading() {
+        let state = resolve(.idle, cached: false, sizeText: "5.0 GB", downloadInFlight: true)
+        XCTAssertEqual(state, .downloading(alias: alias, detail: nil, fraction: nil))
+        XCTAssertNil(state.action)  // in-flight work offers no button
+    }
+
+    /// No download in flight → still the plain "Download" call to action.
+    @Test
+    func testUncachedIdleStillNeedsDownload() {
+        let state = resolve(.idle, cached: false, sizeText: "5.0 GB", downloadInFlight: false)
+        XCTAssertEqual(state, .needsDownload(alias: alias, sizeText: "5.0 GB"))
     }
 
     @Test

@@ -12,6 +12,7 @@ struct ImagesView: View {
     @Bindable var server: ServerManager
     @Environment(\.openWindow) private var openWindow
     @Environment(SettingsRouter.self) private var settingsRouter
+    @Environment(DownloadManager.self) private var downloads
 
     private let contentMaxWidth: CGFloat = RapidTheme.Layout.contentMaxWidth
 
@@ -222,7 +223,8 @@ struct ImagesView: View {
             // different models cannot clobber one another).
             failure: server.residentLoadFailure(for: viewModel.selectedAlias).map {
                 ModelReadiness.Failure(message: $0.message, alias: $0.alias)
-            }
+            },
+            downloadInFlight: downloads.isDownloading(viewModel.selectedAlias)
         )
     }
 
@@ -252,7 +254,17 @@ struct ImagesView: View {
         switch action {
         case .chooseModel:
             break  // the composer's model picker owns this step
-        case .downloadAndStart(let target), .start(let target), .retry(let target):
+        case .download(let target):
+            // Download-only: stage the weights, don't load. The banner flips
+            // to "Start" once cached (see ModelReadiness two-step).
+            guard let entry = viewModel.imageModels.first(where: { $0.alias == target }),
+                  !downloads.isDownloading(target) else { break }
+            _ = downloads.startDownload(
+                alias: target,
+                hfPath: entry.hfRepo,
+                totalBytes: ModelCacheActions.parseSizeBytes(entry.sizeOnDisk)
+            )
+        case .start(let target), .retry(let target):
             let hf = viewModel.imageModels.first { $0.alias == target }?.hfRepo
             // Same shared helper as Chat: ``ensureServing`` (not ``start``),
             // because the user is almost always switching FROM a running chat

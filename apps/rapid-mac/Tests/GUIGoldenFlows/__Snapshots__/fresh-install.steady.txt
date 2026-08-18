@@ -16,7 +16,7 @@ AXApplication title="Rapid-MLX"
           AXGroup desc="lfm2.5-1b-4bit isn't downloaded yet, It downloads once (~<size>), then starts in seconds." enabled=true
             AXStaticText value=text enabled=true
             AXStaticText value=text enabled=true
-            AXButton id="Readiness.Action" desc="Download & start" enabled=true
+            AXButton id="Readiness.Action" desc="Download" enabled=true
           AXStaticText value=text enabled=true
           AXScrollArea
             AXTextArea id="rapid.chat.compose" desc="Message compose field" value=empty

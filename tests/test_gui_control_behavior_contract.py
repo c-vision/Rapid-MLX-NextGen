@@ -20,8 +20,8 @@ def test_audio_readiness_actions_start_both_selected_models_and_clear_the_gate()
     assert '.alias == "fake-qwen3-tts"' in flow
     assert '.alias == "fake-whisper-small"' in flow
     assert "before its pull completed" in flow
-    assert "Speech stayed behind Download & start" in flow
-    assert "Transcription stayed behind Download & start" in flow
+    assert "Speech loaded automatically after a download-only action" in flow
+    assert "Transcription loaded automatically after a download-only action" in flow
 
 
 def test_audio_control_journey_is_blocking_gui_ci_and_has_failure_evidence():

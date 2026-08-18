@@ -158,6 +158,14 @@ final class ServerManager {
     /// consuming one another's confirmation (#1463).
     private var memoryConfirmations = MemoryLoadConfirmationQueue()
 
+    /// Live-memory source. Production uses the host probe; tests replace it so
+    /// launch auto-start semantics can be verified without depending on the
+    /// runner's current pressure.
+    @ObservationIgnored
+    internal var memorySnapshotProvider: () -> MemoryProbe.Snapshot? = {
+        MemoryProbe.snapshot()
+    }
+
     /// Confirmed launches still running, by sequence number. Polled by
     /// ``awaitConfirmedLaunch`` instead of awaiting the task's ``value``:
     /// awaiting a non-throwing Task is NOT cancellation-aware, so a caller
@@ -1339,7 +1347,8 @@ final class ServerManager {
         hfPath: String? = nil,
         isAutoRespawn: Bool = false,
         bypassMemoryGuard: Bool = false,
-        memoryRequestID: UUID? = nil
+        memoryRequestID: UUID? = nil,
+        isLaunchAutoStart: Bool = false
     ) async {
         // Issue #278: a manual restart is the user taking over the
         // lifecycle — reset the budget at entry so a previously
@@ -1393,7 +1402,7 @@ final class ServerManager {
         // Respawn is also recovering a model that ALREADY fit when it first
         // started; a genuine free-RAM drop is bounded by the respawn-attempt
         // budget, and the user's manual restart still routes through the guard.
-        if !bypassMemoryGuard, !isAutoRespawn, let snapshot = MemoryProbe.snapshot() {
+        if !bypassMemoryGuard, !isAutoRespawn, let snapshot = memorySnapshotProvider() {
             let footprint = ModelSizing.estimate(alias: trimmedAlias)
             let safety = ModelSizing.memorySafety(
                 footprint: footprint,
@@ -1409,6 +1418,18 @@ final class ServerManager {
             // only what is genuinely dangerous, and surface "tight"
             // passively — the picker's static sizing bands already do.
             if safety == .unsafe {
+                // A launch auto-start must never greet the user with a scary
+                // modal they did not ask for. Opening the app is not "I want to
+                // chat now" — they may be heading to Audio/Images, or just
+                // checking in. Defer silently: leave the server ``.idle`` with
+                // the alias selected (the readiness banner still shows a Start
+                // affordance), and let this exact warning surface only when the
+                // user explicitly loads it (Start button or first message),
+                // which routes back through here WITHOUT ``isLaunchAutoStart``.
+                if isLaunchAutoStart {
+                    cancelAutoRespawn()
+                    return
+                }
                 let warning = ModelSizing.MemoryWarning(
                     alias: trimmedAlias,
                     hfPath: hfPath,

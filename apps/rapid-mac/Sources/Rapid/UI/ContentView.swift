@@ -342,7 +342,8 @@ struct ContentView: View {
             cacheState: cacheState(for: alias),
             sizeText: sizeText(for: alias),
             progress: progressSnapshot,
-            failure: readinessFailure
+            failure: readinessFailure,
+            downloadInFlight: downloads.isDownloading(alias)
         )
     }
 
@@ -461,7 +462,9 @@ struct ContentView: View {
             // banner names it but deliberately renders no second
             // control. See ``ModelReadiness.Action.isRenderable``.
             break
-        case .downloadAndStart(let target), .start(let target):
+        case .download(let target):
+            downloadModel(target)
+        case .start(let target):
             startModel(target)
         case .retry(let target):
             // Clear the failure first, or the banner would stay in its
@@ -492,6 +495,15 @@ struct ContentView: View {
                 replacementGroup: .assistant
             )
         }
+    }
+
+    /// Fetch the weights WITHOUT loading them. The ``download`` action only
+    /// promises a download; the model becomes ``needsStart`` when the bytes
+    /// land and the user starts it explicitly. Same download-only path the
+    /// picker's "Download in background" uses.
+    private func downloadModel(_ target: String) {
+        let hfPath = catalogEntries.first(where: { $0.alias == target })?.hfRepo
+        _ = downloads.startDownload(alias: target, hfPath: hfPath)
     }
 
     private func selectChatModel(_ target: String) {
@@ -1097,7 +1109,12 @@ struct ContentView: View {
         case .start(let resume):
             alias = resume
             autoStartPendingDownload = nil
-            await server.start(alias: resume)
+            // Launch-time resume: if live memory makes this model unsafe right
+            // now, ``start`` defers silently instead of opening with a memory
+            // modal the user never asked for (issue: annoying warning on every
+            // app open). The user's own Start/first-message routes through
+            // ``start`` without this flag and still gets the warning.
+            await server.start(alias: resume, isLaunchAutoStart: true)
         case .promptDownload(let pending):
             let footprint = ModelSizing.estimate(alias: pending)
             let sizeText: String? = footprint.paramsBillions == nil

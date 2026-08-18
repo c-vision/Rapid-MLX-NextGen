@@ -32,7 +32,7 @@ AXApplication title="Rapid-MLX"
             AXGroup desc="fake-qwen3-tts isn't downloaded yet, It downloads once (<size>), then starts in seconds." enabled=true
               AXStaticText value=text enabled=true
               AXStaticText value=text enabled=true
-              AXButton id="Readiness.Action" desc="Download & start" enabled=true
+              AXButton id="Readiness.Action" desc="Download" enabled=true
             AXButton id="Audio.Speech.Generate" desc="Generate Speech" enabled=false
             AXScrollBar value=number enabled=true
               AXValueIndicator value=number
