@@ -5578,11 +5578,24 @@ def models_command(args):
     # alias so the "how big before I pull?" answer is the first thing a user
     # sees next to the name (issue #1286). Values come from the checked-in
     # model_sizes.json manifest — no per-invocation HuggingFace round-trip.
+    # Tools and Reasoning carry parser keys whose length is unbounded
+    # (``deepseek_r1_distill`` is 19 chars, wider than the old fixed 12).
+    # Size them to the data like the alias column so a long value never
+    # overflows and shifts every field to its right out of the header's
+    # columns (#1999). Preset is last, so its long ``MTP@…`` values can
+    # overrun harmlessly and stay unbounded.
+    tools_width = max(
+        16, max((len(p.tool_call_parser or "—") for p in profiles.values()), default=0)
+    )
+    reasoning_width = max(
+        12,
+        max((len(p.reasoning_parser or "—") for p in profiles.values()), default=0),
+    )
     cols = (
         ("Alias", alias_width),
         ("Size", 10),
-        ("Tools", 16),
-        ("Reasoning", 12),
+        ("Tools", tools_width),
+        ("Reasoning", reasoning_width),
         ("Spec-Decode", 10),
         ("Suffix Tier", 11),
         ("DFlash", 7),
@@ -5624,7 +5637,8 @@ def models_command(args):
         ddtree = "✓" if p.supports_ddtree else "—"
         size = format_size(p.hf_path)
         row = (
-            f"  {alias:<{alias_width}} {size:<10} {tools:<16} {reasoning:<12} "
+            f"  {alias:<{alias_width}} {size:<10} {tools:<{tools_width}} "
+            f"{reasoning:<{reasoning_width}} "
             f"{spec:<10} {tier:<11} {dflash:<7} {ddtree:<7} {preset:<8}"
         )
         print(row)
@@ -5654,12 +5668,15 @@ def models_command(args):
         )
         print()
         print(f"  Audio models ({len(audio_entries)} aliases)")
-        audio_sep = "  " + "─" * width
-        print(audio_sep)
         audio_header = (
             f"  {'Alias':<{audio_alias_width}} {'Size':<10} {'Kind':<10} "
             f"{'Family':<12} {'HF id':<40}"
         )
+        # Size the rule to THIS table's header, not the text table's width —
+        # the text table's Tools/Reasoning columns are data-sized now (#1999),
+        # so reusing its width would stretch every secondary rule.
+        audio_sep = "  " + "─" * (len(audio_header) - 2)
+        print(audio_sep)
         print(audio_header)
         print(audio_sep)
         for entry in audio_entries:
@@ -5682,11 +5699,12 @@ def models_command(args):
         )
         print()
         print(f"  Video models ({len(video_profiles)} aliases)")
-        video_sep = "  " + "─" * width
-        print(video_sep)
-        print(
+        video_header = (
             f"  {'Alias':<{video_alias_width}} {'Size':<10} {'Kind':<11} {'HF id':<40}"
         )
+        video_sep = "  " + "─" * (len(video_header) - 2)
+        print(video_sep)
+        print(video_header)
         print(video_sep)
         for alias in sorted(video_profiles):
             p = video_profiles[alias]
@@ -5708,11 +5726,12 @@ def models_command(args):
         )
         print()
         print(f"  Image models ({len(image_profiles)} aliases)")
-        image_sep = "  " + "─" * width
-        print(image_sep)
-        print(
+        image_header = (
             f"  {'Alias':<{image_alias_width}} {'Size':<10} {'Kind':<11} {'HF id':<40}"
         )
+        image_sep = "  " + "─" * (len(image_header) - 2)
+        print(image_sep)
+        print(image_header)
         print(image_sep)
         for alias in sorted(image_profiles):
             p = image_profiles[alias]
@@ -6063,6 +6082,22 @@ def alias_command(args) -> None:
         raise SystemExit(1) from None
 
 
+def _elide_front(text: str, width: int) -> str:
+    """Trim ``text`` to at most ``width`` chars, keeping the TAIL.
+
+    For a served model that is a filesystem path, the tail (the model name) is
+    the distinctive part, so the head is what gets replaced by a leading ``…``.
+    The result never exceeds ``width`` (widths <= 1 leave no room for the ``…``).
+    """
+    if len(text) <= width:
+        return text
+    if width <= 0:
+        return ""
+    if width == 1:
+        return text[-1:]
+    return "…" + text[-(width - 1) :]
+
+
 def ps_command(_args):
     """List running rapid-mlx servers (process scan)."""
     import time
@@ -6153,9 +6188,14 @@ def ps_command(_args):
     print()
     print(f"  {'PID':<8}{'PORT':<8}{'MODEL':<40}{'UPTIME':<10}")
     print(f"  {'-' * 66}")
+    # Serving a local path (not an alias) is the normal case for a converted
+    # model, and those paths routinely exceed the 40-char column — the old
+    # code let them run straight into UPTIME with no gap (#1999). Elide from
+    # the FRONT so the distinctive tail (the model name) survives, capped at 38
+    # so the ``<40`` pad always leaves at least two spaces before UPTIME.
     # Sort numerically by port — string sort would put "10000" before "8000".
     for pid, port, model, uptime in sorted(rows, key=lambda r: int(r[1])):
-        print(f"  {pid:<8}{port:<8}{model:<40}{uptime:<10}")
+        print(f"  {pid:<8}{port:<8}{_elide_front(model, 38):<40}{uptime:<10}")
     print()
 
 
@@ -8059,7 +8099,7 @@ def connect_command(args):
     lifespan banner uses — so ``ready``/``openai``/``anthropic`` and the
     machine form can never drift from what a running server prints.
     """
-    from vllm_mlx.connect import render_banner, resolve_endpoints
+    from vllm_mlx.connect import probe_server_alive, render_banner, resolve_endpoints
 
     eps = resolve_endpoints(host=args.host, port=args.port, model=args.model)
 
@@ -8072,7 +8112,10 @@ def connect_command(args):
         print(eps.to_json())
         return
 
-    print(render_banner(eps), end="")
+    # Don't announce "Ready:" for a server that isn't there (#1999): probe the
+    # target first so a stopped server reads as "no server", not "warming up".
+    running = eps.listen_fd is not None or probe_server_alive(eps.host, eps.port)
+    print(render_banner(eps, running=running), end="")
 
 
 def _connect_target(args, eps):
