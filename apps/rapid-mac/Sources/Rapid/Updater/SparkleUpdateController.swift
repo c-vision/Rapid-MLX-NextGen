@@ -14,17 +14,38 @@ import Sparkle
 @MainActor
 @Observable
 final class SparkleUpdateController {
+    enum FixtureState {
+        case busy
+    }
+
     private var standardController: SPUStandardUpdaterController?
+    private var canCheckObservation: NSKeyValueObservation?
     private(set) var isStarted = false
     private(set) var automaticallyDownloadsUpdates: Bool
+    /// Mirrors Sparkle's KVO-compliant state so SwiftUI never presents an
+    /// enabled control whose action Sparkle is required to ignore. In
+    /// particular, `canCheckForUpdates` is false while an automatic appcast or
+    /// update download is running in the background.
+    private(set) var canCheckForUpdates: Bool
+    private let fixtureState: FixtureState?
 
     let isEnabled: Bool
 
     init(
         infoDictionary: [String: Any]? = Bundle.main.infoDictionary,
-        checksEnabled: Bool = UpdateChecker.updateChecksEnabled()
+        checksEnabled: Bool = UpdateChecker.updateChecksEnabled(),
+        fixtureState: FixtureState? = nil
     ) {
-        isEnabled = checksEnabled && Self.hasValidConfiguration(infoDictionary)
+        self.fixtureState = fixtureState
+        isEnabled = fixtureState != nil || (checksEnabled && Self.hasValidConfiguration(infoDictionary))
+        // Preserve the pre-start contract: an enabled production controller
+        // is actionable until Sparkle starts and publishes its real KVO
+        // state. The deterministic busy fixture is the sole exception.
+        if case .busy = fixtureState {
+            canCheckForUpdates = false
+        } else {
+            canCheckForUpdates = isEnabled
+        }
         automaticallyDownloadsUpdates = isEnabled
             ? (UserDefaults.standard.object(forKey: "SUAutomaticallyUpdate") as? Bool ?? true)
             : false
@@ -35,6 +56,10 @@ final class SparkleUpdateController {
     /// downloaded update is installed when Rapid next quits normally.
     func start() {
         guard isEnabled, !isStarted else { return }
+        if fixtureState != nil {
+            isStarted = true
+            return
+        }
         let controller = SPUStandardUpdaterController(
             startingUpdater: false,
             updaterDelegate: nil,
@@ -42,7 +67,16 @@ final class SparkleUpdateController {
         )
         standardController = controller
         controller.startUpdater()
-        automaticallyDownloadsUpdates = controller.updater.automaticallyDownloadsUpdates
+        let updater = controller.updater
+        automaticallyDownloadsUpdates = updater.automaticallyDownloadsUpdates
+        canCheckForUpdates = updater.canCheckForUpdates
+        canCheckObservation = updater.observe(\.canCheckForUpdates, options: [.initial, .new]) {
+            [weak self] _, change in
+            guard let value = change.newValue else { return }
+            Task { @MainActor [weak self] in
+                self?.canCheckForUpdates = value
+            }
+        }
         isStarted = true
     }
 
@@ -52,11 +86,8 @@ final class SparkleUpdateController {
     func checkForUpdates() {
         guard isEnabled else { return }
         if !isStarted { start() }
+        guard canCheckForUpdates else { return }
         standardController?.checkForUpdates(nil)
-    }
-
-    var canCheckForUpdates: Bool {
-        isEnabled && (standardController?.updater.canCheckForUpdates ?? true)
     }
 
     func setAutomaticallyDownloadsUpdates(_ enabled: Bool) {

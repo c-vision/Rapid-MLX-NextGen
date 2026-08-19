@@ -254,8 +254,31 @@ struct RapidApp: App {
             customInstructions: customInstructionsConfig,
             server: manager
         )
-        let updateChecker = UpdateChecker()
-        let sparkleUpdateController = SparkleUpdateController()
+        // Deterministic AX fixture for the otherwise release-only state where
+        // Sparkle is already downloading in the background. Requiring both
+        // variables keeps this inert in every normal/dev launch.
+        let updateBusyFixture = ProcessInfo.processInfo.environment["RAPID_GUI_GOLDEN_MODE"] == "1"
+            && ProcessInfo.processInfo.environment["RAPID_GUI_UPDATE_BUSY_FIXTURE"] == "1"
+        let updateFetcher: UpdateChecker.Fetcher?
+        if updateBusyFixture {
+            updateFetcher = {
+                UpdateChecker.Release(
+                    schemaVersion: 1,
+                    version: "99.0.0",
+                    tagName: "rapid-mac-v99.0.0",
+                    htmlURL: "https://rapidmlx.com/desktop",
+                    notes: "Golden-flow update fixture.",
+                    publishedAt: "2026-08-19T00:00:00Z",
+                    dmgURL: "https://dl.rapidmlx.com/rapid-mac-v99.0.0.dmg"
+                )
+            }
+        } else {
+            updateFetcher = nil
+        }
+        let updateChecker = UpdateChecker(fetcher: updateFetcher)
+        let sparkleUpdateController = SparkleUpdateController(
+            fixtureState: updateBusyFixture ? .busy : nil
+        )
         let downloadsInstance = DownloadManager(binaryPath: manager.binaryPath)
         // #253: let ``ServerManager.start(alias:)`` await any in-flight
         // background pull for the same alias before spawning serve.

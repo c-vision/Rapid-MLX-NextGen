@@ -14,7 +14,20 @@ struct SparkleUpdateControllerTests {
         ]))
     }
 
-    @Test("local build without injected public key stays on legacy updater")
+    @MainActor
+    @Test("enabled controller remains actionable before Sparkle starts")
+    func enabledBeforeStart() {
+        let controller = SparkleUpdateController(infoDictionary: [
+            "SUFeedURL": "https://dl.rapidmlx.com/appcast.xml",
+            "SUPublicEDKey": publicKey,
+        ])
+
+        #expect(controller.isEnabled)
+        #expect(!controller.isStarted)
+        #expect(controller.canCheckForUpdates)
+    }
+
+    @Test("local build without injected public key keeps Sparkle disabled")
     func missingPublicKey() {
         #expect(!SparkleUpdateController.hasValidConfiguration([
             "SUFeedURL": "https://dl.rapidmlx.com/appcast.xml",
@@ -44,5 +57,21 @@ struct SparkleUpdateControllerTests {
             checksEnabled: false
         )
         #expect(!controller.isEnabled)
+    }
+
+    @MainActor
+    @Test("golden busy fixture mirrors a background Sparkle session without starting Sparkle")
+    func busyFixture() {
+        let controller = SparkleUpdateController(
+            infoDictionary: [:],
+            checksEnabled: false,
+            fixtureState: .busy
+        )
+
+        #expect(controller.isEnabled)
+        #expect(!controller.canCheckForUpdates)
+        controller.start()
+        #expect(controller.isStarted)
+        #expect(!controller.canCheckForUpdates)
     }
 }

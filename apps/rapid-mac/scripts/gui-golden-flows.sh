@@ -39,7 +39,7 @@ Usage: gui-golden-flows.sh [--flow NAME] [--keep] [--update-baselines]
 Flows: fresh-install, cached-quickstart, cached-curated-tradeup, download-progress, settings-persistence, settings-mtp, chat-restore, message-actions, restored-tools, tool-loop-budget, chat-depth, math-rendering, launch-integrations,
        slow-stream-stop,
        model-crash-recovery, low-memory-choice,
-       update-state, window-close-prompt, no-dead-controls, catalog-integrity,
+       update-state, update-busy, window-close-prompt, no-dead-controls, catalog-integrity,
        browse-all-destination, chat-document-attachment, image-generation, dictation, audio-readiness, all
 
 Most named regression flows drive the app through the accessibility API alone.
@@ -2451,6 +2451,36 @@ flow_update_state() {
     cleanup_persona
 }
 
+# A signed release can discover the new version through Rapid's lightweight
+# manifest while Sparkle is already fetching that same update in the
+# background. Sparkle rejects a second foreground check in this state. The UI
+# must expose the real busy state instead of leaving an enabled orange button
+# whose click is silently ignored.
+flow_update_busy() {
+    start_persona update-busy \
+        RAPID_GUI_GOLDEN_MODE=1 \
+        RAPID_GUI_UPDATE_BUSY_FIXTURE=1
+    dismiss_first_run
+    open_settings
+    see_main "$OUT/settings.json"
+    press "$OUT/settings.json" Settings.Category.app "$OUT/open-app.json"
+    wait_identifier Settings.App.UpdateBusy "$OUT/app-panel.json"
+
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.App.UpdateBusy"
+                    and (.description | contains("Update in progress")))' \
+        "$OUT/app-panel.json" >/dev/null \
+        || die "background Sparkle session has no visible progress feedback"
+    if jq -e '.data.ui_elements[]?
+              | select(.identifier == "Settings.App.UpdateCTA")' \
+             "$OUT/app-panel.json" >/dev/null; then
+        die "background Sparkle session still exposes the no-op update CTA"
+    fi
+    baseline "update-busy.app-panel" "$OUT/app-panel.json"
+    log "  background update replaces the no-op CTA with truthful progress"
+    cleanup_persona
+}
+
 flow_window_close_prompt() {
     # #1590: the prompt, persistence store and delegate proxy all existed, but
     # no WindowAccessor ever attached the proxy to the real main NSWindow.
@@ -4505,6 +4535,7 @@ case "$FLOW" in
     model-crash-recovery) flow_model_crash_recovery ;;
     low-memory-choice) flow_low_memory_choice ;;
     update-state) flow_update_state ;;
+    update-busy) flow_update_busy ;;
     window-close-prompt) flow_window_close_prompt ;;
     no-dead-controls) flow_no_dead_controls ;;
     catalog-integrity) flow_catalog_integrity ;;
@@ -4532,6 +4563,7 @@ case "$FLOW" in
         flow_model_crash_recovery
         flow_low_memory_choice
         flow_update_state
+        flow_update_busy
         flow_window_close_prompt
         flow_no_dead_controls
         flow_catalog_integrity

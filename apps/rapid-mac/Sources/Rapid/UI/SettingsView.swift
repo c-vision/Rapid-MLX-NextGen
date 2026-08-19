@@ -953,14 +953,27 @@ struct SettingsView: View {
                 // uses, so a compromised manifest cannot turn this into a
                 // phishing redirect.
                 if sparkleUpdater.isEnabled {
-                    Button {
-                        sparkleUpdater.checkForUpdates()
-                    } label: {
-                        Label("Update Rapid-MLX", systemImage: "arrow.down.circle.fill")
+                    if sparkleUpdater.canCheckForUpdates {
+                        Button {
+                            sparkleUpdater.checkForUpdates()
+                        } label: {
+                            Label("Update Rapid-MLX", systemImage: "arrow.down.circle.fill")
+                        }
+                        .buttonStyle(.rapidPrimary)
+                        .help("Opens the updater to download and install this release.")
+                        .accessibilityIdentifier("Settings.App.UpdateCTA")
+                    } else {
+                        HStack(spacing: RapidTheme.Space.sm) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Update in progress…")
+                                .font(RapidFont.bodyEmphasis)
+                        }
+                        .foregroundStyle(RapidTheme.textSecondary)
+                        .help("Rapid-MLX is checking or downloading the update in the background.")
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("Settings.App.UpdateBusy")
                     }
-                    .buttonStyle(.rapidPrimary)
-                    .help("Opens the updater to download and install this release.")
-                    .accessibilityIdentifier("Settings.App.UpdateCTA")
                 } else if let releaseURL = ContentView.missingOverlayDownloadURL(
                     for: appUpdater.availableUpdate
                 ) {
