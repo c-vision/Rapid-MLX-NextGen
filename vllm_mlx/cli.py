@@ -5683,7 +5683,11 @@ def recipe_command(args) -> None:
     )
     labels = {"smart": "Smart", "fast": "Fast"}
     for index, pick in enumerate(payload["picks"], start=1):
-        stats = [f"{pick['footprint_gb']:.1f} GB"]
+        # Label the footprint as RAM: it is measured 8K peak memory, a
+        # different axis from the on-disk ``required_disk_gb`` shown in the
+        # won't-fit line below. Without the label the two GB numbers read as
+        # contradictory (e.g. "20.0 GB" then "needs ~16.72 GB").
+        stats = [f"{pick['footprint_gb']:.1f} GB RAM"]
         if pick.get("caveat"):
             stats.append(pick["caveat"])
         else:
