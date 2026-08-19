@@ -295,6 +295,19 @@ def _port_preflight_or_die(host: str, port: int, *, model: str) -> None:
     """
     import socket
 
+    # Validate the port range up front. ``socket.bind()`` raises
+    # ``OverflowError`` (NOT an ``OSError`` subclass) for a port outside
+    # 0-65535, so the ``except OSError`` collision handler below would let
+    # it escape as a raw traceback (dogfood #2125: ``--port 99999`` printed
+    # ``OverflowError: bind(): port must be 0-65535`` instead of a friendly
+    # message). Catch the typo here — before any probe — and emit the same
+    # actionable style as the port-in-use path. ``0`` stays valid: it asks
+    # the OS for an ephemeral port, which uvicorn binds normally.
+    if not 0 <= port <= 65535:
+        print(f"\n  Error: --port {port} is out of range. Ports must be 0-65535.")
+        print(f"  Try a valid port: rapid-mlx serve {model} --port 8000")
+        sys.exit(1)
+
     wildcards = _wildcard_host_aliases()
     if host in wildcards:
         # Probe the requested wildcard FIRST (so a LAN-side port
