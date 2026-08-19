@@ -54,19 +54,33 @@ struct MarkdownCompiler: Sendable {
         // attachment path (ChatGPT's `_viewAttachments`), which is a larger
         // change than this one.
         var pending = ""
-        for segment in LaTeXSegmenter.segment(source) {
+        var inlineMath: [String] = []
+        for segment in LaTeXSegmenter.segment(Self.withoutStraySentinels(source)) {
             switch segment {
             case let .math(latex, displayMode) where displayMode:
                 appendMarkdown(pending, depth: 0, into: &items)
                 pending = ""
                 items.append(.math(.init(latex: latex)))
             case let .math(latex, _):
-                pending += "$\(latex)$"
+                // A sentinel, not the source spelling. Handing `$x_1$` back to
+                // the markdown parser is what the segmenter ran first to
+                // avoid: the underscore is emphasis syntax, and the subscript
+                // is gone before any math code sees it. The sentinel carries
+                // no markdown-significant character, so it survives parsing as
+                // one contiguous piece of a single run and can be swapped back
+                // afterwards — inside **bold**, inside a list item, inside a
+                // table cell, wherever the sentence happened to put it.
+                pending += Self.mathSentinel(inlineMath.count)
+                inlineMath.append(latex)
             case let .markdown(body):
                 pending += body
             }
         }
         appendMarkdown(pending, depth: 0, into: &items)
+
+        if !inlineMath.isEmpty {
+            items = items.map { Self.restoringInlineMath($0, from: inlineMath) }
+        }
 
         return MarkdownResult(items: items, revision: revision)
             .postProcessed(
@@ -245,6 +259,143 @@ struct MarkdownCompiler: Sendable {
     }
 
     // MARK: - Inline walk
+
+    // MARK: - Inline math
+
+    /// Private-use bracket around a decimal index. Nothing in it is markdown
+    /// syntax, so it survives parsing as one contiguous piece of a run.
+    ///
+    /// Plane 15, not the U+E000 block: that block is where Nerd Fonts put
+    /// their glyphs — U+E000 itself is the first Pomicons codepoint — so it
+    /// arrives in pasted terminal output and in model text about fonts.
+    /// A literal `U+E000 0 U+E001` in a message was enough to have the
+    /// reader's own text replaced by somebody else's formula, and a literal
+    /// `U+E000 -1 U+E001` crashed the renderer outright. Nothing ships glyphs
+    /// in the supplementary private-use planes.
+    private static let sentinelOpen: Character = "\u{F0000}"
+    private static let sentinelClose: Character = "\u{F0001}"
+
+    static func mathSentinel(_ index: Int) -> String {
+        "\(sentinelOpen)\(index)\(sentinelClose)"
+    }
+
+    /// Belt and braces for the above: a sentinel that reaches the compiler in
+    /// the source text is not ours, and is dropped before segmentation so it
+    /// can never be read as an index.
+    static func withoutStraySentinels(_ source: String) -> String {
+        guard source.contains(sentinelOpen) || source.contains(sentinelClose) else {
+            return source
+        }
+        return source.filter { $0 != sentinelOpen && $0 != sentinelClose }
+    }
+
+    /// Swap sentinels back for math runs, everywhere runs can appear.
+    ///
+    /// Tables and lists carry text blocks of their own, so this walks the
+    /// whole item rather than only top-level paragraphs — inline math in a
+    /// table cell is the case the original #131 review called out.
+    static func restoringInlineMath(
+        _ item: MarkdownItem, from latex: [String]
+    ) -> MarkdownItem {
+        switch item {
+        case .text(let block):
+            return .text(.init(
+                runs: expandingSentinels(block.runs, from: latex),
+                kind: block.kind,
+                depth: block.depth,
+                listIndex: block.listIndex
+            ))
+        case .table(let block):
+            return .table(.init(
+                header: block.header.map { expandingSentinels($0, from: latex) },
+                rows: block.rows.map { $0.map { expandingSentinels($0, from: latex) } },
+                alignments: block.alignments
+            ))
+        case .code(let block):
+            // The segmenter skips code so `$x$` inside a block stays literal,
+            // but it and swift-markdown do not agree on every spelling of a
+            // block — a `~~~` fence is one swift-markdown recognises and the
+            // segmenter does not. The sentinel then lands in code the reader
+            // sees and the copy button copies. Putting the source spelling
+            // back restores exactly what `main` renders, whichever construct
+            // the two disagreed about.
+            return .code(.init(
+                code: restoringSourceSpelling(in: block.code, from: latex),
+                language: block.language
+            ))
+        case .images, .math:
+            // Neither has an inline layer to walk.
+            return item
+        }
+    }
+
+    /// Rewrite sentinels back to `$…$` in plain text that never became runs.
+    static func restoringSourceSpelling(
+        in text: String, from latex: [String]
+    ) -> String {
+        guard text.contains(sentinelOpen) else { return text }
+        var output = ""
+        var index = text.startIndex
+        while index < text.endIndex {
+            guard text[index] == sentinelOpen,
+                  let close = text[index...].firstIndex(of: sentinelClose),
+                  let slot = Int(text[text.index(after: index)..<close]),
+                  latex.indices.contains(slot)
+            else {
+                output.append(text[index])
+                index = text.index(after: index)
+                continue
+            }
+            output += "$\(latex[slot])$"
+            index = text.index(after: close)
+        }
+        return output
+    }
+
+    /// Split each run on sentinels, keeping the surrounding inline styling.
+    ///
+    /// A math run inherits `isStrong`/`isEmphasis`/`link` from the run it came
+    /// out of, so `**$x$**` stays bold and a formula inside a link stays part
+    /// of the link.
+    static func expandingSentinels(
+        _ runs: [InlineRun], from latex: [String]
+    ) -> [InlineRun] {
+        guard runs.contains(where: { $0.text.contains(sentinelOpen) }) else { return runs }
+        var expanded: [InlineRun] = []
+        for run in runs {
+            guard run.text.contains(sentinelOpen) else { expanded.append(run); continue }
+            var buffer = ""
+            var index = run.text.startIndex
+            while index < run.text.endIndex {
+                guard run.text[index] == sentinelOpen,
+                      let close = run.text[index...].firstIndex(of: sentinelClose),
+                      let slot = Int(run.text[run.text.index(after: index)..<close]),
+                      // `indices.contains`, not `slot < latex.count`:
+                      // `Int("-1")` parses, and a negative index traps.
+                      latex.indices.contains(slot)
+                else {
+                    buffer.append(run.text[index])
+                    index = run.text.index(after: index)
+                    continue
+                }
+                if !buffer.isEmpty {
+                    var prose = run; prose.text = buffer; expanded.append(prose)
+                    buffer = ""
+                }
+                var math = run
+                // The source spelling, so copy and VoiceOver read `$x$` rather
+                // than a private-use character nothing can render.
+                math.text = "$\(latex[slot])$"
+                math.math = latex[slot]
+                expanded.append(math)
+                index = run.text.index(after: close)
+            }
+            if !buffer.isEmpty {
+                var prose = run; prose.text = buffer; expanded.append(prose)
+            }
+        }
+        return expanded
+    }
 
     private func inlineRuns(of markup: Markup) -> [InlineRun] {
         var runs: [InlineRun] = []
