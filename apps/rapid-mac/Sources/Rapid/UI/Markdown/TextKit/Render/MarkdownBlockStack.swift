@@ -201,10 +201,16 @@ private struct MarkdownCodeBlockRepresentable: NSViewRepresentable {
 
 /// Table rendering.
 ///
-/// Note what is absent: grid lines. ChatGPT's option table has
-/// `tableCellInsets`, `tableBorderCornerRadius`, `tableHeaderBackgroundColor`
-/// and `tableTextStyle` — and no field for cell borders. That absence is the
-/// evidence: rows are separated by rhythm and a header fill, not by rules.
+/// A `Grid` rather than a `VStack` of `HStack`s. The stacked version sized
+/// every row independently, so its columns only lined up while each cell was
+/// under the 80pt minimum — any longer value staggered the whole table. That
+/// was survivable while the table was borderless; with grid lines it is not,
+/// because a misaligned divider is visible in a way misaligned text is not.
+///
+/// Grid lines themselves are ours, not transcribed: ChatGPT's option table has
+/// no cell-border field, but a borderless table in this transcript reads as
+/// loose columns of text. `tableBorderColor` set to nil restores that
+/// rendering.
 struct MarkdownTableView: View {
     let block: MarkdownItem.TableBlock
     let options: MarkdownOptions
@@ -213,37 +219,87 @@ struct MarkdownTableView: View {
         // Horizontal scrolling because `nonTableMaxWidth` in the original says
         // tables may exceed the prose column rather than compress into it.
         ScrollView(.horizontal, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 0) {
-                row(block.header, isHeader: true)
-                ForEach(Array(block.rows.enumerated()), id: \.offset) { _, cells in
-                    row(cells, isHeader: false)
+            Grid(horizontalSpacing: 0, verticalSpacing: 0) {
+                GridRow { cells(block.header, rowIndex: 0, isHeader: true) }
+                ForEach(Array(block.rows.enumerated()), id: \.offset) { index, row in
+                    GridRow { cells(row, rowIndex: index + 1, isHeader: false) }
                 }
             }
-            .clipShape(RoundedRectangle(
-                cornerRadius: options.tableBorderCornerRadius, style: .continuous
-            ))
+            .clipShape(borderShape)
+            // `strokeBorder` rather than `stroke`: the line is drawn inside
+            // the shape, so the clip above does not shave half of it off.
+            .overlay {
+                if let border = options.tableBorderColor {
+                    borderShape.strokeBorder(
+                        Color(nsColor: border), lineWidth: options.tableBorderWidth
+                    )
+                }
+            }
         }
     }
 
-    private func row(_ cells: [[InlineRun]], isHeader: Bool) -> some View {
-        HStack(spacing: 0) {
-            ForEach(Array(cells.enumerated()), id: \.offset) { index, runs in
-                Text(styled(runs, isHeader: isHeader))
-                    .frame(
-                        minWidth: 80,
-                        alignment: alignment(for: index)
-                    )
-                    .padding(.horizontal, options.tableCellInsets.leading)
-                    .padding(.vertical, options.tableCellInsets.top)
+    private var borderShape: RoundedRectangle {
+        RoundedRectangle(
+            cornerRadius: options.tableBorderCornerRadius, style: .continuous
+        )
+    }
+
+    /// One row's cells. Each draws only its leading and top dividers, so a
+    /// shared edge is painted once rather than twice — two hairlines on the
+    /// same seam render as a double-weight line at non-integral scale factors.
+    @ViewBuilder
+    private func cells(
+        _ cells: [[InlineRun]], rowIndex: Int, isHeader: Bool
+    ) -> some View {
+        ForEach(Array(cells.enumerated()), id: \.offset) { column, runs in
+            let cell = Text(styled(runs, isHeader: isHeader))
+                .frame(minWidth: 80, alignment: alignment(for: column))
+                .padding(.horizontal, options.tableCellInsets.leading)
+                .padding(.vertical, options.tableCellInsets.top)
+                // `maxHeight` so a short cell still fills a row made tall by a
+                // wrapped neighbour — otherwise its dividers stop short.
+                .frame(minHeight: options.tableRowHeight, maxHeight: .infinity)
+                .background(isHeader
+                    ? Color(nsColor: options.tableHeaderBackgroundColor ?? .clear)
+                    : Color.clear)
+                .overlay(alignment: .leading) {
+                    divider(column > 0, vertical: true)
+                }
+                .overlay(alignment: .top) {
+                    divider(rowIndex > 0, vertical: false)
+                }
+            // Column alignment is a property of the column, so it is declared
+            // once — on the header — rather than restated by every row.
+            if isHeader {
+                cell.gridColumnAlignment(horizontalAlignment(for: column))
+            } else {
+                cell
             }
         }
-        .frame(minHeight: options.tableRowHeight, alignment: .leading)
-        .background(isHeader
-            ? Color(nsColor: options.tableHeaderBackgroundColor ?? .clear)
-            : Color.clear)
+    }
+
+    @ViewBuilder
+    private func divider(_ visible: Bool, vertical: Bool) -> some View {
+        if visible, let border = options.tableBorderColor {
+            Rectangle()
+                .fill(Color(nsColor: border))
+                .frame(
+                    width: vertical ? options.tableBorderWidth : nil,
+                    height: vertical ? nil : options.tableBorderWidth
+                )
+        }
     }
 
     private func alignment(for column: Int) -> SwiftUI.Alignment {
+        guard column < block.alignments.count else { return .leading }
+        switch block.alignments[column] {
+        case .leading: return .leading
+        case .center: return .center
+        case .trailing: return .trailing
+        }
+    }
+
+    private func horizontalAlignment(for column: Int) -> HorizontalAlignment {
         guard column < block.alignments.count else { return .leading }
         switch block.alignments[column] {
         case .leading: return .leading

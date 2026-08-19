@@ -80,13 +80,30 @@ struct MarkdownOptions: @unchecked Sendable {
 
     // MARK: - Code blocks
 
-    /// 实测: sampled #F8F8F8. The nearest token is `bg/tertiary` (#F3F3F3);
-    /// the 5-unit gap suggests a distinct swatch, so the measured literal wins
-    /// until we can prove otherwise.
-    public var codeBlockBackground: NSColor = NSColor(
-        srgbRed: 0.973, green: 0.973, blue: 0.973, alpha: 1
+    /// 实测 (light) was #F8F8F8, and that measurement is now deliberately not
+    /// used: sampled against ChatGPT's white page it separates, but this app's
+    /// canvas is `RapidTheme.canvas` #FAFAF9, two levels away — the card
+    /// vanished into the transcript. #F1F0EC is the same distance below our
+    /// canvas that the measured swatch sat below ChatGPT's.
+    ///
+    /// The dark value is NOT measured — ChatGPT's reference conversation was
+    /// captured in light mode. It is `RapidTheme.card`'s #1A1D21, i.e. one
+    /// step *above* the #141619 canvas rather than the recessed
+    /// `surfaceCode`: a code card sits directly on the transcript, so a
+    /// recessed fill would be indistinguishable from the background.
+    ///
+    /// This used to be a single light literal, which meant the card stayed
+    /// near-white in dark mode while the syntax palette resolved to its dark
+    /// variants — pale purple keywords on white. Both halves have to switch
+    /// together, so this has to be dynamic.
+    public var codeBlockBackground: NSColor = markdownDynamicColor(
+        light: (0xF1, 0xF0, 0xEC), dark: (0x1A, 0x1D, 0x21)
     )
-    public var codeBlockBorder: NSColor?
+    /// Same hairline the table uses, for the same reason: fill alone is not
+    /// enough separation from the canvas at these low contrasts.
+    public var codeBlockBorder: NSColor? = markdownDynamicColor(
+        light: (0xE0, 0xE0, 0xDC), dark: (0x2E, 0x32, 0x38)
+    )
     /// 实测: circle-fit 14.24 (n=40, mid-arc samples).
     public var codeCornerRadius: CGFloat = 14
     /// 待校准.
@@ -105,10 +122,12 @@ struct MarkdownOptions: @unchecked Sendable {
 
     // MARK: - Tables
     //
-    // Note the absence of a grid-line colour. ChatGPT's field list has
-    // `tableCellInsets`, `tableBorderCornerRadius`, `tableHeaderBackgroundColor`
-    // and `tableTextStyle` — and nothing for cell borders. That absence is
-    // evidence: the table has no grid, only a header fill and row rhythm.
+    // ChatGPT's field list has `tableCellInsets`, `tableBorderCornerRadius`,
+    // `tableHeaderBackgroundColor` and `tableTextStyle` — and nothing for cell
+    // borders, which we first read as evidence that the table is separated by
+    // rhythm alone. In practice a borderless table in this transcript reads as
+    // three columns of loose text, so `tableBorderColor` is ours rather than
+    // transcribed. `nil` restores the original borderless rendering.
 
     /// 推导 from the measured 42pt row height.
     public var tableCellInsets: NSDirectionalEdgeInsets = .init(
@@ -116,7 +135,23 @@ struct MarkdownOptions: @unchecked Sendable {
     )
     /// 待校准.
     public var tableBorderCornerRadius: CGFloat = 8
-    public var tableHeaderBackgroundColor: NSColor?
+    /// Grid line around the table and between its cells. Quiet enough to
+    /// stay out of the prose's way — one step softer than
+    /// `RapidTheme.hairlineStrong` in both modes.
+    public var tableBorderColor: NSColor? = markdownDynamicColor(
+        light: (0xE0, 0xE0, 0xDC), dark: (0x2E, 0x32, 0x38)
+    )
+    public var tableBorderWidth: CGFloat = 1
+    /// A quiet fill so the header row reads as a header.
+    ///
+    /// Left nil originally, on the reading that ChatGPT's table separates rows
+    /// by rhythm alone. It does — but rhythm plus a header fill, and with the
+    /// fill absent the whole table collapsed into three columns of loose text
+    /// with nothing marking the head. `Color.clear` under a nil is still the
+    /// escape hatch for a caller that wants the fill gone.
+    public var tableHeaderBackgroundColor: NSColor? = markdownDynamicColor(
+        light: (0xF1, 0xF1, 0xEF), dark: (0x22, 0x25, 0x2A)
+    )
     /// 实测: AX row frame h=42, confirmed by baseline Δ=42.
     public var tableRowHeight: CGFloat = 42
     public var tablePointSize: CGFloat = 14
@@ -178,6 +213,36 @@ struct MarkdownOptions: @unchecked Sendable {
     public var hugsTextHorizontally: Bool = false
 
     public init() {}
+}
+
+/// An appearance-aware `NSColor` for markdown chrome.
+///
+/// Every colour in this file has to be resolved at *draw* time, not at struct
+/// construction: `MarkdownOptions` is built once per view update and outlives
+/// an appearance change, so a colour baked from a light/dark test at init
+/// freezes to whatever the theme was on that pass — the same failure the
+/// syntax palette documents in ``SyntaxHighlighter``. A dynamic provider is
+/// re-evaluated by AppKit on each resolve instead.
+///
+/// Spelled out here rather than reusing `RapidTheme`'s tokens because those
+/// are SwiftUI `Color`s and this layer needs `NSColor`; the round trip back
+/// through `NSColor(_:)` loses the dynamic provider.
+func markdownDynamicColor(
+    light: (Int, Int, Int), dark: (Int, Int, Int)
+) -> NSColor {
+    NSColor(name: nil, dynamicProvider: { appearance in
+        let match = appearance.bestMatch(from: [
+            .aqua, .darkAqua, .accessibilityHighContrastDarkAqua
+        ])
+        let isDark = (match == .darkAqua || match == .accessibilityHighContrastDarkAqua)
+        let c = isDark ? dark : light
+        return NSColor(
+            deviceRed: CGFloat(c.0) / 255.0,
+            green: CGFloat(c.1) / 255.0,
+            blue: CGFloat(c.2) / 255.0,
+            alpha: 1
+        )
+    })
 }
 
 // MARK: - Presets

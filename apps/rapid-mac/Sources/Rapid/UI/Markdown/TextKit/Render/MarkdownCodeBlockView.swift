@@ -80,13 +80,39 @@ final class MarkdownCodeBlockView: NSView {
         headerLabel.stringValue = language?.capitalized ?? ""
         headerLabel.isHidden = (language?.isEmpty ?? true)
         layer?.cornerRadius = options.codeCornerRadius
-        layer?.backgroundColor = options.codeBlockBackground.cgColor
-        if let border = options.codeBlockBorder {
-            layer?.borderWidth = 1
-            layer?.borderColor = border.cgColor
-        }
+        applyAppearanceDependentColors()
         needsDisplay = true
         invalidateIntrinsicContentSize()
+    }
+
+    /// Paint the card fill and border for the CURRENT appearance.
+    ///
+    /// A `CALayer` takes a `CGColor`, which is a resolved value — asking a
+    /// dynamic `NSColor` for `.cgColor` snapshots it against whatever
+    /// appearance happens to be current and never updates again. So the
+    /// resolve is wrapped in `performAsCurrentDrawingAppearance` (which makes
+    /// this view's effective appearance the one the provider sees) and re-run
+    /// from ``viewDidChangeEffectiveAppearance`` on every light/dark flip.
+    /// Without the second half, switching to dark left a near-white card
+    /// behind dark-palette syntax colours until the block was rebuilt.
+    private func applyAppearanceDependentColors() {
+        let fill = options.codeBlockBackground
+        let border = options.codeBlockBorder
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = fill.cgColor
+            layer?.borderWidth = border == nil ? 0 : 1
+            layer?.borderColor = border?.cgColor
+        }
+    }
+
+    public override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyAppearanceDependentColors()
+        // The syntax palette is resolved into the attributed string at build
+        // time, so unlike the fill it cannot re-resolve itself — the text has
+        // to be rebuilt against the new appearance.
+        renderer.setCode(code, language: language)
+        needsDisplay = true
     }
 
     private var headerHeight: CGFloat {

@@ -2079,6 +2079,40 @@ flow_math_rendering() {
         "$OUT/math-settled.json" >/dev/null; then
         die "SwiftMath took the literal-source fallback in the assembled app"
     fi
+
+    # #2056: keep code and table chrome visible through a live appearance
+    # transition. Three short turns fit the hosted runner's 1024x681 window;
+    # unlike chat-depth's five-turn fixture, none of these AX nodes virtualize.
+    send_prompt "shape:code show me fibonacci in python" "markdown-code"
+    wait_send_idle "$OUT/code-settled.json"
+    send_prompt "shape:table compare those two models for me" "markdown-table"
+    wait_send_idle "$OUT/table-settled.json"
+    transcript_only "$OUT/table-settled.json" "$OUT/light-transcript.json"
+    assert_markdown_code_and_table "$OUT/light-transcript.json" "$OUT/light"
+
+    open_settings
+    see_settings "$OUT/settings.json"
+    press "$OUT/settings.json" Settings.Category.appearance "$OUT/appearance-open.json" \
+        || die "Appearance category is not pressable during markdown theme coverage"
+    see_settings "$OUT/appearance.json"
+    press "$OUT/appearance.json" Settings.Appearance.Theme.dark "$OUT/dark-press.json" \
+        || die "Dark appearance is not pressable during markdown theme coverage"
+    see_settings "$OUT/dark.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Appearance.Theme.dark")
+           | select(.selected == true or .value == 1 or .value == "1")' \
+        "$OUT/dark.json" >/dev/null || die "Dark appearance did not become selected"
+    transcript_only "$OUT/dark.json" "$OUT/dark-transcript.json"
+    assert_markdown_code_and_table "$OUT/dark-transcript.json" "$OUT/dark"
+
+    press "$OUT/dark.json" Settings.Appearance.Theme.light "$OUT/light-press.json" \
+        || die "Light appearance is not pressable after the dark markdown check"
+    see_settings "$OUT/light.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Appearance.Theme.light")
+           | select(.selected == true or .value == 1 or .value == "1")' \
+        "$OUT/light.json" >/dev/null || die "Light appearance did not become selected"
+    log "  live Light → Dark → Light kept math, code blocks, and tables rendered"
     cleanup_persona
 }
 
@@ -2882,6 +2916,7 @@ flow_chat_depth() {
     log "  markdown rendered: table cells and list items are their own elements,"
     log "  no raw fences, pipe rows or list markers, code block nested and intact,"
     log "  and the CJK answer kept its emoji and its right-to-left run"
+
     baseline chat-depth.five-turns "$OUT/turn5-settled.json"
 
     # Restore has to bring back the WHOLE conversation. `chat-restore` only
@@ -2914,6 +2949,25 @@ flow_chat_depth() {
     log "  and every shape still rendered the way it was before the relaunch"
     baseline chat-depth.restored "$OUT/depth-restored-transcript.json"
     cleanup_persona
+}
+
+assert_markdown_code_and_table() {
+    local transcript="$1" scratch="$2"
+    local code_message="$scratch-code.json" table_message="$scratch-table.json"
+    assistant_message_only "$transcript" 2 "$code_message"
+    assert_code_block_is_its_own_view "$code_message" \
+        "Here is the function you asked for" "def fib(n)"
+    assert_tree_text "$code_message" "    return a"
+
+    assistant_message_only "$transcript" 3 "$table_message"
+    assert_rendered_as_separate_nodes "$table_message" "table cells" \
+        "qwen3.5-9b" "5.2 GB" "74 tok/s" "llama-3.1-8b" "4.5 GB" "68 tok/s"
+    jq -e '[.data.ui_elements[]?] as $e
+            | any($e[]; .role == "AXOutline" and .description == "Markdown table")
+              and ([ $e[] | select(.role == "AXRow") ] | length >= 2)
+              and ([ $e[] | select(.role == "AXCell") ] | length >= 6)' \
+        "$table_message" >/dev/null \
+        || die "markdown table lost its navigable row/cell structure"
 }
 
 flow_catalog_integrity() {
