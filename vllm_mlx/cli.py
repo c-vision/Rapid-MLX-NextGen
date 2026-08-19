@@ -8403,13 +8403,21 @@ def agents_command(args):
     # No agent specified → list all profiles
     if not agent_name:
         profiles = list_profiles()
+        # Size the name column to the widest alias so a name that meets or
+        # exceeds the old hardcoded 15 (e.g. "deepseek-harness", 16 chars)
+        # can't eat its own separator space and shift every later column
+        # right on that one row. Floor at 15 so short rosters keep the
+        # familiar layout.
+        name_w = max(15, max((len(p.name) for p in profiles), default=15))
         print()
         print("  Supported AI Agents")
         print(
-            f"  {'name':<15} {'client':<20} {'GitHub':>6}  "
+            f"  {'name':<{name_w}} {'client':<20} {'GitHub':>6}  "
             f"{'tools':<5}  recommended models"
         )
-        print("  " + "─" * 78)
+        # Grow the divider in step with the name column so it doesn't fall
+        # short of the header once a long alias widens the table.
+        print("  " + "─" * (78 + name_w - 15))
         for p in profiles:
             tools = "FC" if p.needs_function_calling else "—"
             stars = f"{p.stars // 1000}K" if p.stars and p.stars >= 1000 else ""
@@ -8421,7 +8429,8 @@ def agents_command(args):
             else:
                 models = ""
             print(
-                f"  {p.name:<15} {p.display_name:<20} {stars:>6}  {tools:<5}  {models}"
+                f"  {p.name:<{name_w}} {p.display_name:<20} "
+                f"{stars:>6}  {tools:<5}  {models}"
             )
         print("  FC = function calling")
         print()
