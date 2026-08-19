@@ -54,6 +54,72 @@ from .kv_estimation import (  # noqa: E402
     estimate_kv_footprint,
     rotating_cache_slots,
 )
+
+
+def _read_kv_dims(model):
+    """Permissively resolve ``(num_layers, kv_heads, head_dim, struct_cfg)``
+    from a loaded model, or ``None``.
+
+    mlx-lm models expose the HF dims on ``.args`` (a ModelArgs dataclass), not
+    a ``.config``; multimodal checkpoints nest the text tower under
+    ``text_config`` and may carry DECOY vision dims on the outer config. This
+    only runs when the scheduler's own config-based terms could not resolve,
+    but it still mirrors the admission path's tower selection so it can't pick
+    the wrong one: a config whose OWN ``layer_types`` validates against its OWN
+    ``num_hidden_layers`` (``_pick_structural_config``'s rule) wins, then the
+    nested ``text_config``, then the outer holder (dense: neither validates and
+    only the outer carries dims). Returns the triple plus the config the dims
+    came from, so ``estimate_kv_footprint`` reads its hybrid structural fields
+    from the SAME place.
+    """
+
+    def _pos_int(value):
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            return None
+        return ivalue if ivalue > 0 else None
+
+    def _dims_of(cfg):
+        if cfg is None:
+            return None
+        layers = _pos_int(_cfg_get(cfg, "num_hidden_layers"))
+        kv_heads = _pos_int(_cfg_get(cfg, "num_key_value_heads")) or _pos_int(
+            _cfg_get(cfg, "num_attention_heads")
+        )
+        head_dim = _pos_int(_cfg_get(cfg, "head_dim"))
+        if head_dim is None:
+            hidden = _pos_int(_cfg_get(cfg, "hidden_size"))
+            heads = _pos_int(_cfg_get(cfg, "num_attention_heads"))
+            if hidden and heads:
+                head_dim = hidden // heads
+        if layers and kv_heads and head_dim:
+            return layers, kv_heads, head_dim, cfg
+        return None
+
+    for holder in (getattr(model, "config", None), getattr(model, "args", None)):
+        if holder is None:
+            continue
+        text_cfg = _cfg_get(holder, "text_config")
+        # 1) The structural tower: the config whose own layer_types validates
+        #    against its own num_hidden_layers (the text tower for a hybrid).
+        for cfg in (holder, text_cfg):
+            if cfg is None:
+                continue
+            n = _pos_int(_cfg_get(cfg, "num_hidden_layers"))
+            if n and _valid_layer_types(_cfg_get(cfg, "layer_types"), n):
+                dims = _dims_of(cfg)
+                if dims is not None:
+                    return dims
+        # 2) No validating layer_types (dense / non-hybrid multimodal): prefer
+        #    the nested text tower over the outer (possibly-decoy) config.
+        for cfg in (text_cfg, holder):
+            dims = _dims_of(cfg)
+            if dims is not None:
+                return dims
+    return None
+
+
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig  # noqa: E402
 from .paged_cache import PagedCacheManager
 from .pflash import PFlashConfig, compress_request_tokens
@@ -4884,6 +4950,134 @@ class Scheduler:
         """
         self._resolve_kv_bytes_per_token()
         return self._kv_fixed_baseline_bytes
+
+    def projected_memory_max_context(
+        self, native_context: int | None = None
+    ) -> int | None:
+        """Largest context length whose projected KV footprint fits this
+        device's memory budget right now, or ``None`` when it can't be
+        estimated.
+
+        This is the number behind the ``max_model_len`` model-card field:
+        vLLM/SGLang expose ``max_model_len`` as the served ceiling but crash
+        if it won't fit KV memory; on unified-memory Apple silicon we can go
+        one better and REPORT the memory-fitted ceiling instead of aborting.
+
+        The footprint is the exact per-request projection the admission gate
+        uses (``_estimate_request_kv_bytes``), so the advertised number lines
+        up with what the scheduler would actually admit::
+
+            footprint(T) = fixed_baseline
+                           + per_token_growth * T
+                           + sliding_slot_bytes * rotating_cache_slots(window, T)
+
+        Budget = device working set × utilization − currently-resident bytes.
+        Utilization is the operator's ``gpu_memory_utilization`` when a Metal
+        cap is configured, else a conservative reporting default so the field
+        is populated on the default (cap-disabled) config too. Residency is a
+        point-in-time ``get_active_memory()`` reading — weights plus any live
+        KV/prefix cache — so the number reflects what could be added NOW; it
+        is advisory, re-derived per call, and capped at ``native_context``.
+
+        Returns ``None`` (not a guess) on any failure — a stub/unknown model
+        with no resolvable footprint, no Metal device, or a non-positive
+        budget — so the ``/v1/models`` builder falls through to leaving the
+        field absent rather than advertising a fabricated cap.
+        """
+        try:
+            # Prefer the scheduler's OWN resolved footprint terms so the
+            # advertised ceiling can never diverge from what admission would
+            # actually charge: these honor the operator
+            # ``metal_cap_kv_bytes_per_token`` override and use
+            # ``_pick_structural_config`` to select the right tower on
+            # multimodal/hybrid configs. They are populated whenever the model
+            # exposes a ``.config`` (the admission path's own source).
+            per_tok = self._resolve_kv_bytes_per_token()
+            fixed_baseline = self._resolve_kv_fixed_baseline_bytes()
+            sliding_slot_bytes = self._kv_sliding_slot_bytes
+            sliding_window = self._kv_sliding_window
+            if per_tok <= 0 and fixed_baseline <= 0 and sliding_slot_bytes <= 0:
+                # The scheduler could not resolve terms — mlx-lm models expose
+                # dims on ``.args``, not ``.config``, so its config-only read
+                # yields 0 (and the admission cap is likewise a no-op there, so
+                # there is nothing to diverge from). Fall back to reading the
+                # dims off the model and running the SAME hybrid-aware
+                # estimator, preferring the text tower over any decoy outer
+                # config (``_read_kv_dims``).
+                dims = _read_kv_dims(self.model)
+                if dims is None:
+                    return None
+                num_layers, kv_heads, head_dim, struct_cfg = dims
+                dtype_bytes = self._infer_kv_dtype_bytes(struct_cfg)
+                uniform_per_token = 2 * num_layers * kv_heads * head_dim * dtype_bytes
+                if uniform_per_token <= 0:
+                    return None
+                estimate = estimate_kv_footprint(
+                    struct_cfg,
+                    dtype_bytes=dtype_bytes,
+                    uniform_per_token_bytes=uniform_per_token,
+                    base_num_layers=num_layers,
+                    base_kv_heads=kv_heads,
+                    base_head_dim=head_dim,
+                )
+                per_tok = estimate.per_token_growth_bytes
+                fixed_baseline = estimate.fixed_baseline_bytes
+                sliding_slot_bytes = estimate.sliding_slot_bytes
+                sliding_window = estimate.sliding_window
+                if per_tok <= 0 and fixed_baseline <= 0 and sliding_slot_bytes <= 0:
+                    return None
+
+            if not mx.metal.is_available():
+                return None
+            info = mx.device_info()
+            base = int(
+                info.get("max_recommended_working_set_size", info.get("memory_size", 0))
+                or 0
+            )
+            if base <= 0:
+                return None
+
+            util = float(getattr(self.config, "gpu_memory_utilization", 0.0) or 0.0)
+            if util <= 0.0:
+                # The Metal admission cap is disabled by default, but the
+                # reporting field should still be populated. 0.90 mirrors the
+                # engine's allocation-side default working-set fraction.
+                util = 0.90
+            budget = int(base * util)
+            resident = int(mx.get_active_memory())
+            available = budget - resident
+            if available <= 0:
+                return None
+
+            def _footprint(tokens: int) -> int:
+                return (
+                    fixed_baseline
+                    + per_tok * tokens
+                    + sliding_slot_bytes * rotating_cache_slots(sliding_window, tokens)
+                )
+
+            # Search up to the native window when known (the field is capped
+            # there anyway), else a generous ceiling covering 1M-context models.
+            upper = (
+                native_context
+                if isinstance(native_context, int) and native_context > 0
+                else 8_000_000
+            )
+            if _footprint(upper) <= available:
+                # Memory is not the binding constraint — the native window fits.
+                return upper
+            # Monotonic non-decreasing footprint → binary-search the largest T.
+            lo, hi = 0, upper
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if _footprint(mid) <= available:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return lo if lo > 0 else None
+        except Exception:  # noqa: BLE001
+            # Never let a memory-probe failure break the models endpoint.
+            return None
 
     def _estimate_request_kv_bytes(self, request: Request) -> int:
         """Project KV-cache memory the new request would consume.
