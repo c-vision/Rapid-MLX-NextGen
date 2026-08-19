@@ -11,6 +11,10 @@ GitHub auto-generated notes: a non-technical user reading "Tier 1
 translates each commit subject into something a release-day reader
 can actually understand.
 
+> **Note:** pre-0.9 entries link their issue/PR and compare/release URLs to
+> the app's archived `machinefi/rapid-desktop` repository, where that work
+> shipped before the app moved into this `raullenchai/Rapid-MLX` monorepo.
+
 ## [Unreleased]
 
 ## [0.12.16] — 2026-08-19
@@ -2995,7 +2999,7 @@ Older versions: see the
 [GitHub Releases page](https://github.com/machinefi/rapid-desktop/releases)
 for auto-generated notes against earlier tags.
 
-[Unreleased]: https://github.com/machinefi/rapid-desktop/compare/v0.5.16...HEAD
+[Unreleased]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.12.16...HEAD
 [0.5.16]: https://github.com/machinefi/rapid-desktop/compare/v0.5.15...v0.5.16
 [0.5.15]: https://github.com/machinefi/rapid-desktop/compare/v0.5.14...v0.5.15
 [0.5.14]: https://github.com/machinefi/rapid-desktop/compare/v0.5.13...v0.5.14
