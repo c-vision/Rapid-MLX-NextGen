@@ -13,6 +13,56 @@ can actually understand.
 
 ## [Unreleased]
 
+## [0.12.16] — 2026-08-19
+
+Dictate into any app from a global hotkey, web search works out of the box,
+chat typesets math, and conversations can be filed into folders and
+exported.
+
+### Added
+
+- **Dictate into any app.** Tap right Option, speak, and the words land at
+  your cursor — in any app, even with Rapid's window closed. Transcription
+  runs through your local server, so audio never leaves the Mac.
+- **Math renders as math.** Chat typesets inline and block LaTeX the way
+  models actually write it, so equations show up as equations instead of
+  raw markup.
+- **Web search that just works.** Chat's web search defaults to Keenable's
+  keyless service — real query-relevant snippets with no account and no API
+  key, replacing the DuckDuckGo scrape that rate-limited after a few
+  searches. Want the best measured quality? Paste a free Parallel key in
+  Settings → Tools (it tops the Artificial Analysis Search Index; the free
+  tier covers about 1,000 searches a month). Brave's entry now says plainly
+  that its API requires a card on file and auto-bills overage.
+- **File conversations into folders, and export them.** Create a folder from
+  any conversation's row menu, rename it, and export conversations as
+  Markdown from the same place.
+
+### Changed
+
+- **Model recommendations follow the Artificial Analysis Intelligence
+  Index.** Every Mac from 32 GB up is offered Qwen3.8-27B — GPT-5.6-class
+  intelligence at ~40 tok/s with multi-token prediction on — replacing
+  larger models that score far lower on the same index. Smaller Macs keep
+  their best-in-class picks.
+- Getting a model is now two explicit steps — Download, then Start when
+  you're ready — and the launch memory modal is gone.
+- Setup fills the window instead of floating as a small card over a dimmed
+  chat, so every step is reachable on every display.
+- Opt-in telemetry now includes the chip family and a rounded memory tier —
+  never raw bytes — and the privacy policy spells that out.
+
+### Fixed
+
+- The main window can no longer shrink below a usable size.
+- "Jump to latest" works after an answer finishes.
+- The same file can no longer be attached twice.
+- Code blocks no longer flicker between plain and code styling while an
+  answer streams.
+- Markdown code blocks and tables are visible again in chat.
+- Voice notes in Apple formats (M4A, CAF, …) transcribe directly — the app
+  transcodes them for the server on the fly.
+
 ## [0.12.15] — 2026-08-17
 
 Fixes a bug that could silently truncate files your coding agent writes, adds a
