@@ -6,15 +6,17 @@ Rapid-MLX Desktop ("the App") is a local-first SwiftUI Mac client for the
 `rapid-mlx` inference server. We designed it so that your prompts,
 attachments, and model responses **never leave your Mac** unless you
 explicitly send them somewhere (e.g. via the web-search tool, which
-calls a third-party search provider you configured).
+sends the search query to a third-party search provider — Keenable's
+keyless endpoint by default; you can switch the backend or add your
+own key in Settings → Tools).
 
 ## What stays on your Mac
 
 * Chat history (sessions, messages, attachments) — stored under
   `~/Library/Application Support/Rapid/sessions.json` and never
   transmitted off-device.
-* API keys for tools (Brave / Tavily / etc.) — stored in macOS
-  Keychain.
+* API keys for tools (Keenable / Parallel / Tavily / Brave) — stored
+  in macOS Keychain.
 * Server settings, picker state, window layout — stored in
   UserDefaults under `com.rapidmlx.rapid`.
 
@@ -240,10 +242,16 @@ distributions are out of scope but we will help triage.
   download the DMG from the
   [GitHub Releases page](https://github.com/raullenchai/Rapid-MLX/releases/latest)
   and verify its origin yourself before installing.
-* **Tool providers you configure** — when you call a search / file /
-  web tool, your prompt content is sent directly to that provider
-  (Brave, Tavily, etc.) per their own privacy policy. Rapid-MLX Desktop
-  is a passthrough.
+* **Search and tool providers** — when the model calls the
+  web-search tool, the search query (never your whole conversation)
+  is sent to the configured provider per their own privacy policy.
+  The default backend is Keenable's keyless endpoint
+  (`api.keenable.ai`) — no account, no API key; the request carries
+  the query plus standard connection metadata (such as your IP
+  address), nothing more. You can switch to Parallel, Tavily,
+  Brave, or the DuckDuckGo scrape — or add your own key — in
+  Settings → Tools. When Keenable is unreachable the tool retries the
+  query against DuckDuckGo. Rapid-MLX Desktop is a passthrough.
 
 ## Contact
 

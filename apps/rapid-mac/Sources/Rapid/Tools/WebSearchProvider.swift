@@ -1,111 +1,157 @@
 import Foundation
 import Observation
 
-/// Which backend does ``web_search`` hit? v0.4.41 adds the two
-/// dominant paid options on top of the existing free DDG endpoint.
-///
-/// Why these three:
-///   * **DuckDuckGo** — no key, decent quality, the original
-///     v0.3 backend. Stays the default so a fresh install keeps
-///     working without any setup.
-///   * **Brave Search** — 2 000 queries/month free tier; high
-///     quality, fast, ad-free index.
-///   * **Tavily** — 1 000 queries/month free tier; explicitly
-///     designed for LLM agents (returns clean snippets + a
-///     ranked list, no SERP cruft).
-///
-/// Both paid options ask for a long-lived API key. Keys are
-/// stored in the macOS Keychain, NOT UserDefaults — leaking a
-/// Brave/Tavily key reads as a real privacy bug (the key is
-/// account-linked and per-call billing is metered against it).
-enum WebSearchProvider: String, CaseIterable, Codable, Identifiable, Sendable {
-    case duckduckgo
-    case brave
-    case tavily
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .duckduckgo: return "DuckDuckGo"
-        case .brave:      return "Brave Search"
-        case .tavily:     return "Tavily"
-        }
-    }
-
+/// Static metadata for one ``web_search`` backend. One value per
+/// provider, produced by a single switch in
+/// ``WebSearchProvider/descriptor`` — adding a backend means writing
+/// ONE descriptor plus a client, not editing half a dozen scattered
+/// switches (issue #2040; the old shape needed 8 edits per provider).
+struct WebSearchProviderDescriptor: Sendable {
+    let displayName: String
     /// Plain-English subtitle for the Settings picker. Tells the
     /// user what they're trading off (cost / signup) without
     /// having to read the docs.
-    ///
-    /// The DuckDuckGo line used to end "works out of the box." It
-    /// doesn't: the free HTML endpoint throttles per IP after a
-    /// handful of searches (measured 2026-08-05 — one 200, then 202
-    /// non-results pages for every query after it). A user who hits
-    /// that throttle and comes here looking for the problem must not
-    /// be told the backend is fine.
-    var subtitle: String {
+    let subtitle: String
+    /// Marketing / landing page for the provider's API. Kept
+    /// distinct from ``keyDashboardURL`` — see that field.
+    let keyConsoleURL: URL?
+    /// Direct link to the API-keys dashboard — the page that lists
+    /// existing keys and offers a "create new key" affordance. The
+    /// Settings key row links here so the user lands one click from
+    /// a usable key instead of on a marketing page. Issue #193.
+    let keyDashboardURL: URL?
+    /// The provider cannot run without a key. At dispatch a
+    /// requiresKey provider with no stored key falls back to the
+    /// keyless chain (Keenable → DuckDuckGo).
+    let requiresKey: Bool
+    /// The provider can use a key at all. True for every
+    /// requiresKey provider, and for Keenable — where the key is
+    /// optional and lifts the shared keyless rate limit. Drives the
+    /// Settings key field + Keychain prefetch.
+    let acceptsKey: Bool
+    /// Keychain account label for this provider's API key. Distinct
+    /// per-provider so one provider's key never leaks into another's
+    /// call.
+    let keychainAccount: String?
+}
+
+/// Which backend does ``web_search`` hit?
+///
+/// The roster (2026-08, issues #2040–#2043; quality figures from the
+/// Artificial Analysis Search Index, 2026-08-18):
+///   * **Keenable** — the zero-setup default. No account, no key: the
+///     keyless pool allows 1 000 requests/hour per IP. An optional
+///     free key lifts the shared cap. Scores above both legacy keyed
+///     backends in independent agent-search benchmarking.
+///   * **Parallel** — the recommended keyed backend; strongest
+///     measured result quality of the providers benchmarked, with a
+///     recurring free monthly credit (≈1 000 searches).
+///   * **Tavily** — 1 000 queries/month free tier; agent-tuned
+///     snippets.
+///   * **Brave Search** — kept for existing keys. Brave dropped its
+///     card-free tier in Feb 2026: every plan now requires a card on
+///     file and auto-bills overage (issue #2043), so it is no longer
+///     pitched as a free upgrade.
+///   * **DuckDuckGo** — the original v0.3 scrape backend, demoted to
+///     backstop: its free HTML endpoint throttles per IP after a
+///     handful of searches (measured 2026-08-05) and result quality
+///     is poor. Kept because it needs nothing and never bills.
+///
+/// Keys are stored in the macOS Keychain, NOT UserDefaults — leaking
+/// a search key reads as a real privacy bug (the key is
+/// account-linked and per-call billing is metered against it).
+enum WebSearchProvider: String, CaseIterable, Codable, Identifiable, Sendable {
+    // Case order == Settings radio order: the zero-setup default
+    // first, then the recommended keyed upgrade, then the rest.
+    case keenable
+    case parallel
+    case tavily
+    case brave
+    case duckduckgo
+
+    var id: String { rawValue }
+
+    /// The single source of provider metadata. Every legacy
+    /// per-property accessor below forwards here so existing call
+    /// sites didn't have to churn in the #2040 refactor.
+    var descriptor: WebSearchProviderDescriptor {
         switch self {
-        case .duckduckgo:
-            return "No key required. Best-effort — throttled after a few searches; the keyed backends aren't."
-        case .brave:
-            return "Requires a free Brave Search API key. 2 000 queries/month."
+        case .keenable:
+            return WebSearchProviderDescriptor(
+                displayName: "Keenable",
+                subtitle: "No key needed — the default. A free key lifts the shared hourly limit.",
+                keyConsoleURL: URL(string: "https://keenable.ai/"),
+                keyDashboardURL: URL(string: "https://keenable.ai/console"),
+                requiresKey: false,
+                acceptsKey: true,
+                keychainAccount: "rapid.web-search.keenable"
+            )
+        case .parallel:
+            return WebSearchProviderDescriptor(
+                displayName: "Parallel",
+                subtitle: "Recommended — the highest-quality backend in our testing. Free key covers about 1 000 searches a month.",
+                keyConsoleURL: URL(string: "https://parallel.ai/"),
+                keyDashboardURL: URL(string: "https://platform.parallel.ai/"),
+                requiresKey: true,
+                acceptsKey: true,
+                keychainAccount: "rapid.web-search.parallel"
+            )
         case .tavily:
-            return "Requires a free Tavily API key. 1 000 queries/month, agent-tuned snippets."
+            return WebSearchProviderDescriptor(
+                displayName: "Tavily",
+                subtitle: "Requires a free Tavily API key. 1 000 queries/month, agent-tuned snippets.",
+                keyConsoleURL: URL(string: "https://app.tavily.com/home"),
+                keyDashboardURL: URL(string: "https://app.tavily.com/home"),
+                requiresKey: true,
+                acceptsKey: true,
+                keychainAccount: "rapid.web-search.tavily"
+            )
+        case .brave:
+            return WebSearchProviderDescriptor(
+                displayName: "Brave Search",
+                // Not "a free key" any more: Brave dropped the
+                // card-free tier in Feb 2026 — every plan keeps a
+                // card on file and overage is auto-billed. The
+                // subtitle must say so BEFORE the user follows the
+                // key link (issue #2043).
+                subtitle: "Requires a Brave Search API key and a card on file — usage past the monthly credit is auto-billed.",
+                keyConsoleURL: URL(string: "https://brave.com/search/api/"),
+                // The dashboard host is separate from the API host;
+                // the API-serving host returns HTTP 403 for this UI
+                // route.
+                keyDashboardURL: URL(string: "https://api-dashboard.search.brave.com/app/keys"),
+                requiresKey: true,
+                acceptsKey: true,
+                keychainAccount: "rapid.web-search.brave"
+            )
+        case .duckduckgo:
+            // The subtitle used to end "works out of the box." It
+            // doesn't: the free HTML endpoint throttles per IP after
+            // a handful of searches (measured 2026-08-05 — one 200,
+            // then 202 non-results pages for every query after it).
+            // A user who hits that throttle and comes here looking
+            // for the problem must not be told the backend is fine.
+            return WebSearchProviderDescriptor(
+                displayName: "DuckDuckGo",
+                subtitle: "No key required. Backstop only — throttled after a few searches, and result quality is poor.",
+                keyConsoleURL: nil,
+                keyDashboardURL: nil,
+                requiresKey: false,
+                acceptsKey: false,
+                keychainAccount: nil
+            )
         }
     }
 
-    /// Where the user goes to mint a key. Shown as an "Open
-    /// dashboard" link in Settings so the affordance is one click
-    /// instead of "Google for the right URL."
-    var keyConsoleURL: URL? {
-        switch self {
-        case .duckduckgo: return nil
-        case .brave:      return URL(string: "https://brave.com/search/api/")
-        case .tavily:     return URL(string: "https://app.tavily.com/home")
-        }
-    }
+    // MARK: Forwarding accessors (pre-#2040 API, unchanged call sites)
 
-    /// Direct link to the API-keys dashboard for the provider — the
-    /// page that lists existing keys and offers a "create new key"
-    /// affordance. Distinct from ``keyConsoleURL`` (the marketing
-    /// landing) because the "Upgrade to Brave" / "Upgrade to Tavily"
-    /// nudge in Settings + Onboarding wants to drop the user one
-    /// click closer to a usable key — landing on a marketing page
-    /// adds an extra "click Sign in / Get key" hop. Issue #193.
-    ///
-    /// For Tavily this resolves to the same /home page as
-    /// ``keyConsoleURL`` (the dashboard IS the home view). Brave
-    /// splits: ``keyConsoleURL`` points at the public API landing,
-    /// while ``keyDashboardURL`` uses the dedicated dashboard host
-    /// and jumps straight to /app/keys. The API-serving host returns
-    /// HTTP 403 for that UI route.
-    var keyDashboardURL: URL? {
-        switch self {
-        case .duckduckgo: return nil
-        case .brave:      return URL(string: "https://api-dashboard.search.brave.com/app/keys")
-        case .tavily:     return URL(string: "https://app.tavily.com/home")
-        }
-    }
-
-    /// True only when the provider needs an API key. Lets the
-    /// Settings panel hide the SecureField when DDG is selected.
-    var requiresKey: Bool {
-        switch self {
-        case .duckduckgo: return false
-        case .brave, .tavily: return true
-        }
-    }
-
-    /// Keychain account label used to store this provider's
-    /// API key. Distinct per-provider so a Brave key never
-    /// leaks into a Tavily call (and vice versa).
-    var keychainAccount: String? {
-        switch self {
-        case .duckduckgo: return nil
-        case .brave:      return "rapid.web-search.brave"
-        case .tavily:     return "rapid.web-search.tavily"
-        }
-    }
+    var displayName: String { descriptor.displayName }
+    var subtitle: String { descriptor.subtitle }
+    var keyConsoleURL: URL? { descriptor.keyConsoleURL }
+    var keyDashboardURL: URL? { descriptor.keyDashboardURL }
+    var requiresKey: Bool { descriptor.requiresKey }
+    var acceptsKey: Bool { descriptor.acceptsKey }
+    var keychainAccount: String? { descriptor.keychainAccount }
 }
 
 /// User-facing, persisted web-search configuration. Provider
@@ -117,8 +163,11 @@ enum WebSearchProvider: String, CaseIterable, Codable, Identifiable, Sendable {
 final class WebSearchConfig {
     /// Backed by ``UserDefaults`` under a single stable key so a
     /// reset-defaults action (or a corrupted prefs file) doesn't
-    /// need to sweep multiple keys. The default is ``.duckduckgo``
-    /// because that's the only zero-setup option.
+    /// need to sweep multiple keys. The default is ``.keenable``
+    /// (#2041): zero-setup like DuckDuckGo was, but with usable
+    /// result quality and no per-handful-of-searches throttle. A
+    /// user who ever picked a provider explicitly has a stored raw
+    /// value and keeps their choice.
     var provider: WebSearchProvider {
         didSet {
             guard oldValue != provider else { return }
@@ -159,7 +208,7 @@ final class WebSearchConfig {
            let p = WebSearchProvider(rawValue: raw) {
             self.provider = p
         } else {
-            self.provider = .duckduckgo
+            self.provider = .keenable
         }
     }
 
@@ -193,26 +242,24 @@ final class WebSearchConfig {
     /// "delete + tab" gesture removes the key instead of storing
     /// an empty record that pretends to be a key).
     ///
-    /// **Auto-promote on first key paste.** If the user is still on
-    /// the install-default ``.duckduckgo`` backend and pastes a key
-    /// for a paid provider (``.brave`` or ``.tavily``), we silently
-    /// flip ``provider`` to the keyed backend.
+    /// **Auto-promote on first key paste.** If the user is on a
+    /// keyless backend (the install-default ``.keenable``, or
+    /// ``.duckduckgo``) and pastes a key for a key-REQUIRING
+    /// provider, we silently flip ``provider`` to the keyed backend.
     ///
-    /// Why: DDG HTML scraping is silently rate-limited / anti-bot-
-    /// blocked in production today — the `cc=botnet` anomaly modal
-    /// returns 0 results without surfacing a real error, so the
-    /// tool appears to "work" while delivering nothing. When a user
-    /// goes to the trouble of pasting a Brave/Tavily key they have
-    /// explicitly opted into a more reliable backend; requiring them
-    /// to ALSO flip the provider picker is silent-broken UX (their
-    /// key is stored but never used).
+    /// Why: a user who goes to the trouble of pasting a
+    /// Parallel/Tavily/Brave key has explicitly opted into that
+    /// backend; requiring them to ALSO flip the provider picker is
+    /// silent-broken UX (their key is stored but never used).
     ///
-    /// We only auto-promote from the default DDG state. If the user
-    /// has already explicitly chosen a paid backend (say `.brave`)
-    /// and then pastes a key for the OTHER paid backend (`.tavily`),
+    /// We only auto-promote from a keyless state. If the user has
+    /// already explicitly chosen a keyed backend (say `.parallel`)
+    /// and then pastes a key for ANOTHER keyed backend (`.tavily`),
     /// the explicit prior choice wins — they're managing both keys
-    /// without re-selecting. Clearing a key never demotes; the user
-    /// can manually switch back to DDG in Settings.
+    /// without re-selecting. Pasting a Keenable key while on
+    /// Keenable is not a promotion either — the key is picked up in
+    /// place (it lifts the shared rate cap). Clearing a key never
+    /// demotes; the user can manually switch back in Settings.
     /// Returns ``true`` when the Keychain write/delete that backs the
     /// requested mutation actually succeeded. v0.6.7 added the
     /// return value to drive the inline "Saved" confirmation in
@@ -261,10 +308,12 @@ final class WebSearchConfig {
                 // Auto-promote happens AFTER a successful keychain
                 // write so the provider state can never get ahead of
                 // the stored key. Gate on ``provider.requiresKey``
-                // so a hypothetical future free provider can't
+                // so a key-optional provider (Keenable) can't
                 // trigger promotion via this path — the silent-
-                // broken UX only exists for keyed backends.
-                if self.provider == .duckduckgo && provider.requiresKey {
+                // broken UX only exists for key-REQUIRING backends,
+                // and a keyless backend keeps working when a key for
+                // it lands.
+                if !self.provider.requiresKey && provider.requiresKey {
                     self.provider = provider
                 }
                 return true
@@ -276,12 +325,9 @@ final class WebSearchConfig {
     /// True if the currently-selected provider has a usable key
     /// (or doesn't need one). Drives the "Effective backend" hint
     /// in Settings — when this is false, the tool will fall back
-    /// to DuckDuckGo at dispatch time.
+    /// to the keyless chain (Keenable) at dispatch time.
     var currentProviderUsable: Bool {
-        switch provider {
-        case .duckduckgo: return true
-        case .brave, .tavily: return apiKey(for: provider) != nil
-        }
+        !provider.requiresKey || apiKey(for: provider) != nil
     }
 
     // MARK: - Async prefetch (cycle-12 P3: Settings → Web Search blocked
@@ -388,7 +434,10 @@ final class WebSearchConfig {
     /// once, off the main actor, before the panel re-renders.
     func prefetchAllAPIKeys() async {
         await withTaskGroup(of: Void.self) { group in
-            for provider in WebSearchProvider.allCases where provider.requiresKey {
+            // ``acceptsKey``, not ``requiresKey``: Keenable's key is
+            // optional but still lives in the Keychain and still
+            // needs warming before the Settings key row renders.
+            for provider in WebSearchProvider.allCases where provider.acceptsKey {
                 group.addTask { await self.prefetchAPIKey(for: provider) }
             }
         }

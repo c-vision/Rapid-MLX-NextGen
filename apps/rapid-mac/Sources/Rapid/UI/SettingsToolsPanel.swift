@@ -241,7 +241,7 @@ struct SettingsToolsPanel: View {
         @Bindable var config = webSearch
         return SettingsSection(
             "Web search",
-            subtitle: "Which backend `web_search` queries. DuckDuckGo needs no account but is rate-limited; the keyed backends are more reliable."
+            subtitle: "Which backend `web_search` queries. Keenable works with no account; add a free key (Parallel recommended) for the best results. Keys stay in your Keychain."
         ) {
                 VStack(alignment: .leading, spacing: RapidTheme.Space.md) {
                     // Native macOS radio group, kept native: radios are
@@ -287,7 +287,10 @@ struct SettingsToolsPanel: View {
                         .foregroundStyle(RapidTheme.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    if config.provider.requiresKey {
+                    // ``acceptsKey``, not ``requiresKey``: Keenable's
+                    // key is optional (it lifts the shared keyless
+                    // rate limit) but still needs the field.
+                    if config.provider.acceptsKey {
                         SettingsRowDivider()
                         keyField(for: config.provider)
                     }
@@ -344,7 +347,7 @@ struct SettingsToolsPanel: View {
                     .foregroundStyle(RapidTheme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text("No key stored — searches fall back to DuckDuckGo until you save one.")
+                Text(Self.noKeyCaption(for: provider))
                     .font(RapidFont.caption)
                     .foregroundStyle(RapidTheme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -352,6 +355,17 @@ struct SettingsToolsPanel: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .onAppear { resetKeyDraft() }
+    }
+
+    /// What an empty key slot means depends on the provider: a
+    /// key-REQUIRING backend silently degrades to the keyless chain
+    /// at dispatch, while Keenable just keeps using the shared pool.
+    /// Static + internal so the copy is pinned by tests.
+    static func noKeyCaption(for provider: WebSearchProvider) -> String {
+        if provider.requiresKey {
+            return "No key stored — searches fall back to Keenable until you save one."
+        }
+        return "No key stored — \(provider.displayName) works without one; a free key lifts the shared rate limit."
     }
 
     private func commitKey(for provider: WebSearchProvider) {

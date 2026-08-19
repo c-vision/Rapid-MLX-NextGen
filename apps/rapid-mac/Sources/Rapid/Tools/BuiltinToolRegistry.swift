@@ -4,8 +4,9 @@ import Foundation
 /// surface exposes:
 ///
 ///   * ``weather`` — no approval, hits Open-Meteo over HTTPS
-///   * ``web_search`` — no approval, DuckDuckGo / Brave / Tavily per
-///     ``WebSearchConfig``
+///   * ``web_search`` — no approval, backend per ``WebSearchConfig``
+///     (Keenable keyless by default; Parallel / Tavily / Brave with a
+///     key; DuckDuckGo backstop)
 ///   * ``browse`` — USER-approved per fetch (``BrowseApprovalStore``),
 ///     SSRF-guarded, byte-capped
 ///

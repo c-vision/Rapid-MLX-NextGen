@@ -265,8 +265,10 @@ enum FailureDiagnoser {
             // endpoint per IP within a handful of searches, so the honest
             // remedy is a different backend, and the message has to say which
             // ones and where. Kept to one sentence of situation + one of
-            // remedy so it still reads inside the tool card.
-            message = "DuckDuckGo is rate-limiting web searches from this Mac. Switch to Brave Search or Tavily in Settings → Tools and add a free key."
+            // remedy so it still reads inside the tool card. Not Brave any
+            // more (#2043): Brave requires a card on file now, so pitching it
+            // as the free fix would steer the user into surprise billing.
+            message = "DuckDuckGo is rate-limiting web searches from this Mac. Switch to Keenable (no key) or add a free Parallel or Tavily key in Settings → Tools."
             action = .openWebSearchSettings
         case .browsePageTooLarge:
             message = "This page is too large for Rapid to read at once. Search it or open a smaller page instead."

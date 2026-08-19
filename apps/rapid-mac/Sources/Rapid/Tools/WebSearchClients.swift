@@ -230,3 +230,269 @@ enum TavilySearchClient {
         return out
     }
 }
+
+/// Keenable client (#2041) — the zero-setup default backend.
+///
+/// Keenable exposes two surfaces and we use both:
+///
+///   * **Keyless** — its public MCP endpoint accepts a bare
+///     JSON-RPC ``tools/call`` POST with no account, no key and no
+///     session handshake (verified live 2026-08-18: a cold
+///     ``tools/call`` with neither ``initialize`` nor a session
+///     header answers 200). Shared pool, 1 000 requests/hour per
+///     IP. This is NOT an MCP-client integration — it's one plain
+///     HTTPS POST; we never speak the rest of the protocol.
+///   * **Keyed** — ``POST /v1/search`` REST with an ``X-API-Key``
+///     header. Requires a (free) key; lifts the hourly cap and
+///     meters against the org's monthly credit allowance.
+///
+/// The keyless response arrives as a JSON-RPC envelope whose
+/// ``result.content[0].text`` is a plain-text block list
+/// (``Title:`` / ``URL:`` / ``Snippets:`` separated by ``---``);
+/// the keyed response is structured JSON. Both funnel into the
+/// engine-agnostic ``WebSearchTool.Result`` shape.
+enum KeenableSearchClient {
+    static let mcpEndpoint = "https://api.keenable.ai/mcp"
+    static let restEndpoint = "https://api.keenable.ai/v1/search"
+    static let timeout: TimeInterval = 15
+
+    /// One JSON-RPC ``tools/call`` against the public MCP endpoint.
+    /// The ``id`` is fixed: we send exactly one request per HTTP
+    /// call, so there is nothing to correlate.
+    static func buildKeylessRequest(query: String, snippetMaxLength: Int) -> URLRequest? {
+        guard let url = URL(string: mcpEndpoint) else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = timeout
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // The MCP transport may answer either plain JSON or an SSE
+        // frame; advertise both so the server picks freely and
+        // ``parseKeylessResults`` handles either.
+        req.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
+        let body: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": [
+                "name": "search_web_pages",
+                "arguments": [
+                    "query": query,
+                    // Server-side schema minimum is 180; we pass our
+                    // display cap so the upstream doesn't ship chars
+                    // we'd truncate anyway.
+                    "snippet_max_length": max(180, snippetMaxLength),
+                ] as [String: Any],
+            ] as [String: Any],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        req.httpBody = data
+        return req
+    }
+
+    /// Keyed REST call. The key rides in ``X-API-Key`` — same
+    /// control-byte defence as every other header-borne key.
+    static func buildKeyedRequest(query: String, apiKey: String, snippetMaxLength: Int) -> URLRequest? {
+        guard let cleanKey = headerSafeKey(apiKey) else { return nil }
+        guard let url = URL(string: restEndpoint) else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = timeout
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue(cleanKey, forHTTPHeaderField: "X-API-Key")
+        let body: [String: Any] = [
+            "query": query,
+            "snippet_max_length": max(180, snippetMaxLength),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        req.httpBody = data
+        return req
+    }
+
+    /// Unwrap the JSON-RPC envelope (optionally SSE-framed) and parse
+    /// the tool text. ``nil`` means "malformed / error envelope" —
+    /// the caller degrades to the DuckDuckGo backstop; an empty array
+    /// is a genuine zero-hit search.
+    static func parseKeylessResults(_ data: Data, cap: Int) -> [WebSearchTool.Result]? {
+        struct Envelope: Decodable {
+            struct ResultBody: Decodable {
+                struct ContentItem: Decodable {
+                    let type: String?
+                    let text: String?
+                }
+                let content: [ContentItem]?
+                let isError: Bool?
+            }
+            struct RPCError: Decodable { let message: String? }
+            let result: ResultBody?
+            let error: RPCError?
+        }
+        var payload = data
+        // SSE frame: take the last ``data:`` line — the transport
+        // streams at most one JSON-RPC response per request here.
+        if let text = String(data: data, encoding: .utf8),
+           text.hasPrefix("event:") || text.hasPrefix("data:") || text.contains("\ndata:") {
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+            if let last = lines.last(where: { $0.hasPrefix("data:") }) {
+                let json = last.dropFirst("data:".count).trimmingCharacters(in: .whitespaces)
+                payload = Data(json.utf8)
+            }
+        }
+        guard let env = try? JSONDecoder().decode(Envelope.self, from: payload) else { return nil }
+        guard env.error == nil, let result = env.result, result.isError != true else { return nil }
+        guard let text = result.content?.first(where: { $0.text != nil })?.text else { return nil }
+        return parseTextBlocks(text, cap: cap)
+    }
+
+    /// Parse the keyless tool text: blocks separated by ``---``
+    /// lines, each carrying ``Title:`` / ``URL:`` headers and a
+    /// free-text body after a ``Snippets:`` line. ``Published:`` /
+    /// ``Acquired:`` metadata lines are dropped — the model reads
+    /// title + URL + snippet, same as every other backend.
+    static func parseTextBlocks(_ text: String, cap: Int) -> [WebSearchTool.Result] {
+        var out: [WebSearchTool.Result] = []
+        for rawBlock in text.components(separatedBy: "\n---\n") {
+            if out.count >= cap { break }
+            var title = ""
+            var url = ""
+            var snippetLines: [String] = []
+            var inSnippets = false
+            for line in rawBlock.split(separator: "\n", omittingEmptySubsequences: false) {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if !inSnippets {
+                    if trimmed.hasPrefix("Title: ") {
+                        title = String(trimmed.dropFirst("Title: ".count))
+                    } else if trimmed.hasPrefix("URL: ") {
+                        url = String(trimmed.dropFirst("URL: ".count))
+                    } else if trimmed == "Snippets:" {
+                        inSnippets = true
+                    }
+                    // ``Published:`` / ``Acquired:`` fall through untouched.
+                } else if !trimmed.isEmpty {
+                    // Codex r1: a metadata line emitted AFTER the
+                    // snippet body must not leak into the model-visible
+                    // snippet text.
+                    let isMetadata = ["Title: ", "URL: ", "Published: ", "Acquired: "]
+                        .contains { trimmed.hasPrefix($0) }
+                    if !isMetadata { snippetLines.append(trimmed) }
+                }
+            }
+            // Same boundary gate as every backend: only http(s)
+            // destinations reach the model.
+            guard WebSearchTool.isSafeHttpURL(url) else { continue }
+            out.append(WebSearchTool.Result(
+                title: title,
+                url: url,
+                snippet: snippetLines.joined(separator: " ")
+            ))
+        }
+        return out
+    }
+
+    /// Keyed REST response: ``{ "query", "results": [{ "title",
+    /// "url", "description", "snippet" }] }``. ``snippet`` carries
+    /// the query-relevant highlight; ``description`` is the static
+    /// page description — prefer the former, fall back to the
+    /// latter.
+    static func parseKeyedResults(_ data: Data, cap: Int) -> [WebSearchTool.Result]? {
+        struct Envelope: Decodable {
+            struct Item: Decodable {
+                let title: String?
+                let url: String?
+                let description: String?
+                let snippet: String?
+            }
+            let results: [Item]
+        }
+        guard let env = try? JSONDecoder().decode(Envelope.self, from: data) else { return nil }
+        var out: [WebSearchTool.Result] = []
+        for item in env.results {
+            if out.count >= cap { break }
+            let url = item.url ?? ""
+            guard WebSearchTool.isSafeHttpURL(url) else { continue }
+            out.append(WebSearchTool.Result(
+                title: item.title ?? "",
+                url: url,
+                snippet: item.snippet ?? item.description ?? ""
+            ))
+        }
+        return out
+    }
+}
+
+/// Parallel Search client (#2042) — the recommended keyed backend.
+/// ``POST /v1/search`` with the key in ``x-api-key``. We pin
+/// ``mode: "advanced"`` (the provider default and its
+/// strongest-measured tier) rather than inheriting a server-side
+/// default that could drift, and bound the response to our display
+/// budget via ``advanced_settings`` so extra excerpt characters are
+/// never fetched just to be truncated locally.
+enum ParallelSearchClient {
+    static let endpoint = "https://api.parallel.ai/v1/search"
+    static let timeout: TimeInterval = 15
+
+    static func buildRequest(
+        query: String,
+        apiKey: String,
+        maxResults: Int,
+        maxCharsPerResult: Int
+    ) -> URLRequest? {
+        guard let cleanKey = headerSafeKey(apiKey) else { return nil }
+        guard let url = URL(string: endpoint) else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = timeout
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue(cleanKey, forHTTPHeaderField: "x-api-key")
+        // ``search_queries`` is the required field (an array);
+        // ``objective`` additionally carries the natural-language
+        // intent, which Parallel uses for ranking. Our tool has one
+        // query string, so it fills both.
+        let body: [String: Any] = [
+            "objective": query,
+            "search_queries": [query],
+            "mode": "advanced",
+            "advanced_settings": [
+                "max_results": maxResults,
+                "excerpt_settings": [
+                    "max_chars_per_result": maxCharsPerResult
+                ] as [String: Any],
+            ] as [String: Any],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        req.httpBody = data
+        return req
+    }
+
+    /// Response: ``{ "results": [{ "url", "title", "excerpts": [str] }] }``.
+    /// ``excerpts`` is an array of markdown-formatted passages;
+    /// join them — ``formatOutput`` applies the display cap.
+    static func parseResults(_ data: Data, cap: Int) -> [WebSearchTool.Result]? {
+        struct Envelope: Decodable {
+            struct Item: Decodable {
+                let url: String?
+                let title: String?
+                let excerpts: [String]?
+            }
+            let results: [Item]
+        }
+        guard let env = try? JSONDecoder().decode(Envelope.self, from: data) else { return nil }
+        var out: [WebSearchTool.Result] = []
+        for item in env.results {
+            if out.count >= cap { break }
+            let url = item.url ?? ""
+            guard WebSearchTool.isSafeHttpURL(url) else { continue }
+            let snippet = (item.excerpts ?? [])
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " … ")
+            out.append(WebSearchTool.Result(
+                title: item.title ?? "",
+                url: url,
+                snippet: snippet
+            ))
+        }
+        return out
+    }
+}

@@ -122,9 +122,12 @@ struct WebSearchThrottleTests {
         let content = WebSearchTool.duckDuckGoThrottleContent
         #expect(content.contains("web_search tool is enabled and working"))
         #expect(content.contains("rate-limited"))
-        #expect(content.contains("Brave Search"))
-        #expect(content.contains("Tavily"))
+        #expect(content.contains("Keenable"))
+        #expect(content.contains("Parallel"))
         #expect(content.contains("Settings → Tools"))
+        // #2043: Brave's card-free tier is gone — the remedy list must
+        // not pitch it as the free fix any more.
+        #expect(!content.contains("Brave"))
     }
 
     @Test("A pending fallback note survives the throttle path")
@@ -143,9 +146,12 @@ struct WebSearchThrottleTests {
     func diagnosisCopyIsActionable() {
         let diagnosis = FailureDiagnoser.diagnosis(for: .webSearchRateLimited)
         #expect(diagnosis.message.contains("DuckDuckGo"))
-        #expect(diagnosis.message.contains("Brave Search"))
-        #expect(diagnosis.message.contains("Tavily"))
+        #expect(diagnosis.message.contains("Keenable"))
+        #expect(diagnosis.message.contains("Parallel"))
         #expect(diagnosis.message.contains("Settings → Tools"))
+        // #2043: no longer steer throttled users toward Brave — its
+        // "free" key now requires a card and auto-bills overage.
+        #expect(!diagnosis.message.contains("Brave"))
         // The dead end this replaced. Settings are not the problem when the
         // free backend throttles, so the copy must not send the user there to
         // "check" anything.

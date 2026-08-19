@@ -1,15 +1,12 @@
 import Foundation
 
-/// Cheap web search via DuckDuckGo's HTML-only endpoint. No API key,
-/// no JS engine — we just GET the HTML page and pull the visible
-/// result links + snippets with regex. Brittle by design but the
-/// alternative (Google CSE / Bing API / SerpAPI) all require paid
-/// keys and an account, which Rapid's privacy-first stance doesn't
-/// want to ship with.
-///
-/// Returns the top N results as a plain-text bulleted list the
-/// model can quote from. No raw HTML, no link tracking — just
-/// title + URL + snippet per result.
+/// The ``web_search`` tool. Dispatches to the configured
+/// ``WebSearchProvider`` (Keenable keyless by default; Parallel /
+/// Tavily / Brave with a key; DuckDuckGo scrape as the backstop) and
+/// returns the top N results as a plain-text bulleted list the model
+/// can quote from. No raw HTML, no link tracking — just title + URL
+/// + snippet per result, identically shaped whatever backend
+/// answered.
 enum WebSearchTool {
     static let definition = ToolDefinition(
         name: "web_search",
@@ -41,20 +38,25 @@ enum WebSearchTool {
         await run(arguments: arguments, provider: .duckduckgo, apiKey: nil)
     }
 
-    /// v0.4.41 provider-aware entry point. Dispatches on the
-    /// configured ``WebSearchProvider``:
+    /// Provider-aware entry point. Dispatches on the configured
+    /// ``WebSearchProvider``:
     ///
-    ///   * ``.duckduckgo`` — HTML scrape, no key
-    ///   * ``.brave`` — JSON API, ``X-Subscription-Token`` header
+    ///   * ``.keenable`` — keyless JSON-RPC POST (default), or keyed
+    ///     REST when a key is stored
+    ///   * ``.parallel`` — JSON API, ``x-api-key`` header
     ///   * ``.tavily`` — JSON API, key in body
+    ///   * ``.brave`` — JSON API, ``X-Subscription-Token`` header
+    ///   * ``.duckduckgo`` — HTML scrape, no key (backstop)
     ///
-    /// When a paid provider is configured but the user hasn't
-    /// pasted a key yet, we silently fall back to DuckDuckGo with
-    /// a one-line hint appended to the model-visible result so the
-    /// assistant can tell the user what's going on (and so the
-    /// fallback isn't completely invisible). This matches the
-    /// "no broken state" promise the rest of the app makes — the
-    /// search keeps working even if the API key slot is empty.
+    /// When a key-requiring provider is configured but the user
+    /// hasn't pasted a key yet, we silently fall back to the keyless
+    /// Keenable pool with a one-line hint appended to the
+    /// model-visible result so the assistant can tell the user
+    /// what's going on (and so the fallback isn't completely
+    /// invisible). This matches the "no broken state" promise the
+    /// rest of the app makes — the search keeps working even if the
+    /// API key slot is empty. If Keenable itself is unreachable, the
+    /// DuckDuckGo scrape is the backstop of last resort.
     static func run(
         arguments: String,
         provider: WebSearchProvider,
@@ -82,20 +84,45 @@ enum WebSearchTool {
                 )
             ])
         }
-        var effectiveProvider = provider
-        var fallbackNote: String? = nil
-        if provider.requiresKey, apiKey == nil {
-            effectiveProvider = .duckduckgo
-            fallbackNote = "Note: \(provider.displayName) is selected but no API key is set — falling back to DuckDuckGo. Open Settings → Tools → Web search to paste a key."
-        }
-        switch effectiveProvider {
+        let plan = dispatchPlan(provider: provider, hasKey: apiKey != nil)
+        switch plan.effective {
+        case .keenable:
+            // ``apiKey`` belongs to the SELECTED provider. It only
+            // reaches the Keenable runner when Keenable is the
+            // selected provider — on a no-key fallback from a keyed
+            // backend it is nil by construction.
+            return await runKeenable(
+                query: q,
+                apiKey: plan.effective == provider ? apiKey : nil,
+                fallbackNote: plan.fallbackNote
+            )
         case .duckduckgo:
-            return await runDuckDuckGo(query: q, fallbackNote: fallbackNote)
+            return await runDuckDuckGo(query: q, fallbackNote: plan.fallbackNote)
+        case .parallel:
+            return await runParallel(query: q, apiKey: apiKey ?? "")
         case .brave:
             return await runBrave(query: q, apiKey: apiKey ?? "")
         case .tavily:
             return await runTavily(query: q, apiKey: apiKey ?? "")
         }
+    }
+
+    /// Pure dispatch decision, extracted so the fallback contract is
+    /// unit-testable without touching the network: a key-REQUIRING
+    /// provider with no stored key degrades to the keyless Keenable
+    /// pool, with a model-visible note naming both the situation and
+    /// the remedy.
+    static func dispatchPlan(
+        provider: WebSearchProvider,
+        hasKey: Bool
+    ) -> (effective: WebSearchProvider, fallbackNote: String?) {
+        guard provider.requiresKey, !hasKey else {
+            return (provider, nil)
+        }
+        return (
+            .keenable,
+            "Note: \(provider.displayName) is selected but no API key is set — falling back to Keenable. Open Settings → Tools → Web search to paste a key."
+        )
     }
 
     /// Turn relative "last week" language into the previous complete
@@ -305,9 +332,9 @@ enum WebSearchTool {
         web_search error: the DuckDuckGo backend rate-limited this Mac, so this query \
         returned no results. The web_search tool is enabled and working — DuckDuckGo \
         throttles its free endpoint per IP after a few searches, and usually recovers \
-        after a few minutes. The user can also switch the backend to Brave Search or \
-        Tavily in Settings → Tools → Web search (Brave: 2000 queries/month free; \
-        Tavily: 1000 queries/month free), which are not throttled this way.
+        after a few minutes. The user can switch the backend in Settings → Tools → \
+        Web search: Keenable needs no key, and Parallel or Tavily work with a free \
+        API key — none of them are throttled this way.
         """
 
     /// Wraps ``duckDuckGoThrottleContent`` with the stable UI classification.
@@ -326,6 +353,151 @@ enum WebSearchTool {
             isError: true,
             failureKind: .webSearchRateLimited
         )
+    }
+
+    /// Keenable runner (#2041). Keyless by default (public JSON-RPC
+    /// pool); keyed REST when the user stored a key. Unlike the
+    /// keyed backends, transport-level failure here does NOT surface
+    /// as an error: Keenable is the zero-setup default, so its
+    /// outages degrade to the DuckDuckGo backstop with a
+    /// model-visible note — the "no broken state" promise again.
+    /// Key problems (401/402/403/429 on the keyed path) still
+    /// surface loudly: the user pasted that key and must hear about
+    /// its rejection or quota state rather than silently burning
+    /// the keyless pool.
+    static func runKeenable(
+        query q: String,
+        apiKey: String?,
+        fallbackNote: String?
+    ) async -> ToolCallResult {
+        let toolName = "web_search"
+        let request: URLRequest?
+        if let apiKey {
+            request = KeenableSearchClient.buildKeyedRequest(
+                query: q, apiKey: apiKey, snippetMaxLength: snippetCharCap
+            )
+        } else {
+            request = KeenableSearchClient.buildKeylessRequest(
+                query: q, snippetMaxLength: snippetCharCap
+            )
+        }
+        guard let request else {
+            // Only reachable with a malformed (control-byte) key —
+            // an account-level problem, not an availability one.
+            return ToolCallResult(
+                toolCallID: "",
+                content: "\(toolName) error: could not build Keenable request — re-paste the API key in Settings → Tools → Web search.",
+                isError: true
+            )
+        }
+        do {
+            let (data, response) = try await cappedData(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return await duckDuckGoBackstop(query: q, fallbackNote: fallbackNote)
+            }
+            switch http.statusCode {
+            case 200..<300:
+                let parsed = apiKey != nil
+                    ? KeenableSearchClient.parseKeyedResults(data, cap: resultCap)
+                    : KeenableSearchClient.parseKeylessResults(data, cap: resultCap)
+                guard let results = parsed else {
+                    // Schema drift / error envelope — same degrade
+                    // path as unreachable: the user shouldn't eat an
+                    // error for a backend they never chose.
+                    return await duckDuckGoBackstop(query: q, fallbackNote: fallbackNote)
+                }
+                return formatOutput(query: q, provider: .keenable, results: results, fallbackNote: fallbackNote)
+            // NB: ``where`` binds per-pattern in Swift, so it must be
+            // repeated — ``case 401, 403 where …`` would guard only
+            // the 403 arm and let a keyless 401 surface as a key
+            // error for a key that doesn't exist.
+            case 401 where apiKey != nil, 403 where apiKey != nil:
+                return ToolCallResult(
+                    toolCallID: "",
+                    content: "\(toolName) error: Keenable rejected the API key (HTTP \(http.statusCode)). Re-paste it in Settings → Tools → Web search.",
+                    isError: true
+                )
+            case 402 where apiKey != nil:
+                return ToolCallResult(
+                    toolCallID: "",
+                    content: "\(toolName) error: the Keenable key's monthly credit allowance is used up (HTTP 402). Searches continue on the keyless pool if you clear the key.",
+                    isError: true
+                )
+            case 429 where apiKey != nil:
+                // Codex r1 MAJOR: a keyed 429 is an account problem
+                // (the org's rate cap), not "Keenable was unavailable"
+                // — degrading here would hide and mislabel the quota
+                // state the user's own key is in. Same loud-surface
+                // contract as 401/402.
+                return ToolCallResult(
+                    toolCallID: "",
+                    content: "\(toolName) error: Keenable rate limit hit for this API key (HTTP 429). Wait a moment or check the plan's limits.",
+                    isError: true
+                )
+            default:
+                // Keyless 429 (shared pool exhausted), 5xx, or any
+                // other transport-level answer: degrade.
+                return await duckDuckGoBackstop(query: q, fallbackNote: fallbackNote)
+            }
+        } catch {
+            return await duckDuckGoBackstop(query: q, fallbackNote: fallbackNote)
+        }
+    }
+
+    /// Last hop of the keyless chain: run the DuckDuckGo scrape and
+    /// tell the model why it's seeing the backstop.
+    private static func duckDuckGoBackstop(query q: String, fallbackNote: String?) async -> ToolCallResult {
+        let backstopNote = "Note: Keenable was unavailable for this search — the DuckDuckGo backstop answered instead."
+        let combined = [fallbackNote, backstopNote].compactMap { $0 }.joined(separator: "\n")
+        return await runDuckDuckGo(query: q, fallbackNote: combined)
+    }
+
+    /// Parallel runner (#2042). Standard keyed backend: account
+    /// problems surface with the remedy, everything else is a plain
+    /// error the model can relay.
+    static func runParallel(query q: String, apiKey: String) async -> ToolCallResult {
+        let toolName = "web_search"
+        guard let req = ParallelSearchClient.buildRequest(
+            query: q,
+            apiKey: apiKey,
+            maxResults: resultCap,
+            maxCharsPerResult: snippetCharCap
+        ) else {
+            return ToolCallResult(toolCallID: "", content: "\(toolName) error: could not build Parallel request", isError: true)
+        }
+        do {
+            let (data, response) = try await cappedData(for: req)
+            guard let http = response as? HTTPURLResponse else {
+                return ToolCallResult(toolCallID: "", content: "\(toolName) error: Parallel returned no HTTP response", isError: true)
+            }
+            switch http.statusCode {
+            case 200..<300:
+                guard let results = ParallelSearchClient.parseResults(data, cap: resultCap) else {
+                    return ToolCallResult(
+                        toolCallID: "",
+                        content: "\(toolName) error: Parallel returned an invalid response",
+                        isError: true
+                    )
+                }
+                return formatOutput(query: q, provider: .parallel, results: results)
+            case 401, 403:
+                return ToolCallResult(
+                    toolCallID: "",
+                    content: "\(toolName) error: Parallel rejected the API key (HTTP \(http.statusCode)). Re-paste it in Settings → Tools → Web search.",
+                    isError: true
+                )
+            case 429:
+                return ToolCallResult(
+                    toolCallID: "",
+                    content: "\(toolName) error: Parallel rate limit hit (HTTP 429). Wait a few minutes or check your plan's monthly credit.",
+                    isError: true
+                )
+            default:
+                return ToolCallResult(toolCallID: "", content: "\(toolName) error: Parallel returned HTTP \(http.statusCode)", isError: true)
+            }
+        } catch {
+            return ToolCallResult(toolCallID: "", content: "\(toolName) error: \(error.localizedDescription)", isError: true)
+        }
     }
 
     static func runBrave(query q: String, apiKey: String) async -> ToolCallResult {
