@@ -9,7 +9,7 @@ AXApplication title="Rapid-MLX"
           AXButton id="Sidebar.Audio" desc="Audio" enabled=true
           AXButton id="Sidebar.Launch" desc="Launch" enabled=true
           AXScrollArea
-            AXHeading desc="<relative-day>" enabled=true
+            AXButton id="Sidebar.Folder.Toggle.Golden-Work" desc="Golden Work (1)" enabled=true
             AXButton id="Sidebar.Conversation.Pin.<uuid>" desc="Pin conversation" help="Pin conversation" enabled=true
             AXPopUpButton id="Sidebar.Conversation.Menu.<uuid>" desc="Conversation actions" enabled=true
             AXButton id="Sidebar.Conversation.<uuid>" desc="golden restore marker" enabled=true

@@ -288,21 +288,47 @@ struct SidebarView: View {
         } message: { _ in
             Text("The conversations in it are kept and move back into the date list.")
         }
-        .alert(
-            folderPromptTitle,
+        .sheet(
             isPresented: Binding(
                 get: { folderPrompt != nil },
                 set: { if !$0 { folderPrompt = nil } }
             )
         ) {
-            TextField("Folder name", text: $folderNameDraft)
-                .accessibilityIdentifier("Sidebar.Folder.NameField")
-            Button("Save") { commitFolderPrompt() }
-                .accessibilityIdentifier("Sidebar.Folder.Prompt.Confirm")
-                .disabled(!canCommitFolderPrompt)
-            Button("Cancel", role: .cancel) { folderPrompt = nil }
-                .accessibilityIdentifier("Sidebar.Folder.Prompt.Cancel")
+            folderPromptSheet
         }
+    }
+
+    /// #2050: this prompt used to be a `.alert` with a TextField. SwiftUI
+    /// drops the accessibilityIdentifier from a text field inside an alert
+    /// (button identifiers propagate; the field's does not), and on the CI
+    /// runner an AX value write into an alert field never reaches the
+    /// SwiftUI binding — so the golden flow could neither find the field
+    /// nor enable Save. A plain sheet exposes the same controls as
+    /// ordinary views, where identifiers, value writes, and presses all
+    /// behave (fresh-install drives the consent sheet the same way on the
+    /// same runner). The three identifiers are the flow's contract — keep
+    /// them stable.
+    private var folderPromptSheet: some View {
+        VStack(alignment: .leading, spacing: RapidTheme.Space.lg) {
+            Text(folderPromptTitle)
+                .font(RapidFont.bodyEmphasis)
+            TextField("Folder name", text: $folderNameDraft)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("Sidebar.Folder.NameField")
+                .onSubmit { if canCommitFolderPrompt { commitFolderPrompt() } }
+            HStack(spacing: RapidTheme.Space.sm) {
+                Spacer()
+                Button("Cancel", role: .cancel) { folderPrompt = nil }
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("Sidebar.Folder.Prompt.Cancel")
+                Button("Save") { commitFolderPrompt() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canCommitFolderPrompt)
+                    .accessibilityIdentifier("Sidebar.Folder.Prompt.Confirm")
+            }
+        }
+        .padding(RapidTheme.Space.xl)
+        .frame(width: 320)
     }
 
     private var folderPromptTitle: String {

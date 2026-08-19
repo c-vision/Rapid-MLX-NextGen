@@ -340,6 +340,20 @@ wait_identifier() {
     die "timed out waiting for AX identifier $identifier"
 }
 
+wait_identifier_enabled() {
+    local identifier="$1" destination="$2" attempts="${3:-80}"
+    for ((i=0; i<attempts; i++)); do
+        see_main "$destination"
+        if jq -e --arg id "$identifier" \
+            '.data.ui_elements[]? | select(.identifier == $id and .enabled == true)' \
+            "$destination" >/dev/null; then
+            return
+        fi
+        sleep 0.25
+    done
+    die "timed out waiting for enabled AX identifier $identifier"
+}
+
 wait_tree_text() {
     local needle="$1" destination="$2" attempts="${3:-80}"
     for ((i=0; i<attempts; i++)); do
@@ -1682,7 +1696,11 @@ flow_chat_restore() {
     wait_identifier Sidebar.Folder.NameField "$OUT/folder-prompt.json"
     "$AX_DRIVER" set-value "$APP_PID" Sidebar.Folder.NameField "Golden Work" \
         > "$OUT/folder-name.json"
-    see_main "$OUT/folder-name-set.json"
+    # AXValue changes reach the native field before SwiftUI has necessarily
+    # propagated the binding and rebuilt the alert action as enabled. Pressing
+    # during that gap is a real disabled-button interaction, not a transient
+    # stale-element failure, so wait for the observable enabled state first.
+    wait_identifier_enabled Sidebar.Folder.Prompt.Confirm "$OUT/folder-name-set.json"
     press "$OUT/folder-name-set.json" Sidebar.Folder.Prompt.Confirm \
         "$OUT/folder-save.json"
     wait_identifier Sidebar.Folder.Toggle.Golden-Work "$OUT/folder-created.json"
@@ -1711,8 +1729,11 @@ flow_chat_restore() {
     done
     [[ "$export_panel_visible" == 1 ]] \
         || die "Markdown export did not present its save panel"
-    "$AX_DRIVER" close-window "$APP_PID" "Export Conversation" \
-        > "$OUT/export-panel-close.json" \
+    # #2050: the save panel's window object publishes neither AXCloseButton
+    # nor AXCancelButton, so `close-window` can never dismiss it. Its
+    # content IS bridged into the app's AX tree, and AppKit gives the
+    # cancel affordance a stable identifier — press that instead.
+    press "$OUT/export-panel.json" CancelButton "$OUT/export-panel-close.json" \
         || die "export save panel could not be cancelled"
 
     local conversation_suffix pin_id unpin_id
