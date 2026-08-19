@@ -3402,7 +3402,12 @@ def test_scheduler_config_preserves_the_historical_positional_prefix():
         "model_name",
     ]
     assert names[:50] == historical_prefix
-    assert names[49:] == ["model_name", "vision_min_pixels", "vision_max_pixels"]
+    # ``model_name`` (index 49) and the two vision fields hold their historical
+    # positions; anything the future appends lands at index 52+ rather than
+    # shifting them. A slice equality here (not the whole tail) is what lets a
+    # genuinely-appended field — e.g. ``idle_cache_clear_seconds`` (#2038) —
+    # pass while a field INSERTED into the prefix still fails.
+    assert names[49:52] == ["model_name", "vision_min_pixels", "vision_max_pixels"]
 
 
 def test_fixed_k_observer_leaves_the_ceiling_to_whoever_selects_depth():
