@@ -5,19 +5,33 @@ import Observation
 @Observable
 final class AudioViewModel {
     enum Mode: String, CaseIterable, Identifiable {
+        case dictation
         case speech
         case transcription
 
         var id: String { rawValue }
         var label: String {
             switch self {
+            case .dictation: return "Dictation"
             case .transcription: return "Transcription"
             case .speech: return "Speech"
             }
         }
+
+        /// The AX identifier suffix, kept separate from ``label`` so the
+        /// harness never has to quote a control name: the golden flows address
+        /// controls by identifier as bare shell words, and the labels now carry
+        /// spaces ("Speech to Text").
+        var axName: String {
+            switch self {
+            case .dictation: return "Dictation"
+            case .speech: return "Speech"
+            case .transcription: return "Transcription"
+            }
+        }
     }
 
-    var mode: Mode = .speech
+    var mode: Mode = .dictation
     var audioModels: [ModelEntry] = []
     var catalogLoaded = false
     var selectedTranscriptionAlias = ""

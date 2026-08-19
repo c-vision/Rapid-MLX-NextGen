@@ -14,6 +14,7 @@ struct AudioView: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(SettingsRouter.self) private var settingsRouter
     @Environment(DownloadManager.self) private var downloads
+    @Environment(DictationController.self) private var dictation
 
     @State private var copied = false
     @State private var playback = AudioPlaybackController()
@@ -151,7 +152,7 @@ struct AudioView: View {
                     .init(
                         value: $0,
                         title: $0.label,
-                        identifier: "Audio.Mode.\($0.label)"
+                        identifier: "Audio.Mode.\($0.axName)"
                     )
                 },
                 accessibilityLabel: "Audio mode"
@@ -169,6 +170,16 @@ struct AudioView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             switch viewModel.mode {
+            case .dictation:
+                if viewModel.transcriptionModels.isEmpty {
+                    unavailableState(operation: "dictation")
+                } else {
+                    DictationView(
+                        controller: dictation,
+                        viewModel: viewModel,
+                        server: server
+                    )
+                }
             case .transcription:
                 if viewModel.transcriptionModels.isEmpty {
                     unavailableState(operation: "transcription")

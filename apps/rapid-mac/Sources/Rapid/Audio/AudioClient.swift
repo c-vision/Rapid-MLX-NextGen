@@ -67,6 +67,30 @@ struct AudioClient {
         let text: String
         let language: String?
         let duration: Double?
+
+        private enum CodingKeys: String, CodingKey {
+            case text, language, duration
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            text = try container.decode(String.self, forKey: .text)
+            duration = try? container.decodeIfPresent(Double.self, forKey: .duration)
+
+            // `language` is not one shape across backends: Whisper reports a
+            // single code ("zh"), Qwen3-ASR reports a list (["Chinese"]) because
+            // it detects per segment. Decoding it as a plain String made the
+            // WHOLE response fail to decode against a Qwen3-ASR reply, which the
+            // UI then reported as "the audio server returned an unreadable
+            // response" — pointing at the server for a client-side type error.
+            if let single = try? container.decodeIfPresent(String.self, forKey: .language) {
+                language = single
+            } else if let many = try? container.decodeIfPresent([String].self, forKey: .language) {
+                language = many.first
+            } else {
+                language = nil
+            }
+        }
     }
 
     private struct VoicesWire: Decodable { let voices: [String] }
@@ -136,6 +160,69 @@ struct AudioClient {
             fileName: "input.\(upload.fileExtension)",
             fileMime: upload.mimeType,
             fileData: upload.data
+        )
+
+        let (data, response) = try await send(request)
+        try validate(response: response, data: data)
+        guard let decoded = try? JSONDecoder().decode(TranscriptionWire.self, from: data) else {
+            throw AudioClientError.invalidResponse
+        }
+        return AudioTranscriptionResult(
+            text: decoded.text,
+            language: decoded.language,
+            duration: decoded.duration
+        )
+    }
+
+    /// Transcribe audio already held in memory.
+    ///
+    /// Dictation captures straight into a 16 kHz mono WAV buffer, so routing it
+    /// through the file-based path above would mean a pointless write/read of a
+    /// temporary file on the latency-critical path.
+    ///
+    /// `context` carries the user's proper-noun list. The server maps it onto
+    /// whichever decoding-hint parameter the loaded backend exposes
+    /// (`initial_prompt` for whisper, `system_prompt` for Qwen3-ASR); it is
+    /// omitted entirely when empty, because an empty hint still consumes
+    /// decoder attention.
+    func transcribe(
+        audioData: Data,
+        model: String,
+        context: String?,
+        port: Int,
+        bearer: String?
+    ) async throws -> AudioTranscriptionResult {
+        guard audioData.count <= Self.maxUploadBytes else {
+            throw AudioClientError.fileTooLarge(maxBytes: Self.maxUploadBytes)
+        }
+        guard !audioData.isEmpty else { throw AudioClientError.emptyAudio }
+
+        let boundary = "rapid-dictation-\(UUID().uuidString)"
+        var request = URLRequest(
+            url: Self.loopbackURL(port: port)
+                .appendingPathComponent("v1/audio/transcriptions")
+        )
+        request.httpMethod = "POST"
+        request.timeoutInterval = Self.requestTimeout
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(
+            "multipart/form-data; boundary=\(boundary)",
+            forHTTPHeaderField: "Content-Type"
+        )
+        applyBearer(&request, bearer)
+
+        var fields = [("model", model), ("response_format", "json")]
+        if let context, !context.isEmpty {
+            fields.append(("context", context))
+        }
+
+        request.httpBody = ImageClient.multipartBody(
+            boundary: boundary,
+            fields: fields,
+            fileField: "file",
+            fileName: "dictation.wav",
+            fileMime: "audio/wav",
+            fileData: audioData
         )
 
         let (data, response) = try await send(request)

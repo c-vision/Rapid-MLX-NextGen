@@ -22,12 +22,12 @@ struct AudioCatalogTests {
       flux2-klein-4b               4.3 GiB    [image:gen] Runpod/FLUX.2-klein-4B-mflux-4bit
     """
 
-    @Test("audio mode control places Speech before Transcription")
+    @Test("audio adds Dictation without removing either existing workbench")
     @MainActor
     func modeOrder() {
-        #expect(AudioViewModel.Mode.allCases == [.speech, .transcription])
+        #expect(AudioViewModel.Mode.allCases == [.dictation, .speech, .transcription])
         let viewModel = AudioViewModel(server: ServerManager(testingState: .idle))
-        #expect(viewModel.mode == .speech)
+        #expect(viewModel.mode == .dictation)
     }
 
     @Test("Qwen voice labels and previews follow each speaker's primary language")

@@ -11,6 +11,7 @@ AXApplication title="Rapid-MLX"
         AXSplitter value=number enabled=false
         AXGroup subrole=AXHostingView
           AXGroup id="Audio.Mode" desc="Audio mode" enabled=true
+            AXButton id="Audio.Mode.Dictation" desc="Dictation" enabled=true
             AXButton id="Audio.Mode.Speech" desc="Speech" enabled=true
             AXButton id="Audio.Mode.Transcription" desc="Transcription" enabled=true
           AXScrollArea

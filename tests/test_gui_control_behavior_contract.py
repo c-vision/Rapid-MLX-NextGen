@@ -11,17 +11,24 @@ HARNESS = ROOT / "apps/rapid-mac/scripts/gui-golden-flows.sh"
 WORKFLOW = ROOT / ".github/workflows/rapid-mac-ci.yml"
 
 
-def test_audio_readiness_actions_start_both_selected_models_and_clear_the_gate():
+def test_audio_readiness_actions_start_the_selected_model_and_clear_the_gate():
     source = HARNESS.read_text()
     flow = source.split("flow_audio_readiness() {", 1)[1].split("\n}", 1)[0]
 
     assert flow.count('press "$OUT/') >= 3
+    # Speech synthesis and file transcription each preserve the explicit
+    # Download → Start lifecycle. Dictation owns no readiness banner: it loads
+    # only after the user invokes the global hotkey.
     assert flow.count('.subcommand == "pull"') == 2
     assert '.alias == "fake-qwen3-tts"' in flow
     assert '.alias == "fake-whisper-small"' in flow
     assert "before its pull completed" in flow
     assert "Speech loaded automatically after a download-only action" in flow
-    assert "Transcription loaded automatically after a download-only action" in flow
+    assert "Opening Audio started a model before any user action" in flow
+    assert "Opening Dictation loaded its model before the user dictated" in flow
+    assert "Transcription loaded automatically after Download" in flow
+    assert "Audio.Transcription.Run" in flow
+    assert "Audio.Transcription.Result" in flow
 
 
 def test_audio_control_journey_is_blocking_gui_ci_and_has_failure_evidence():
