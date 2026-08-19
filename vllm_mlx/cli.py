@@ -541,14 +541,20 @@ def _print_unknown_model_help(name: str, *, full_path_example: str) -> None:
     supported). Now: always show *something* — fuzzy matches when we have
     them, curated popular aliases when we don't.
     """
-    from vllm_mlx.model_aliases import POPULAR_ALIASES, list_aliases, suggest_similar
+    from vllm_mlx.model_aliases import POPULAR_ALIASES, suggest_similar
 
     suggestions = suggest_similar(name)
     if suggestions:
         print(f"  Did you mean: {', '.join(suggestions)}?")
     else:
         print(f"  Try one of: {', '.join(POPULAR_ALIASES)}")
-    print(f"  Run `rapid-mlx models` to see all {len(list_aliases())} aliases,")
+    # No hardcoded alias total here. ``models`` splits the registry into
+    # tagged sections (chat / audio / video / image), each with its own
+    # accurate per-section count, so a single grand total printed here can
+    # only contradict the first header a user lands on (dogfood #2126:
+    # this line said "182 aliases" while ``models`` opened with "172").
+    # Let ``models`` be the single source of truth for the counts.
+    print("  Run `rapid-mlx models` to see all available aliases,")
     print(f"  or pass a full path like: {full_path_example}")
 
 
