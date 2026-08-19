@@ -170,6 +170,84 @@
       "decode_short_tps": 59.86,
       "decode_8k_tps": null,
       "swap_delta_mb": 648.4
+    },
+    {
+      "model": "qwen3.8-27b-4bit",
+      "status": "ok",
+      "load_s": 7.08,
+      "idle_footprint_gb": 15.0,
+      "load_peak_gb": 15.0,
+      "short_footprint_gb": 15.0,
+      "short_peak_gb": 16.0,
+      "long_footprint_gb": 17.0,
+      "long_peak_gb": 20.0,
+      "short": {
+        "elapsed_s": 1.539,
+        "prompt_tokens": 24,
+        "completion_tokens": 51,
+        "wall_decode_tps": 33.13,
+        "server_prompt_tps": 125.83,
+        "server_generation_tps": 40.66,
+        "metal": {
+          "active_memory_gb": 15.13,
+          "peak_memory_gb": 15.51,
+          "cache_memory_gb": 0.11
+        }
+      },
+      "long": {
+        "elapsed_s": 26.649,
+        "prompt_tokens": 8112,
+        "completion_tokens": 56,
+        "wall_decode_tps": 2.1,
+        "server_prompt_tps": 324.26,
+        "server_generation_tps": 37.64,
+        "metal": {
+          "active_memory_gb": 15.13,
+          "peak_memory_gb": 19.08,
+          "cache_memory_gb": 1.62
+        }
+      },
+      "swap_delta_mb": 0.0,
+      "environment_note": "Measured 2026-08-18 on Mac15,14 (M3 Ultra, 256 GB), rapid-mlx 0.12.15 — not this file's M2 Pro 32 GB baseline host. Footprint figures are config-bound (weights + KV at the same context) rather than host-bound; the tok/s figures are M3 Ultra and will read lower on smaller chips."
+    },
+    {
+      "model": "qwen3.8-27b-mixed-3.5bpw",
+      "status": "ok",
+      "load_s": 11.12,
+      "idle_footprint_gb": 13.0,
+      "load_peak_gb": 14.0,
+      "short_footprint_gb": 14.0,
+      "short_peak_gb": 14.0,
+      "long_footprint_gb": 16.0,
+      "long_peak_gb": 19.0,
+      "short": {
+        "elapsed_s": 2.541,
+        "prompt_tokens": 24,
+        "completion_tokens": 92,
+        "wall_decode_tps": 36.21,
+        "server_prompt_tps": 123.86,
+        "server_generation_tps": 40.83,
+        "metal": {
+          "active_memory_gb": 13.46,
+          "peak_memory_gb": 13.83,
+          "cache_memory_gb": 0.11
+        }
+      },
+      "long": {
+        "elapsed_s": 25.443,
+        "prompt_tokens": 8112,
+        "completion_tokens": 10,
+        "wall_decode_tps": 0.39,
+        "server_prompt_tps": 323.74,
+        "server_generation_tps": 42.3,
+        "metal": {
+          "active_memory_gb": 13.46,
+          "peak_memory_gb": 17.4,
+          "cache_memory_gb": 1.62
+        }
+      },
+      "swap_delta_mb": 0.0,
+      "environment_note": "Measured 2026-08-18 on Mac15,14 (M3 Ultra, 256 GB), rapid-mlx 0.12.15 — not this file's M2 Pro 32 GB baseline host. Footprint figures are config-bound (weights + KV at the same context) rather than host-bound; the tok/s figures are M3 Ultra and will read lower on smaller chips."
     }
   ]
 }

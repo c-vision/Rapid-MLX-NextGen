@@ -5,7 +5,7 @@
   "axes": {
     "general_reasoning": {
       "label_en": "General & Reasoning",
-      "label_zh": "\u901a\u8bc6\u548c\u63a8\u7406",
+      "label_zh": "通识和推理",
       "definition": "arithmetic_mean(mmlu_pro, gpqa_diamond) when both present; otherwise the single available bench",
       "thresholds": {
         "good": 50.0,
@@ -259,7 +259,7 @@
     "qwen3-coder-30b-4bit": {
       "general_reasoning": null,
       "code": null,
-      "code_null_reason": "Qwen publishes no LiveCodeBench/HumanEval/SWE-bench pass@1 for the Coder variant; the only available number was Artificial Analysis's Coding *Index* (29.0), a normalized composite on a different scale than the pass@1 family the Code axis renders. Shown beside its bucket-mates it put our dedicated coder below every general-purpose model (#468). Honest gap per the no-fabrication / no-incomparable-substitution policy \u2014 leave null rather than display a cross-scale number.",
+      "code_null_reason": "Qwen publishes no LiveCodeBench/HumanEval/SWE-bench pass@1 for the Coder variant; the only available number was Artificial Analysis's Coding *Index* (29.0), a normalized composite on a different scale than the pass@1 family the Code axis renders. Shown beside its bucket-mates it put our dedicated coder below every general-purpose model (#468). Honest gap per the no-fabrication / no-incomparable-substitution policy — leave null rather than display a cross-scale number.",
       "tool": null,
       "tool_null_reason": "Qwen does not publish BFCL for the Coder variant",
       "ifeval": null,
@@ -278,7 +278,7 @@
       "code": 83.9,
       "code_source": "https://huggingface.co/Qwen/Qwen3.6-27B",
       "tool": null,
-      "tool_null_reason": "Qwen3.6 blog does not publish BFCL \u2014 focuses on SWE-bench + Terminal-Bench",
+      "tool_null_reason": "Qwen3.6 blog does not publish BFCL — focuses on SWE-bench + Terminal-Bench",
       "ifeval": null,
       "ifeval_null_reason": "Qwen3.6 blog does not publish IFEval",
       "speed_tps": 36.5,
@@ -471,6 +471,21 @@
       "speed_tps": 21.14,
       "speed_source": "Rapid-MLX 0.12.7 M2 Pro 32GB ~8K decode",
       "local_release_eval_composite": 84.25
+    },
+    "qwen3.8-27b-4bit": {
+      "general_reasoning": 89.2,
+      "general_reasoning_source": "gpqa_diamond only (Qwen3.8 model card does not publish MMLU-Pro)",
+      "general_reasoning_basis": {
+        "gpqa_diamond": 89.2
+      },
+      "code": 90.3,
+      "code_source": "LiveCodeBench v6, Qwen3.8-27B model card (vendor-reported)",
+      "tool": null,
+      "tool_null_reason": "Qwen3.8 model card publishes Terminal-Bench 2.1 (73.0) and SWE-bench Pro (61.7), not BFCL or tau-bench",
+      "ifeval": null,
+      "ifeval_null_reason": "Qwen3.8 model card publishes IFBench (79.5), not IFEval prompt-strict",
+      "speed_tps": 40.7,
+      "speed_source": "docs/benchmarks/model-recommendation-measurements.json (short-prompt decode, M3 Ultra, MTP on; 8K decode: 37.6)"
     }
   },
   "ground_truth_source": "data/benchmark-ground-truth.json"

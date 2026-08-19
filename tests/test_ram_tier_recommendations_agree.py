@@ -152,21 +152,20 @@ def _render_banner(ram_gb: int) -> str:
     ).stdout
 
 
-def test_the_banner_actually_prints_the_launch_flags():
-    """gemma-4-26b-4bit at 32 GB needs its vision tower dropped and its KV
-    budget capped. That is not advice — without the flags the command does
-    not fit on the Mac it is being handed to."""
-    printed = _render_banner(32)
-    assert "gemma-4-26b-4bit" in printed, printed
-    for flag in ("--no-mllm", "--kv-cache-dtype", "bf16", "--cache-memory-mb", "512"):
-        assert flag in printed, (
-            f"{flag!r} missing from the quick-start line:\n{printed}"
-        )
+def test_the_banner_prints_the_27b_bare_from_32_gb_up():
+    """AA-Index policy (2026-08-18): every Mac from 32 GB up is handed
+    qwen3.8-27b-4bit, and it needs no tier flags — MTP is baked into the
+    alias and the measured 8K peak (20.0 GB) fits every one of these
+    tiers bare. The gemma flag bundle left the table with gemma."""
+    for ram in (32, 64, 96):
+        printed = _render_banner(ram)
+        assert "qwen3.8-27b-4bit" in printed, f"{ram} GB banner: {printed}"
 
 
 def test_the_banner_prints_a_bare_command_where_no_flags_are_needed():
-    """Control: the flags must not leak onto tiers that do not want them."""
-    for ram in (8, 16, 24, 64):
+    """Control: launch flags must not leak onto tiers that do not want
+    them — since the gemma pick retired, that is every tier."""
+    for ram in (8, 16, 24, 32, 64, 96):
         printed = _render_banner(ram)
         assert "rapid-mlx serve" in printed
         assert "--no-mllm" not in printed, f"{ram} GB banner: {printed}"

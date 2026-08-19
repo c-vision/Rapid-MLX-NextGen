@@ -102,11 +102,11 @@ check(alias(forPhysicalRAMGB: 18) == "qwen3.5-9b-4bit",     "18GB → qwen3.5-9b
 check(alias(forPhysicalRAMGB: 20) == "qwen3.5-9b-4bit",     "20GB rounds DOWN to 18 (qwen9), not 24")
 check(alias(forPhysicalRAMGB: 24) == "bonsai-27b-2bit",     "24GB → bonsai-27b")
 check(alias(forPhysicalRAMGB: 30) == "bonsai-27b-2bit",     "30GB → 24 tier")
-check(alias(forPhysicalRAMGB: 32) == "gemma-4-26b-4bit",    "32GB → gemma-4-26b")
-check(alias(forPhysicalRAMGB: 48) == "gemma-4-26b-4bit",    "48GB → gemma-4-26b")
-check(alias(forPhysicalRAMGB: 64) == "qwen3.6-35b-8bit",    "64GB → qwen3.6-35b-8bit")
-check(alias(forPhysicalRAMGB: 96) == "qwen3.5-122b-mxfp4",  "96GB → 122b-mxfp4")
-check(alias(forPhysicalRAMGB: 256) == "qwen3.5-122b-mxfp4", "256GB → 96 tier (122b-mxfp4)")
+check(alias(forPhysicalRAMGB: 32) == "qwen3.8-27b-4bit",    "32GB → qwen3.8-27b")
+check(alias(forPhysicalRAMGB: 48) == "qwen3.8-27b-4bit",    "48GB → qwen3.8-27b")
+check(alias(forPhysicalRAMGB: 64) == "qwen3.8-27b-4bit",    "64GB → qwen3.8-27b")
+check(alias(forPhysicalRAMGB: 96) == "qwen3.8-27b-4bit",    "96GB → qwen3.8-27b")
+check(alias(forPhysicalRAMGB: 256) == "qwen3.8-27b-4bit",   "256GB → 96 tier (qwen3.8-27b)")
 
 print("Smart + fast picks per tier:")
 for floor in [8.0, 16.0, 18.0, 24.0, 32.0, 48.0, 64.0, 96.0] {
@@ -115,7 +115,7 @@ for floor in [8.0, 16.0, 18.0, 24.0, 32.0, 48.0, 64.0, 96.0] {
 check(picks(forPhysicalRAMGB: 18).count == 2, "18GB has smart + fast")
 check(picks(forPhysicalRAMGB: 18)[1].alias == "qwen3.5-4b-4bit", "18GB fast is qwen3.5-4b")
 check(picks(forPhysicalRAMGB: 24)[0].alias == "bonsai-27b-2bit", "24GB smart is bonsai")
-check(picks(forPhysicalRAMGB: 32)[0].alias == "gemma-4-26b-4bit", "32GB smart is gemma")
+check(picks(forPhysicalRAMGB: 32)[0].alias == "qwen3.8-27b-4bit", "32GB smart is qwen3.8-27b")
 check(picks(forPhysicalRAMGB: 48)[1].alias == "qwen3.6-35b-4bit", "48GB retains reviewed Qwen3.6 fast pick")
 // 64/96 GB → fast alt is the lighter 4-bit Qwen3.6-35B.
 check(picks(forPhysicalRAMGB: 64).count == 2, "64GB has smart + fast")
@@ -136,7 +136,7 @@ for ram in [8.0, 16.0, 18.0, 24.0, 32.0, 48.0, 64.0, 96.0] {
               "\(Int(ram))GB smart (\(ps[0].capabilityPct)%) not shown below its fast alt (\(ps[1].capabilityPct)%)")
     }
 }
-check(picks(forPhysicalRAMGB: 64)[0].capabilityPct == 87, "64GB 8-bit floored at its 4-bit's 87%")
+check(picks(forPhysicalRAMGB: 64)[0].capabilityPct == 92, "64GB smart (qwen3.8-27b) reads 92%, above its 35b-4bit alt")
 
 print("Smart-pick capability is monotonic non-decreasing by RAM (no 'more RAM, worse pick' dip):")
 let floors = [8.0, 16.0, 18.0, 24.0, 32.0, 48.0, 64.0, 96.0]
@@ -164,15 +164,17 @@ check(pickStatsLine(fast96) == "20.0 GB · 87% capability · ~60 tok/s", "genera
 let smart16 = picks(forPhysicalRAMGB: 16)[0]
 check(pickStatsLine(smart16) == "6.0 GB · 78% capability · ~61 tok/s", "16GB qwen4 renders measured 8K peak")
 let smart96 = picks(forPhysicalRAMGB: 96)[0]
-check(pickStatsLine(smart96) == "65.0 GB · 88% capability", "no-tok/s smart pick omits the speed figure")
+check(pickStatsLine(smart96) == "20.0 GB · 92% capability · ~41 tok/s", "96GB smart renders measured 8K peak + speed")
 
 print("Launch flags travel with the recommendation, gated by RAM:")
 check(launchFlags(forAlias: "lfm2.5-2.6b-4bit", physicalRAMGB: 8).isEmpty, "8GB lfm2.5-2.6b → no flags")
 check(launchFlags(forAlias: "qwen3.5-9b-4bit", physicalRAMGB: 18).isEmpty, "18GB qwen9 → no flags")
-check(launchFlags(forAlias: "gemma-4-26b-4bit", physicalRAMGB: 32) == ["--no-mllm", "--kv-cache-dtype", "bf16", "--cache-memory-mb", "512"], "32GB gemma-26b → kv trio")
+// No tier carries launch flags since the gemma pick retired with the
+// AA-Index roster — qwen3.8-27b-4bit runs bare (MTP lives in the alias).
+// The gating machinery is still exercised via non-pick and foreign-tier lookups.
+check(launchFlags(forAlias: "qwen3.8-27b-4bit", physicalRAMGB: 32).isEmpty, "32GB qwen3.8-27b → no flags")
 check(launchFlags(forAlias: "qwen3.6-35b-4bit", physicalRAMGB: 48).isEmpty, "48GB reviewed 35b-4bit → no flags")
-// Key: hand-picking gemma-26b on a big Mac (where it is NOT the pick) → no forced flags.
-check(launchFlags(forAlias: "gemma-4-26b-4bit", physicalRAMGB: 64).isEmpty, "gemma-26b on 64GB (not its tier) keeps vision")
+check(launchFlags(forAlias: "gemma-4-26b-4bit", physicalRAMGB: 64).isEmpty, "gemma-26b on 64GB (not a pick) keeps vision")
 check(launchFlags(forAlias: "some-random", physicalRAMGB: 32).isEmpty, "unknown alias → no flags")
 
 print("isRecommendedPick is floor-gated (the floor is now 8 GB, not 16):")
@@ -184,9 +186,10 @@ check(isRecommendedPick(alias: "qwen3.5-9b-4bit", physicalRAMGB: 18), "qwen9 rec
 check(!isRecommendedPick(alias: "bonsai-27b-2bit", physicalRAMGB: 18), "bonsai is not recommended below 24GB")
 check(!isRecommendedPick(alias: "gemma-4-12b-4bit", physicalRAMGB: 18), "gemma-12b NOT recommended anywhere (dropped from picks)")
 check(isRecommendedPick(alias: "bonsai-27b-2bit", physicalRAMGB: 24), "bonsai recommended on 24GB")
-check(isRecommendedPick(alias: "gemma-4-26b-4bit", physicalRAMGB: 32), "gemma-26b recommended on 32GB")
-check(isRecommendedPick(alias: "qwen3.5-122b-mxfp4", physicalRAMGB: 96), "122b-mxfp4 recommended on 96GB")
-check(!isRecommendedPick(alias: "qwen3.5-122b-mxfp4", physicalRAMGB: 64), "122b-mxfp4 NOT recommended on 64GB")
+check(isRecommendedPick(alias: "qwen3.8-27b-4bit", physicalRAMGB: 32), "qwen3.8-27b recommended on 32GB")
+check(isRecommendedPick(alias: "qwen3.8-27b-4bit", physicalRAMGB: 96), "qwen3.8-27b recommended on 96GB")
+check(!isRecommendedPick(alias: "qwen3.5-122b-mxfp4", physicalRAMGB: 96), "122b-mxfp4 no longer a pick anywhere (AA-Index roster)")
+check(!isRecommendedPick(alias: "qwen3.8-27b-4bit", physicalRAMGB: 24), "qwen3.8-27b NOT recommended below 32GB (8K peak 20 GB misses the 24 GB tier budget)")
 // The fast alt is a recommended pick on its tiers too (skips the .tooBig gate).
 check(isRecommendedPick(alias: "qwen3.6-35b-4bit", physicalRAMGB: 64), "qwen3.6-35b-4bit fast alt recommended on 64GB")
 check(isRecommendedPick(alias: "qwen3.6-35b-4bit", physicalRAMGB: 96), "qwen3.6-35b-4bit fast alt recommended on 96GB")

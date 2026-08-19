@@ -34,17 +34,21 @@ private final class RecommendationBundleFinder: NSObject {}
 /// | 16 GB  | qwen3.5-4b-4bit     |  6.0 | 78% | 60.7  | lfm2.5-1b-4bit · basic · 208.4   |
 /// | 18 GB  | qwen3.5-9b-4bit     |  8.7 | 82% | 35.7  | qwen3.5-4b-4bit · 78% · 60.7     |
 /// | 24 GB  | bonsai-27b-2bit     | 13.0 | 86% | 17.5  | qwen3.5-4b-4bit · 78% · 60.7     |
-/// | 32 GB  | gemma-4-26b-4bit    | 17.0 | 87% | 49.5  | qwen3.5-4b-4bit · 78% · 60.7     |
-/// | 48 GB  | gemma-4-26b-4bit    | 17.0 | 87% | 49.5  | qwen3.6-35b-4bit · 87% · 60      |
-/// | 64 GB  | qwen3.6-35b-8bit    | 37.7 | 87% | —     | qwen3.6-35b-4bit · 87% · 60      |
-/// | 96 GB+ | qwen3.5-122b-mxfp4  | 65.0 | 88% | —     | qwen3.6-35b-4bit · 87% · 60      |
+/// | 32 GB  | qwen3.8-27b-4bit    | 20.0 | 92% | 40.7  | qwen3.5-4b-4bit · 78% · 60.7     |
+/// | 48 GB  | qwen3.8-27b-4bit    | 20.0 | 92% | 40.7  | qwen3.6-35b-4bit · 87% · 60      |
+/// | 64 GB  | qwen3.8-27b-4bit    | 20.0 | 92% | 40.7  | qwen3.6-35b-4bit · 87% · 60      |
+/// | 96 GB+ | qwen3.8-27b-4bit    | 20.0 | 92% | 40.7  | qwen3.6-35b-4bit · 87% · 60      |
+///
+/// Every tier from 32 GB up shares one smart pick (AA-Index policy,
+/// 2026-08-18): qwen3.8-27b-4bit is the highest-scoring open-weights model
+/// the engine serves on the Artificial Analysis Intelligence Index (52 —
+/// GPT-5.6-class; the 122B it displaced scores 33), and its measured 8K
+/// peak clears every one of those tiers' budgets.
 ///
 /// The measured rows use the standard ~8K prompt peak of the complete
-/// ``rapid-mlx serve`` process tree on an M2 Pro 32 GB Mac mini, not weight
-/// size or an idle/short-prompt RSS. Recommendations require zero new swap,
-/// peak below 75% of the tier floor, 8K prefill >=100 tok/s, and decode
-/// >=10 tok/s. The 64/96 GB rows predate this run and remain explicitly
-/// unmeasured until matching hardware is available.
+/// ``rapid-mlx serve`` process tree, not weight size or an idle/short-prompt
+/// RSS. Recommendations require zero new swap, peak below 75% of the tier
+/// floor, 8K prefill >=100 tok/s, and decode >=10 tok/s.
 ///
 /// These figures must be measured THROUGH serve: a bare ``mlx_lm`` probe
 /// does not exercise the product's cache configuration or full process

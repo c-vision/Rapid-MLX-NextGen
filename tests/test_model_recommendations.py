@@ -31,16 +31,15 @@ def test_recipe_json_is_stable_and_has_two_picks(monkeypatch, capsys) -> None:
     assert payload["tier_floor_gb"] == 32
     assert [pick["role"] for pick in payload["picks"]] == ["smart", "fast"]
     assert [pick["alias"] for pick in payload["picks"]] == [
-        "gemma-4-26b-4bit",
+        "qwen3.8-27b-4bit",
         "qwen3.5-4b-4bit",
     ]
-    assert payload["picks"][0]["launch_flags"] == [
-        "--no-mllm",
-        "--kv-cache-dtype",
-        "bf16",
-        "--cache-memory-mb",
-        "512",
-    ]
+    # qwen3.8-27b-4bit needs no tier flags — MTP is baked into the alias
+    # and the measured 8K peak (20.0 GB) fits the 32 GB tier bare. The
+    # flag-carrying pick moved out of the recommendation table with
+    # gemma-4-26b; flag propagation is still covered by
+    # test_ram_tier_recommendations_agree.py against the SSOT.
+    assert payload["picks"][0]["launch_flags"] == []
 
 
 def test_recipe_text_prints_ready_to_run_commands(monkeypatch, capsys) -> None:

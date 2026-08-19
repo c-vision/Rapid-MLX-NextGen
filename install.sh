@@ -219,10 +219,14 @@ fi
 # Mac a command that does not fit in it.
 RAM_GB=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%d", $1/1073741824}')
 RECOMMENDED_FLAGS=""
-if   [ "$RAM_GB" -ge 96 ]; then RECOMMENDED_MODEL="qwen3.5-122b-mxfp4";  RAM_TIER="96+ GB"
-elif [ "$RAM_GB" -ge 64 ]; then RECOMMENDED_MODEL="qwen3.6-35b-8bit";    RAM_TIER="64-95 GB"
-elif [ "$RAM_GB" -ge 32 ]; then RECOMMENDED_MODEL="gemma-4-26b-4bit";    RAM_TIER="32-63 GB"
-                                RECOMMENDED_FLAGS=" --no-mllm --kv-cache-dtype bf16 --cache-memory-mb 512"
+# 32 GB and up all get the same pick (AA-Index policy, 2026-08-18):
+# qwen3.8-27b-4bit is the highest-scoring open-weights model we serve
+# (AA Intelligence Index 52 — GPT-5.6-class), and its measured 8K-prefill
+# peak of 20 GB clears every one of these tiers' 75 % budgets. The
+# branches stay split so the banner names the user's actual tier.
+if   [ "$RAM_GB" -ge 96 ]; then RECOMMENDED_MODEL="qwen3.8-27b-4bit";    RAM_TIER="96+ GB"
+elif [ "$RAM_GB" -ge 64 ]; then RECOMMENDED_MODEL="qwen3.8-27b-4bit";    RAM_TIER="64-95 GB"
+elif [ "$RAM_GB" -ge 32 ]; then RECOMMENDED_MODEL="qwen3.8-27b-4bit";    RAM_TIER="32-63 GB"
 elif [ "$RAM_GB" -ge 24 ]; then RECOMMENDED_MODEL="bonsai-27b-2bit";     RAM_TIER="24-31 GB"
 elif [ "$RAM_GB" -ge 18 ]; then RECOMMENDED_MODEL="qwen3.5-9b-4bit";     RAM_TIER="18-23 GB"
 elif [ "$RAM_GB" -ge 16 ]; then RECOMMENDED_MODEL="qwen3.5-4b-4bit";     RAM_TIER="16-17 GB"

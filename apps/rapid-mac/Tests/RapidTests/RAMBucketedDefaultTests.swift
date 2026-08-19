@@ -14,10 +14,10 @@ import Testing
 ///   16 GB  → qwen3.5-4b-4bit   (+ fast lfm2.5-1b-4bit)
 ///   18 GB  → qwen3.5-9b-4bit   (+ fast qwen3.5-4b-4bit)
 ///   24 GB  → bonsai-27b-2bit   (+ fast qwen3.5-4b-4bit)
-///   32 GB  → gemma-4-26b-4bit  (+ fast qwen3.5-4b-4bit)
-///   48 GB  → gemma-4-26b-4bit  (+ fast qwen3.6-35b-4bit)
-///   64 GB  → qwen3.6-35b-8bit  (+ fast qwen3.6-35b-4bit)
-///   96 GB+ → qwen3.5-122b-mxfp4 (+ fast qwen3.6-35b-4bit)
+///   32 GB  → qwen3.8-27b-4bit  (+ fast qwen3.5-4b-4bit)
+///   48 GB  → qwen3.8-27b-4bit  (+ fast qwen3.6-35b-4bit)
+///   64 GB  → qwen3.8-27b-4bit  (+ fast qwen3.6-35b-4bit)
+///   96 GB+ → qwen3.8-27b-4bit  (+ fast qwen3.6-35b-4bit)
 ///
 /// Note: the picks trust the maintainer's MEASURED footprints, which are
 /// smaller than ``ModelSizing``'s heuristic estimate for low-bit / MoE
@@ -36,11 +36,11 @@ struct RAMBucketedDefaultTests {
         #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 17) == "qwen3.5-4b-4bit")
         #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 18) == "qwen3.5-9b-4bit")
         #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 24) == "bonsai-27b-2bit")
-        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 32) == "gemma-4-26b-4bit")
-        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 48) == "gemma-4-26b-4bit")
-        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 64) == "qwen3.6-35b-8bit")
-        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 96) == "qwen3.5-122b-mxfp4")
-        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 256) == "qwen3.5-122b-mxfp4") // 96 tier
+        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 32) == "qwen3.8-27b-4bit")
+        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 48) == "qwen3.8-27b-4bit")
+        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 64) == "qwen3.8-27b-4bit")
+        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 96) == "qwen3.8-27b-4bit")
+        #expect(RAMBucketedDefault.alias(forPhysicalRAMGB: 256) == "qwen3.8-27b-4bit") // 96 tier
     }
 
     @Test("A 20 GB Mac rounds DOWN to the 18 GB pick (fits), not up to 24 GB")
@@ -77,9 +77,9 @@ struct RAMBucketedDefaultTests {
         #expect(RAMBucketedDefault.picks(forPhysicalRAMGB: 24).map(\.alias)
             == ["bonsai-27b-2bit", "qwen3.5-4b-4bit"])
         #expect(RAMBucketedDefault.picks(forPhysicalRAMGB: 32).map(\.alias)
-            == ["gemma-4-26b-4bit", "qwen3.5-4b-4bit"])
+            == ["qwen3.8-27b-4bit", "qwen3.5-4b-4bit"])
         #expect(RAMBucketedDefault.picks(forPhysicalRAMGB: 48).map(\.alias)
-            == ["gemma-4-26b-4bit", "qwen3.6-35b-4bit"])
+            == ["qwen3.8-27b-4bit", "qwen3.6-35b-4bit"])
         // 64/96 GB: fast alt is the lighter 4-bit Qwen3.6-35B (no caveat).
         let tier64 = RAMBucketedDefault.picks(forPhysicalRAMGB: 64)
         #expect(tier64.count == 2)
@@ -95,11 +95,12 @@ struct RAMBucketedDefaultTests {
     @Test("Flags apply only when the alias IS the pick for that Mac's RAM")
     func launchFlagsAreRAMGated() {
         #expect(RAMBucketedDefault.launchFlags(forAlias: "qwen3.5-9b-4bit", physicalRAMGB: 18).isEmpty)
-        #expect(RAMBucketedDefault.launchFlags(forAlias: "gemma-4-26b-4bit", physicalRAMGB: 32)
-            == ["--no-mllm", "--kv-cache-dtype", "bf16", "--cache-memory-mb", "512"])
+        // No tier carries launch flags since the gemma pick retired with
+        // the AA-Index roster (qwen3.8-27b-4bit runs bare; MTP is in the
+        // alias). The RAM-gating machinery itself is still exercised: a
+        // non-pick alias and a foreign tier both come back flagless.
+        #expect(RAMBucketedDefault.launchFlags(forAlias: "qwen3.8-27b-4bit", physicalRAMGB: 32).isEmpty)
         #expect(RAMBucketedDefault.launchFlags(forAlias: "qwen3.6-35b-4bit", physicalRAMGB: 48).isEmpty)
-        // Hand-picking gemma-26b on a 64 GB Mac (where it is NOT the pick)
-        // → no forced flags, so it keeps vision.
         #expect(RAMBucketedDefault.launchFlags(forAlias: "gemma-4-26b-4bit", physicalRAMGB: 64).isEmpty)
         #expect(RAMBucketedDefault.launchFlags(forAlias: "not-a-pick", physicalRAMGB: 32).isEmpty)
     }
@@ -365,11 +366,13 @@ struct CacheAwareDefaultTests {
     @Test("Cached preference walks closest eligible tier downward, smart before fast")
     func curatedPreferenceOrder() {
         let order = RAMBucketedDefault.preferenceOrder(forPhysicalRAMGB: 256)
+        // 96/64/48 dedupe to the shared 27B smart + 35B fast picks, so the
+        // walk reaches the 32-tier fast and the 24-tier smart next.
         #expect(order.prefix(4) == [
-            "qwen3.5-122b-mxfp4",
+            "qwen3.8-27b-4bit",
             "qwen3.6-35b-4bit",
-            "qwen3.6-35b-8bit",
-            "gemma-4-26b-4bit",
+            "qwen3.5-4b-4bit",
+            "bonsai-27b-2bit",
         ])
         #expect(Set(order).count == order.count)
         #expect(RAMBucketedDefault.preferenceOrder(forPhysicalRAMGB: 4).prefix(2) == [
