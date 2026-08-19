@@ -17,6 +17,21 @@ can actually understand.
 
 ## [Unreleased]
 
+## [0.12.17] — 2026-08-19
+
+Dictation actually works now — 0.12.16's release build shipped without the
+microphone permission, so the "Allow…" button did nothing. Update, and macOS
+will ask for the microphone like it should.
+
+### Fixed
+
+- **Speech to Text can be enabled again.** The signed app now carries the
+  microphone entitlement macOS requires. 0.12.16's release build shipped
+  without it, so the permission prompt never appeared and dictation
+  dead-ended at setup — development builds were unaffected, which is why
+  it slipped through. The build pipeline now refuses to sign a release
+  that is missing it.
+
 ## [0.12.16] — 2026-08-19
 
 Dictate into any app from a global hotkey, web search works out of the box,
