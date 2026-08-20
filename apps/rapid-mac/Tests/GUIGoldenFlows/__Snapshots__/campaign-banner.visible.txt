@@ -25,20 +25,22 @@ AXApplication title="Rapid-MLX"
           AXStaticText value=text enabled=true
           AXScrollArea
             AXTextArea id="rapid.chat.compose" desc="Message compose field" value=empty
-          AXButton id="ChatView.AddPhotos" desc="Add photos" help="This model doesn't support images" enabled=false
+          AXButton id="ChatView.AddAttachments" desc="Add attachments" help="Add PDF, CSV, or TXT files" enabled=true
+          AXButton id="ChatView.ConversationInstructions" desc="Conversation instructions" help="Conversation instructions" enabled=true
           AXPopUpButton id="ModelPickerBar.ModelMenu" desc="Model" help="Choose which model to run" value=text enabled=true
-          AXButton id="info.circle" desc="Show model details" help="Show model details" enabled=true
+          AXButton id="ModelPickerBar.ModelInfo" desc="Show model details" help="Show model details" enabled=true
           AXButton id="ChatView.SendOrStopButton" desc="Send message" help="Start <model> before sending." enabled=false
-      AXButton desc="Settings" help="Settings — ⌘," enabled=true
+      AXButton id="ContentView.Settings" desc="Settings" help="Settings — ⌘," enabled=true
       AXButton id="ContentView.ToggleLogs" desc="Show logs" help="Show logs" enabled=true
       AXUnknown desc="Server status" enabled=true
       AXUnknown desc="Tokens per second: no data yet" enabled=true
       AXUnknown desc="CPU <percent>" enabled=true
       AXUnknown desc="GPU <gpu>" enabled=true
-      AXUnknown desc="Memory tight: <size> used out of <size>" enabled=true
-      AXButton id="Footer.DesktopVersionPill" desc="Rapid-MLX <version>" help="Rapid-MLX <version>. Click to open Settings → App." enabled=true
+      AXUnknown desc="Memory <pressure>: <size> used out of <size>" enabled=true
+      AXButton id="Footer.DesktopVersionPill" desc="Rapid-MLX <version> <update-state>" help="Rapid-MLX <version> <update-state>" enabled=true
     AXToolbar
       AXButton desc="Hide Sidebar" enabled=true
+      AXButton id="Toolbar.SearchChats" desc="Search chats" enabled=true
     AXButton subrole=AXCloseButton enabled=true
     AXButton subrole=AXFullScreenButton help="this button also has an action to zoom the window" enabled=true
     AXButton subrole=AXMinimizeButton enabled=true
