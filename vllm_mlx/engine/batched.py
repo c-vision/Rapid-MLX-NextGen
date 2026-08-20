@@ -1310,6 +1310,19 @@ class BatchedEngine(BaseEngine):
                 **load_kwargs,
             ).result()
 
+            # Fuse MoE gate+up expert projections: one gather_qmm launch
+            # instead of two per MoE layer per token, bit-exact (see
+            # vllm_mlx/moe_fusion.py; measured +7% decode on
+            # Qwen3.6-35B-A3B). Runs on the mlx-step worker — the weight
+            # concat touches MLX streams only that thread owns (#170).
+            # Intentionally inside the non-disk-stream branch: the
+            # disk-stream forward reads gate_proj/up_proj directly and its
+            # lazy load never materializes the routed weights. Dense
+            # models are a cheap no-op (no SwitchGLU to find).
+            from ..moe_fusion import fuse_gate_up
+
+            self._model_load_executor.submit(fuse_gate_up, self._model).result()
+
         # 0.9.13 PR-A: new-arch MTP inject dispatcher (Gemma 4 external
         # assistant / Qwen3.5 baked-in MTP). Runs BEFORE the scheduler is
         # built so ``_install_mtp_vendored`` in scheduler.py sees the
