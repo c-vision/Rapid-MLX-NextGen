@@ -32,6 +32,10 @@ final class DictationController {
     private(set) var phase: Phase = .off
     private(set) var lastError: String?
     private(set) var lastLatency: TimeInterval?
+    /// Phase split of ``lastLatency`` ("model 1.2 s · asr 0.3 s"), present
+    /// only when model bring-up took noticeable time. Answers "why was that
+    /// one slow" without a log dive.
+    private(set) var lastLatencyDetail: String?
     private(set) var elapsed: TimeInterval = 0
     /// Set when the TCC row says Accessibility is granted but this process
     /// still cannot install an event tap — i.e. the grant landed after launch.
@@ -65,7 +69,10 @@ final class DictationController {
             // renders from has to move with it — otherwise picking a model
             // leaves the Enable switch stuck until something else refreshes.
             refreshReadiness()
-            Task { await prewarmModel() }
+            // Replacing, not joining: a prewarm still in flight here is
+            // warming the PREVIOUS model, and joining it would return with
+            // the new selection never warmed.
+            Task { await prewarmModel(replacingCurrent: true) }
         }
     }
 
@@ -94,6 +101,10 @@ final class DictationController {
     private var capturingApp: String?
     private var level: Float = 0
     private var transcribeTask: Task<Void, Never>?
+    /// The in-flight prewarm, retained so ``disable()`` and a hotkey press
+    /// can cancel it and so concurrent triggers join it (single-flight)
+    /// instead of stacking probes in the engine's serial STT lane.
+    private var prewarmTask: Task<Void, Never>?
     /// alias → HuggingFace repo. `ensureServing` needs the repo to fetch a
     /// model that is not on disk yet; passing nil silently limits it to models
     /// already cached.
@@ -221,11 +232,17 @@ final class DictationController {
         accessibilityNeedsRelaunch = false
         lastError = nil
         phase = .idle
+        // Warm the whole lane now — catalog cache, sidecar, STT weights — so
+        // the first hotkey press of the session starts from a hot path. Fire
+        // and forget: enabling must not block on a model coming up.
+        Task { [weak self] in await self?.prewarmModel() }
     }
 
     func disable() {
         transcribeTask?.cancel()
         transcribeTask = nil
+        prewarmTask?.cancel()
+        prewarmTask = nil
         stopTicking()
         hotkey.stop()
         recorder.shutdown()
@@ -283,11 +300,111 @@ final class DictationController {
     /// Loads the model ahead of the first hotkey press. Without this the first
     /// dictation of a session pays for a process swap *and* a possible download
     /// while the user is already talking.
-    func prewarmModel() async {
-        guard isEnabled, !modelAlias.isEmpty else { return }
-        guard server.servingAlias != modelAlias else { return }
-        _ = await ensureModelServing()
+    ///
+    /// Three costs move off the hotkey path here, in order:
+    /// 1. The alias→repo catalog lookup. On a cache miss ``resolveRepo``
+    ///    spawns `rapid-mlx` CLI subprocesses — one to three SECONDS of cold
+    ///    interpreter — and the old early-return below skipped it exactly when
+    ///    the sidecar was already serving this model, so the most common warm
+    ///    session still paid it inside the first transcription.
+    /// 2. The process swap, when another model is being served.
+    /// 3. The STT weights: the engine loads them lazily on the first
+    ///    transcription of each process lifetime (measured ~1.2 s for
+    ///    parakeet), so ``warmUpEngine()`` sends a beat of silence to make
+    ///    the sidecar pay that now instead of inside the user's first real
+    ///    dictation.
+    /// - Parameter replacingCurrent: pass `true` when the model CHANGED —
+    ///   an in-flight prewarm is then warming the wrong model and must be
+    ///   superseded, not joined. The default joins it: for a same-model
+    ///   trigger (enable + tab appear firing close together) the running
+    ///   flight already covers this call.
+    func prewarmModel(replacingCurrent: Bool = false) async {
+        if replacingCurrent {
+            prewarmTask?.cancel()
+            prewarmTask = nil
+        }
+        // Single-flight. The check-and-assign below is MainActor-synchronous
+        // (no await between them), so concurrent triggers cannot both slip
+        // past: the second joins the task the first created instead of
+        // racing it through the engine's serial STT lane.
+        if let running = prewarmTask {
+            await running.value
+            return
+        }
+        var created: Task<Void, Never>!
+        created = Task { [weak self] in
+            await self?.performPrewarm()
+            // Only the flight that still OWNS the slot may clear it. A
+            // cancelled predecessor finishing late must not null out the
+            // task a later enable started, or single-flight breaks.
+            if let self, self.prewarmTask == created {
+                self.prewarmTask = nil
+            }
+        }
+        prewarmTask = created
+        await created.value
     }
+
+    private func performPrewarm() async {
+        guard isEnabled, !modelAlias.isEmpty else { return }
+        let alias = modelAlias
+        _ = await resolveRepo(for: alias)
+        // Actor reentrancy: every await above and below is a window for
+        // disable() or a model change to land. Re-check before each step
+        // that mutates the sidecar or touches the wire.
+        guard !Task.isCancelled, isEnabled, modelAlias == alias else { return }
+        if server.servingAlias != alias {
+            guard await ensureModelServing() else { return }
+            guard !Task.isCancelled, isEnabled, modelAlias == alias else { return }
+        }
+        await warmUpEngine()
+    }
+
+    /// Forces the sidecar to load the STT weights by transcribing a beat of
+    /// silence. Skipped whenever a real dictation is underway — the engine
+    /// serialises transcriptions, so a probe would queue in front of it.
+    private func warmUpEngine() async {
+        guard phase == .idle else { return }
+        guard server.servingAlias == modelAlias else { return }
+        do {
+            _ = try await client.transcribe(
+                audioData: Self.silentProbeWAV,
+                model: modelAlias,
+                context: nil,
+                port: server.activePort,
+                bearer: server.activeBearer
+            )
+        } catch is CancellationError {
+            // Expected: a hotkey press or disable() superseded the probe.
+        } catch {
+            // Not user-facing — the cost of a failed probe is only that the
+            // first real dictation pays the weight load again — but leave a
+            // trace so a recurring failure is diagnosable.
+            NSLog("Dictation prewarm probe failed for %@: %@", modelAlias, String(describing: error))
+        }
+    }
+
+    /// 0.2 s of 16 kHz mono PCM silence — the smallest useful body for
+    /// ``warmUpEngine()``. Same WAV layout ``DictationRecorder`` produces.
+    static let silentProbeWAV: Data = {
+        let sampleCount = 3_200
+        let dataBytes = sampleCount * 2
+        var wav = Data()
+        wav.append(contentsOf: Array("RIFF".utf8))
+        wav.append(UInt32(36 + dataBytes).littleEndianBytes)
+        wav.append(contentsOf: Array("WAVEfmt ".utf8))
+        wav.append(UInt32(16).littleEndianBytes)
+        wav.append(UInt16(1).littleEndianBytes)
+        wav.append(UInt16(1).littleEndianBytes)
+        wav.append(UInt32(16_000).littleEndianBytes)
+        wav.append(UInt32(16_000 * 2).littleEndianBytes)
+        wav.append(UInt16(2).littleEndianBytes)
+        wav.append(UInt16(16).littleEndianBytes)
+        wav.append(contentsOf: Array("data".utf8))
+        wav.append(UInt32(dataBytes).littleEndianBytes)
+        wav.append(Data(count: dataBytes))
+        return wav
+    }()
 
     // MARK: - Hotkey
 
@@ -307,6 +424,12 @@ final class DictationController {
             lastError = "Choose a transcription model first."
             return
         }
+        // A probe still in flight would sit in front of this dictation in the
+        // engine's serial STT lane. Abandon it — if it already reached the
+        // sidecar, the weight load it triggered continues server-side and
+        // benefits the transcription that follows either way.
+        prewarmTask?.cancel()
+        prewarmTask = nil
         do {
             try recorder.startCapture()
         } catch {
@@ -365,6 +488,10 @@ final class DictationController {
         }
 
         let started = Date()
+        // Phase timing: "how long was that" is unanswerable from one opaque
+        // number when the cost can hide in catalog resolution, a model swap,
+        // or inference. The split is surfaced in the Dictation tab.
+        let ensureStarted = Date()
         guard await ensureModelServing() else {
             lastError = repoByAlias[modelAlias] == nil
                 ? "\(modelAlias) isn't in the audio model catalog. Pick another model."
@@ -372,9 +499,11 @@ final class DictationController {
             return
         }
         guard !Task.isCancelled else { return }
+        let ensureSeconds = Date().timeIntervalSince(ensureStarted)
 
         do {
             let context = vocabulary.contextPrompt
+            let requestStarted = Date()
             let result = try await client.transcribe(
                 audioData: audio,
                 model: modelAlias,
@@ -382,6 +511,7 @@ final class DictationController {
                 port: server.activePort,
                 bearer: server.activeBearer
             )
+            let requestSeconds = Date().timeIntervalSince(requestStarted)
             guard !Task.isCancelled else { return }
 
             let text = Self.tidy(result.text)
@@ -392,6 +522,11 @@ final class DictationController {
 
             let latency = Date().timeIntervalSince(started)
             lastLatency = latency
+            // Only worth spelling out when something besides inference took
+            // real time — a warm run reads better as one number.
+            lastLatencyDetail = ensureSeconds >= 0.1
+                ? String(format: "model %.1f s · asr %.1f s", ensureSeconds, requestSeconds)
+                : nil
             lastError = nil
 
             // Suspend the tap across injection: synthesising ⌘V puts a Command
@@ -480,5 +615,13 @@ final class DictationController {
         if text.hasSuffix("。") { text.removeLast() }
         else if text.hasSuffix(".") && !text.hasSuffix("...") { text.removeLast() }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+private extension FixedWidthInteger {
+    /// The value's little-endian bytes, for hand-assembling the WAV header of
+    /// ``DictationController/silentProbeWAV``.
+    var littleEndianBytes: Data {
+        withUnsafeBytes(of: littleEndian) { Data($0) }
     }
 }

@@ -136,6 +136,11 @@ struct DictationView: View {
         if let latency = controller.lastLatency {
             parts.append(String(format: "%.2f s last", latency))
         }
+        // "why was that one slow" — present only when model bring-up ate
+        // noticeable time, so the common warm line stays short.
+        if let detail = controller.lastLatencyDetail {
+            parts.append(detail)
+        }
         return parts.filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
@@ -301,6 +306,9 @@ struct DictationView: View {
         var parts = [controller.modelAlias]
         if let latency = controller.lastLatency {
             parts.append(String(format: "%.2f s last", latency))
+        }
+        if let detail = controller.lastLatencyDetail {
+            parts.append(detail)
         }
         return parts.joined(separator: " · ")
     }

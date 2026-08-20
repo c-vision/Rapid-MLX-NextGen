@@ -40,6 +40,46 @@ struct DictationTests {
         #expect(DictationController.tidy("。") == "")
     }
 
+    // MARK: - Warm-up probe
+
+    /// The prewarm probe is a hand-assembled WAV; a malformed header would
+    /// turn every prewarm into a silent 400 and the lazy weight-load would
+    /// quietly return to the user's first real dictation. Pins the exact
+    /// layout ``DictationRecorder`` produces: PCM16, mono, 16 kHz, with RIFF
+    /// and data sizes that match the payload.
+    @MainActor
+    @Test("the silent prewarm probe is a valid 16 kHz mono PCM16 WAV")
+    func silentProbeShape() {
+        let wav = DictationController.silentProbeWAV
+        func u32(_ offset: Int) -> UInt32 {
+            wav.subdata(in: offset..<(offset + 4)).withUnsafeBytes {
+                UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self))
+            }
+        }
+        func u16(_ offset: Int) -> UInt16 {
+            wav.subdata(in: offset..<(offset + 2)).withUnsafeBytes {
+                UInt16(littleEndian: $0.loadUnaligned(as: UInt16.self))
+            }
+        }
+        #expect(String(data: wav.prefix(4), encoding: .ascii) == "RIFF")
+        #expect(String(data: wav.subdata(in: 8..<16), encoding: .ascii) == "WAVEfmt ")
+        #expect(String(data: wav.subdata(in: 36..<40), encoding: .ascii) == "data")
+        #expect(u16(20) == 1)              // PCM
+        #expect(u16(22) == 1)              // mono
+        #expect(u32(24) == 16_000)         // sample rate
+        #expect(u32(28) == 32_000)         // byte rate
+        #expect(u16(32) == 2)              // block align
+        #expect(u16(34) == 16)             // bits per sample
+        let payload = u32(40)
+        #expect(u32(4) == 36 + payload)    // RIFF size ties to data size
+        #expect(Int(payload) == wav.count - 44)
+        // A beat of silence: long enough to force the weight load, short
+        // enough to be free.
+        let seconds = Double(payload) / 32_000
+        #expect(seconds > 0.05 && seconds < 1.0)
+        #expect(wav.suffix(Int(payload)).allSatisfy { $0 == 0 })
+    }
+
     // MARK: - Vocabulary
 
     /// The cap is the whole design constraint: measured accuracy falls off past
