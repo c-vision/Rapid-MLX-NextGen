@@ -102,6 +102,7 @@ def test_checkpoint_profile_defaults_and_conservative_capabilities() -> None:
     assert profile is not None
     assert profile.tool_call_parser is None
     assert profile.reasoning_parser is None
+    assert profile.is_hybrid is False
     assert profile.is_moe is True
     assert profile.supports_spec_decode is False
 
@@ -118,5 +119,6 @@ def test_public_4bit_alias_defaults_and_conservative_capabilities() -> None:
     assert profile.hf_path == "mlx-community/North-Mini-Code-1.0-4bit"
     assert profile.tool_call_parser is None
     assert profile.reasoning_parser is None
+    assert profile.is_hybrid is False
     assert profile.is_moe is True
     assert profile.supports_spec_decode is False

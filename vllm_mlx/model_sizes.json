@@ -58,6 +58,8 @@
     "mlx-community/Muse-Glimmer-30B-bf16": 59581776079,
     "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit": 17792571825,
     "mlx-community/Nanbeige4.1-3B-4bit": 2231499570,
+    "mlx-community/North-Mini-Code-1.0-4bit": 18514853287,
+    "mlx-community/North-Mini-Code-1.0-bf16": 60988268172,
     "mlx-community/Phi-3.5-mini-instruct-4bit": 2152081350,
     "mlx-community/Qwen2.5-14B-Instruct-4bit": 8321091241,
     "mlx-community/Qwen3-0.6B-4bit": 351383618,

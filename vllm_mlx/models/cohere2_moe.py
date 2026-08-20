@@ -11,6 +11,13 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+
+# Installing this before any ``mlx_lm`` import protects M5 single-stream
+# devices from mlx-lm's module-load-time thread-local stream capture (#404).
+from .. import _mlx_compat
+
+_mlx_compat.install()
+
 from mlx_lm.models.activations import swiglu
 from mlx_lm.models.base import (
     BaseModelArgs,
