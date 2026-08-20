@@ -120,6 +120,7 @@ def _read_kv_dims(model):
     return None
 
 
+from .gdn_prefill import install as install_gdn_prefill_kernel
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig  # noqa: E402
 from .paged_cache import PagedCacheManager
 from .pflash import PFlashConfig, compress_request_tokens
@@ -169,6 +170,11 @@ def _pflash_compressed(request: Request) -> bool:
 
 # Enable MambaCache batching support for models like Nemotron
 ensure_mamba_support()
+
+# Install the blocked-seq GDN prefill kernel for Qwen3.5/3.6/3.8 hybrids.
+# Shape-gated inside: non-GDN models and decode steps are untouched, and
+# RAPID_MLX_GDN_PREFILL=0 opts out entirely.
+install_gdn_prefill_kernel()
 
 # Error patterns that indicate cache corruption.
 # Each pattern must be specific enough to avoid false positives.
