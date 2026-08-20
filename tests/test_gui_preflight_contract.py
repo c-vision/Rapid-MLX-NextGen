@@ -105,6 +105,8 @@ def test_peekaboo_requirement_is_default_deny():
         "no-dead-controls",
         "catalog-integrity",
         "update-state",
+        "update-busy",
+        "campaign-banner",
         "launch-integrations",
         "slow-stream-stop",
         "model-crash-recovery",
