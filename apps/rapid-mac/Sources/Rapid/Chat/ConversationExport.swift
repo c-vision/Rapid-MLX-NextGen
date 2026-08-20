@@ -88,7 +88,14 @@ enum ConversationExport {
 
         // A conversation with no turns still exports — an empty file with a
         // title beats a save that silently produces nothing.
-        for message in conversation.messages where isConversationTurn(message.role) {
+        //
+        // The VISIBLE path, not the whole tree: this is a readable document
+        // of the conversation the user actually had, and splicing in the
+        // answers they regenerated away would read as though the model
+        // replied three times to one prompt. ``json(_:)`` keeps every branch
+        // — that is the archive format, and the same split in labour the
+        // doc comment above describes for reasoning and tool rows.
+        for message in conversation.activePath where isConversationTurn(message.role) {
             out += "\n---\n\n## \(heading(for: message.role))\n\n"
             out += body(of: message)
         }

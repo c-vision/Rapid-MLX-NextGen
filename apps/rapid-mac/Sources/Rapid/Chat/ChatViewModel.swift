@@ -19,7 +19,101 @@ final class ChatViewModel {
     /// The ACTIVE conversation's live message buffer. All streaming /
     /// append / update goes through here; ``persistActive()`` snapshots it
     /// into ``conversations`` + disk at each turn boundary (M3 history).
+    ///
+    /// This is the visible root-to-leaf PATH, not the whole tree. Branching
+    /// deliberately did not change that: every streaming write addresses a
+    /// message by its index in this array, so keeping it linear left all of
+    /// that untouched. The turns the user has branched away from live in
+    /// ``branchedAway`` and are re-joined at persist time.
     private(set) var messages: [ChatMessage] = []
+
+    /// Nodes of the active conversation's tree that are NOT on the visible
+    /// path — the answers a Regenerate replaced, the prompts an edit
+    /// superseded, and everything that hung below them.
+    ///
+    /// Held apart from ``messages`` purely so the live buffer stays a plain
+    /// linear array (see above). The two are concatenated back into one bag
+    /// of nodes by ``persistActive`` and split apart again on load, so
+    /// ``ChatConversation.messages`` remains the single serialised tree.
+    private var branchedAway: [ChatMessage] = []
+
+    /// Parent → last-chosen-child for the active conversation's forks. Kept
+    /// alongside the split buffers and persisted with them; see
+    /// ``ChatConversation/branchChoices`` for why it exists.
+    private var branchChoices: [UUID: UUID] = [:]
+
+    /// Monotonic stamp of the tree's SHAPE — bumped when nodes are added,
+    /// moved between the two buffers, or removed. Streamed tokens landing in
+    /// an existing row leave it alone.
+    ///
+    /// Exists for ``treeSnapshot``: the per-row queries (`branchPosition`,
+    /// `deletionImpact`, `siblings`) run inside the transcript's ForEach, so
+    /// they re-execute for every visible row on every render pass — including
+    /// the pass after each streamed token. Rescanning and re-sorting
+    /// `branchedAway + messages` there is quadratic in transcript length at
+    /// thirty invalidations a second; reading a snapshot rebuilt only on
+    /// shape changes is not.
+    private var treeShapeVersion = 0
+
+    /// The whole tree, indexed: rebuilt lazily whenever ``treeShapeVersion``
+    /// moves. ``children`` groups are pre-sorted in sibling order.
+    ///
+    /// READ-ONLY by contract. Because content writes do not move the shape
+    /// version, a snapshot built while an answer streams holds that row's
+    /// EARLY value; only the fields that never mutate after append — id,
+    /// role, parentID, createdAt — may be trusted from it. Every structural
+    /// mutation (``selectBranch``, ``deleteMessage``) re-reads node VALUES
+    /// from the live buffers via ``liveTree()`` before adopting or
+    /// persisting; feeding ``nodes`` back into ``adoptTree`` would restore a
+    /// truncated mid-stream answer over the finished one.
+    private struct TreeSnapshot {
+        var version = -1
+        var nodes: [ChatMessage] = []
+        var byID: [UUID: ChatMessage] = [:]
+        var children: [UUID: [ChatMessage]] = [:]
+        var roots: [ChatMessage] = []
+
+        func childGroup(of parentID: UUID?) -> [ChatMessage] {
+            guard let parentID else { return roots }
+            return children[parentID] ?? []
+        }
+    }
+
+    private var cachedTree = TreeSnapshot()
+
+    /// The current tree snapshot, rebuilding it first if the shape moved.
+    private func treeSnapshot() -> TreeSnapshot {
+        if cachedTree.version == treeShapeVersion { return cachedTree }
+        // Path first: if a corrupt store ever produces the same id in both
+        // buffers, the visible row is the one that wins everywhere.
+        let nodes = MessageTree.deduplicatingByID(messages + branchedAway)
+        var snapshot = TreeSnapshot()
+        snapshot.version = treeShapeVersion
+        snapshot.nodes = nodes
+        snapshot.byID.reserveCapacity(nodes.count)
+        for node in nodes { snapshot.byID[node.id] = node }
+        for node in nodes {
+            if let parent = node.parentID {
+                snapshot.children[parent, default: []].append(node)
+            } else {
+                snapshot.roots.append(node)
+            }
+        }
+        for key in snapshot.children.keys {
+            snapshot.children[key]?.sort(by: MessageTree.precedes)
+        }
+        snapshot.roots.sort(by: MessageTree.precedes)
+        cachedTree = snapshot
+        return snapshot
+    }
+
+    /// The whole tree with CURRENT node values, straight from the live
+    /// buffers. The input to every structural mutation — never the cached
+    /// snapshot, whose values may predate the tokens that streamed in since
+    /// it was built.
+    private func liveTree() -> [ChatMessage] {
+        MessageTree.deduplicatingByID(messages + branchedAway)
+    }
 
     /// Saved conversations, newest-updated first — the sidebar "Older"
     /// list. Loaded from disk on init; upserted whenever the active
@@ -255,7 +349,19 @@ final class ChatViewModel {
     private func persistActive(touching: Bool = true) {
         guard messages.contains(where: { $0.role == .user }) else { return }
         let now = Date()
+        // Title comes from the VISIBLE path: the sidebar row must match the
+        // conversation the user sees, not a prompt they branched away from.
         let title = ConversationStore.title(from: messages)
+        // The visible path and the branches it was split from go to SEPARATE
+        // fields. `messages` stays a linear transcript so a downgrade renders
+        // the conversation the user was looking at instead of a flattened pile
+        // of alternatives; `branches` is a new key an old build ignores.
+        //
+        // The leaf pointer is only meaningful once alternatives exist — for a
+        // linear conversation the decoder's `messages.last` fallback IS the
+        // leaf. Omitting it keeps every branching key absent from a
+        // conversation that never branched.
+        let leaf = branchedAway.isEmpty ? nil : messages.last?.id
         if conversations.contains(where: { $0.id == activeConversationID }) {
             conversations = ConversationOrdering.updating(
                 conversations,
@@ -264,6 +370,9 @@ final class ChatViewModel {
                 at: now
             ) { conversation in
                 conversation.messages = messages
+                conversation.branches = branchedAway
+                conversation.activeLeafID = leaf
+                conversation.branchChoices = branchChoices
                 // A renamed row keeps its name. Re-deriving unconditionally
                 // meant the next streamed token silently reverted the user's
                 // rename back to the first prompt's opening words.
@@ -280,6 +389,9 @@ final class ChatViewModel {
                     id: activeConversationID,
                     title: title,
                     messages: messages,
+                    branches: branchedAway,
+                    activeLeafID: leaf,
+                    branchChoices: branchChoices,
                     createdAt: now,
                     updatedAt: now,
                     customInstructions: Self.normalizedInstruction(conversationInstructions)
@@ -463,7 +575,10 @@ final class ChatViewModel {
         isStreaming = false
         persistActive(touching: false)
         guard let conv = conversations.first(where: { $0.id == id }) else { return }
-        messages = conv.messages
+        // Seed BEFORE adopting — the stored map is what tells ``adoptTree``
+        // where the user was inside each branch of the incoming conversation.
+        branchChoices = conv.branchChoices
+        adoptTree(conv.allMessages, activeLeafID: conv.activeLeafID ?? conv.messages.last?.id)
         conversationInstructions = conv.customInstructions ?? ""
         activeConversationID = id
         lastError = nil
@@ -483,6 +598,9 @@ final class ChatViewModel {
             inflight = nil
             conversationEpoch &+= 1
             messages.removeAll()
+            branchedAway.removeAll()
+            treeShapeVersion += 1
+            branchChoices.removeAll()
             conversationInstructions = ""
             activeConversationID = UUID()
             isStreaming = false          // messages now empty → persistActive no-ops
@@ -496,16 +614,58 @@ final class ChatViewModel {
 
     // MARK: - In-memory message storage
 
+    /// Load a stored tree into the split live representation: the visible
+    /// path into ``messages``, everything else into ``branchedAway``.
+    ///
+    /// The inverse of the re-join in ``persistActive``. Splitting on load and
+    /// merging on save is what lets the streaming path keep addressing
+    /// messages by index into a plain linear array while the conversation as
+    /// a whole is still a tree.
+    private func adoptTree(_ tree: [ChatMessage], activeLeafID: UUID?) {
+        let path = MessageTree.activePath(
+            in: tree,
+            activeLeafID: activeLeafID,
+            preferring: branchChoices
+        )
+        let visible = Set(path.map(\.id))
+        messages = path
+        branchedAway = tree.filter { !visible.contains($0.id) }
+        treeShapeVersion += 1
+        // Record which way this path went at every fork it crosses. MERGED,
+        // not replaced: forks that are not on this path keep the position
+        // they had, which is the whole point — stepping to a sibling must not
+        // wipe out where the user was inside the branch they just left.
+        branchChoices.merge(MessageTree.choices(along: path)) { _, new in new }
+    }
+
     /// Append a message and return its index in ``messages``.
     @discardableResult
     private func appendMessage(_ message: ChatMessage) -> Int {
-        messages.append(message)
+        // Every append extends the visible path, so the new node's parent is
+        // whatever currently ends it. Setting the link here — at the single
+        // funnel every send / stream / tool-result append already goes
+        // through — is what keeps the tree connected without touching any of
+        // those call sites.
+        var linked = message
+        if linked.parentID == nil {
+            linked.parentID = messages.last?.id
+        }
+        messages.append(linked)
+        treeShapeVersion += 1
         return messages.count - 1
     }
 
     /// Overwrite the message at ``index`` when it is still in range.
     private func updateMessage(at index: Int, with message: ChatMessage) {
         guard messages.indices.contains(index) else { return }
+        // Streamed tokens replace a row's CONTENT, which the branch metadata
+        // snapshot does not care about. Only a write that moves the row to a
+        // different node — new id or new parent — is a shape change; today no
+        // caller does that, and this guard keeps the invariant honest if one
+        // ever starts to.
+        if messages[index].id != message.id || messages[index].parentID != message.parentID {
+            treeShapeVersion += 1
+        }
         messages[index] = message
     }
 
@@ -536,6 +696,9 @@ final class ChatViewModel {
         isStreaming = false
         persistActive(touching: false)
         messages.removeAll()
+        branchedAway.removeAll()
+        treeShapeVersion += 1
+        branchChoices.removeAll()
         conversationInstructions = ""
         activeConversationID = UUID()
         lastError = nil
@@ -547,7 +710,15 @@ final class ChatViewModel {
     /// the `DevSnapshot` harness can render a populated chat. Never called
     /// in normal use (only from the env-gated snapshot path).
     func devSeedMessages(_ seeded: [ChatMessage]) {
-        messages = seeded
+        // Chain the fixture into a tree. Callers hand over a plain linear
+        // array, which in tree terms is a set of parentless roots — the
+        // transcript would render as a single turn, and a Regenerate on it
+        // would branch from nothing. Same repair the ``ChatConversation``
+        // initialiser applies, for the same reason.
+        messages = MessageTree.repairingLegacyChain(seeded)
+        branchedAway.removeAll()
+        treeShapeVersion += 1
+        branchChoices.removeAll()
     }
 
     /// Append a locally authored assistant message to the open conversation.
@@ -615,6 +786,19 @@ final class ChatViewModel {
         // send the instant it happens, not only once the reply lands.
         persistActive()
 
+        beginAssistantTurn(alias: alias, forcedWebSearchQuery: forcedWebSearchQuery)
+    }
+
+    /// Open a streaming assistant turn under whatever currently ends the
+    /// visible path, and drive it to completion.
+    ///
+    /// Split out of ``send`` so a regeneration can answer the user turn ALREADY
+    /// in the transcript instead of appending a copy of it. Getting that wrong
+    /// branches at the wrong level: the replacement answer would hang under a
+    /// duplicate prompt, making it a sibling of the original *question* rather
+    /// than of the original *answer*, and the `‹ n/m ›` control would never
+    /// see the two answers as alternatives at all.
+    private func beginAssistantTurn(alias: String, forcedWebSearchQuery: String?) {
         let placeholder = ChatMessage(role: .assistant, status: .streaming)
         let placeholderIndex = appendMessage(placeholder)
 
@@ -1302,19 +1486,37 @@ final class ChatViewModel {
         )
     }
 
-    /// Edit a user turn in place: replace its prose, drop everything
-    /// that came after it, and re-send. Matches ChatGPT Desktop's
-    /// "edit message" pattern — the edit point becomes the new
-    /// conversation tip.
+    /// Rewind the visible path to ``index`` — everything from there on is
+    /// moved into ``branchedAway`` rather than discarded.
+    ///
+    /// This is the single primitive behind Regenerate, Retry, and editing a
+    /// prompt. All three used to do `messages = Array(messages.prefix(idx))`,
+    /// which destroyed the answer the user was replacing: a regeneration that
+    /// came back worse than the original was unrecoverable. Setting the tail
+    /// aside instead costs nothing at the call sites — the very next
+    /// ``send`` appends under ``messages.last``, so the replacement turn
+    /// lands as a SIBLING of the rewound one and both stay reachable through
+    /// the switcher.
+    private func rewindPath(to index: Int) {
+        guard messages.indices.contains(index) else { return }
+        branchedAway.append(contentsOf: messages[index...])
+        messages = Array(messages.prefix(index))
+        treeShapeVersion += 1
+    }
+
+    /// Edit a user turn: replace its prose and re-send from that point.
+    ///
+    /// The pre-edit prompt and every answer under it are kept as a sibling
+    /// branch, so the original wording stays one `‹ 1/2 ›` click away.
     ///
     /// The replay stays on the CURRENT conversation id. An earlier build
     /// forked to a fresh id here so the pre-edit transcript survived as a
     /// recoverable branch, but the branch was indistinguishable from a real
     /// chat in the sidebar: every edit and every Retry silently spawned a
     /// duplicate row with the same title, so a few regenerations buried the
-    /// history list under near-identical entries. Rewinding in place is what
-    /// ChatGPT and Claude desktop do, and it is what the row the user is
-    /// looking at appears to promise.
+    /// history list under near-identical entries. Branching WITHIN the
+    /// conversation is what that comment was reaching for — the alternatives
+    /// now live inside the one row the user is looking at.
     @discardableResult
     func editUserMessage(
         id: UUID,
@@ -1329,7 +1531,7 @@ final class ChatViewModel {
         guard !trimmed.isEmpty || !imageAttachments.isEmpty || !fileAttachments.isEmpty else {
             return false
         }
-        messages = Array(messages.prefix(idx))
+        rewindPath(to: idx)
         send(
             trimmed,
             alias: alias,
@@ -1339,20 +1541,47 @@ final class ChatViewModel {
         return true
     }
 
-    /// Drop the most recent assistant turn and resend the user turn that
+    /// Re-answer the user turn at ``userIndex``, keeping every answer that
+    /// already hangs off it as an alternative.
+    ///
+    /// Rewinds to just AFTER the prompt — the prompt itself stays on the path
+    /// and is reused — so the new answer is appended as its child and lands as
+    /// a true sibling of the one being replaced. Rewinding past the prompt and
+    /// re-sending its text instead would append a duplicate prompt, and the
+    /// two answers would end up in different branches entirely.
+    private func regenerateAnswer(afterUserAt userIndex: Int, alias: String) {
+        guard !isStreaming, messages.indices.contains(userIndex) else { return }
+        let userMessage = messages[userIndex]
+        guard !userMessage.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !userMessage.imageAttachments.isEmpty
+                || !userMessage.fileAttachments.isEmpty else { return }
+
+        rewindPath(to: userIndex + 1)
+        let forcedTool = Self.forcedToolForUserTurn(
+            userMessage.content,
+            // The prompt being re-answered is on the path, so it must not also
+            // count as its own prior context.
+            priorMessages: Array(messages.dropLast()),
+            enabledToolNames: Set(enabledDefinitions.map { $0.function.name })
+        )
+        beginAssistantTurn(
+            alias: alias,
+            forcedWebSearchQuery: forcedTool == "web_search"
+                ? Self.webSearchQuery(for: userMessage.content, priorMessages: messages)
+                : nil
+        )
+    }
+
+    /// Drop the most recent assistant turn and re-answer the user turn that
     /// preceded it. Powers the per-message Regenerate button under each
     /// assistant bubble. No-op while a stream is in flight.
+    ///
+    /// The replaced answer is kept as a sibling, not discarded — see
+    /// ``rewindPath(to:)``.
     func regenerateLast(alias: String) {
         guard !isStreaming else { return }
         guard let lastUserIndex = messages.lastIndex(where: { $0.role == .user }) else { return }
-        let userMessage = messages[lastUserIndex]
-        messages = Array(messages.prefix(lastUserIndex))
-        send(
-            userMessage.content,
-            alias: alias,
-            imageAttachments: userMessage.imageAttachments,
-            fileAttachments: userMessage.fileAttachments
-        )
+        regenerateAnswer(afterUserAt: lastUserIndex, alias: alias)
     }
 
     /// Retry the turn that produced a specific assistant message. This is
@@ -1376,14 +1605,201 @@ final class ChatViewModel {
             return false
         }
         // In place, on the SAME conversation id — see ``editUserMessage``
-        // for why the old fork-into-a-branch behaviour was removed.
-        messages = Array(messages.prefix(userIndex))
-        send(
-            userMessage.content,
-            alias: alias,
-            imageAttachments: userMessage.imageAttachments,
-            fileAttachments: userMessage.fileAttachments
+        // for why the old fork-into-a-separate-chat behaviour was removed.
+        // The retried answer and its replacement become siblings.
+        regenerateAnswer(afterUserAt: userIndex, alias: alias)
+        return true
+    }
+
+    // MARK: - Branch navigation
+
+    /// The node whose sibling group represents ``id``'s alternatives.
+    ///
+    /// A regeneration branches at the turn that ANSWERS a prompt, but a tool
+    /// round-trip writes several rows for one logical answer:
+    /// `user → assistant(tool_calls) → tool → assistant(final)`. The branch
+    /// therefore forks at the dispatch row, while the row the user reads —
+    /// and the only one carrying a visible action bar — is the final answer.
+    /// Asking for the final answer's own siblings finds none, so the switcher
+    /// vanished exactly when a tool was used.
+    ///
+    /// Walking back to the first node after the owning user turn maps every
+    /// row of a logical answer onto the same fork, so the control appears on
+    /// the answer the user is looking at and both directions stay reachable.
+    private func branchAnchor(for id: UUID, in tree: TreeSnapshot) -> ChatMessage? {
+        guard let node = tree.byID[id] else { return nil }
+        // A user turn branches on its own account (prompt edits).
+        guard node.role != .user else { return node }
+        var current = node
+        // Same cycle guard as ``MessageTree/activePath``, and needed for the
+        // same reason: that walk TRUNCATES a corrupt parent chain rather than
+        // rejecting it, so a looping tree still reaches the transcript and
+        // every rendered row asks for its branch position. Without the seen
+        // set this walk spins on the main actor and the window hangs.
+        var seen: Set<UUID> = [node.id]
+        while let parentID = current.parentID, let parent = tree.byID[parentID] {
+            if parent.role == .user { return current }
+            guard seen.insert(parent.id).inserted else { return current }
+            current = parent
+        }
+        return current
+    }
+
+    /// The alternatives available at ``id``, in stable order.
+    ///
+    /// A single-element result means the turn was never regenerated; the UI
+    /// hides the switcher in that case rather than rendering a permanent
+    /// `‹ 1/1 ›`.
+    func siblings(of id: UUID) -> [ChatMessage] {
+        let tree = treeSnapshot()
+        guard let anchor = branchAnchor(for: id, in: tree) else { return [] }
+        return tree.childGroup(of: anchor.parentID)
+    }
+
+    /// 1-based position of ``id`` among its alternatives, and how many there
+    /// are — exactly what the `‹ 2/3 ›` control renders. ``nil`` when the
+    /// turn has no alternatives.
+    func branchPosition(of id: UUID) -> (index: Int, count: Int)? {
+        let tree = treeSnapshot()
+        guard let anchor = branchAnchor(for: id, in: tree) else { return nil }
+        let group = tree.childGroup(of: anchor.parentID)
+        guard group.count > 1, let offset = group.firstIndex(where: { $0.id == anchor.id }) else {
+            return nil
+        }
+        return (offset + 1, group.count)
+    }
+
+    /// Switch the visible transcript to the alternative at ``offset`` within
+    /// ``id``'s sibling group.
+    ///
+    /// Blocked mid-stream: the in-flight turn writes by index into
+    /// ``messages``, so swapping the buffer under it would land tokens in the
+    /// wrong branch. The UI disables the control for the same reason.
+    @discardableResult
+    func selectBranch(at offset: Int, forSiblingOf id: UUID) -> Bool {
+        guard !isStreaming else { return false }
+        let snapshot = treeSnapshot()
+        // Resolve to the fork this row belongs to before indexing, so a tool
+        // round-trip's final answer selects among the same alternatives its
+        // switcher displays.
+        guard let anchor = branchAnchor(for: id, in: snapshot) else { return false }
+        let group = snapshot.childGroup(of: anchor.parentID)
+        guard group.indices.contains(offset) else { return false }
+        let target = group[offset]
+        guard target.id != anchor.id else { return false }
+
+        // From here on the operation MUTATES: leave the snapshot (its node
+        // values may be stale — see ``TreeSnapshot``) and work on the live
+        // buffers, which always carry the finished content.
+        let tree = liveTree()
+        // Resolve DOWN from the chosen sibling: it is typically an interior
+        // turn with its own continuation, and the transcript has to end at a
+        // leaf. Prefer wherever the user last was inside that branch, falling
+        // back to its newest tip for one never visited.
+        let leaf = MessageTree.deepestLeaf(
+            from: target.id,
+            in: tree,
+            preferring: branchChoices
         )
+        // Record the step itself before adopting. ``adoptTree`` only sees the
+        // path it resolves, and this edge — the parent choosing THIS sibling —
+        // is the one the user just made.
+        if let parent = target.parentID {
+            branchChoices[parent] = target.id
+        }
+        adoptTree(tree, activeLeafID: leaf)
+        // Persist WITHOUT touching updatedAt: switching branches is
+        // navigation, not work, and should not reshuffle the sidebar — the
+        // same reasoning as ``selectConversation``'s `touching: false`.
+        persistActive(touching: false)
+        return true
+    }
+
+    /// Move one alternative earlier / later in ``id``'s sibling group.
+    /// Bounded, not wrapping: `‹` on the first branch is a no-op so the
+    /// control's disabled state matches what it does.
+    @discardableResult
+    func stepBranch(from id: UUID, by delta: Int) -> Bool {
+        let tree = treeSnapshot()
+        guard let anchor = branchAnchor(for: id, in: tree) else { return false }
+        let group = tree.childGroup(of: anchor.parentID)
+        guard let current = group.firstIndex(where: { $0.id == anchor.id }) else { return false }
+        let target = current + delta
+        guard group.indices.contains(target) else { return false }
+        return selectBranch(at: target, forSiblingOf: id)
+    }
+
+    /// How many turns ``deleteMessage(id:)`` would remove — the message plus
+    /// everything beneath it, across every branch.
+    ///
+    /// The confirmation dialog needs this: deleting one visible bubble can
+    /// take a dozen turns with it, and a user who has branched cannot see
+    /// what is hanging off the other branches. Returns 0 for an unknown id.
+    func deletionImpact(of id: UUID) -> Int {
+        let tree = treeSnapshot()
+        guard tree.byID[id] != nil else { return 0 }
+        var collected: Set<UUID> = [id]
+        var frontier: [UUID] = [id]
+        while let current = frontier.popLast() {
+            for child in tree.childGroup(of: current) where collected.insert(child.id).inserted {
+                frontier.append(child.id)
+            }
+        }
+        return collected.count
+    }
+
+    /// Confirmation title naming exactly what a delete would take.
+    ///
+    /// A bare "Delete message?" understates a deletion that silently removes
+    /// a long follow-up thread and any branches hanging off it — and after a
+    /// few regenerations some of those turns are not on screen for the user
+    /// to count for themselves.
+    ///
+    /// Lives on the view model rather than the row that renders it because
+    /// ``MessageRow`` is `private` to ``ChatView``; this is the part of the
+    /// dialog worth pinning in a test.
+    nonisolated static func deleteConfirmationTitle(turnCount: Int) -> String {
+        turnCount <= 1
+            ? "Delete this message?"
+            : "Delete this message and the \(turnCount - 1) turn\(turnCount == 2 ? "" : "s") below it?"
+    }
+
+    /// Delete a turn and every alternative continuation beneath it. The
+    /// producing prompt stays: a childless prompt is still something the user
+    /// said, and the natural seed for a fresh regeneration.
+    ///
+    /// The whole subtree goes: re-parenting the orphans onto the deleted
+    /// node's parent would splice together a prompt and an answer that never
+    /// belonged to each other and present it as real history.
+    @discardableResult
+    func deleteMessage(id: UUID) -> Bool {
+        guard !isStreaming else { return false }
+        // Live values, not the snapshot: what survives the delete is re-split
+        // and persisted, so it must carry the finished content of every row.
+        let tree = liveTree()
+        guard tree.contains(where: { $0.id == id }) else { return false }
+        let doomed = MessageTree.subtree(of: id, in: tree)
+        let remaining = tree.filter { !doomed.contains($0.id) }
+        guard !remaining.isEmpty else {
+            // Deleting the root clears the conversation rather than leaving
+            // an empty row behind.
+            deleteConversation(activeConversationID)
+            return true
+        }
+        // Land on the branch nearest the deletion — the parent's newest
+        // surviving continuation — instead of jumping to an unrelated one.
+        let parentID = tree.first(where: { $0.id == id })?.parentID
+        // Drop navigation hints that pointed into the deleted subtree before
+        // resolving, so a stale edge cannot steer the walk at the very fork
+        // the user is standing on.
+        branchChoices = branchChoices.filter { entry in
+            !doomed.contains(entry.key) && !doomed.contains(entry.value)
+        }
+        let leaf = parentID.map {
+            MessageTree.deepestLeaf(from: $0, in: remaining, preferring: branchChoices)
+        } ?? MessageTree.defaultLeaf(in: remaining, preferring: branchChoices)
+        adoptTree(MessageTree.promotingOrphans(remaining), activeLeafID: leaf)
+        persistActive()
         return true
     }
 

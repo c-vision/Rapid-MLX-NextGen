@@ -245,6 +245,26 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
     /// ``reasoningTruncated`` / ``contentTruncated`` /
     /// ``toolNotCalledFlagged``).
     var toolCallArtifactSuppressed: Bool
+    /// Parent node in the conversation tree, or ``nil`` for a root turn.
+    ///
+    /// A conversation stores EVERY branch, not just the visible transcript;
+    /// the path on screen is derived by walking up from
+    /// ``ChatConversation.activeLeafID`` through this link (see
+    /// ``ChatConversation/activePath``). Two messages sharing a ``parentID``
+    /// are siblings — alternative continuations of the same point — which is
+    /// what Regenerate / Retry / editing a prompt now produce instead of
+    /// truncating the tail away.
+    ///
+    /// Siblings are deliberately NOT mirrored in a `childrenIDs` array on the
+    /// parent: one authoritative edge per node cannot drift out of sync,
+    /// whereas a bidirectional pair has to be repaired on every insert,
+    /// delete, and decode. Sibling order is derived from ``createdAt``.
+    ///
+    /// Optional, and absent from every conversation written before branching
+    /// shipped. ``ChatConversation``'s decode reconnects such a legacy linear
+    /// array into a degenerate tree (each row parented to the one before it),
+    /// so old transcripts render exactly as they always did.
+    var parentID: UUID?
     let createdAt: Date
 
     init(
@@ -264,6 +284,7 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         contentTruncated: Bool = false,
         toolNotCalledFlagged: Bool = false,
         toolCallArtifactSuppressed: Bool = false,
+        parentID: UUID? = nil,
         createdAt: Date = Date()
     ) {
         self.id = id
@@ -282,6 +303,7 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         self.contentTruncated = contentTruncated
         self.toolNotCalledFlagged = toolNotCalledFlagged
         self.toolCallArtifactSuppressed = toolCallArtifactSuppressed
+        self.parentID = parentID
         self.createdAt = createdAt
     }
 
@@ -297,6 +319,7 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         case stats, reasoningTruncated, contentTruncated
         case toolNotCalledFlagged
         case toolCallArtifactSuppressed
+        case parentID
         case createdAt
         /// The outcome as THIS build understands it. ``failureKind`` carries
         /// the same outcome narrowed to a value older builds can decode — see
@@ -339,6 +362,11 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         try c.encode(contentTruncated, forKey: .contentTruncated)
         try c.encode(toolNotCalledFlagged, forKey: .toolNotCalledFlagged)
         try c.encode(toolCallArtifactSuppressed, forKey: .toolCallArtifactSuppressed)
+        // Omitted for root turns. Non-root rows always carry it — including
+        // in conversations that never branched — which is safe because it is
+        // an additive key every shipped decoder ignores; the conversation-
+        // level schema marker is the `branches` key, not this one.
+        try c.encodeIfPresent(parentID, forKey: .parentID)
         try c.encode(createdAt, forKey: .createdAt)
     }
 
@@ -378,6 +406,11 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         // release have no key for this field; default to false so old
         // transcripts decode cleanly.
         self.toolCallArtifactSuppressed = try c.decodeIfPresent(Bool.self, forKey: .toolCallArtifactSuppressed) ?? false
+        // Absent on every row written before branching shipped, and absent on
+        // root turns thereafter. ``ChatConversation``'s decode rebuilds the
+        // parent chain for a legacy linear array, so ``nil`` here is not
+        // assumed to mean "root" until that repair has run.
+        self.parentID = try c.decodeIfPresent(UUID.self, forKey: .parentID)
         self.createdAt = try c.decode(Date.self, forKey: .createdAt)
     }
 

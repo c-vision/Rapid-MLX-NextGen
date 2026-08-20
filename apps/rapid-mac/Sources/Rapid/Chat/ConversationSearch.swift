@@ -18,9 +18,16 @@ enum ConversationSearch {
     }
 
     /// Match every whitespace-delimited query term against the conversation's
-    /// title or visible user/assistant prose. Terms may land in different
+    /// title or user/assistant prose. Terms may land in different
     /// messages, which makes a query such as "swift cache" useful even when
     /// the two words came from different turns.
+    ///
+    /// Searches ALL branches, not just the transcript currently on screen.
+    /// Search is how a user finds a conversation they half-remember, and an
+    /// answer they regenerated away is exactly the kind of thing they come
+    /// back looking for — matching only the visible path would report "no
+    /// results" for text the app is still holding. The row this returns opens
+    /// on its own active branch, from which the switcher reaches the rest.
     static func results(
         in conversations: [ChatConversation],
         matching query: String
@@ -29,7 +36,7 @@ enum ConversationSearch {
         return conversations
             .filter { conversation in
                 guard !terms.isEmpty else { return true }
-                let searchableText = [conversation.title] + conversation.messages.compactMap { message in
+                let searchableText = [conversation.title] + conversation.allMessages.compactMap { message in
                     switch message.role {
                     case .user, .assistant:
                         return message.content

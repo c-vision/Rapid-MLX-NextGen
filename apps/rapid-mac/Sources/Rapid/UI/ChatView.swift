@@ -446,7 +446,23 @@ struct ChatView: View {
                         // dims and carries the Send tooltip's sentence, which
                         // is the pattern ``sendOrStopButton`` already uses.
                         retryEnabled: readiness.sendAllowed,
-                        retryTooltip: readiness.sendTooltip
+                        retryTooltip: readiness.sendTooltip,
+                        // Switching branches replays no turn, so unlike Edit
+                        // and Retry it deliberately does NOT go through
+                        // ``acknowledgeIfNotReady`` — reading an answer the
+                        // model already produced must keep working with the
+                        // model stopped.
+                        branchPosition: viewModel.branchPosition(of: message.id),
+                        onSelectBranch: { delta in
+                            _ = viewModel.stepBranch(from: message.id, by: delta)
+                        },
+                        // Deleting removes content the model already produced,
+                        // so like the branch switcher it stays available with
+                        // the model stopped.
+                        deletionImpact: viewModel.deletionImpact(of: message.id),
+                        onDelete: {
+                            _ = viewModel.deleteMessage(id: message.id)
+                        }
                     )
                     .frame(maxWidth: contentMaxWidth, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -1131,12 +1147,29 @@ private struct MessageRow: View {
     /// The one sentence explaining a disabled Retry. Same string the
     /// Send button uses, so both channels say the same thing.
     var retryTooltip: String = "Retry response"
+    /// This turn's position among its alternatives, 1-based, or ``nil`` when
+    /// it has none. Drives the `‹ 2/3 ›` switcher — absent means the control
+    /// is not rendered at all, so a transcript that was never regenerated
+    /// looks exactly as it did before branching shipped.
+    var branchPosition: (index: Int, count: Int)? = nil
+    /// Step to the previous / next alternative. The argument is the signed
+    /// offset, so one callback covers both arrows.
+    var onSelectBranch: (Int) -> Void = { _ in }
+    /// How many turns deleting this message would remove, including
+    /// everything on branches the user cannot currently see. ``nil`` disables
+    /// the delete affordance entirely (the dev-snapshot harness and previews
+    /// pass no handler).
+    var deletionImpact: Int? = nil
+    /// Delete this message and its whole subtree. Called only after the
+    /// confirmation below is accepted.
+    var onDelete: () -> Void = {}
 
     @State private var reasoningExpanded: Bool = false
     @State private var isEditing: Bool = false
     @State private var editDraft: String = ""
     @State private var copiedRecently: Bool = false
     @State private var selectTextPresented: Bool = false
+    @State private var deleteConfirmationPresented: Bool = false
     @FocusState private var editFieldFocused: Bool
 
     var body: some View {
@@ -1305,6 +1338,9 @@ private struct MessageRow: View {
                 )
                 .accessibilityIdentifier(actionIdentifier("SaveEdit"))
             } else {
+                // Editing a prompt branches too, so the same switcher applies
+                // here — it is what makes the pre-edit wording reachable.
+                branchSwitcher
                 copyButton(text: message.content, label: "Copy message")
                 selectTextButton(text: message.content)
                 QuietIconButton(
@@ -1317,6 +1353,7 @@ private struct MessageRow: View {
                 }
                 .disabled(isStreaming)
                 .accessibilityIdentifier(actionIdentifier("Edit"))
+                deleteButton
             }
         }
     }
@@ -1457,8 +1494,52 @@ private struct MessageRow: View {
         )
     }
 
+    /// Remove this turn and everything under it.
+    ///
+    /// Hidden unless a handler was supplied. Confirmed first, and the dialog
+    /// states the real cost: deleting one visible bubble takes its whole
+    /// subtree, which after a few regenerations includes answers sitting on
+    /// branches the user cannot currently see.
+    @ViewBuilder
+    private var deleteButton: some View {
+        if let impact = deletionImpact, impact > 0 {
+            QuietIconButton(
+                symbol: "trash",
+                label: "Delete message",
+                help: "Delete message",
+                size: RapidTheme.ControlHeight.mini
+            ) {
+                deleteConfirmationPresented = true
+            }
+            .disabled(isStreaming)
+            .accessibilityIdentifier(actionIdentifier("Delete"))
+            // ``confirmationDialog`` over ``alert`` so the cancel-role button
+            // is Return-bound — same choice, and the same empirically-verified
+            // AXIdentifier survival through AppKit's re-hosting, as the
+            // delete-conversation dialog in ``SidebarView``.
+            .confirmationDialog(
+                ChatViewModel.deleteConfirmationTitle(turnCount: impact),
+                isPresented: $deleteConfirmationPresented,
+                titleVisibility: .visible
+            ) {
+                Button("Delete", role: .destructive) {
+                    onDelete()
+                    deleteConfirmationPresented = false
+                }
+                .accessibilityIdentifier(actionIdentifier("DeleteConfirm"))
+                Button("Keep", role: .cancel) {
+                    deleteConfirmationPresented = false
+                }
+                .accessibilityIdentifier(actionIdentifier("DeleteKeep"))
+            } message: {
+                Text("This can't be undone.")
+            }
+        }
+    }
+
     private var assistantActions: some View {
         HStack(spacing: 2) {
+            branchSwitcher
             copyButton(text: assistantCopyText, label: "Copy response")
             selectTextButton(text: assistantCopyText)
             QuietIconButton(
@@ -1472,6 +1553,74 @@ private struct MessageRow: View {
             .disabled(isStreaming || !retryEnabled)
             .accessibilityHint(retryEnabled ? "" : retryTooltip)
             .accessibilityIdentifier(actionIdentifier("Retry"))
+            deleteButton
+        }
+    }
+
+    /// `‹ 2/3 ›` — steps between the alternative answers at this point in the
+    /// conversation.
+    ///
+    /// Rendered ONLY when this turn actually has alternatives. A permanent
+    /// `‹ 1/1 ›` on every row would be noise on the overwhelmingly common
+    /// path, and its arrows would be dead: the affordance appearing is itself
+    /// the signal that a regeneration is recoverable.
+    ///
+    /// Arrows are bounded, not wrapping, and each is disabled at its end of
+    /// the group so the control never looks live while doing nothing.
+    @ViewBuilder
+    private var branchSwitcher: some View {
+        // Suppressed on a tool-dispatch row. Every row of one logical answer
+        // now resolves to the same fork, so without this the control would
+        // render twice for a tool round-trip — once on the "Calling
+        // web_search…" row and again on the answer that follows it. The answer
+        // is the one the user reads, so the dispatch row yields.
+        //
+        // Keyed on the dispatch SHAPE, not on ``showsAssistantActions``: that
+        // property lets a dispatch row through as soon as it carries prose of
+        // its own ("Let me look that up…" + tool_calls), which is exactly the
+        // case where both `n/m` controls appeared.
+        if let branch = branchPosition, !isToolDispatchRow {
+            // "Response" on an assistant row, "Version" on a user one — the
+            // alternatives under a prompt are rewordings of what the user
+            // said, not answers.
+            let noun = message.role == .user ? "version" : "response"
+            HStack(spacing: 1) {
+                QuietIconButton(
+                    symbol: "chevron.left",
+                    label: "Previous \(noun)",
+                    help: "Previous \(noun)",
+                    size: RapidTheme.ControlHeight.mini
+                ) {
+                    onSelectBranch(-1)
+                }
+                // Disabled mid-stream for the same reason the view model
+                // refuses the switch: the in-flight turn writes by index into
+                // the visible transcript, so swapping it underneath would
+                // land tokens in the branch the user just left.
+                .disabled(isStreaming || branch.index <= 1)
+                .accessibilityIdentifier(actionIdentifier("PreviousBranch"))
+
+                Text("\(branch.index)/\(branch.count)")
+                    .font(.caption2)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    // One label for the pair: VoiceOver reads "Response 2 of
+                    // 3" instead of spelling out a bare fraction between two
+                    // unexplained chevrons.
+                    .accessibilityLabel("\(noun.capitalized) \(branch.index) of \(branch.count)")
+                    .accessibilityIdentifier(actionIdentifier("BranchPosition"))
+
+                QuietIconButton(
+                    symbol: "chevron.right",
+                    label: "Next \(noun)",
+                    help: "Next \(noun)",
+                    size: RapidTheme.ControlHeight.mini
+                ) {
+                    onSelectBranch(1)
+                }
+                .disabled(isStreaming || branch.index >= branch.count)
+                .accessibilityIdentifier(actionIdentifier("NextBranch"))
+            }
         }
     }
 
@@ -1492,6 +1641,19 @@ private struct MessageRow: View {
     /// Keyed on the tool-dispatch shape rather than "is the last row" so
     /// it holds for every round of a multi-round turn, and for a row
     /// still streaming its follow-up prose.
+    /// Whether this row is an assistant turn that DISPATCHED tools, as
+    /// opposed to a prompt, a tool result, or an answer.
+    ///
+    /// Deliberately independent of whether the row also carries prose: a
+    /// model is free to narrate before it calls ("Let me check the
+    /// weather…"), and that row is still mid-turn plumbing rather than the
+    /// answer the branch switcher belongs on.
+    private var isToolDispatchRow: Bool {
+        guard message.role == .assistant else { return false }
+        guard let calls = message.toolCalls else { return false }
+        return !calls.isEmpty
+    }
+
     private var showsAssistantActions: Bool {
         // Not until the answer is finished. Copy and Select Text would hand
         // back a half-written response, and Retry was already dead here (it

@@ -3,10 +3,44 @@ import Foundation
 /// A saved conversation — the unit the sidebar history list shows and the
 /// on-disk history persists. ``ChatMessage`` is already ``Codable``, so a
 /// conversation serialises as-is.
+///
+/// ``messages`` holds EVERY branch as an unordered bag of tree nodes, not the
+/// visible transcript. Read ``activePath`` for what the user is looking at.
 struct ChatConversation: Identifiable, Codable, Equatable {
     let id: UUID
     var title: String
+    /// The VISIBLE transcript — the active root-to-leaf path, in order.
+    ///
+    /// Deliberately still a plain linear conversation, because this is the
+    /// field every already-shipped build reads. A downgrade shows the
+    /// conversation the user was actually looking at and re-saves it intact;
+    /// it loses the off-path alternatives (unavoidable — that build cannot
+    /// represent them) but never scrambles the transcript. Storing the whole
+    /// node bag here instead would hand an old build a pile of alternatives
+    /// with no parent links and let it present them as one linear thread.
     var messages: [ChatMessage]
+    /// Nodes that are NOT on the active path: the answers a Regenerate
+    /// replaced, the prompts an edit superseded, and everything under them.
+    ///
+    /// A NEW key, which is also the schema marker. Its presence — not the
+    /// shape of the parent links — is what says "this file was written by a
+    /// build that understands branching". Shape inference cannot work here: a
+    /// user who edits the opening prompt legitimately owns several parentless
+    /// roots, which is indistinguishable from a pre-branching linear array.
+    var branches: [ChatMessage] = []
+    /// Tip of the branch currently on screen. ``nil`` means "resolve the most
+    /// recently grown branch", which is also what every conversation written
+    /// before branching shipped decodes to.
+    var activeLeafID: UUID? = nil
+    /// Parent → last-chosen-child, for every fork the user has navigated.
+    ///
+    /// Stepping to a sibling has to resolve downwards to some leaf, and
+    /// "newest child" alone would throw away where the user was: leave a
+    /// branch three turns from its tip, look at the alternative, come back,
+    /// and you would land at the tip instead of where you left. Persisted so
+    /// that survives relaunch too. Stale entries are ignored at read time
+    /// rather than pruned, so a deleted branch cannot corrupt navigation.
+    var branchChoices: [UUID: UUID] = [:]
     let createdAt: Date
     var updatedAt: Date
 
@@ -42,6 +76,9 @@ struct ChatConversation: Identifiable, Codable, Equatable {
         id: UUID,
         title: String,
         messages: [ChatMessage],
+        branches: [ChatMessage] = [],
+        activeLeafID: UUID? = nil,
+        branchChoices: [UUID: UUID] = [:],
         createdAt: Date,
         updatedAt: Date,
         isPinned: Bool = false,
@@ -52,7 +89,22 @@ struct ChatConversation: Identifiable, Codable, Equatable {
     ) {
         self.id = id
         self.title = title
-        self.messages = messages
+        // ``messages`` is the active PATH, so it is linear by construction and
+        // its parent chain is derivable. Callers that build one by hand (tests,
+        // dev fixtures, a future importer) hand over a bare array with no
+        // links; chaining it here means no construction path can express a
+        // path whose nodes are not connected.
+        //
+        // Keyed on ``branches`` being empty, NOT on the shape of the links: a
+        // caller supplying real branch data owns the parent links already, and
+        // re-chaining them would splice separate branches into one bogus line.
+        let linked = branches.isEmpty
+            ? MessageTree.repairingLegacyChain(messages)
+            : messages
+        self.messages = linked
+        self.branches = branches
+        self.activeLeafID = activeLeafID
+        self.branchChoices = branchChoices
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.isPinned = isPinned
@@ -67,11 +119,93 @@ struct ChatConversation: Identifiable, Codable, Equatable {
     /// property as required, so a missing `isPinned` key would throw —
     /// and ``ConversationStore.load`` turns one throw into "the whole
     /// history is corrupt", i.e. an apparently wiped sidebar on upgrade.
+    /// Declared explicitly: writing ``encode(to:)`` by hand suppresses the
+    /// compiler's synthesis of this enum along with the encoder itself.
+    enum CodingKeys: String, CodingKey {
+        case id, title, messages, branches, activeLeafID, branchChoices
+        case createdAt, updatedAt, isPinned, isArchived, hasCustomTitle
+        case customInstructions, folderID
+    }
+
+    /// Hand-written to match ``init(from:)``'s string-keyed
+    /// ``branchChoices``. Everything else is written exactly as the
+    /// synthesised encoder would.
+    ///
+    /// This has to exist: without it Swift synthesises an encoder that emits
+    /// `[UUID: UUID]` as a flat array, the hand-written decoder asks for an
+    /// object, and the map would be silently dropped on every reload — the
+    /// feature would look like it worked all session and forget on relaunch.
+    ///
+    /// Compatibility contract, precisely: a conversation that never branched
+    /// carries NO conversation-level branching key (`branches`,
+    /// `activeLeafID`, `branchChoices` are all omitted). Its rows do carry
+    /// `parentID` — an additive per-row key every shipped decoder ignores —
+    /// so the output is decodable-identical to a pre-branching file, not
+    /// byte-identical. What is load-bearing is the `branches` key's absence,
+    /// which is the schema marker ``init(from:)`` keys on.
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(title, forKey: .title)
+        try c.encode(messages, forKey: .messages)
+        // Omitted when empty — the key's ABSENCE is the schema signal on the
+        // way back in: no `branches` key means "linear transcript, links may
+        // be re-derived".
+        if !branches.isEmpty {
+            try c.encode(branches, forKey: .branches)
+        }
+        try c.encodeIfPresent(activeLeafID, forKey: .activeLeafID)
+        if !branchChoices.isEmpty {
+            let flattened = branchChoices.reduce(into: [String: String]()) { acc, entry in
+                acc[entry.key.uuidString] = entry.value.uuidString
+            }
+            try c.encode(flattened, forKey: .branchChoices)
+        }
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encode(updatedAt, forKey: .updatedAt)
+        try c.encode(isPinned, forKey: .isPinned)
+        try c.encode(isArchived, forKey: .isArchived)
+        try c.encode(hasCustomTitle, forKey: .hasCustomTitle)
+        try c.encodeIfPresent(customInstructions, forKey: .customInstructions)
+        try c.encodeIfPresent(folderID, forKey: .folderID)
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
         title = try c.decode(String.self, forKey: .title)
-        messages = try c.decode([ChatMessage].self, forKey: .messages)
+        // ``branches`` is the schema marker. Its PRESENCE says the writer
+        // understood branching, so the stored parent links are authoritative
+        // and must be left exactly as they are. Its absence means either a
+        // pre-branching file or a conversation that never branched; in both
+        // cases the transcript is linear and its links can be re-derived.
+        //
+        // Inferring this from the tree's shape instead — "no node has a
+        // parent, therefore legacy" — is WRONG and was a real bug: editing the
+        // opening prompt legitimately produces several parentless roots, which
+        // is shape-identical to a legacy array. Re-chaining then spliced two
+        // separate branches into one thread and destroyed the branch entry.
+        let storedPath = try c.decode([ChatMessage].self, forKey: .messages)
+        let storedBranches = try c.decodeIfPresent([ChatMessage].self, forKey: .branches)
+        if let storedBranches {
+            messages = storedPath
+            branches = storedBranches
+        } else {
+            messages = MessageTree.repairingLegacyChain(storedPath)
+            branches = []
+        }
+        activeLeafID = try c.decodeIfPresent(UUID.self, forKey: .activeLeafID)
+        // Stored as a string-keyed object: Swift encodes a `[UUID: UUID]` as
+        // a FLAT ARRAY of alternating keys and values, which is unreadable in
+        // the file and silently order-dependent. Any entry that fails to
+        // parse as a UUID pair is dropped rather than throwing — a corrupt
+        // navigation hint must never cost the user the conversation.
+        let storedChoices = try c.decodeIfPresent([String: String].self, forKey: .branchChoices) ?? [:]
+        branchChoices = storedChoices.reduce(into: [UUID: UUID]()) { acc, entry in
+            guard let parent = UUID(uuidString: entry.key),
+                  let child = UUID(uuidString: entry.value) else { return }
+            acc[parent] = child
+        }
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         updatedAt = try c.decode(Date.self, forKey: .updatedAt)
         isPinned = try c.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
@@ -83,6 +217,44 @@ struct ChatConversation: Identifiable, Codable, Equatable {
 }
 
 extension ChatConversation: ConversationOrderingItem {}
+
+extension ChatConversation {
+    /// Every node across every branch — the conversation as a tree.
+    ///
+    /// ``messages`` alone is only the visible path; anything the user
+    /// regenerated away lives in ``branches``. Orphans are promoted here
+    /// rather than at decode time so a hand-edited file cannot strand a
+    /// subtree outside every path.
+    var allMessages: [ChatMessage] {
+        // Dedupe first — path wins over branches — so a corrupt file that
+        // carries the same id twice resolves to ONE node before any tree
+        // arithmetic sees it; see ``MessageTree/deduplicatingByID``.
+        MessageTree.promotingOrphans(MessageTree.deduplicatingByID(messages + branches))
+    }
+
+    /// The visible transcript — the root-to-leaf path ending at
+    /// ``activeLeafID``, oldest turn first.
+    ///
+    /// Use this anywhere the user's current conversation is meant: rendering,
+    /// the outbound wire body, export, title derivation. For a conversation
+    /// that never branched this is just ``messages``.
+    var activePath: [ChatMessage] {
+        // One code path for every conversation — no `branches.isEmpty` fast
+        // path. For a valid linear transcript the derived walk returns the
+        // same array, and for a hand-edited one (dangling parents, cycles, a
+        // stale leaf pointer) it degrades through the same guards every
+        // branched conversation gets instead of returning raw storage.
+        MessageTree.activePath(
+            in: allMessages,
+            activeLeafID: activeLeafID ?? messages.last?.id,
+            preferring: branchChoices
+        )
+    }
+
+    /// Whether any turn here has an alternative. Drives the "this row has
+    /// branches" affordance without forcing callers to walk the tree.
+    var hasBranches: Bool { !branches.isEmpty }
+}
 
 /// On-disk store for the conversation history. One JSON file under
 /// Application Support, keyed by bundle identifier so a dogfood-isolated
