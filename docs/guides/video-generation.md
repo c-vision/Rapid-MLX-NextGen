@@ -1,6 +1,6 @@
 # Video generation
 
-Rapid-MLX exposes LTX-2.3, CogVideoX-Fun and Wan through the asynchronous
+Rapid-MLX exposes LTX-2.3, LTX-2.5, CogVideoX-Fun and Wan through the asynchronous
 OpenAI-compatible Videos API.
 
 Video generation requires Python 3.11 or newer because the upstream
@@ -16,8 +16,8 @@ text and audio features continue to support Python 3.10.
 - `frames` overrides the frame count derived from `seconds`. LTX requires
   `8n+1` with a minimum of 9; Wan and CogVideoX-Fun require `4n+1` with a
   minimum of 5.
-- `guidance_scale` (1–30) and `negative_prompt` are passed to the served
-  backend's classifier-free guidance implementation.
+- `guidance_scale` (1–30) and `negative_prompt` are passed to backends with
+  classifier-free guidance. LTX-2.5's distilled pipeline rejects both.
 - `conditioning_strength` (0–1) controls how closely LTX image-to-video follows
   `input_reference`; it is rejected without a reference image and is not
   currently supported by Wan or CogVideoX-Fun.
@@ -111,6 +111,54 @@ curl http://localhost:8000/v1/videos \
 
 LTX honours the `fps`, `frames` and `conditioning_strength` controls described
 above; `frames` must satisfy LTX's own frame-count rule.
+
+## LTX-2.5
+
+LTX-2.5 uses a new Gemma 4 text encoder and is served through the standalone
+`ltx-2-mlx` research runtime. That runtime is not published on PyPI yet, so it
+must be installed from its audited source commit. The registered Q8 checkpoint
+is a 67.7 GB download and uses the low-RAM distilled path by default.
+The weights are distributed under the LTX-2.x Community License rather than
+an open-source license; review the checkpoint's `LICENSE.md` before use,
+especially its commercial-use and generated-content disclosure terms.
+
+```bash
+git clone --branch ltx25 https://github.com/MrMoferFRAN/ltx-2-mlx.git
+git -C ltx-2-mlx checkout 57952288076766abe27dda3a774b2c24f7346977
+uv sync --project ltx-2-mlx
+brew install ffmpeg
+
+RAPID_MLX_LTX25_RUNTIME="$PWD/ltx-2-mlx/.venv/bin/ltx-2-mlx" \
+  rapid-mlx serve ltx-2.5-mlx-q8
+```
+
+Rapid uses the executable only to locate and verify the source checkout: it
+must be the expected workspace entry point, with a tracked lockfile and the
+exact HEAD above. For every generation, Rapid materializes only the tracked
+files from that exact commit into a process-private temporary tree and runs
+`uv sync --frozen` during startup preflight. Generations reuse that provisioned
+environment, so checkout modifications, untracked files and the mutable
+checkout `.venv` are never executed or rebuilt per request. Generations have a
+two-hour safety deadline; set
+`RAPID_MLX_LTX25_TIMEOUT_SEC` to a larger value (minimum 60) for unusually
+large jobs.
+
+Create a job with the same API. LTX-2.5 generates synchronized audio and Rapid
+preserves that audio track:
+
+```bash
+curl http://localhost:8000/v1/videos \
+  -F model=ltx-2.5-mlx-q8 \
+  -F 'prompt=A red fox trots across fresh snow at golden hour' \
+  -F frames=97 \
+  -F fps=24 \
+  -F size=704x480
+```
+
+Text-to-video and image-to-video are supported. Frame counts must be `8n+1`;
+dimensions are rounded up to the runtime's required 32-pixel boundary and
+cropped back to the requested OpenAI size when necessary. The distilled path
+does not expose `guidance_scale` or `negative_prompt`.
 
 ## CogVideoX-Fun
 

@@ -2756,12 +2756,10 @@ def serve_command(args):
         from .runtime.video_lane import require_video_runtime_or_exit
         from .video.wan import is_wan_model
 
-        model_folded = args.model.casefold()
+        # Used by the generic model-prefetch guard later in this function;
+        # Wan owns its own revision-pinned download path.
         _is_wan_video = is_wan_model(args.model)
-        if "cogvideox" in model_folded or _is_wan_video:
-            require_video_runtime_or_exit(args.model)
-        else:
-            require_video_runtime_or_exit()
+        require_video_runtime_or_exit(args.model)
 
     # F-H08-INCOMPLETE: the ``[embeddings]`` extra-required guard MUST
     # fire first thing in ``serve_command`` — before

@@ -325,7 +325,7 @@ def _video_engine():
     return engine
 
 
-def _parse_size(value: str) -> tuple[int, int]:
+def _parse_size(value: str, *, multiple: int = 64) -> tuple[int, int]:
     try:
         width, height = (int(part) for part in value.lower().split("x", 1))
     except (TypeError, ValueError) as exc:
@@ -333,7 +333,7 @@ def _parse_size(value: str) -> tuple[int, int]:
             status_code=400, detail="size must be WIDTHxHEIGHT"
         ) from exc
     openai_sizes = {(1280, 720), (720, 1280)}
-    is_model_aligned = width % 64 == 0 and height % 64 == 0
+    is_model_aligned = width % multiple == 0 and height % multiple == 0
     if not (
         256 <= width <= 1920
         and 256 <= height <= 1920
@@ -342,7 +342,7 @@ def _parse_size(value: str) -> tuple[int, int]:
         raise HTTPException(
             status_code=400,
             detail=(
-                "video width/height must be 256..1920 and divisible by 64, "
+                f"video width/height must be 256..1920 and divisible by {multiple}, "
                 "or use 1280x720 / 720x1280"
             ),
         )
@@ -392,6 +392,16 @@ def _video_capabilities(engine) -> dict:
         }
         seconds = {"minimum": 1, "maximum": 20, "default": 4}
         frames = {"minimum": 5, "maximum": 1201, "step": 4, "offset": 1}
+    elif family == "ltx-2.5":
+        modes = ["text-to-video", "image-to-video"]
+        size = {
+            "type": "range",
+            "width": {"minimum": 256, "maximum": 1920, "multiple_of": 32},
+            "height": {"minimum": 256, "maximum": 1920, "multiple_of": 32},
+            "also_supported": ["1280x720", "720x1280"],
+        }
+        seconds = {"minimum": 1, "maximum": 20, "default": 4}
+        frames = {"minimum": 9, "maximum": 1201, "step": 8, "offset": 1}
     else:
         modes = ["text-to-video", "image-to-video"]
         size = {
@@ -423,7 +433,9 @@ def _video_capabilities(engine) -> dict:
                 "metric": "pixel_frames",
                 "maximum": _MAX_PIXEL_FRAMES,
                 "dimension_rounding": (
-                    "none" if family == "cogvideox-fun" else "ceil_to_64"
+                    "none"
+                    if family == "cogvideox-fun"
+                    else ("ceil_to_32" if family == "ltx-2.5" else "ceil_to_64")
                 ),
             },
             "input_reference": {
@@ -433,11 +445,15 @@ def _video_capabilities(engine) -> dict:
             },
         },
         "controls": {
-            "guidance_scale": {"minimum": 1.0, "maximum": 30.0},
-            "conditioning_strength": (
-                {"minimum": 0.0, "maximum": 1.0} if family == "ltx-2.3" else None
+            "guidance_scale": (
+                None if family == "ltx-2.5" else {"minimum": 1.0, "maximum": 30.0}
             ),
-            "negative_prompt": True,
+            "conditioning_strength": (
+                {"minimum": 0.0, "maximum": 1.0}
+                if family in {"ltx-2.3", "ltx-2.5"}
+                else None
+            ),
+            "negative_prompt": family != "ltx-2.5",
         },
     }
 
@@ -486,8 +502,13 @@ async def _run_job(
     output = _jobs_root / job.id / "output.mp4"
     generation_gate = _generation_gate_for_current_loop()
     is_cogvideox = getattr(engine, "video_family", "") == "cogvideox-fun"
-    generation_width = width if is_cogvideox else ((width + 63) // 64) * 64
-    generation_height = height if is_cogvideox else ((height + 63) // 64) * 64
+    alignment = 32 if getattr(engine, "video_family", "") == "ltx-2.5" else 64
+    generation_width = (
+        width if is_cogvideox else ((width + alignment - 1) // alignment) * alignment
+    )
+    generation_height = (
+        height if is_cogvideox else ((height + alignment - 1) // alignment) * alignment
+    )
 
     async def generate_under_gate() -> bool:
         nonlocal started
@@ -586,6 +607,7 @@ async def create_video(
     engine = _video_engine()
     is_cogvideox = getattr(engine, "video_family", "") == "cogvideox-fun"
     is_wan = getattr(engine, "video_family", "") == "wan"
+    is_ltx25 = getattr(engine, "video_family", "") == "ltx-2.5"
     with _jobs_lock:
         if not _accepting_jobs:
             raise HTTPException(status_code=503, detail="video server is shutting down")
@@ -596,7 +618,7 @@ async def create_video(
     profile = resolve_profile(model)
     if profile is not None and profile.hf_path == engine.model_name:
         allowed_models.add(model)
-    if not (is_cogvideox or is_wan):
+    if not (is_cogvideox or is_wan or is_ltx25):
         allowed_models.add("ltx-2.3-mlx-q4")
     if model not in allowed_models:
         raise HTTPException(
@@ -631,7 +653,7 @@ async def create_video(
             )
         width, height = 672, 384
     else:
-        width, height = _parse_size(size)
+        width, height = _parse_size(size, multiple=32 if is_ltx25 else 64)
     native_fps = 5 if is_cogvideox else getattr(engine, "native_fps", 24)
     request_fps = native_fps if fps is None else fps
     if not 1 <= request_fps <= 60:
@@ -667,9 +689,18 @@ async def create_video(
                 detail="conditioning_strength requires input_reference",
             )
     if negative_prompt is not None:
-        negative_prompt = negative_prompt.strip()
-    generation_width = ((width + 63) // 64) * 64
-    generation_height = ((height + 63) // 64) * 64
+        negative_prompt = negative_prompt.strip() or None
+    if is_ltx25 and (negative_prompt or guidance_scale is not None):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "LTX-2.5 distilled generation does not support negative_prompt "
+                "or guidance_scale"
+            ),
+        )
+    alignment = 32 if is_ltx25 else 64
+    generation_width = ((width + alignment - 1) // alignment) * alignment
+    generation_height = ((height + alignment - 1) // alignment) * alignment
     if frames is not None:
         request_frames = frames
     elif is_cogvideox:
@@ -705,7 +736,9 @@ async def create_video(
     workload_height = height if is_cogvideox else generation_height
     if workload_width * workload_height * request_frames > _MAX_PIXEL_FRAMES:
         family = (
-            "CogVideoX-Fun" if is_cogvideox else ("Wan" if is_wan else "LTX-2.3 Q4")
+            "CogVideoX-Fun"
+            if is_cogvideox
+            else ("Wan" if is_wan else ("LTX-2.5 Q8" if is_ltx25 else "LTX-2.3 Q4"))
         )
         raise HTTPException(
             status_code=400,
@@ -765,7 +798,7 @@ async def create_video(
 
         job = _VideoJob(
             id=job_id,
-            model=model if (is_cogvideox or is_wan) else "ltx-2.3-mlx-q4",
+            model=model if (is_cogvideox or is_wan or is_ltx25) else "ltx-2.3-mlx-q4",
             prompt=prompt,
             seconds=str(seconds_int),
             size=f"{width}x{height}",

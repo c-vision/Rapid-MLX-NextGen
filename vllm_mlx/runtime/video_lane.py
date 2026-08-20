@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MLX-native LTX-2.3, CogVideoX-Fun and Wan video-generation lane."""
+"""MLX-native LTX, CogVideoX-Fun and Wan video-generation lane."""
 
 from __future__ import annotations
 
@@ -85,6 +85,12 @@ def _is_wan_name(model_name: str | None) -> bool:
     return is_wan_model(model_name)
 
 
+def _is_ltx25_name(model_name: str | None) -> bool:
+    from ..video.ltx25 import is_ltx25_model
+
+    return is_ltx25_model(model_name)
+
+
 def require_video_runtime_or_exit(model_name: str | None = None) -> None:
     """Fail before model download when the optional video stack is absent."""
     if sys.version_info < (3, 11):
@@ -98,7 +104,28 @@ def require_video_runtime_or_exit(model_name: str | None = None) -> None:
         raise SystemExit(2)
 
     missing = []
-    if _is_cogvideox_name(model_name):
+    if _is_ltx25_name(model_name):
+        from ..video.ltx25 import (
+            LTX25_RUNTIME_COMMIT,
+            LTX25BackendError,
+            prepare_ltx25_runtime,
+            resolve_ltx25_runtime,
+        )
+
+        runtime = resolve_ltx25_runtime()
+        if runtime is None:
+            missing.append(
+                "the pinned LTX-2.5 runtime "
+                f"(commit {LTX25_RUNTIME_COMMIT}; see the video generation guide)"
+            )
+        if shutil.which("uv") is None:
+            missing.append("uv (`brew install uv`)")
+        elif runtime is not None:
+            try:
+                prepare_ltx25_runtime(runtime)
+            except LTX25BackendError:
+                missing.append("a provisioned pinned LTX-2.5 runtime")
+    elif _is_cogvideox_name(model_name):
         cogvideox_modules = {
             "videox_fun_mlx": "the bundled VideoX-Fun-mlx runtime",
             "mlx_arsenal": "mlx-arsenal",
@@ -131,7 +158,7 @@ def require_video_runtime_or_exit(model_name: str | None = None) -> None:
 
 
 class VideoEngine:
-    """Thin adapter over ``mlx-video-with-audio``'s LTX-2.3 pipeline.
+    """Adapter over the supported MLX video runtimes.
 
     The upstream function owns model loading and generation. Rapid-MLX owns
     request validation, job lifecycle, concurrency and the OpenAI-compatible
@@ -158,10 +185,15 @@ class VideoEngine:
         self.video_family = (
             "cogvideox-fun"
             if _is_cogvideox_name(model_name)
-            else ("wan" if _is_wan_name(model_name) else "ltx-2.3")
+            else (
+                "wan"
+                if _is_wan_name(model_name)
+                else ("ltx-2.5" if _is_ltx25_name(model_name) else "ltx-2.3")
+            )
         )
         self._cog_engine = None
         self._wan_engine = None
+        self._ltx25_engine = None
         if self.video_family == "cogvideox-fun":
             from ..video.engine import VideoGenerationEngine
 
@@ -170,6 +202,10 @@ class VideoEngine:
             from ..video.wan import WanVideoEngine
 
             self._wan_engine = WanVideoEngine(model_name)
+        elif self.video_family == "ltx-2.5":
+            from ..video.ltx25 import LTX25VideoEngine
+
+            self._ltx25_engine = LTX25VideoEngine(model_name)
         # Shared across engine instances and app lifespans. A bounded shutdown
         # may detach an old daemon worker; an in-process restart must not run a
         # second Metal graph concurrently with that still-draining worker.
@@ -192,6 +228,42 @@ class VideoEngine:
         output_width: int | None = None,
         output_height: int | None = None,
     ) -> None:
+        if getattr(self, "_ltx25_engine", None) is not None:
+            from ..video.ltx25 import LTX25BackendError
+
+            if negative_prompt is not None or guidance_scale is not None:
+                raise VideoRuntimeError(
+                    "LTX-2.5 distilled generation does not support negative_prompt "
+                    "or guidance_scale."
+                )
+            if image is None and conditioning_strength is not None:
+                raise VideoRuntimeError(
+                    "LTX-2.5 conditioning_strength requires an input image."
+                )
+            try:
+                with self._generation_lock:
+                    self._ltx25_engine.generate(
+                        prompt=prompt,
+                        output_path=output_path,
+                        width=width,
+                        height=height,
+                        num_frames=num_frames,
+                        fps=fps,
+                        seed=seed,
+                        image=image,
+                        conditioning_strength=conditioning_strength,
+                    )
+            except LTX25BackendError as exc:
+                raise VideoRuntimeError(str(exc)) from exc
+            self._crop_generated_output(
+                output_path=output_path,
+                width=width,
+                height=height,
+                output_width=output_width,
+                output_height=output_height,
+                family="LTX-2.5",
+            )
+            return
         if self._wan_engine is not None:
             from ..video.wan import WanBackendError
 
@@ -408,5 +480,9 @@ class VideoEngine:
         """Video weights load lazily; startup must not trigger a 40+ GB pull."""
 
     async def stop(self) -> None:
+        if getattr(self, "_ltx25_engine", None) is not None:
+            import asyncio
+
+            await asyncio.to_thread(self._ltx25_engine.stop)
         if self._cog_engine is not None:
             await self._cog_engine.close()

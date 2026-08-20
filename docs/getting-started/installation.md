@@ -64,7 +64,7 @@ The base text-only install is ~460 MB. Vision/audio/etc. ship as opt-in extras.
 | `audio` | `pip install 'rapid-mlx[audio]'` | mlx-audio + spacy + scipy (~600 MB) for TTS / STT |
 | `embeddings` | `pip install 'rapid-mlx[embeddings]'` | mlx-embeddings (~50 MB) for `/v1/embeddings` |
 | `chat` | `pip install 'rapid-mlx[chat]'` | Gradio web UI (~150 MB) |
-| `video` | `pip install 'rapid-mlx[video]'` | mlx-video + imageio for video generation (LTX-2.3 T2V/I2V with audio); requires Python 3.11+ |
+| `video` | `pip install 'rapid-mlx[video]'` | mlx-video + imageio for LTX-2.3/Wan; LTX-2.5 additionally uses a pinned source runtime documented in the video guide; requires Python 3.11+ |
 | `image` | `pip install 'rapid-mlx[image]'` | mflux for text-to-image / image edit (FLUX.1-schnell, Qwen-Image); requires Python 3.11+ |
 | `mtp` | `pip install 'rapid-mlx[mtp]'` | pillow for MTP speculative decoding (Gemma 4 assistant drafters) |
 | `guided` | `pip install 'rapid-mlx[guided]'` | Legacy no-op kept for compatibility — llguidance ships in the core install (it replaced outlines in 0.10) |

@@ -384,7 +384,8 @@ def test_serve_dispatches_video_preflight(monkeypatch: pytest.MonkeyPatch) -> No
     class PreflightReachedError(RuntimeError):
         pass
 
-    def stop_at_preflight() -> None:
+    def stop_at_preflight(model_name: str) -> None:
+        assert model_name == "ltx-2.3-mlx-q4"
         raise PreflightReachedError
 
     monkeypatch.setattr(video_lane, "require_video_runtime_or_exit", stop_at_preflight)
