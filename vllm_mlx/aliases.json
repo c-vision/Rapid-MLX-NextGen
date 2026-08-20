@@ -1700,6 +1700,18 @@
     "suffix_decoding_tier": "unknown",
     "min_memory_gb": 16
   },
+  "qwen-image": {
+    "hf_path": "mflux-community/qwen-image-mflux-q6",
+    "modality": "image-gen",
+    "tool_call_parser": null,
+    "reasoning_parser": null,
+    "is_hybrid": false,
+    "is_moe": false,
+    "supports_spec_decode": false,
+    "supports_dflash": false,
+    "suffix_decoding_tier": "unknown",
+    "min_memory_gb": 64
+  },
   "embeddinggemma-300m-6bit": {
     "hf_path": "mlx-community/embeddinggemma-300m-6bit",
     "tool_call_parser": null,

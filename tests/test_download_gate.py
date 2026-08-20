@@ -1396,6 +1396,75 @@ def test_mflux_missing_weights_reports_non_string_index_without_raising(
     ]
 
 
+def test_mflux_local_snapshot_rejects_unpinned_repo_revision(tmp_path, monkeypatch):
+    """A pinned repo's cache must match the pin, not merely exist.
+
+    Codex review (PR #2157): without this, an alias only ever resolves
+    whatever ``refs/main`` currently points to — an upstream force-push or
+    account compromise on the repo would silently change the weights a
+    fresh pull fetches, with nothing to notice. A pinned repo resolves
+    straight to ``snapshots/<pinned_revision>`` (see the next test's
+    docstring for why refs/main can't be used here); a fully-seeded
+    snapshot at any OTHER sha — even with refs/main pointing at it, as a
+    pre-pin cache or a compromised upstream would leave it — must not be
+    mistaken for the pinned one.
+    """
+    repo = "mflux-community/qwen-image-mflux-q6"
+    assert repo in gate.IMAGE_MODEL_REVISIONS
+    cache_root = tmp_path / "hf-cache"
+    repo_root = cache_root / "models--mflux-community--qwen-image-mflux-q6"
+    _seed_mflux_snapshot(repo_root, "1" * 40)  # NOT the pinned sha
+
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache_root))
+
+    assert gate.mflux_local_snapshot(repo) is None
+    assert gate.mflux_missing_weights(repo) is None
+
+
+def test_mflux_local_snapshot_accepts_the_pinned_revision(tmp_path, monkeypatch):
+    """The exact pinned commit resolves normally — pinning isn't a fail-closed trap."""
+    repo = "mflux-community/qwen-image-mflux-q6"
+    pinned_sha = gate.IMAGE_MODEL_REVISIONS[repo]
+    cache_root = tmp_path / "hf-cache"
+    repo_root = cache_root / "models--mflux-community--qwen-image-mflux-q6"
+    _seed_mflux_snapshot(repo_root, pinned_sha)
+
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache_root))
+
+    resolved = gate.mflux_local_snapshot(repo)
+    assert resolved is not None
+    assert resolved.endswith(pinned_sha)
+    assert gate.mflux_missing_weights(repo) == []
+
+
+def test_mflux_local_snapshot_accepts_pinned_revision_without_refs_main(
+    tmp_path, monkeypatch
+):
+    """A pinned commit resolves even with no ``refs/main`` at all.
+
+    Codex review (PR #2157): ``snapshot_download(repo, revision=<commit
+    SHA>)`` — what a cold pull of a pinned repo does — caches the commit
+    under its own ``snapshots/<sha>`` directory WITHOUT necessarily moving
+    ``refs/main``; that ref only advances when a branch name (like
+    ``main``) is resolved, not an explicit commit. Resolving a pinned repo
+    through ``refs/main`` would then never recognize its own freshly
+    downloaded snapshot and re-download on every subsequent warm start.
+    """
+    repo = "mflux-community/qwen-image-mflux-q6"
+    pinned_sha = gate.IMAGE_MODEL_REVISIONS[repo]
+    cache_root = tmp_path / "hf-cache"
+    repo_root = cache_root / "models--mflux-community--qwen-image-mflux-q6"
+    _seed_mflux_snapshot(repo_root, pinned_sha)
+    (repo_root / "refs" / "main").unlink()
+
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache_root))
+
+    resolved = gate.mflux_local_snapshot(repo)
+    assert resolved is not None
+    assert resolved.endswith(pinned_sha)
+    assert gate.mflux_missing_weights(repo) == []
+
+
 def _seed_blob(blobs_dir, name: str, *, size: int, age_seconds: float = 0.0):
     blobs_dir.mkdir(parents=True, exist_ok=True)
     path = blobs_dir / name

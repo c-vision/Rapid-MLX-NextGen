@@ -216,10 +216,29 @@ def estimate_model_bytes(model_name: str) -> int:
     known_image_gib = {
         "flux2-klein-4b": 5.9,
         "z-image-turbo": 5.9,
+        # 6-bit-transformer Qwen-Image (20B) — measured peak RSS during a
+        # real generation at 1024x1024 (mflux-community/qwen-image-mflux-q6,
+        # the API/GUI default resolution; `/usr/bin/time -l`): ~55.7 GiB.
+        # (512x512 measured lower, ~40.2 GiB — the API/GUI default is what
+        # this charge must cover.) The text encoder in this repo is full
+        # precision (quantizing it "causes significant semantic degradation"
+        # per mflux's own weight definition), so it dominates the footprint
+        # over the quantized transformer. Without this entry the digit-free
+        # alias falls through to the 4 GB default and mis-admits.
+        "qwen-image": 55.7,
     }
     for token, gib in known_image_gib.items():
-        if token in folded:
-            return int(gib * _GIB)
+        if token not in folded:
+            continue
+        if token == "qwen-image" and "qwen-image-edit" in folded:
+            # "qwen-image" is a substring of "qwen-image-edit" — this charge
+            # was measured against the txt2img family only (see the comment
+            # above), and the edit variant's extra image-conditioning input
+            # makes its real footprint unverified, not merely "the same
+            # number". Falls through to the generic param-count estimate
+            # below rather than asserting an unmeasured number.
+            continue
+        return int(gib * _GIB)
 
     params = [float(value) for value in _PARAM_RE.findall(folded)]
     if not params:

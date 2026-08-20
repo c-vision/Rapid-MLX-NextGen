@@ -144,7 +144,11 @@ final class ImageGenViewModel {
     }
 
     static func seedSteps(for alias: String) -> Int {
-        if alias.localizedCaseInsensitiveContains("qwen-image-edit") { return 20 }
+        // Non-distilled Qwen-Image denoises for ~20 steps (both the base
+        // text-to-image model and the edit variant) — matching the engine's
+        // per-family default, so the bar isn't scaled for a 4-step turbo run
+        // that is actually a 20-step one.
+        if alias.localizedCaseInsensitiveContains("qwen-image") { return 20 }
         return alias.localizedCaseInsensitiveContains("z-image") ? 8 : 4
     }
 

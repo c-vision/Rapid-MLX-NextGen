@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import gc
 import io
+import os
 import re
 import threading
 import time
@@ -230,13 +231,33 @@ class ImageGenerationEngine:
         start rather than failing fast. Resolving the cached snapshot ourselves
         and passing the directory keeps a warm start entirely local. Falls back
         to the repo id whenever the cache can't be vouched for, so a cold or
-        partial cache still pulls exactly as before.
+        partial cache still pulls exactly as before — unless the repo is
+        pinned (``IMAGE_MODEL_REVISIONS``), in which case we fetch it
+        ourselves at the exact verified commit rather than let mflux resolve
+        and download whatever ``main`` currently points to.
         """
         if not self._prequantized:
             return None
-        from .._download_gate import mflux_local_snapshot
+        from .._download_gate import IMAGE_MODEL_REVISIONS, mflux_local_snapshot
 
-        return mflux_local_snapshot(self.model_name) or self.model_name
+        snapshot = mflux_local_snapshot(self.model_name)
+        if snapshot is not None:
+            return snapshot
+        pinned_revision = IMAGE_MODEL_REVISIONS.get(self.model_name)
+        if pinned_revision is None:
+            return self.model_name
+        from huggingface_hub import snapshot_download
+
+        downloaded = snapshot_download(self.model_name, revision=pinned_revision)
+        # A pinned cold pull bypasses ``_verify_weights_complete()``'s
+        # normal preflight — at the time it ran (in ``_ensure_loaded``,
+        # right before this method), there was nothing cached yet to
+        # inspect, so it no-opped. Run it again now that the pinned commit
+        # is actually on disk: an interrupted download or a checkpoint
+        # whose text encoder turns out to be quantized must not reach
+        # mflux either way, cold pull or not.
+        self._verify_weights_complete()
+        return downloaded
 
     def _build_model(self):
         """Instantiate the backing mflux model (import-lazy)."""
@@ -319,15 +340,229 @@ class ImageGenerationEngine:
         from .._download_gate import mflux_missing_weights
 
         missing = mflux_missing_weights(self.model_name)
+        if missing is None:
+            # No verdict — not a registered image-gen alias, or nothing
+            # cached yet. An environment problem must not read as a broken
+            # model, and the structural text-encoder check below has no
+            # completeness guarantee to build on here either: `not missing`
+            # is True for BOTH `[]` and `None`, which used to let the
+            # text-encoder check run on a `None` verdict too — an
+            # indeterminate result treated as "go ahead and inspect it"
+            # instead of "no opinion".
+            return
         if not missing:
-            # ``[]`` verified complete, ``None`` no verdict — see that
-            # function: an environment problem must not read as a broken model.
+            # ``[]`` — verified complete. Only NOW does the structural
+            # text-encoder check have something to build on.
+            self._verify_text_encoder_not_quantized()
             return
         raise ImageRuntimeError(
             f"Image model '{self.model_name}' is only partially downloaded, so "
             "generating with it would produce noise rather than an image. "
             f"Missing: {', '.join(missing)}. Re-run the download to finish it."
         )
+
+    # Hidden size mflux hardcodes for the Qwen2 text encoder backing both
+    # qwen-image and qwen-image-edit (``QwenEncoderLayer.__init__``'s
+    # ``hidden_size: int = 3584`` default) — not read from the checkpoint,
+    # so a repo whose weights disagree cannot be caught by shape-checking
+    # against anything the checkpoint itself declares.
+    _QWEN_TEXT_ENCODER_HIDDEN_SIZE = 3584
+
+    def _verify_text_encoder_not_quantized(self) -> None:
+        """Refuse a Qwen-Image checkpoint whose text encoder is quantized.
+
+        mflux's Qwen weight definition sets ``skip_quantization=True`` for
+        the text encoder ("quantization causes significant semantic
+        degradation") and never dequantizes on load. A checkpoint packaged
+        with a *quantized* text encoder anyway — ``embed_tokens.weight``
+        shape ``[vocab, hidden/pack_ratio]`` plus ``scales``/``biases``
+        siblings, instead of plain ``[vocab, hidden]`` — loads without error
+        and fails minutes later, deep in the transformer's RMSNorm, with a
+        shape-mismatch that gives no hint the text encoder was the cause.
+        Reproduced live against ``filipstrand/Qwen-Image-mflux-6bit`` before
+        this check existed; see ``tests/test_qwen_image_alias.py``.
+
+        Reads only the safetensors HEADER (a small JSON prefix — see
+        ``safetensors``' format spec) of the one shard holding
+        ``embed_tokens.weight``, never the tensor data, so this costs one
+        small file read regardless of checkpoint size.
+        """
+        if self.family not in {"qwen-image", "qwen-image-edit"}:
+            return
+        from .._download_gate import mflux_local_snapshot
+
+        snapshot = mflux_local_snapshot(self.model_name)
+        if snapshot is None:
+            return
+        weight_key = "encoder.embed_tokens.weight"
+        text_encoder_dir = Path(snapshot) / "text_encoder"
+        weight_map = self._read_text_encoder_weight_map(text_encoder_dir)
+        if weight_map is None:
+            # No index, or unreadable: outside what this check can vouch
+            # for — ``_verify_weights_complete`` already required the index
+            # to exist and name every shard to reach this point, so this is
+            # an environment problem, not a signal about the checkpoint.
+            return
+        if weight_key not in weight_map:
+            # The index is readable and complete but simply does not name
+            # this key. Every Qwen-Image / Qwen-Image-Edit checkpoint this
+            # check has ever seen uses it, so an absent key is more likely a
+            # differently packaged or renamed encoder than a legitimate
+            # repackaging — and this check exists specifically to catch
+            # checkpoints that would otherwise fail confusingly, minutes
+            # into generation. Refuse rather than fabricate an "OK" verdict
+            # for a layout it cannot actually vouch for.
+            raise ImageRuntimeError(
+                f"Image model '{self.model_name}' text encoder does not "
+                f"expose the expected weight key {weight_key!r} in its "
+                "safetensors index, so the text-encoder-not-quantized guard "
+                "has no way to vouch for it (unsupported layout, not "
+                "necessarily quantization). Refusing to load rather than "
+                "risk minutes of generation before an unrelated-looking "
+                "shape error."
+            )
+        # Checked against the WHOLE index, not just the header of the shard
+        # holding ``embed_tokens.weight``: a quantized embedding's
+        # ``scales``/``biases`` siblings can land in a DIFFERENT shard, which
+        # would let a quantized checkpoint with a superficially plausible
+        # primary-shard shape slip past a single-shard check.
+        #
+        # MLX's quantized-module convention names ``scales``/``biases`` as
+        # SIBLINGS of the base parameter's prefix — ``<module>.scales`` next
+        # to ``<module>.weight`` — not children of the weight key itself.
+        # Verified against the real filipstrand/Qwen-Image-mflux-6bit shard
+        # this check exists to catch: ``encoder.embed_tokens.weight``,
+        # ``encoder.embed_tokens.scales``, ``encoder.embed_tokens.biases`` —
+        # all three siblings under ``encoder.embed_tokens``, not nested under
+        # ``.weight``. An earlier version of this check looked for
+        # ``encoder.embed_tokens.weight.scales`` — a key that convention
+        # never produces — so it never actually matched real quantized
+        # metadata; it only worked by accident, via the shape check below,
+        # for the ONE packing width that happens to leave a mismatched last
+        # dimension.
+        prefix = weight_key.removesuffix(".weight")
+        if f"{prefix}.scales" in weight_map or f"{prefix}.biases" in weight_map:
+            self._raise_quantized_text_encoder_error(weight_key, str(text_encoder_dir))
+            return
+        shard_path = self._resolve_shard_path(text_encoder_dir, weight_map[weight_key])
+        header = self._read_safetensors_header(shard_path) if shard_path else None
+        entry = header.get(weight_key) if header else None
+        shape = entry.get("shape") if isinstance(entry, dict) else None
+        # A genuine embedding shape is rank-2: [vocab, hidden]. Requiring
+        # that (not just "the last element happens to equal 3584") rejects
+        # malformed entries like ``[3584]`` (rank-1), ``[0, 3584]``, or
+        # ``["x", 3584]`` that would otherwise slip past a bare
+        # ``shape[-1] == ...`` check despite being obvious nonsense.
+        shape_is_valid_rank2 = (
+            isinstance(shape, list)
+            and len(shape) == 2
+            and all(
+                isinstance(dim, int) and not isinstance(dim, bool) and dim > 0
+                for dim in shape
+            )
+        )
+        # Fail CLOSED, not open, once the index has named a shard for this
+        # key: the index is an explicit claim that the tensor lives there
+        # with some shape, so an unresolvable shard, an unreadable header, or
+        # a missing/malformed shape entry is itself suspicious — not a
+        # reason to silently let generation proceed.
+        if (
+            shard_path is None
+            or header is None
+            or not shape_is_valid_rank2
+            or shape[-1] != self._QWEN_TEXT_ENCODER_HIDDEN_SIZE
+        ):
+            self._raise_quantized_text_encoder_error(
+                weight_key, shard_path or str(text_encoder_dir)
+            )
+
+    def _raise_quantized_text_encoder_error(
+        self, weight_key: str, shard_path: str
+    ) -> None:
+        raise ImageRuntimeError(
+            f"Image model '{self.model_name}' packages a quantized text "
+            "encoder, which this mflux version cannot load correctly (it "
+            "never dequantizes the Qwen text encoder on load, and the "
+            "mismatch would otherwise surface as an unrelated shape error "
+            "deep in generation). Pick a checkpoint with a full-precision "
+            f"text encoder. (Found in {shard_path}: {weight_key!r} does not "
+            f"have the expected {self._QWEN_TEXT_ENCODER_HIDDEN_SIZE}-wide "
+            "last dimension, is missing/unreadable where the index says it "
+            "lives, or carries quantization scale/bias tensors.)"
+        )
+
+    @staticmethod
+    def _read_text_encoder_weight_map(text_encoder_dir: Path) -> dict | None:
+        import json
+
+        index_path = text_encoder_dir / "model.safetensors.index.json"
+        try:
+            with open(index_path, encoding="utf-8") as fh:
+                index = json.load(fh)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        return weight_map if isinstance(weight_map, dict) else None
+
+    @staticmethod
+    def _resolve_shard_path(text_encoder_dir: Path, shard: object) -> str | None:
+        # String-only traversal guard — matching ``_download_gate.py``'s
+        # ``mflux_missing_weights`` — NOT ``.resolve()``-then-compare-parents:
+        # a HF hub cache's snapshot files are themselves symlinks into a
+        # sibling ``blobs/`` directory, so resolving them walks straight out
+        # of ``text_encoder_dir`` and made every real cached checkpoint fail
+        # this check (caught live: a false positive against a known-good,
+        # actually-cached repo — every ``blobs``-backed shard would trip the
+        # old parent-directory check identically, so this HF cache layout is
+        # unconditionally incompatible with resolve-and-compare here).
+        if (
+            not isinstance(shard, str)
+            or os.path.basename(shard) != shard
+            or shard in (".", "..")
+        ):
+            return None
+        shard_path = text_encoder_dir / shard
+        return str(shard_path) if shard_path.is_file() else None
+
+    # Real safetensors headers run from a few hundred bytes (this text
+    # encoder's own shards) to low tens of megabytes for the largest known
+    # checkpoints' component indices. A claimed length beyond this is a
+    # corrupt or hostile file, not a legitimately large model — reading it
+    # into memory to find out would defeat the point of a header-only check.
+    _SAFETENSORS_HEADER_MAX_BYTES = 64 * 1024 * 1024
+
+    @classmethod
+    def _read_safetensors_header(cls, path: str) -> dict | None:
+        """The JSON header of a ``.safetensors`` file, or ``None`` if unreadable.
+
+        Format: an 8-byte little-endian header length, then that many bytes
+        of JSON naming every tensor's dtype/shape/byte-offsets — never the
+        tensor data itself, which is why this is cheap for a multi-gigabyte
+        shard.
+        """
+        import json
+        import struct
+
+        try:
+            with open(path, "rb") as fh:
+                (header_len,) = struct.unpack("<Q", fh.read(8))
+                # A corrupt/truncated file could claim an enormous header
+                # length; cap it independent of the file's own (possibly
+                # multi-gigabyte) size rather than let a malformed length
+                # read gigabytes into memory before ``json.loads`` even runs.
+                if header_len <= 0 or header_len > cls._SAFETENSORS_HEADER_MAX_BYTES:
+                    return None
+                # The 8-byte length prefix itself isn't part of what
+                # ``header_len`` counts, so the budget for the header bytes
+                # is the file size MINUS those 8 bytes — comparing against
+                # the raw file size let a file truncated by up to 8 bytes
+                # (e.g. only trailing padding lost) still "fit".
+                if header_len > Path(path).stat().st_size - 8:
+                    return None
+                header = json.loads(fh.read(header_len).decode("utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, struct.error):
+            return None
+        return header if isinstance(header, dict) else None
 
     def _ensure_loaded(self, *, for_edit: bool | None = None):
         if for_edit is None:
