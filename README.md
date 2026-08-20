@@ -19,6 +19,7 @@
   <a href="https://github.com/raullenchai/Rapid-MLX/stargazers"><img src="https://img.shields.io/github/stars/raullenchai/Rapid-MLX?style=social" alt="GitHub stars"></a>
   <a href="https://github.com/raullenchai/Rapid-MLX/graphs/contributors"><img src="https://img.shields.io/github/contributors/raullenchai/Rapid-MLX?color=orange" alt="Contributors"></a>
   <a href="https://github.com/raullenchai/Rapid-MLX/commits/main"><img src="https://img.shields.io/github/last-commit/raullenchai/Rapid-MLX?color=orange" alt="Last commit"></a>
+  <a href="https://discord.gg/nZcXkUjY5R"><img src="https://img.shields.io/discord/1540051732279599116?color=5865F2&label=Discord&logo=discord&logoColor=white" alt="Join the Rapid-MLX Discord"></a>
   <a href="https://deepwiki.com/raullenchai/Rapid-MLX"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
 </p>
 
@@ -27,7 +28,8 @@
     <a href="https://rapidmlx.com"><b>rapidmlx.com</b></a> ·
     <a href="https://rapidmlx.com/docs/">Docs</a> ·
     <a href="https://models.rapidmlx.com/">Model mirror</a> ·
-    <a href="https://rapidmlx.com/desktop">Desktop app</a>
+    <a href="https://rapidmlx.com/desktop">Desktop app</a> ·
+    <a href="https://discord.gg/nZcXkUjY5R">Discord</a>
   </sub>
 </p>
 
@@ -349,6 +351,7 @@ Top three things that go wrong:
 - **Report a bug or request a model:** [Issues](https://github.com/raullenchai/Rapid-MLX/issues/new/choose)
 - **Report a security issue:** [Private advisory](https://github.com/raullenchai/Rapid-MLX/security/advisories/new) — see [SECURITY.md](SECURITY.md)
 - **Ask a question or share a build:** [Discussions](https://github.com/raullenchai/Rapid-MLX/discussions)
+- **Get live help and meet the community:** [Join the Rapid-MLX Discord](https://discord.gg/nZcXkUjY5R)
 - **Contribute code, aliases, or docs:** [CONTRIBUTING.md](CONTRIBUTING.md)
 - **Add your hardware to the public benchmark:** `rapid-mlx bench <alias> --submit` opens the PR for you
 
