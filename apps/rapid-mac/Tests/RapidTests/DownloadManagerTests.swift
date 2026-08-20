@@ -227,6 +227,7 @@ struct DownloadManagerTests {
 
         #expect(flag.fired)
         #expect(mgr.job(for: "bonsai-1.7b-2bit")?.status == .completed)
+        #expect(job.completedCacheGeneration == mgr.cacheGeneration)
     }
 
     @Test("Non-zero exit → failed status with a generic message (raw stderr is never surfaced)")

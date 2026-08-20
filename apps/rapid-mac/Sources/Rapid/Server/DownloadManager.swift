@@ -86,6 +86,8 @@ final class DownloadManager {
         let alias: String
         let progress: DownloadProgress
         fileprivate(set) var status: Status
+        /// Cache generation created by a successful pull, if completed.
+        fileprivate(set) var completedCacheGeneration: UInt?
         let hfPath: String?
         let totalBytes: Int64?
         let source: DownloadSource
@@ -127,6 +129,7 @@ final class DownloadManager {
             self.alias = alias
             self.progress = DownloadProgress()
             self.status = .running
+            self.completedCacheGeneration = nil
             self.hfPath = hfPath
             self.totalBytes = totalBytes
             self.source = source
@@ -696,10 +699,11 @@ final class DownloadManager {
         switch reason {
         case .exit where status == 0:
             job.failureKind = nil
-            job.status = .completed
             // Weights just landed: every catalog snapshot in the app is
             // now stale.
             markCacheChanged()
+            job.completedCacheGeneration = cacheGeneration
+            job.status = .completed
         case .exit:
             recordFailure(job: job, alias: alias, signal: false)
         case .uncaughtSignal:

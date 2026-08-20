@@ -39,7 +39,7 @@ Usage: gui-golden-flows.sh [--flow NAME] [--keep] [--update-baselines]
 Flows: fresh-install, cached-quickstart, cached-curated-tradeup, download-progress, settings-persistence, settings-mtp, chat-restore, message-actions, restored-tools, tool-loop-budget, chat-depth, math-rendering, launch-integrations,
        slow-stream-stop,
        model-crash-recovery, low-memory-choice,
-       update-state, update-busy, window-close-prompt, no-dead-controls, catalog-integrity,
+       update-state, update-busy, campaign-banner, window-close-prompt, no-dead-controls, catalog-integrity,
        browse-all-destination, chat-document-attachment, image-generation, dictation, audio-readiness, all
 
 Most named regression flows drive the app through the accessibility API alone.
@@ -99,7 +99,7 @@ flow_requires_screen_recording() {
 # unattended without taking on any of that.
 flow_requires_peekaboo() {
     case "$FLOW" in
-        fresh-install|cached-quickstart|cached-curated-tradeup|download-progress|settings-persistence|settings-mtp|chat-restore|message-actions|restored-tools|tool-loop-budget|chat-depth|math-rendering|browse-all-destination|no-dead-controls|catalog-integrity|update-state|launch-integrations) return 1 ;;
+        fresh-install|cached-quickstart|cached-curated-tradeup|download-progress|settings-persistence|settings-mtp|chat-restore|message-actions|restored-tools|tool-loop-budget|chat-depth|math-rendering|browse-all-destination|no-dead-controls|catalog-integrity|update-state|update-busy|campaign-banner|launch-integrations) return 1 ;;
         slow-stream-stop|model-crash-recovery|low-memory-choice|chat-document-attachment|image-generation|dictation|audio-readiness|window-close-prompt|resident-load-rejected) return 1 ;;
         *) return 0 ;;
     esac
@@ -2481,6 +2481,59 @@ flow_update_busy() {
     cleanup_persona
 }
 
+flow_campaign_banner() {
+    # This flow owns campaign state, not the live release channel. Keep the
+    # footer deterministic so a newly published app version cannot invalidate
+    # the campaign's structural baseline.
+    start_persona campaign-banner \
+        RAPID_GUI_CAMPAIGN_PREVIEW=1 RAPIDMLX_NO_UPDATE_CHECK=1
+    dismiss_first_run
+    wait_identifier_enabled Campaign.Action "$OUT/campaign-visible.json"
+    assert_tree_text "$OUT/campaign-visible.json" "Qwen3.5 35B is ready"
+    jq -e '.data.ui_elements[]? | select(.identifier == "Campaign.Action" and .enabled == true)' \
+        "$OUT/campaign-visible.json" >/dev/null \
+        || die "campaign CTA is absent or disabled"
+    baseline campaign-banner.visible "$OUT/campaign-visible.json"
+    # Race two genuine AX activations against SwiftUI's disabled-state update.
+    # DownloadManager must coalesce them to one pull even if both actions enter.
+    "$AX_DRIVER" press "$APP_PID" Campaign.Action > "$OUT/campaign-action-1.json" 2>/dev/null &
+    local action_pid_1=$!
+    "$AX_DRIVER" press "$APP_PID" Campaign.Action > "$OUT/campaign-action-2.json" 2>/dev/null &
+    local action_pid_2=$!
+    wait "$action_pid_1" || true
+    wait "$action_pid_2" || true
+    jq -s -e 'any(.[]; .success == true)' \
+        "$OUT/campaign-action-1.json" "$OUT/campaign-action-2.json" >/dev/null \
+        || die "neither rapid campaign activation reached AXPress"
+    wait_fake_event \
+        '.event == "command" and .subcommand == "pull" and .alias == "qwen3.5-35b-4bit"' \
+        "campaign CTA did not start the allowlisted model pull"
+    [[ "$(jq -s '[.[] | select(.event == "command" and .subcommand == "pull" and .alias == "qwen3.5-35b-4bit")] | length' "$OUT/fake-events.jsonl")" == 1 ]] \
+        || die "campaign CTA started the model pull more than once"
+    wait_identifier Campaign.Dismiss "$OUT/campaign-after-action.json"
+    press "$OUT/campaign-after-action.json" Campaign.Dismiss "$OUT/campaign-dismiss.json"
+    for _ in {1..40}; do
+        see_main "$OUT/campaign-dismissed.json"
+        if ! jq -e '.data.ui_elements[]? | select(.identifier == "Campaign.Banner")' \
+            "$OUT/campaign-dismissed.json" >/dev/null; then
+            break
+        fi
+        sleep 0.25
+    done
+    ! jq -e '.data.ui_elements[]? | select(.identifier == "Campaign.Banner")' \
+        "$OUT/campaign-dismissed.json" >/dev/null \
+        || die "campaign remained visible after dismissal"
+
+    relaunch_persona
+    dismiss_first_run
+    see_main "$OUT/campaign-relaunched.json"
+    ! jq -e '.data.ui_elements[]? | select(.identifier == "Campaign.Banner")' \
+        "$OUT/campaign-relaunched.json" >/dev/null \
+        || die "dismissed campaign returned after relaunch"
+    log "  campaign banner renders one typed CTA and remembers dismissal"
+    cleanup_persona
+}
+
 flow_window_close_prompt() {
     # #1590: the prompt, persistence store and delegate proxy all existed, but
     # no WindowAccessor ever attached the proxy to the real main NSWindow.
@@ -4536,6 +4589,7 @@ case "$FLOW" in
     low-memory-choice) flow_low_memory_choice ;;
     update-state) flow_update_state ;;
     update-busy) flow_update_busy ;;
+    campaign-banner) flow_campaign_banner ;;
     window-close-prompt) flow_window_close_prompt ;;
     no-dead-controls) flow_no_dead_controls ;;
     catalog-integrity) flow_catalog_integrity ;;
@@ -4564,6 +4618,7 @@ case "$FLOW" in
         flow_low_memory_choice
         flow_update_state
         flow_update_busy
+        flow_campaign_banner
         flow_window_close_prompt
         flow_no_dead_controls
         flow_catalog_integrity

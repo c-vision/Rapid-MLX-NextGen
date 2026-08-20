@@ -64,8 +64,11 @@ struct ContentView: View {
     /// "this alias is not downloaded" from "we don't know yet", which
     /// are different sentences and different next steps.
     @State private var catalogLoaded: Bool = false
+    /// Cache generation represented by ``catalogEntries``.
+    @State private var catalogGeneration: UInt = 0
     /// FU-1: persisted opt-out for the launch-time auto-start path.
     @AppStorage(AutoStartPreference.storageKey) private var autoStartOnLaunch: Bool = AutoStartPreference.defaultValue
+    @State private var campaign: Campaign? = Campaign.previewFromEnvironment(ProcessInfo.processInfo.environment)
 
     var body: some View {
         // Capture the identity owned by this alert render. A delayed dismiss
@@ -291,6 +294,16 @@ struct ContentView: View {
             // but was never mounted, so a failed Finder replacement was
             // detected and then silently discarded.
             FailedReplaceBanner()
+            if let campaign,
+               !telemetryConsentPending,
+               !UserDefaults.standard.bool(forKey: campaign.dismissalKey) {
+                CampaignBanner(
+                    campaign: campaign,
+                    actionState: campaignActionState(for: campaign),
+                    onAction: performCampaignAction,
+                    onDismiss: { dismissCampaign(campaign) }
+                )
+            }
             NavigationSplitView {
                 SidebarView(
                 selection: $section,
@@ -381,6 +394,41 @@ struct ContentView: View {
     }
 
     // MARK: - Readiness (the one shared lifecycle value)
+
+    private func performCampaignAction(_ action: Campaign.Action) {
+        switch action {
+        case .pullModel(let model):
+            _ = downloads.startDownload(alias: model.alias, hfPath: model.hfRepo)
+        }
+    }
+
+    private func campaignActionState(for campaign: Campaign) -> Campaign.ActionState {
+        switch campaign.action {
+        case .pullModel(let model):
+            let alias = model.alias
+            let downloadState: Campaign.DownloadState? = switch downloads.job(for: alias)?.status {
+            case .running: .running
+            case .completed:
+                downloads.job(for: alias)?.completedCacheGeneration.map {
+                    .completed(cacheGeneration: $0)
+                } ?? .retryable
+            case .failed, .cancelled: .retryable
+            case nil: nil
+            }
+            return Campaign.actionState(
+                download: downloadState,
+                isCached: catalogEntries.first(where: { $0.alias == alias })?.cached == true,
+                catalogLoaded: catalogLoaded,
+                catalogGeneration: catalogGeneration,
+                currentGeneration: downloads.cacheGeneration
+            )
+        }
+    }
+
+    private func dismissCampaign(_ dismissed: Campaign) {
+        UserDefaults.standard.set(true, forKey: dismissed.dismissalKey)
+        campaign = nil
+    }
 
     /// The window's single readiness value.
     ///
@@ -491,12 +539,14 @@ struct ContentView: View {
 
     private func refreshCatalogSnapshot() async {
         guard let binary = server.binaryPath else { return }
+        let generation = downloads.cacheGeneration
         let loaded = await ModelCatalogCache.shared.entries(
             binary: binary,
-            generation: downloads.cacheGeneration
+            generation: generation
         )
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, generation == downloads.cacheGeneration else { return }
         catalogEntries = loaded
+        catalogGeneration = generation
         catalogLoaded = true
     }
 

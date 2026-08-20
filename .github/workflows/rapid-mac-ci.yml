@@ -469,6 +469,12 @@ jobs:
         env:
           RAPID_GUI_GOLDEN_OUT: ${{ runner.temp }}/golden/update-busy
 
+      - name: 'Golden flow: campaign-banner'
+        continue-on-error: true
+        run: ./scripts/gui-golden-flows.sh --flow campaign-banner
+        env:
+          RAPID_GUI_GOLDEN_OUT: ${{ runner.temp }}/golden/campaign-banner
+
       - name: 'Golden flow: launch-integrations'
         continue-on-error: true
         run: ./scripts/gui-golden-flows.sh --flow launch-integrations
@@ -489,7 +495,7 @@ jobs:
           from pathlib import Path
 
           root = Path(os.environ["GOLDEN_ROOT"])
-          expected = 26
+          expected = 27
           results = sorted(root.glob("*/result.json"))
           failures = []
           for path in results:
@@ -531,7 +537,7 @@ jobs:
           set -uo pipefail
           mkdir -p "$SCRATCH/snapshots"
           cp Tests/GUIGoldenFlows/__Snapshots__/*.txt "$SCRATCH/snapshots/"
-          for flow in fresh-install settings-persistence settings-mtp chat-restore slow-stream-stop model-crash-recovery update-state update-busy image-generation audio-readiness launch-integrations; do
+          for flow in fresh-install settings-persistence settings-mtp chat-restore slow-stream-stop model-crash-recovery update-state update-busy campaign-banner image-generation audio-readiness launch-integrations; do
             RAPID_GUI_BASELINE_DIR="$SCRATCH/snapshots" \
             RAPID_GUI_GOLDEN_OUT="$SCRATCH/run/$flow" \
               ./scripts/gui-golden-flows.sh --flow "$flow" --update-baselines || true
