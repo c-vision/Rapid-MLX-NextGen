@@ -158,6 +158,9 @@ enum ReonboardingReset {
 
         if scope.contains(.onboarding) {
             quickstart.resetForReonboarding()
+            defaults.removeObject(
+                forKey: GitHubCommunity.didShowOnboardingPromptKey
+            )
             // The wizard is gated on this alias as well as on its own flags,
             // and `stop()` only clears it when there was a child to stop —
             // so an idle app would otherwise restart straight past Quickstart.

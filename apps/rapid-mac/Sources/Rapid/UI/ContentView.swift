@@ -50,6 +50,9 @@ struct ContentView: View {
     /// by the onboarding completion transaction so the user lands in their
     /// first chat with the caret already in the message field.
     @State private var composerFocusRequest: Int = 0
+    @State private var showOnboardingCompletePrompt = false
+    @AppStorage(GitHubCommunity.didShowOnboardingPromptKey)
+    private var didShowOnboardingCompletePrompt = false
     @Environment(SettingsRouter.self) private var settingsRouter
     /// #223: launch-time auto-start "needs download" state — the empty
     /// state names the pending pull when non-nil.
@@ -105,6 +108,20 @@ struct ContentView: View {
         .overlay {
             if showConversationSearch {
                 conversationSearchOverlay
+            }
+        }
+        .overlay(alignment: .bottomTrailing) {
+            if showOnboardingCompletePrompt {
+                OnboardingCompletePrompt {
+                    withAnimation(RapidMotion.resolve(
+                        RapidMotion.standard,
+                        reduceMotion: reduceMotion
+                    )) {
+                        showOnboardingCompletePrompt = false
+                    }
+                }
+                .padding(20)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
         .onChange(of: server.state) { _, newState in
@@ -753,6 +770,17 @@ struct ContentView: View {
         section = .chat
         VoiceOverAnnouncer.announce("Setup complete. Opening your first chat.")
         composerFocusRequest &+= 1
+        let prompt = GitHubStarPromptCompletion.completingOnboarding(
+            hasShown: didShowOnboardingCompletePrompt
+        )
+        didShowOnboardingCompletePrompt = prompt.hasShown
+        guard prompt.shouldPresent else { return }
+        withAnimation(RapidMotion.resolve(
+            RapidMotion.standard,
+            reduceMotion: reduceMotion
+        )) {
+            showOnboardingCompletePrompt = true
+        }
     }
 
     /// True when the Quickstart card should render in place of the chat

@@ -173,6 +173,7 @@ struct ReonboardingResetTests {
         defer { TestDefaultsScope.cleanup(suiteNames: [suite]) }
         let defaults = UserDefaults(suiteName: suite)!
         defaults.set("qwen3.5-9b-4bit", forKey: "rapid.serve.lastAlias")
+        defaults.set(true, forKey: GitHubCommunity.didShowOnboardingPromptKey)
 
         ReonboardingReset.eraseState(
             scope: .onboarding,
@@ -184,6 +185,9 @@ struct ReonboardingResetTests {
         )
 
         #expect(defaults.object(forKey: "rapid.serve.lastAlias") == nil)
+        #expect(defaults.object(
+            forKey: GitHubCommunity.didShowOnboardingPromptKey
+        ) == nil)
     }
 
     // MARK: - Relaunch

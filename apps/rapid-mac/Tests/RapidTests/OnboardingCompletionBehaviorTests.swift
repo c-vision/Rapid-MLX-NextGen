@@ -488,7 +488,7 @@ struct OnboardingCompletionBehaviorTests {
         // the transaction, in that order.
         let handoff = "privatefuncfinishOnboardingHandoff(){section=.chat" +
             #"VoiceOverAnnouncer.announce("Setupcomplete.Openingyourfirstchat.")"# +
-            "composerFocusRequest&+=1}"
+            "composerFocusRequest&+=1"
         #expect(
             body.contains(handoff),
             """
