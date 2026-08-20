@@ -35,6 +35,30 @@ category. The exhaustive flag list (every flag visible in
 | `--max-request-bytes` | Max HTTP request body size in bytes; oversized requests get HTTP 413 before parsing. 0 disables. (also via `RAPID_MLX_MAX_REQUEST_BYTES`) | 8 MiB (8388608) |
 | `--timeout` | Request timeout in seconds | `1800` |
 
+#### MLLM media input guards (environment only)
+
+`rapid-mlx` also hardens user-supplied image/video inputs against two
+security primitives; these are environment variables, not CLI flags:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `RAPID_MLX_DISABLE_LOCAL_MEDIA_PATHS` | Set to `1` to refuse local-file image/video paths entirely (URLs and base64 only). Recommended for deployments exposed beyond the loopback boundary. | unset |
+| `RAPID_MLX_MEDIA_ROOT` | Required to enable local-file image/video inputs. Reads are confined to this directory tree; validated files are copied from a no-follow descriptor into server-owned temporary storage before decoding. | unset (local paths disabled) |
+
+By default, remote image/video URLs are validated at request time so they
+cannot resolve to loopback, RFC1918 private space, link-local (including the
+cloud metadata address `169.254.169.254`), multicast, or reserved addresses —
+on both the initial request and every redirect hop. When a media root is
+configured, local image/video paths are accepted only when they are confined
+regular files with a supported extension and a recognized media signature.
+
+This is an intentional security tightening for local paths: extensionless
+files and formats outside the documented image/video allowlist are rejected.
+Rename supported media to a conventional extension, or convert it first
+(`.jpg`, `.png`, `.webp`, `.avif`, `.mp4`, `.mov`, etc.). SVG is not accepted
+as raster image input. Set `RAPID_MLX_MEDIA_ROOT` to the narrowest directory
+needed by the application; leave it unset for URL/base64-only deployments.
+
 ### Admission and Batching Options
 
 | Option | Description | Default |
