@@ -197,6 +197,7 @@
     "pipenetwork/Holo-3.1-35B-A3B-MLX-4bit": 23490832707,
     "pipenetwork/Holo-3.1-35B-A3B-MLX-8bit": 40810031931,
     "prism-ml/Ternary-Bonsai-1.7B-mlx-2bit": 495525300,
+    "prism-ml/Ternary-Bonsai-8B-mlx-2bit": 2315084354,
     "prism-ml/Ternary-Bonsai-27B-mlx-2bit": 8521052337,
     "rapid-mlx/Ling-3.0-tiny-MLX-4bit": 4459772529,
     "rapid-mlx/Qwen3.8-27B-4bit-MTP-MLX": 16320413916,

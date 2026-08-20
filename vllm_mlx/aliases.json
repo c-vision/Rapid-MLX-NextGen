@@ -1384,6 +1384,14 @@
     "is_hybrid_explicit": true,
     "supports_spec_decode": false
   },
+  "bonsai-8b-2bit": {
+    "hf_path": "prism-ml/Ternary-Bonsai-8B-mlx-2bit",
+    "tool_call_parser": "hermes",
+    "reasoning_parser": "qwen3",
+    "is_hybrid": false,
+    "is_hybrid_explicit": true,
+    "supports_spec_decode": false
+  },
   "bonsai-27b-2bit": {
     "hf_path": "prism-ml/Ternary-Bonsai-27B-mlx-2bit",
     "is_text_only": true,

@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+from vllm_mlx import model_sizes
 from vllm_mlx.model_aliases import (
     POPULAR_ALIASES,
     VALID_PFLASH_TIERS,
@@ -839,6 +840,24 @@ def test_bonsai_ternary_alias_wiring() -> None:
         f"{alias}: is_hybrid_explicit must be true to pin non-hybrid."
     )
     assert p.supports_spec_decode is False
+
+    # Discussion #1060 specifically requested the packed 8B checkpoint.
+    # Its Qwen3 chat template emits Hermes JSON tool envelopes and explicit
+    # <think> wrappers, so unlike the non-thinking 1.7B variant it uses the
+    # qwen3 reasoning parser.
+    alias_8b = "bonsai-8b-2bit"
+    assert alias_8b in raw, f"{alias_8b} missing from aliases.json"
+    p8 = list_profiles()[alias_8b]
+    assert p8.hf_path == "prism-ml/Ternary-Bonsai-8B-mlx-2bit"
+    assert p8.tool_call_parser == "hermes"
+    assert p8.reasoning_parser == "qwen3"
+    assert p8.is_hybrid is False
+    assert raw[alias_8b].get("is_hybrid_explicit") is True
+    assert p8.supports_spec_decode is False
+    assert model_sizes.size_bytes(p8.hf_path) == 2_315_084_354, (
+        f"{alias_8b}: download footprint drifted from the Hugging Face "
+        "repository metadata verified on 2026-08-20"
+    )
 
     # The three FP16 ``bonsai-*-unpacked`` aliases are gone, and no alias
     # may resurrect an ``-unpacked`` repo (they lose all compression).
