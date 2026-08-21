@@ -2156,7 +2156,8 @@ def _resolve_family(model_path: str, cfg: "ModelConfig") -> str:
 def _mtp_path_label(model_path: str, cfg: "ModelConfig") -> str:
     """Truth-in-labeling for the MTP spec-decode path of a model.
 
-    Returns one of ``native`` / ``sidecar`` / ``disabled``:
+    Returns one of ``native`` / ``sidecar`` /
+    ``sidecar (opt-in: --speculative-config)`` / ``disabled``:
 
     * ``native``   — the family ships a native MTP head in the checkpoint
       (Qwen3.5 / Qwen3.6 / HY3) AND the resolved profile enables spec
@@ -2165,6 +2166,8 @@ def _mtp_path_label(model_path: str, cfg: "ModelConfig") -> str:
     * ``sidecar``  — Gemma 4: MTP is provided by an assistant drafter
       loaded alongside the base weights (no head baked in), and the
       profile enables spec decode.
+    * ``sidecar (opt-in: --speculative-config)`` — the alias declares an MTP
+      sidecar, but Rapid leaves it disabled until the user explicitly opts in.
     * ``disabled`` — spec decode is off for this profile
       (``supports_spec_decode=False`` — hybrid arch, or no MTP head /
       drafter registered for this alias), the family has no MTP mechanism

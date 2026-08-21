@@ -19,7 +19,6 @@ AXApplication title="Rapid-MLX"
             AXHeading desc="Text" enabled=true
             AXScrollArea
               AXTextArea id="Audio.Speech.Text" desc="Text to speak" value=empty
-              AXScrollBar value=number enabled=false
             AXStaticText value=text enabled=true
             AXPopUpButton id="Audio.Speech.ModelPicker" desc="Model" value=text enabled=true
             AXStaticText value=text enabled=true

@@ -53,6 +53,21 @@ raise SystemExit(child.returncode)
 """
 
 
+def _isolated_python_environment() -> dict[str, str]:
+    """Return an environment that does not pin a child to Rapid's Python.
+
+    The signed desktop sidecar deliberately exports ``PYTHONHOME`` and
+    ``PYTHONPATH`` so its own interpreter cannot import host packages.  Those
+    variables must not cross the runtime boundary: uv's build-isolation
+    interpreters and the provisioned LTX interpreter otherwise try to start
+    with Rapid's stdlib/site-packages and fail before importing ``encodings``.
+    """
+    environment = os.environ.copy()
+    environment.pop("PYTHONHOME", None)
+    environment.pop("PYTHONPATH", None)
+    return environment
+
+
 def is_ltx25_model(model_name: str | None) -> bool:
     """Return whether a model identifier explicitly selects LTX-2.5."""
     if not model_name:
@@ -258,6 +273,7 @@ def prepare_ltx25_runtime(executable: str) -> Path:
                         stdout=subprocess.DEVNULL,
                         stderr=uv_stderr,
                         timeout=1800,
+                        env=_isolated_python_environment(),
                     )
                 except subprocess.CalledProcessError as run_exc:
                     # Real runs route stderr to the file, so the exception
@@ -445,6 +461,7 @@ class LTX25VideoEngine:
                     stderr=subprocess.DEVNULL,
                     text=True,
                     start_new_session=True,
+                    env=_isolated_python_environment(),
                 )
                 self._process = process
             process.communicate(input=prompt, timeout=timeout)

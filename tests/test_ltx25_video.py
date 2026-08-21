@@ -486,6 +486,34 @@ def test_ltx25_runtime_is_provisioned_once(
     assert calls[0][0][:3] == ["/trusted/uv", "sync", "--frozen"]
 
 
+def test_ltx25_provisioning_does_not_leak_bundled_python_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "checkout" / ".venv" / "bin" / "ltx-2-mlx"
+    runtime.parent.mkdir(parents=True)
+    monkeypatch.setattr(ltx25, "_RUNTIME_CACHE", None)
+    monkeypatch.setattr(ltx25.shutil, "which", lambda _: "/trusted/uv")
+    monkeypatch.setattr(ltx25, "_materialize_runtime", lambda *args: None)
+    monkeypatch.setenv("PYTHONHOME", "/signed-sidecar/python")
+    monkeypatch.setenv("PYTHONPATH", "/signed-sidecar/site-packages")
+    captured: dict[str, str] = {}
+
+    def provision(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+        captured.update(kwargs["env"])
+        workspace = Path(command[command.index("--project") + 1])
+        interpreter = workspace / ".venv/bin/python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text("#!/bin/sh\n")
+        interpreter.chmod(0o755)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(ltx25.subprocess, "run", provision)
+    ltx25.prepare_ltx25_runtime(str(runtime))
+
+    assert "PYTHONHOME" not in captured
+    assert "PYTHONPATH" not in captured
+
+
 def test_ltx25_generation_uses_cache_without_rechecking_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -541,6 +569,8 @@ def test_serve_routes_ltx25_model_to_specific_preflight(
 def test_ltx25_engine_invokes_pinned_runtime_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("PYTHONHOME", "/signed-sidecar/python")
+    monkeypatch.setenv("PYTHONPATH", "/signed-sidecar/site-packages")
     output = tmp_path / "result.mp4"
     image = tmp_path / "reference.png"
     image.write_bytes(b"png")
@@ -584,6 +614,9 @@ def test_ltx25_engine_invokes_pinned_runtime_contract(
     )
 
     command, run_kwargs = calls[0]
+    child_environment = run_kwargs.pop("env")
+    assert "PYTHONHOME" not in child_environment
+    assert "PYTHONPATH" not in child_environment
     assert command[:2] == [str(runtime_cache / ".venv/bin/python"), "-c"]
     assert command[2] == ltx25._STDIN_PROMPT_RUNNER
     assert command[3:5] == ["generate", "--model"]

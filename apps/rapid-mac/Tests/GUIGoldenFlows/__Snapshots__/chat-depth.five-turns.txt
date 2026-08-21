@@ -93,8 +93,6 @@ AXApplication title="Rapid-MLX"
                   AXButton subrole=AXSortButton title="model" enabled=true
                   AXButton subrole=AXSortButton title="size" enabled=true
                   AXButton subrole=AXSortButton title="speed" enabled=true
-              AXScrollBar value=number enabled=false
-              AXScrollBar value=number enabled=false
             AXStaticText value=text enabled=true
             AXStaticText value=text enabled=true
             AXButton id="ChatView.Message.Copy.<uuid>" desc="Copy response" help="Copy response" enabled=true
@@ -125,12 +123,6 @@ AXApplication title="Rapid-MLX"
             AXButton id="ChatView.Message.SelectText.<uuid>" desc="Select text" help="Select text" enabled=true
             AXButton id="ChatView.Message.Retry.<uuid>" desc="Retry response" enabled=true
             AXButton id="ChatView.Message.Delete.<uuid>" desc="Delete message" help="Delete message" enabled=true
-            AXScrollBar value=number enabled=true
-              AXValueIndicator value=number
-              AXButton subrole=AXIncrementArrow
-              AXButton subrole=AXDecrementArrow
-              AXButton subrole=AXIncrementPage
-              AXButton subrole=AXDecrementPage
           AXStaticText value=text enabled=true
           AXScrollArea
             AXTextArea id="rapid.chat.compose" desc="Message compose field" value=empty
