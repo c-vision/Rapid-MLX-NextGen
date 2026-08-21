@@ -239,15 +239,28 @@ final class DictationController {
     }
 
     func disable() {
+        // Stop accepting global input before tearing down anything the input
+        // depends on. During app termination the server can spend several
+        // seconds in its graceful-shutdown window; leaving the event tap live
+        // for that window makes the hotkey appear to work even though no new
+        // transcription can possibly complete.
+        hotkey.stop()
         transcribeTask?.cancel()
         transcribeTask = nil
         prewarmTask?.cancel()
         prewarmTask = nil
         stopTicking()
-        hotkey.stop()
         recorder.shutdown()
         hud.hide()
         phase = .off
+    }
+
+    /// Tear down the process-wide dictation service without changing the
+    /// user's persisted Enabled preference. A normal relaunch should re-arm
+    /// dictation, but no global hotkey may survive into the app's synchronous
+    /// server/download shutdown window.
+    func shutdownForTermination() {
+        disable()
     }
 
     /// The system silently disables an event tap that misbehaves; re-arm when
