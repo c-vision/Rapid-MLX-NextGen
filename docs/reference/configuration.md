@@ -152,14 +152,29 @@ into the same config path.
 
 | Config | Description |
 |--------|-------------|
-| `{"method":"dflash"}` | Enable the DFlash single-user bridge on validated aliases. |
-| `{"method":"ddtree"}` | Enable experimental DDTree verification on validated aliases. |
+| `{"method":"dflash","model":"<drafter>"}` | Enable DFlash. Curated aliases may supply the drafter automatically; unknown/unverified targets require it explicitly. |
+| `{"method":"ddtree","model":"<drafter>","num_speculative_tokens":16,"tree_budget":24}` | Enable DDTree. Unknown/unverified targets require all structural inputs explicitly. |
 | `{"method":"dspark","num_speculative_tokens":5}` | Enable checkpoint-native DSpark for a local DeepSeek V4 Flash checkpoint. The token count must match the checkpoint's complete DSpark block. Greedy single-request decoding is accelerated; unsupported request shapes safely use baseline decoding. |
 | `{"method":"mtp"}` | Enable MTP speculative decoding for checkpoints accepted by the existing MTP eligibility gate. |
 | `{"method":"mtp","model":"<sidecar-head-repo>"}` | Attach a standalone MTP **sidecar head** (e.g. `mlx-community/Qwen3.6-27B-MTP-4bit`) to a full base checkpoint. The base must be MTP-eligible; the head repo goes in the `model` field — **not** in the `serve` positional. See [MTP sidecar heads are not standalone models](#mtp-sidecar-heads-are-not-standalone-models) below. Gemma 4 sidecar MTP remains disabled after its greedy-lossless A/B failed. |
 | `{"method":"mtp","num_speculative_tokens":3}` | Set the MTP max-K controller ceiling. |
 | `{"method":"mtp","disable_auto_k":true}` | Disable the MTP EV depth controller for fixed-K parity benches. |
 | `{"method":"suffix","num_speculative_tokens":8}` | Enable explicit SuffixDecoding for high-overlap workloads. |
+
+Rapid-MLX separates capability from recommendation. Registry flags identify
+combinations verified for correctness and performance; they control defaults,
+not operator permission. An explicit configuration may run an unverified or
+4-bit target after method-specific structural/runtime preflight, with an
+experimental warning. Such combinations remain default-off and may be slower
+or produce worse application-level output. True incompatibilities—missing or
+mismatched drafter metadata, unsupported verifiers, unavailable runtimes, and
+mutually exclusive modes—still fail before generation.
+
+Generate the all-alias/all-method policy report with:
+
+```bash
+python -m vllm_mlx.spec_decode.report
+```
 
 #### MTP is not free — measure before you enable it
 
