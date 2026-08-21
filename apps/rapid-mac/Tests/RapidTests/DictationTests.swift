@@ -10,6 +10,11 @@ import Testing
 @Suite("Dictation")
 struct DictationTests {
 
+    @MainActor
+    private final class CatalogState {
+        var cached = true
+    }
+
     // MARK: - Transcript tidying
 
     /// The trailing period is stripped because a dictated fragment usually
@@ -259,6 +264,108 @@ struct DictationTests {
 
     // MARK: - Hotkey
 
+    @MainActor
+    @Test("turning dictation off while catalog refresh waits cannot finish enabling")
+    func staleEnableCannotRearmAfterDisable() async {
+        var continuation: CheckedContinuation<[ModelEntry], Never>?
+        let binary = Self.tempDirectory().appendingPathComponent("rapid-mlx")
+        let server = ServerManager(testingState: .idle, binaryPath: binary)
+        let controller = DictationController(
+            server: server,
+            testingEnabled: true,
+            audioCatalogLoader: { _ in
+                await withCheckedContinuation { continuation = $0 }
+            }
+        )
+
+        let enabling = Task { await controller.enable() }
+        while continuation == nil { await Task.yield() }
+        controller.isEnabled = false
+        continuation?.resume(returning: [])
+        await enabling.value
+
+        #expect(controller.isEnabled == false)
+        #expect(controller.phase == .off)
+    }
+
+    @MainActor
+    @Test("a hotkey-boundary refresh observes a model deleted after enabling")
+    func recordingBoundaryRefreshObservesDeletion() async {
+        let state = CatalogState()
+        let entry: (Bool) -> ModelEntry = { cached in
+            ModelEntry(
+                alias: "whisper-small",
+                hfRepo: "mlx-community/whisper-small",
+                sizeOnDisk: cached ? "461 MiB" : nil,
+                cached: cached,
+                kind: .audio,
+                audioCapability: .transcription,
+                audioFamily: "whisper"
+            )
+        }
+        let binary = Self.tempDirectory().appendingPathComponent("rapid-mlx")
+        let controller = DictationController(
+            server: ServerManager(testingState: .idle, binaryPath: binary),
+            audioCatalogLoader: { _ in [entry(state.cached)] }
+        )
+
+        #expect(await controller.modelIsOnDiskAfterRefresh("whisper-small"))
+        state.cached = false
+        #expect(await !controller.modelIsOnDiskAfterRefresh("whisper-small"))
+    }
+
+    @MainActor
+    @Test("a second hotkey tap cancels a pending disk check")
+    func secondTapCancelsPendingRecordingRequest() async {
+        var continuation: CheckedContinuation<[ModelEntry]?, Never>?
+        let controller = DictationController(
+            server: ServerManager(
+                testingState: .idle,
+                binaryPath: Self.tempDirectory().appendingPathComponent("rapid-mlx")
+            ),
+            testingEnabled: true,
+            testingModelAlias: "whisper-small",
+            testingPhase: .idle,
+            audioCatalogLoader: { _ in
+                await withCheckedContinuation { continuation = $0 }
+            }
+        )
+
+        controller.toggleFromUI()
+        while continuation == nil { await Task.yield() }
+        controller.toggleFromUI()
+        continuation?.resume(returning: [])
+        await Task.yield()
+
+        #expect(controller.phase == .idle)
+    }
+
+    @MainActor
+    @Test("a failed catalog probe preserves the last successful cache snapshot")
+    func failedCatalogProbePreservesCacheSnapshot() async {
+        let state = CatalogState()
+        let entry = ModelEntry(
+            alias: "whisper-small",
+            hfRepo: "mlx-community/whisper-small",
+            sizeOnDisk: "461 MiB",
+            cached: true,
+            kind: .audio,
+            audioCapability: .transcription,
+            audioFamily: "whisper"
+        )
+        let controller = DictationController(
+            server: ServerManager(
+                testingState: .idle,
+                binaryPath: Self.tempDirectory().appendingPathComponent("rapid-mlx")
+            ),
+            audioCatalogLoader: { _ in state.cached ? [entry] : nil }
+        )
+
+        #expect(await controller.modelIsOnDiskAfterRefresh("whisper-small"))
+        state.cached = false
+        #expect(await controller.modelIsOnDiskAfterRefresh("whisper-small"))
+    }
+
     /// Only right-hand modifiers are offered. Left ⌘ rides along with ⌘C/⌘V/
     /// ⌘Tab dozens of times an hour, so "tapped on its own" cannot be detected
     /// reliably enough to arm a microphone with.
@@ -273,12 +380,16 @@ struct DictationTests {
 
     // MARK: - Audio mode
 
-    /// Dictation is additive: neither existing file transcription nor speech
-    /// synthesis disappears when the global hotkey workflow is introduced.
+    /// The Audio surface is a two-lane product: Speech to Text (dictation)
+    /// and Text to Speech. The old file-transcription workbench was removed
+    /// deliberately — a third tab reappearing here is a regression, not a
+    /// feature. Speech to Text stays the landing mode.
     @MainActor
-    @Test("Audio opens on Dictation without removing either workbench")
+    @Test("Audio opens on Speech to Text and offers exactly the two lanes")
     func audioModeDefault() {
-        #expect(AudioViewModel.Mode.allCases == [.dictation, .speech, .transcription])
+        #expect(AudioViewModel.Mode.allCases == [.dictation, .speech])
+        #expect(AudioViewModel.Mode.dictation.label == "Speech to Text")
+        #expect(AudioViewModel.Mode.speech.label == "Text to Speech")
         let viewModel = AudioViewModel(server: ServerManager(testingState: .idle))
         #expect(viewModel.mode == .dictation)
     }
@@ -296,7 +407,6 @@ struct DictationTests {
         }
         #expect(AudioViewModel.Mode.dictation.axName == "Dictation")
         #expect(AudioViewModel.Mode.speech.axName == "Speech")
-        #expect(AudioViewModel.Mode.transcription.axName == "Transcription")
     }
 
     // MARK: - Helpers
