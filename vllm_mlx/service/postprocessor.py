@@ -3117,6 +3117,21 @@ class StreamingPostProcessor:
             kept_reasoning, overflow_content = self._consume_reasoning_budget(reasoning)
             reasoning = kept_reasoning or None
             if overflow_content:
+                # The parser's reasoning bytes precede its content bytes in
+                # the source delta (``thought-tail</think>answer``).  Collect
+                # everything promoted at the cap boundary separately so it
+                # can be prepended to parser content below.  Appending the
+                # overflow produced ``answerthought-tail`` on a terminal
+                # chunk and the route then buffered that malformed ordering
+                # as the single finish event (#2182).
+                promoted_content = ""
+                # Usually parser content follows reasoning in the source
+                # delta (``thought-tail</think>answer``), but the shared
+                # think parser can also interleave promoted tool calls with
+                # multiple reasoning spans.  Preserve its ordered source
+                # segments so a cap crossing in any span can reclassify the
+                # exact suffix without moving it across tool markup or answer.
+                source_segments = getattr(delta_msg, "source_segments", None)
                 flip_succeeded = self._reasoning_close_injected
                 if not self._reasoning_close_injected:
                     # Codex round-10 BLOCKING #1: only mark the close-
@@ -3168,9 +3183,41 @@ class StreamingPostProcessor:
                         else None
                     )
                     if isinstance(flip_content, str) and flip_content:
-                        content = (content or "") + flip_content
-                if flip_succeeded:
-                    content = (content or "") + overflow_content
+                        promoted_content += flip_content
+                if flip_succeeded and source_segments:
+                    # ``kept_reasoning`` is the prefix retained across all
+                    # reasoning segments.  Walk those segments in source order,
+                    # skip that prefix, and join every remaining reasoning byte
+                    # with the existing content segments.  Insert any parser
+                    # bytes released by the synthetic close exactly where the
+                    # first overflow byte begins.
+                    kept_chars = len(kept_reasoning)
+                    rebuilt_content: list[str] = []
+                    flip_inserted = False
+                    for channel, segment in source_segments:
+                        if channel == "content":
+                            rebuilt_content.append(segment)
+                            continue
+                        if kept_chars >= len(segment):
+                            kept_chars -= len(segment)
+                            continue
+                        if promoted_content and not flip_inserted:
+                            rebuilt_content.append(promoted_content)
+                            flip_inserted = True
+                        rebuilt_content.append(segment[kept_chars:])
+                        kept_chars = 0
+                    if promoted_content and not flip_inserted:
+                        rebuilt_content.insert(0, promoted_content)
+                    content = "".join(rebuilt_content) or content
+                elif flip_succeeded:
+                    promoted_content += overflow_content
+                    # Parsers without ordered provenance can emit mixed
+                    # content/reasoning deltas in content-first order (for
+                    # example DeepSeek V4 re-entering ``<think>`` after visible
+                    # prose). Preserve their historical content-first fallback;
+                    # think-tag parsers that need finer ordering provide
+                    # ``source_segments`` and take the exact rebuild above.
+                    content = (content or "") + promoted_content
             # ``full_reasoning`` only needed within this block; release
             # the reference to drop the temporary view.
             del full_reasoning
