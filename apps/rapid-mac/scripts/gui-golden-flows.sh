@@ -3567,15 +3567,15 @@ flow_image_generation() {
     # And the rest of the payload. Without this the picker can show and load
     # the image alias while the request names something else entirely — the
     # tab would look right and render with the wrong model.
-    # `1024x1024` is what the default (square) aspect maps to. A shape-only
+    # `512x512` is what the default (square) aspect maps to. A shape-only
     # check like `^[0-9]+x[0-9]+$` passes `768x1024` — the PORTRAIT size — so
     # an aspect control wired to the wrong case would render the wrong shape
     # and the flow would call it correct.
     jq -s -e --arg alias "$FAKE_IMAGE_ALIAS" \
         'all(.[] | select(.event == "image_request");
-             .model == $alias and .n == 1 and .size == "1024x1024")' \
+             .model == $alias and .n == 1 and .size == "512x512")' \
         "$OUT/fake-events.jsonl" >/dev/null \
-        || die "an image request named the wrong model, asked for n != 1, or did not carry the square size 1024x1024: $(jq -s -c '[.[] | select(.event == "image_request") | {model, size, n}]' "$OUT/fake-events.jsonl")"
+        || die "an image request named the wrong model, asked for n != 1, or did not carry the square size 512x512: $(jq -s -c '[.[] | select(.event == "image_request") | {model, size, n}]' "$OUT/fake-events.jsonl")"
     # ...and the UI agreed that square was selected, so the two cannot drift
     # into agreeing on a wrong value together.
     # On `selected`, not on existence. All three ratio buttons carry the

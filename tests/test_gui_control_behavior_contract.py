@@ -9,6 +9,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 HARNESS = ROOT / "apps/rapid-mac/scripts/gui-golden-flows.sh"
 WORKFLOW = ROOT / ".github/workflows/rapid-mac-ci.yml"
+IMAGE_VIEW_MODEL = ROOT / "apps/rapid-mac/Sources/Rapid/Images/ImageGenViewModel.swift"
 
 
 def test_audio_readiness_actions_start_the_selected_model_and_clear_the_gate():
@@ -40,6 +41,23 @@ def test_audio_control_journey_is_blocking_gui_ci_and_has_failure_evidence():
         1
     ]
     assert "image-generation audio-readiness" in diagnostic
+
+
+def test_image_generation_journey_asserts_the_product_default_request_size():
+    """Keep the shell E2E contract aligned with the Swift default.
+
+    The view-model test catches a wrong UI default, while the golden journey
+    catches a wrong request body. Pinning both sides here prevents changing
+    one literal and leaving the other to fail only in the 20-minute GUI job.
+    """
+    view_model = IMAGE_VIEW_MODEL.read_text()
+    flow = (
+        HARNESS.read_text().split("flow_image_generation() {", 1)[1].split("\n}", 1)[0]
+    )
+
+    assert "var resolution: Resolution = .compact" in view_model
+    assert '.size == "512x512"' in flow
+    assert "square size 512x512" in flow
 
 
 SNAPSHOTS = ROOT / "apps/rapid-mac/Tests/GUIGoldenFlows/__Snapshots__"
