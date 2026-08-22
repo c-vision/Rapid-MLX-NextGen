@@ -1055,8 +1055,26 @@ start_model() {
     # Hosted macOS runners can spend more than 30 seconds cold-starting the
     # bundled fake sidecar after a full release build. Keep the event-based
     # readiness proof, but allow 60 seconds before declaring startup broken.
+    local memory_confirmed=0
     for _ in {1..240}; do
         grep -q '"event": "server_started"' "$OUT/fake-events.jsonl" 2>/dev/null && break
+        # Authoritative aliases retain their production footprint estimate
+        # even though this journey launches the zero-weight fake sidecar.  A
+        # memory-constrained hosted runner can therefore present the real
+        # safety confirmation after Start.  Confirm only when that explicit
+        # sheet exists; this keeps the product gate covered without leaving a
+        # fake-model GUI journey dependent on the runner's ambient pressure.
+        if [[ "$memory_confirmed" == 0 ]]; then
+            see_main "$OUT/readiness-after-start.json"
+            if jq -e '.data.ui_elements[]?
+                      | select(.identifier == "MemoryWarning.Confirm" and .enabled == true)' \
+                "$OUT/readiness-after-start.json" >/dev/null; then
+                "$AX_DRIVER" click-center "$APP_PID" MemoryWarning.Confirm \
+                    > "$OUT/readiness-memory-confirm.json"
+                memory_confirmed=1
+                log "  confirmed hosted-runner memory warning for fake sidecar"
+            fi
+        fi
         sleep 0.25
     done
     grep -q '"event": "server_started"' "$OUT/fake-events.jsonl" 2>/dev/null \
@@ -3603,18 +3621,21 @@ flow_image_generation() {
 
     # The in-flight card. Asserted BEFORE the result so a render that returns
     # instantly (or a card that never appears) is a failure rather than a frame
-    # nobody looked at.
+    # nobody looked at.  SwiftUI mounts Cancel one layout pass before the
+    # indeterminate indicator the baseline owns; require both so the snapshot
+    # cannot race that valid intermediate tree.
     local inflight=0
     for ((i=0; i<80; i++)); do
         see_main "$OUT/ig-inflight.json"
-        if jq -e '.data.ui_elements[]? | select(.identifier == "Images.Cancel")' \
+        if jq -e 'any(.data.ui_elements[]?; .identifier == "Images.Cancel")
+                  and any(.data.ui_elements[]?; .role == "AXBusyIndicator")' \
                "$OUT/ig-inflight.json" >/dev/null; then
             inflight=1; break
         fi
         sleep 0.1
     done
     [[ "$inflight" == 1 ]] \
-        || die "no in-flight progress card: Images.Cancel never appeared during a render"
+        || die "no settled in-flight progress card with Cancel and busy indicator"
     baseline image-generation.inflight "$OUT/ig-inflight.json"
 
     # Sampling completion is followed by VAE decode / encoding. That tail must

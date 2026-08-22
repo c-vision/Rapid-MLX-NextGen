@@ -54,6 +54,16 @@ def test_trust_success_requires_all_three_signals():
     assert "screenLocked" in line
 
 
+def test_ax_dump_omits_non_finite_numbers_before_json_serialization():
+    source = DRIVER.read_text()
+    json_value = source.split("func jsonValue", 1)[1].split("\n}", 1)[0]
+    assert "number.doubleValue.isFinite ? number : nil" in json_value
+    bounds = source.split('record["bounds"]', 1)[0].rsplit("if let origin = point", 1)[
+        1
+    ]
+    assert "origin.x.isFinite" in bounds and "extent.height.isFinite" in bounds
+
+
 def test_each_fault_fails_with_its_own_message():
     source = DRIVER.read_text()
     assert source.count("fail(") >= 4
@@ -179,6 +189,15 @@ def test_start_model_waits_for_an_interactive_readiness_action():
     assert helper.index("wait_identifier_enabled Readiness.Action") < helper.index(
         'press "$OUT/readiness-start.json" Readiness.Action'
     )
+    assert 'identifier == "MemoryWarning.Confirm" and .enabled == true' in helper
+    assert '"$AX_DRIVER" click-center "$APP_PID" MemoryWarning.Confirm' in helper
+
+    driver = DRIVER.read_text()
+    click = driver.split('case "click-center":', 1)[1].split(
+        'case "set-scroll-value":', 1
+    )[0]
+    assert "kAXPositionAttribute" in click and "kAXSizeAttribute" in click
+    assert ".leftMouseDown" in click and ".leftMouseUp" in click
 
 
 def test_audio_baseline_waits_for_residency_poll_to_settle():
