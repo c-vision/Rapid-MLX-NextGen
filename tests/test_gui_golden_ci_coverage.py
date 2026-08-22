@@ -72,6 +72,19 @@ def test_failure_diagnostic_regenerates_every_ci_baseline_and_nothing_else():
     assert diagnostic_flows() == workflow_flows() & baseline_flows()
 
 
+def test_failure_diagnostic_skips_regeneration_for_semantic_failures():
+    steps = workflow_steps()
+    (diagnostic,) = [
+        step
+        for step in steps
+        if step.get("name") == "Regenerate baselines on this runner (diagnostic)"
+    ]
+    run = str(diagnostic.get("run", ""))
+    assert 'for result in "$GOLDEN_ROOT"/*/result.json' in run
+    assert 'find "$(dirname "$result")" -name \'*.observed.txt\'' in run
+    assert "No structural baseline mismatch" in run
+
+
 def test_all_named_flows_run_before_one_blocking_verdict():
     steps = workflow_steps()
     flow_steps = [
