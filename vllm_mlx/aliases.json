@@ -682,6 +682,7 @@
     "is_hybrid": false,
     "is_moe": false,
     "supports_spec_decode": true,
+    "recommended_prefill_step_size": 512,
     "recommended_sampling": {
       "temperature": 1.0,
       "top_p": 0.95,

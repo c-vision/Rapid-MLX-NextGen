@@ -2676,6 +2676,21 @@ def _resolve_prefill_step_size(
     return resolved
 
 
+def _resolve_vision_prefill_token_budget(
+    *,
+    configured: int | None,
+    prefill_step_size: int,
+    prefill_user_set_explicit: bool,
+    mllm_default: int = 8192,
+) -> int:
+    """Resolve the independent MLLM vision admission budget."""
+    if configured is not None:
+        return configured
+    if prefill_user_set_explicit:
+        return prefill_step_size
+    return max(prefill_step_size, mllm_default)
+
+
 def _needs_bounded_trim_free_reuse(model_name: str) -> bool:
     """Whether this model's cache can reuse prefixes but not trim exact hits."""
     from .model_aliases import resolve_profile as _resolve_alias
@@ -3880,11 +3895,18 @@ def serve_command(args):
         or any(a.startswith("--hybrid-cache-entries=") for a in sys.argv),
         model_name=getattr(args, "_original_alias", None) or args.model,
     )
+    _prefill_user_set_explicit = "--prefill-step-size" in sys.argv or any(
+        a.startswith("--prefill-step-size=") for a in sys.argv
+    )
     _prefill_step_size = _resolve_prefill_step_size(
         model_name=getattr(args, "_original_alias", None) or args.model,
         configured=args.prefill_step_size,
-        user_set_explicit="--prefill-step-size" in sys.argv
-        or any(a.startswith("--prefill-step-size=") for a in sys.argv),
+        user_set_explicit=_prefill_user_set_explicit,
+    )
+    _vision_prefill_token_budget = _resolve_vision_prefill_token_budget(
+        configured=getattr(args, "vision_prefill_token_budget", None),
+        prefill_step_size=_prefill_step_size,
+        prefill_user_set_explicit=_prefill_user_set_explicit,
     )
 
     # 0.9.13 PR-A codex round-E blocker #2: resolve model_type on the
@@ -3945,6 +3967,7 @@ def serve_command(args):
         # accepted but never used. See #400 and the CLI ↔ Config fidelity
         # audit at scripts/audit_cli_config_fidelity.py.
         prefill_step_size=_prefill_step_size,
+        vision_prefill_token_budget=_vision_prefill_token_budget,
         vision_min_pixels=getattr(args, "vision_min_pixels", 0),
         vision_max_pixels=getattr(args, "vision_max_pixels", 0),
         # Speculative decoding selection.
@@ -9895,6 +9918,16 @@ Examples:
         help="Chunk size for prompt prefill processing. Larger values use more memory "
         "but can improve prefill throughput. (default: 2048; bench-verified model "
         "profiles may recommend a smaller value unless explicitly set)",
+    )
+    serve_parser.add_argument(
+        "--vision-prefill-token-budget",
+        type=positive_int,
+        default=None,
+        help=(
+            "Advanced: maximum prompt tokens per vision-bearing request. "
+            "Defaults to 8192 for automatic profiles; an explicit "
+            "--prefill-step-size preserves the legacy shared limit."
+        ),
     )
     serve_parser.add_argument(
         "--vision-min-pixels",

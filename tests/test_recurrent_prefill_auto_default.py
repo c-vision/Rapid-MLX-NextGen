@@ -127,7 +127,9 @@ def test_only_bench_verified_profiles_opt_in():
     ):
         assert resolve_profile(alias).recommended_prefill_step_size == 1024
 
-    for alias in ("qwen3.5-35b-4bit", "gemma-4-12b-4bit"):
+    assert resolve_profile("gemma-4-12b-4bit").recommended_prefill_step_size == 512
+
+    for alias in ("qwen3.5-35b-4bit",):
         assert resolve_profile(alias).recommended_prefill_step_size is None
 
 
@@ -139,6 +141,41 @@ def test_real_profile_recommendations_reach_runtime_resolver():
             user_set_explicit=False,
         )
         == 1024
+    )
+    assert (
+        cli._resolve_prefill_step_size(
+            model_name="gemma-4-12b-4bit",
+            configured=2048,
+            user_set_explicit=False,
+        )
+        == 512
+    )
+
+
+def test_vision_budget_distinguishes_gui_profile_from_explicit_prefill():
+    assert (
+        cli._resolve_vision_prefill_token_budget(
+            configured=None,
+            prefill_step_size=512,
+            prefill_user_set_explicit=False,
+        )
+        == 8192
+    )
+    assert (
+        cli._resolve_vision_prefill_token_budget(
+            configured=None,
+            prefill_step_size=512,
+            prefill_user_set_explicit=True,
+        )
+        == 512
+    )
+    assert (
+        cli._resolve_vision_prefill_token_budget(
+            configured=4096,
+            prefill_step_size=512,
+            prefill_user_set_explicit=False,
+        )
+        == 4096
     )
 
 
@@ -155,3 +192,10 @@ def test_prefill_help_describes_profile_scoped_recommendation():
     )
     assert "bench-verified model profiles" in action.help
     assert "recurrent/linear-attention models auto-tune" not in action.help
+
+    vision_action = next(
+        action
+        for action in serve_parser._actions
+        if "--vision-prefill-token-budget" in action.option_strings
+    )
+    assert vision_action.default is None

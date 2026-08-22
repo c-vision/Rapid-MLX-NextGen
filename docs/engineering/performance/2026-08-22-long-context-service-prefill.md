@@ -4,7 +4,8 @@
 
 Bench-verified text-model profiles should select their own prefill chunk in
 `rapid-mlx serve`: Qwen3.5 4B/9B 4-bit use 512; Qwen3.5 4B/9B 6/8-bit and
-27B 4-bit use 1,024. Against the previous universal
+27B 4-bit use 1,024; Gemma 4 12B 4-bit uses 512 with an independent 8,192-token
+vision admission budget. Against the previous universal
 2,048-token default, the original Qwen3.5 4B 4-bit result:
 
 - reduced a short request's TTFT under a concurrent long prefill by 51.1%;
@@ -152,12 +153,26 @@ single-repeat scout through mlx-vlm 0.6.15 found that 512 was promising:
 | 4K | 131.79 | 136.48 | +3.6% | -7.8% |
 | 16K | 125.38 | 130.12 | +3.8% | -13.3% |
 
-The later repeat-three direct-prefill matrix reproduced this result. It still
-does not justify a service default: on the multimodal path, the same setting is
-also the per-image admission budget. A 512 value can reject a token-dense image
-before generation. Gemma therefore remains at the MLLM default until the text
-chunk and image admission budget are separated, or repeated image-service tests
-prove a safe policy.
+The later repeat-three direct-prefill matrix reproduced this result. The runtime
+now keeps the language-model prefill chunk separate from the per-image admission
+budget: Gemma can use the measured 512 chunk while vision-bearing requests keep
+the safe 8,192-token budget. This matters especially to Desktop users, because
+the GUI launches the alias without performance flags and receives both defaults
+automatically.
+
+Operator compatibility is source-aware. An explicit
+`--vision-prefill-token-budget` always wins; an explicit
+`--prefill-step-size` without that new flag preserves the historical shared
+limit for memory-constrained deployments. Only the zero-flag/profile path
+separates Gemma's 512 computation chunk from the 8,192 vision budget.
+
+A zero-flag service spot check used the same Desktop launch shape on the M2 Pro:
+`rapid-mlx serve gemma-4-12b-4bit`. Startup selected the profile's 512 chunk,
+and a 64×64 red PNG sent through `/v1/chat/completions` completed normally with
+280 prompt tokens and the non-empty response `The image is dark red.` The
+admission regression test separately pins a representative 2,292-token image
+prompt as accepted by the 8,192 budget while proving it would have failed if
+the budget still followed the 512 chunk.
 
 ## Recurrent cross-model regression matrix
 
@@ -202,14 +217,14 @@ greater than 3% at either 4K or 16K, then prefer the smallest remaining chunk.
 | Qwen3.5 9B 6-bit | 1,024 | 1,024 | -0.8% | -1.2% | -7.0% | -10.1% |
 | Qwen3.5 9B 8-bit | 1,024 | 1,024 | -1.2% | -1.6% | -5.1% | -7.8% |
 | Qwen3.5 27B 4-bit | 1,024 | 1,024 | -0.6% | -0.5% | -6.6% | -8.9% |
-| Gemma 4 12B 4-bit | 512 | MLLM default | +3.3% | +3.8% | -7.8% | -13.3% |
+| Gemma 4 12B 4-bit | 512 | 512 | +3.3% | +3.8% | -7.8% | -13.3% |
 
 For the four 6/8-bit Qwen aliases, 512 regressed throughput by 3.9--7.5%, so
 1,024 is not merely a midpoint: it is the smallest candidate that stays within
 the regression budget. Qwen3.5 27B at 512 was acceptable at 4K (-2.5%) but
 missed at 16K (-3.3%), so it also uses 1,024. Gemma's repeat-three result
-confirmed the earlier scout, but is not deployed because the MLLM admission
-budget currently shares this setting.
+confirmed the earlier scout. It is deployed only after separating the 512
+language-model chunk from the 8,192-token vision admission budget.
 
 ### Desktop/GUI consumption audit
 
@@ -289,6 +304,6 @@ Land the profile-scoped 512 auto-default with the benchmark harness. Then:
 
 1. run the same HTTP workload against a calibrated oMLX deployment (none was
    installed on this mini during this run), including equivalent cache policy;
-2. repeat the Gemma 4 12B service A/B before considering a broader default;
+2. repeat the Gemma 4 12B image-service A/B before generalizing to other MLLMs;
 3. profile cache admission/eviction for multiple 16K--64K agent prefixes; and
 4. add a repeat-three service tier to scheduled Mac performance CI.
