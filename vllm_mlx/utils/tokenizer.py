@@ -1093,6 +1093,7 @@ def load_model_with_fallback(
     enable_dspark: bool = False,
     lazy: bool = False,
     return_config: bool = False,
+    return_source: bool = False,
 ):
     """
     Load model and tokenizer with fallback for non-standard tokenizers.
@@ -1122,10 +1123,15 @@ def load_model_with_fallback(
             (needed to read ``model_type`` for
             ``disk_stream_patch.install``) — passed straight through to
             ``mlx_lm.load(..., return_config=True)``.
+        return_source: Append the concrete checkpoint source selected for this
+            load. Engine startup uses this to pin persisted-cache identity
+            without requiring the returned model object to accept attributes.
 
     Returns:
-        Tuple of (model, tokenizer), or (model, tokenizer, config) when
-        ``return_config=True``.
+        ``(model, tokenizer)`` by default; ``(model, tokenizer, config)``
+        with ``return_config=True``; ``(model, tokenizer, source)`` with
+        ``return_source=True``; or ``(model, tokenizer, config, source)``
+        when both flags are true.
     """
     # Publishers who ship one repo per model with a folder per quant
     # (``LiquidAI/LFM2.5-2.6B-MLX`` → ``4bit/``, ``8bit/``, ``bf16/`` …)
@@ -1142,6 +1148,14 @@ def load_model_with_fallback(
     # round-trip that hangs a start on a poisoned-DNS network. No-op for a cold
     # cache or an already-local path (see the helper).
     model_name = _local_snapshot_if_cached(model_name)
+
+    # Pin remote repositories to the concrete snapshot that THIS load will
+    # consume. Persisted KV identity must never be derived later from mutable
+    # refs/main state, which can advance while the server is running.
+    if not Path(model_name).is_dir():
+        resolved_snapshot = _resolve_model_path(model_name)
+        if resolved_snapshot is not None:
+            model_name = str(resolved_snapshot)
 
     # ``mlx_lm.load`` may import config.json::model_file.  Validate that
     # caller-supplied local path once at this shared boundary before any native
@@ -1239,7 +1253,7 @@ def load_model_with_fallback(
         # branches would ever fire for a checkpoint this code path is
         # actually used for.
         _post_load_ubc_evict(model_name)
-        return result
+        return (*result, str(model_name)) if return_source else result
     if enable_dspark:
         result = _load_model_with_fallback_impl(
             model_name, tokenizer_config, enable_dspark=True
@@ -1258,7 +1272,7 @@ def load_model_with_fallback(
     # mirror worth evicting after the inner loader succeeded.
     # No-op on non-Darwin.
     _post_load_ubc_evict(model_name)
-    return result
+    return (*result, str(model_name)) if return_source else result
 
 
 # mlx-lm's tokenizer loader (``mlx_lm.tokenizer_utils.load``) imports a
