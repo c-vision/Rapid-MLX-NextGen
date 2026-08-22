@@ -59,6 +59,12 @@ jobs:
       - name: Workflow expression sanity
         run: python scripts/check_workflow_expressions.py
 
+      # The model-management diagram and status tables are generated from one
+      # reviewed YAML manifest. Fail if a PR edits status/relationships without
+      # regenerating the GitHub-facing Mermaid/SVG views.
+      - name: Model-management architecture SSOT
+        run: python scripts/render_model_management_architecture.py --check
+
       # The release scripts cannot be exercised without cutting a release, so
       # their tag-claim, recovery and refuse-to-move paths are covered offline
       # against a mock ``gh``. These existed but nothing ran them, which is how
