@@ -89,17 +89,17 @@ were all invisible to journey-shaped tests:
 
 ### Full flow roster
 
-The numbered narrative above is selective. The authoritative, complete set of
-flows the harness can run is the dispatch table in `scripts/gui-golden-flows.sh`
-(`case "$FLOW" in …`). As of this checkout that is 26 flows: `fresh-install`,
-`cached-quickstart`, `cached-curated-tradeup`, `download-progress`,
-`settings-persistence`, `settings-mtp`, `chat-restore`, `message-actions`,
-`restored-tools`, `tool-loop-budget`, `chat-depth`, `math-rendering`,
-`slow-stream-stop`, `model-crash-recovery`, `low-memory-choice`, `update-state`,
-`window-close-prompt`, `no-dead-controls`, `catalog-integrity`,
-`browse-all-destination`, `chat-document-attachment`, `image-generation`,
-`dictation`, `audio-readiness`, `resident-load-rejected`, `launch-integrations`.
-`--flow all` runs them in that order.
+The numbered narrative above is selective. The authoritative inventory is
+`Tests/GUIGoldenFlows/journeys.yaml`. It records every journey's group, risk,
+driver, fixtures, source-path mapping, CI tier, and structural-baseline
+ownership. Contract tests fail if it drifts from the shell dispatcher or the
+PR workflow. `chat-depth` is explicitly local-only because the hosted runner's
+small window virtualizes its oldest transcript rows; all other declared flows
+are PR-gated when the full Desktop gate is selected.
+
+Each journey execution writes a `result.json` containing its outcome, UTC start
+time, execution duration in seconds, and artifact directory. This makes per-journey
+timing and failure evidence machine-readable without parsing Actions logs.
 
 ### Current baseline
 

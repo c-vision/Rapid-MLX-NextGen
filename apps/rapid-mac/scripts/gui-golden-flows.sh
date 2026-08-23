@@ -45,6 +45,8 @@ MAIN_WINDOW_ID=""
 BUNDLE_ID=""
 AX_DRIVER=""
 RESULT_WRITTEN=0
+RUN_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+RUN_STARTED_EPOCH="$(date +%s)"
 PERSONA_ENV=()
 
 usage() {
@@ -89,6 +91,18 @@ done
 log() { printf '[gui-golden] %s\n' "$*"; }
 die() { printf '[gui-golden] FAIL: %s\n' "$*" >&2; exit 1; }
 pb() { peekaboo "$@" --bridge-socket "$BRIDGE"; }
+write_result() {
+    local status="$1" exit_code="$2" finished_epoch duration_seconds
+    finished_epoch="$(date +%s)"
+    duration_seconds=$((finished_epoch - RUN_STARTED_EPOCH))
+    jq -n --arg status "$status" --arg flow "$FLOW" --arg app "$APP_SOURCE" \
+        --arg started_at "$RUN_STARTED_AT" --arg artifact_path "$OUT_ROOT" \
+        --argjson duration_seconds "$duration_seconds" \
+        --argjson exit_code "$exit_code" \
+        '{status: $status, flow: $flow, app: $app, started_at: $started_at,
+          duration_seconds: $duration_seconds, artifact_path: $artifact_path,
+          exit_code: $exit_code}' > "$OUT_ROOT/result.json"
+}
 flow_requires_screen_recording() {
     case "$FLOW" in
         all) return 0 ;;
@@ -183,18 +197,21 @@ cleanup_operator_server() {
 finish() {
     local status=$?
     set +e
-    if [[ "$status" -ne 0 && "$RESULT_WRITTEN" == 0 && -d "$OUT_ROOT" ]]; then
-        jq -n --arg status fail --arg flow "$FLOW" --arg app "$APP_SOURCE" \
-            --argjson exit_code "$status" \
-            '{status: $status, flow: $flow, app: $app, exit_code: $exit_code}' \
-            > "$OUT_ROOT/result.json" 2>/dev/null || true
-    fi
     cleanup_persona
     cleanup_operator_server
+    if [[ "$status" -ne 0 && "$RESULT_WRITTEN" == 0 ]]; then
+        mkdir -p "$OUT_ROOT" 2>/dev/null || true
+        if [[ -d "$OUT_ROOT" ]]; then
+            write_result fail "$status" 2>/dev/null || true
+        fi
+    fi
 }
 trap finish EXIT
-trap 'cleanup_persona; cleanup_operator_server; exit 130' INT
-trap 'cleanup_persona; cleanup_operator_server; exit 143' TERM
+# Signal handlers only select the conventional exit code. The EXIT handler is
+# the single owner of cleanup and final evidence, avoiding double-cleanup and
+# ensuring cancellation/timeout failures receive the same result schema.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # The preconditions every flow depends on and none of them can observe:
 # permission to read another process's AX tree, and a session that can actually
@@ -4776,8 +4793,7 @@ case "$FLOW" in
     *) die "unknown flow: $FLOW" ;;
 esac
 
-jq -n --arg status pass --arg flow "$FLOW" --arg app "$APP_SOURCE" \
-    '{status: $status, flow: $flow, app: $app}' > "$OUT_ROOT/result.json"
+write_result pass 0
 RESULT_WRITTEN=1
 log "PASS — $FLOW"
 log "artifacts: $OUT_ROOT"
