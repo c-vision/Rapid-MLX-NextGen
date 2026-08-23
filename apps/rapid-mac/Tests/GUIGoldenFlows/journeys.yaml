@@ -211,7 +211,7 @@ journeys:
     driver: hybrid
     ci_tier: pr
     fixtures: [fake-sidecar, generated-images, isolated-home]
-    source_paths: [apps/rapid-mac/Sources/Rapid/Images/]
+    source_paths: [apps/rapid-mac/Sources/Rapid/Images/, apps/rapid-mac/Sources/Rapid/UI/ImagesView.swift]
     owns_baseline: true
   - name: dictation
     group: audio
@@ -219,7 +219,7 @@ journeys:
     driver: ax
     ci_tier: pr
     fixtures: [fake-sidecar, delayed-transcription, isolated-home]
-    source_paths: [apps/rapid-mac/Sources/Rapid/Dictation/, apps/rapid-mac/Sources/Rapid/Audio/]
+    source_paths: [apps/rapid-mac/Sources/Rapid/Dictation/, apps/rapid-mac/Sources/Rapid/Audio/, apps/rapid-mac/Sources/Rapid/UI/DictationView.swift]
     owns_baseline: false
   - name: audio-readiness
     group: audio
@@ -227,7 +227,7 @@ journeys:
     driver: ax
     ci_tier: pr
     fixtures: [fake-sidecar, audio-models, isolated-home]
-    source_paths: [apps/rapid-mac/Sources/Rapid/Audio/, apps/rapid-mac/Sources/Rapid/Dictation/]
+    source_paths: [apps/rapid-mac/Sources/Rapid/Audio/, apps/rapid-mac/Sources/Rapid/Dictation/, apps/rapid-mac/Sources/Rapid/UI/AudioView.swift, apps/rapid-mac/Sources/Rapid/UI/DictationView.swift]
     owns_baseline: true
   - name: resident-load-rejected
     group: models

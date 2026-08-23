@@ -268,7 +268,9 @@ def test_all_named_flows_run_before_one_blocking_verdict():
     assert len(verdicts) == 1
     verdict = verdicts[0]
     assert verdict.get("if") == "always()"
-    assert f"expected = {len(workflow_flows())}" in str(verdict.get("run", ""))
+    assert 'expected = int(os.environ["EXPECTED_FLOW_COUNT"])' in str(
+        verdict.get("run", "")
+    )
 
 
 def test_golden_job_builds_the_release_ui_surface():

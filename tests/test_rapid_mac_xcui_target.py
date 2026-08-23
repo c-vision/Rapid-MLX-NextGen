@@ -25,10 +25,13 @@ def test_xcui_target_is_checked_in_and_runs_in_gui_ci():
     upload_index, upload = named_steps["Upload XCUITest evidence"]
     verdict_index, verdict = named_steps["Require native XCUITest"]
     assert xcui["id"] == "xcui"
+    assert "image-generation" in xcui["if"]
     assert xcui["continue-on-error"] is True
     assert upload["if"] == "steps.xcui.outcome == 'failure'"
     assert verdict["if"] == "always()"
     assert "steps.xcui.outcome" in verdict["env"]["XCUI_OUTCOME"]
+    assert "image-generation" in verdict["env"]["IMAGE_SELECTED"]
+    assert "IMAGE_SELECTED" in verdict["run"]
     assert xcui_index < upload_index < verdict_index
 
 

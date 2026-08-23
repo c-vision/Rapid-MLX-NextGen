@@ -39,10 +39,24 @@ actual diff. Apply it only when the PR is ready to merge; removing it returns
 subsequent commits to the path-aware PR gate.
 
 - Engine changes expand to the full five-model L1 matrix.
-- Desktop changes expand to the complete GUI golden-flow job.
+- Desktop changes build the release GUI once, then run every journey group
+  mapped to the changed controls and product sources in
+  `Tests/GUIGoldenFlows/journeys.yaml`.
 - Cross-cutting or unknown changes expand both lanes.
 - Documentation-only changes require neither product lane and do not need the
   label.
+
+GUI routing expands a changed source to its complete journey group, so sibling
+flows around the same user workflow remain covered. It fails closed: empty or
+invalid diffs, new unmapped Desktop paths, shared UI components, packaging
+inputs, the harness, its manifest, and the CI workflow select every PR journey.
+Broad mixed-responsibility directories such as `Sources/Rapid/UI/` never grant
+narrow ownership to a new file; that requires an explicit file or cohesive
+domain-directory mapping in the manifest.
+Each named workflow step remains visible but an unselected journey exits before
+preflight, app launch, or artifact creation. The final verdict requires exactly
+the number of result records selected by the classifier, so a selected journey
+cannot silently disappear.
 
 The label never changes lane classification. This prevents an engine-only PR
 from allocating the full Desktop gate, or a Desktop-only PR from allocating
@@ -83,4 +97,6 @@ Disable the merge queue first, restore `full-ci` label-based merging, and leave
 the `merge_group` triggers in place. The triggers are harmless while the queue
 is disabled. If path classification is suspect, make its policy select both
 lanes for every PR; this restores the previous validation coverage without
-renaming required checks.
+renaming required checks. For GUI routing specifically, removing the
+`GUI_FLOWS` job environment or making `scripts/select_gui_flows.py` return the
+full manifest roster restores the previous all-journey behavior.

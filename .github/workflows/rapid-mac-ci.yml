@@ -45,6 +45,8 @@ jobs:
     outputs:
       desktop: ${{ steps.policy.outputs.desktop }}
       full_gate: ${{ steps.policy.outputs.full_gate }}
+      gui_flows: ${{ steps.policy.outputs.gui_flows }}
+      gui_flow_count: ${{ steps.policy.outputs.gui_flow_count }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
@@ -62,6 +64,7 @@ jobs:
             # A future merge queue candidate may combine independently scoped
             # PRs, so validate both product lanes.
             python scripts/classify_ci_changes.py --github-output "$GITHUB_OUTPUT"
+            python scripts/select_gui_flows.py --github-output "$GITHUB_OUTPUT"
             {
               echo 'full_gate=true'
             } >> "$GITHUB_OUTPUT"
@@ -73,6 +76,9 @@ jobs:
             # new destination participate in classification.
             git diff --no-renames --name-only "$PR_BASE_SHA" "$GITHUB_SHA" > /tmp/changed-paths
             python scripts/classify_ci_changes.py \
+              --paths-file /tmp/changed-paths \
+              --github-output "$GITHUB_OUTPUT"
+            python scripts/select_gui_flows.py \
               --paths-file /tmp/changed-paths \
               --github-output "$GITHUB_OUTPUT"
             echo "full_gate=$FULL_CI" >> "$GITHUB_OUTPUT"
@@ -189,7 +195,11 @@ jobs:
         run: pytest tests/test_gui_preflight_contract.py -q
 
       - name: GUI golden-flow coverage contract
-        run: pytest tests/test_gui_golden_ci_coverage.py -q
+        run: |
+          pytest \
+            tests/test_gui_golden_ci_coverage.py \
+            tests/test_gui_flow_routing.py \
+            -q
 
       - name: Fake sidecar catalog contract
         run: pytest tests/test_fake_sidecar_image_catalog.py -q
@@ -292,6 +302,10 @@ jobs:
     defaults:
       run:
         working-directory: apps/rapid-mac
+    env:
+      # Compact JSON selected from the real PR diff. Every named step remains
+      # visible, but the harness exits before launch for unaffected journeys.
+      GUI_FLOWS: ${{ needs.changes.outputs.gui_flows }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
@@ -339,6 +353,7 @@ jobs:
       # records actually draw different pixels rather than the same bitmap.
       - name: 'XCUITest: image-generation pixels'
         id: xcui
+        if: contains(fromJSON(needs.changes.outputs.gui_flows), 'image-generation')
         continue-on-error: true
         env:
           RAPID_XCUI_RESULT_BUNDLE: ${{ runner.temp }}/RapidUITests.xcresult
@@ -555,6 +570,7 @@ jobs:
         if: always()
         env:
           GOLDEN_ROOT: ${{ runner.temp }}/golden
+          EXPECTED_FLOW_COUNT: ${{ needs.changes.outputs.gui_flow_count }}
         run: |
           python3 - <<'PY'
           import json
@@ -562,7 +578,7 @@ jobs:
           from pathlib import Path
 
           root = Path(os.environ["GOLDEN_ROOT"])
-          expected = 29
+          expected = int(os.environ["EXPECTED_FLOW_COUNT"])
           results = sorted(root.glob("*/result.json"))
           failures = []
           for path in results:
@@ -650,7 +666,12 @@ jobs:
         if: always()
         env:
           XCUI_OUTCOME: ${{ steps.xcui.outcome }}
+          IMAGE_SELECTED: ${{ contains(fromJSON(needs.changes.outputs.gui_flows), 'image-generation') }}
         run: |
+          if [[ "$IMAGE_SELECTED" != true && "$XCUI_OUTCOME" == skipped ]]; then
+            echo "Image-generation journey not selected; native XCUITest not required"
+            exit 0
+          fi
           if [[ "$XCUI_OUTCOME" != success ]]; then
             echo "::error::Native XCUITest failed ($XCUI_OUTCOME)"
             exit 1

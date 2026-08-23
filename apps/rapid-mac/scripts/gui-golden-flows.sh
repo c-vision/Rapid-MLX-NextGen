@@ -88,6 +88,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# CI may route a Desktop diff to a subset of the manifest's journey groups.
+# Keep the selection check before preflight, app launch, output-directory
+# creation, and cleanup registration so an unaffected named workflow step is a
+# true no-op. Empty/malformed routing input fails closed by running the flow.
+if [[ -n "${GUI_FLOWS:-}" && "$FLOW" != all ]]; then
+    if selected="$(jq -r --arg flow "$FLOW" \
+        'if type == "array" then any(.[]; . == $flow) else error("not an array") end' \
+        <<<"$GUI_FLOWS" 2>/dev/null)"; then
+        if [[ "$selected" != true ]]; then
+            printf '[gui-golden] SKIP — %s is outside the selected risk groups\n' "$FLOW"
+            exit 0
+        fi
+    else
+        printf '[gui-golden] WARN: invalid GUI_FLOWS; running %s fail-closed\n' "$FLOW" >&2
+    fi
+fi
+
 log() { printf '[gui-golden] %s\n' "$*"; }
 die() { printf '[gui-golden] FAIL: %s\n' "$*" >&2; exit 1; }
 pb() { peekaboo "$@" --bridge-socket "$BRIDGE"; }
