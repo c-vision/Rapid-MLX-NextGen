@@ -410,6 +410,35 @@ target.write_text(src)
 print("==> mflux torch imports deferred into the 3 torch-only loading modes")
 PY
 
+# mflux 0.19.0's PiD checkpoint converter is imported transitively by every
+# Qwen Image model even though it is only used for the separate PiD upscaler.
+# Keep that optional PyTorch conversion path lazy too, otherwise selecting the
+# bundled qwen-image alias fails before model construction with
+# ``ModuleNotFoundError: No module named 'torch'``.
+"$STAGE/python/bin/python3.12" - "$STAGE/site-packages" <<'PY'
+import pathlib
+import sys
+
+target = pathlib.Path(sys.argv[1]) / "mflux/models/common/pid_decoder/pid_weight_mapping.py"
+src = target.read_text()
+eager = "import torch\n"
+functions = (
+    "def convert_checkpoint(pth_path: str) -> dict[str, mx.array]:\n",
+    "def _to_mx_array(tensor: torch.Tensor) -> mx.array:\n",
+)
+if src.count(eager) != 1 or any(src.count(function) != 1 for function in functions):
+    raise SystemExit(
+        "ERR: mflux PiD weight mapping changed. Re-verify the torch-free "
+        "qwen-image path before bumping the mflux pin."
+    )
+src = src.replace(eager, "", 1)
+for function in functions:
+    replacement = function.replace("tensor: torch.Tensor", "tensor")
+    src = src.replace(function, replacement + '    import torch\n', 1)
+target.write_text(src)
+print("==> mflux PiD torch import deferred behind checkpoint conversion")
+PY
+
 # Fail closed: with no torch in the stage, importing mflux's weight loader
 # is itself the proof that the image lane no longer needs a 363 MB
 # dependency. A regression here means every Images-tab generation 500s.
@@ -418,6 +447,7 @@ import importlib
 import sys
 
 importlib.import_module("mflux.models.common.weights.loading.weight_loader")
+importlib.import_module("mflux.models.qwen.variants.txt2img.qwen_image")
 if "torch" in sys.modules:
     raise SystemExit("ERR: mflux still pulls torch at import time")
 print("==> mflux image lane imports without torch: OK")

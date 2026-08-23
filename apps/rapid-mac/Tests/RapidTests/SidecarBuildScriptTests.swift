@@ -111,6 +111,10 @@ struct SidecarBuildScriptTests {
                 "The torch-deferral patch must abort when a target function moves.")
         #expect(script.contains("mflux still pulls torch at import time"),
                 "A post-patch import probe must prove the image lane needs no torch.")
+        #expect(script.contains("mflux/models/common/pid_decoder/pid_weight_mapping.py"),
+                "The Qwen Image import path must defer PiD's optional torch checkpoint converter.")
+        #expect(script.contains(#"importlib.import_module("mflux.models.qwen.variants.txt2img.qwen_image")"#),
+                "The bundle build must prove qwen-image itself imports without torch.")
     }
 
     @Test("Desktop sidecar bundles and smokes both audio lanes")

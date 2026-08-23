@@ -428,11 +428,13 @@ struct SpawnArgumentsTests {
         )
         for key in env.keys {
             let lc = key.lowercased()
+            let components = lc.split(separator: "_")
             // Allow exactly the canonical RAPID_MLX_API_KEY; anything
-            // else carrying "key" / "token" / "bearer" / "api" is a
-            // signal of an unintended duplicate channel.
+            // else carrying a credential-shaped token is a signal of an
+            // unintended duplicate channel. Match `api` as a component — a
+            // raw substring check also matches the letters inside `rapid`.
             if key == "RAPID_MLX_API_KEY" { continue }
-            #expect(!lc.contains("api"))
+            #expect(!components.contains("api"))
             #expect(!lc.contains("token"))
             #expect(!lc.contains("bearer"))
             #expect(!lc.contains("apikey"))

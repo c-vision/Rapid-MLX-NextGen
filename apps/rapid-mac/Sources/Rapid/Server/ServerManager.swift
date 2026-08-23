@@ -3374,6 +3374,14 @@ final class ServerManager {
         if !bearer.isEmpty {
             env["RAPID_MLX_API_KEY"] = bearer
         }
+        // Prefix-cache restore is a best-effort server warm-start optimization,
+        // but the engine performs it on the same single MLX step thread used by
+        // generation. A large or slow on-disk cache can therefore leave the
+        // sidecar reporting Ready while the first Desktop chat waits minutes
+        // behind the restore. Desktop prioritizes truthful first-message
+        // readiness; keep the in-memory cache and explicit import/export, but
+        // do not auto-restore persisted entries for an app-owned sidecar.
+        env["RAPID_MLX_PREFIX_CACHE_AUTOLOAD"] = "0"
         // Issue #1412: rapid-mlx defaults the prefix cache to 20% of
         // available RAM, which is appropriate for a dedicated server but
         // can push a 16/32 GB desktop Mac into swap while the user is also
