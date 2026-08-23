@@ -46,7 +46,7 @@ The full path from "I want to release" to "users on `brew upgrade` see the new v
    Post-tag verification: `python3 scripts/release_smoke.py --version X.Y.Z`
    re-runs the gate against the wheel actually published to PyPI.
 
-2. **Bump `pyproject.toml` in a dedicated bump PR** — change `version = "X.Y.Z"` to `X.Y.(Z+1)` (or minor / major as appropriate). Never push the bump directly to `main`: `version-check.yml` only accepts a `version`-line change in a PR titled `chore: bump version to X.Y.Z` (see "Safety nets" below), and direct pushes to `main` are against repo convention anyway.
+2. **Bump `pyproject.toml` in a dedicated bump PR** — change `version = "X.Y.Z"` to `X.Y.(Z+1)` (or minor / major as appropriate). A release candidate uses `X.Y.Z-rcN`, beginning at `rc1`; RCs publish as GitHub/PyPI prereleases and immutable desktop artifacts, but deliberately do not replace the stable desktop updater feed. Never push the bump directly to `main`: `version-check.yml` only accepts a `version`-line change in a PR titled `chore: bump version to X.Y.Z` or `chore: bump version to X.Y.Z-rcN` (see "Safety nets" below), and direct pushes to `main` are against repo convention anyway.
 
    ```bash
    git checkout -b chore/bump-0.6.16 raullenchai/main

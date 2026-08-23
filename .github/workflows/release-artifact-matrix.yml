@@ -231,9 +231,10 @@ jobs:
           if len(sdists) != 1:
               raise SystemExit("manifest must contain exactly one sdist")
           version = os.environ["EXPECTED_VERSION"]
-          if not wheels[0].startswith(f"rapid_mlx-{version}-"):
+          artifact_version = version.replace("-rc", "rc")
+          if not wheels[0].startswith(f"rapid_mlx-{artifact_version}-"):
               raise SystemExit("wheel filename does not match the candidate version")
-          if sdists[0] != f"rapid_mlx-{version}.tar.gz":
+          if sdists[0] != f"rapid_mlx-{artifact_version}.tar.gz":
               raise SystemExit("sdist filename does not match the candidate version")
           print("release manifest verified")
           PY

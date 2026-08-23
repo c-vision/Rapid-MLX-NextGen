@@ -109,6 +109,7 @@ jobs:
 
           manifest = json.loads(Path("candidate/release-manifest.json").read_text())
           version = os.environ["EXPECTED_VERSION"].removeprefix("v")
+          artifact_version = version.replace("-rc", "rc")
           if manifest.get("schema") != 1 or manifest.get("project") != "rapid-mlx":
               raise SystemExit("invalid release manifest schema/project")
           if manifest.get("version") != version:
@@ -136,9 +137,9 @@ jobs:
           sdists = [name for name in artifacts if name.endswith(".tar.gz")]
           if len(sdists) != 1:
               raise SystemExit("manifest must contain exactly one sdist")
-          if not wheels[0].startswith(f"rapid_mlx-{version}-"):
+          if not wheels[0].startswith(f"rapid_mlx-{artifact_version}-"):
               raise SystemExit("wheel filename does not match the release tag")
-          if sdists[0] != f"rapid_mlx-{version}.tar.gz":
+          if sdists[0] != f"rapid_mlx-{artifact_version}.tar.gz":
               raise SystemExit("sdist filename does not match the release tag")
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"sdist_sha256={artifacts[sdists[0]]['sha256']}\n")
