@@ -24,7 +24,7 @@ struct AttachmentDedupTests {
 
     /// A filter nothing calls is not a filter.
     ///
-    /// The cases below all exercise ``ChatView/withoutAlreadyAttached`` in
+    /// The cases below all exercise ``ChatAttachmentDraft/withoutAlreadyAttached`` in
     /// isolation, so deleting its one call site leaves every one of them
     /// green — verified by doing exactly that. This session has now produced
     /// three bugs of that shape (a window floor declared but never applied, a
@@ -47,7 +47,7 @@ struct AttachmentDedupTests {
         // Reduced to a Bool first: `#expect` prints the expression it is
         // handed, and the stripped source is the whole of ChatView.
         let wired = stripped.contains(
-            "Self.withoutAlreadyAttached(urls,attached:Set(attachedSourcePaths.values))"
+            "attachmentDraft.filteringAlreadyAttached(urls)"
         )
         #expect(
             wired,
@@ -65,8 +65,8 @@ struct AttachmentDedupTests {
 
     @Test("A file already attached is rejected, and counted")
     func rejectsAlreadyAttached() {
-        let attached: Set<String> = [ChatView.attachmentKey(for: url("/tmp/report.pdf"))]
-        let (fresh, duplicates) = ChatView.withoutAlreadyAttached(
+        let attached: Set<String> = [ChatAttachmentDraft.attachmentKey(for: url("/tmp/report.pdf"))]
+        let (fresh, duplicates) = ChatAttachmentDraft.withoutAlreadyAttached(
             [url("/tmp/report.pdf")], attached: attached
         )
         #expect(fresh.isEmpty)
@@ -77,7 +77,7 @@ struct AttachmentDedupTests {
     /// pasting it twice, and arrives as a single batch.
     @Test("Repeats inside one batch collapse")
     func collapsesRepeatsWithinABatch() {
-        let (fresh, duplicates) = ChatView.withoutAlreadyAttached(
+        let (fresh, duplicates) = ChatAttachmentDraft.withoutAlreadyAttached(
             [url("/tmp/a.pdf"), url("/tmp/a.pdf"), url("/tmp/b.csv")],
             attached: []
         )
@@ -89,8 +89,8 @@ struct AttachmentDedupTests {
     /// `a.pdf` reached from different working directories both attach.
     @Test("Path spelling does not create a second file")
     func normalisesPathSpelling() {
-        let attached: Set<String> = [ChatView.attachmentKey(for: url("/tmp/docs/a.pdf"))]
-        let (fresh, _) = ChatView.withoutAlreadyAttached(
+        let attached: Set<String> = [ChatAttachmentDraft.attachmentKey(for: url("/tmp/docs/a.pdf"))]
+        let (fresh, _) = ChatAttachmentDraft.withoutAlreadyAttached(
             [url("/tmp/docs/../docs/a.pdf")], attached: attached
         )
         #expect(fresh.isEmpty, "a non-normalised path attached the same file again")
@@ -102,8 +102,8 @@ struct AttachmentDedupTests {
     /// discovered later.
     @Test("Distinct paths remain distinct")
     func distinctPathsAreKept() {
-        let attached: Set<String> = [ChatView.attachmentKey(for: url("/tmp/a.pdf"))]
-        let (fresh, duplicates) = ChatView.withoutAlreadyAttached(
+        let attached: Set<String> = [ChatAttachmentDraft.attachmentKey(for: url("/tmp/a.pdf"))]
+        let (fresh, duplicates) = ChatAttachmentDraft.withoutAlreadyAttached(
             [url("/tmp/copy/a.pdf")], attached: attached
         )
         #expect(fresh.count == 1)
@@ -115,10 +115,10 @@ struct AttachmentDedupTests {
     @Test("The filter does not care whether the file is an image or a document")
     func imagesAndDocumentsShareTheFilter() {
         let attached: Set<String> = [
-            ChatView.attachmentKey(for: url("/tmp/shot.png")),
-            ChatView.attachmentKey(for: url("/tmp/report.pdf")),
+            ChatAttachmentDraft.attachmentKey(for: url("/tmp/shot.png")),
+            ChatAttachmentDraft.attachmentKey(for: url("/tmp/report.pdf")),
         ]
-        let (fresh, duplicates) = ChatView.withoutAlreadyAttached(
+        let (fresh, duplicates) = ChatAttachmentDraft.withoutAlreadyAttached(
             [url("/tmp/shot.png"), url("/tmp/report.pdf"), url("/tmp/new.csv")],
             attached: attached
         )
@@ -128,7 +128,7 @@ struct AttachmentDedupTests {
 
     @Test("Nothing attached yet lets everything through")
     func emptyAttachedSetAcceptsAll() {
-        let (fresh, duplicates) = ChatView.withoutAlreadyAttached(
+        let (fresh, duplicates) = ChatAttachmentDraft.withoutAlreadyAttached(
             [url("/tmp/a.pdf"), url("/tmp/b.pdf")], attached: []
         )
         #expect(fresh.count == 2)
