@@ -27,21 +27,9 @@ name: rapid-mac CI
 on:
   pull_request:
     branches: [main]
-    paths:
-      - "apps/rapid-mac/**"
-      - ".github/workflows/rapid-mac-ci.yml"
-      # The gate script itself, so a change to the detector re-runs it...
-      - "scripts/check_rapid_mac_ax_identifiers.py"
-      # ...and its regression suite, which is the only thing that runs when a
-      # PR touches the detector but no Swift at all.
-      - "tests/test_rapid_mac_ax_identifiers.py"
-      # Same reasoning for the harness contract suites and the captured
-      # cross-OS dumps they assert against: a PR that edits only those must
-      # still run them.
-      - "tests/test_ax_baseline_os_variance.py"
-      - "tests/test_gui_preflight_contract.py"
-      - "tests/fixtures/ax_baseline/**"
-      - "tests/test_fake_sidecar_image_catalog.py"
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -52,11 +40,47 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      desktop: ${{ steps.policy.outputs.desktop }}
+      full_gate: ${{ steps.policy.outputs.full_gate }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify desktop lane
+        id: policy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "merge_group" ] || [ "$FULL_CI" = true ]; then
+            # Empty input deliberately fails closed to every product lane.
+            python scripts/classify_ci_changes.py --github-output "$GITHUB_OUTPUT"
+            {
+              echo 'full_gate=true'
+            } >> "$GITHUB_OUTPUT"
+          else
+            # Disable rename folding so both the removed source path and the
+            # new destination participate in classification.
+            git diff --no-renames --name-only "$PR_BASE_SHA" "$GITHUB_SHA" > /tmp/changed-paths
+            python scripts/classify_ci_changes.py \
+              --paths-file /tmp/changed-paths \
+              --github-output "$GITHUB_OUTPUT"
+            echo 'full_gate=false' >> "$GITHUB_OUTPUT"
+          fi
+
   # Pure text lint over the diff — no Swift toolchain, no simulator, no app
   # build. It runs on ubuntu in ~15s beside the multi-minute macOS build rather
   # than inside it, so a missing identifier reads as its own red check with its
   # own log instead of hiding at the bottom of a compile job.
   accessibility-identifiers:
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -99,6 +123,8 @@ jobs:
   # to redden the tests without also taking down the gate that needs no
   # network at all.
   accessibility-identifier-tests:
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -136,6 +162,8 @@ jobs:
   #     nothing else notices, and the failure surfaces on a Mac, hours later,
   #     disguised as a product defect.
   gui-harness-contracts:
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -162,7 +190,18 @@ jobs:
       - name: Fake sidecar catalog contract
         run: pytest tests/test_fake_sidecar_image_catalog.py -q
 
+      - name: GUI and XCUITest workflow contracts
+        run: |
+          pytest \
+            tests/test_ax_baseline.py \
+            tests/test_gui_control_behavior_contract.py \
+            tests/test_gui_walk_completeness.py \
+            tests/test_rapid_mac_xcui_target.py \
+            -q
+
   build:
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
     # macos-15 → default Xcode 16 → Swift 6.0, matching Package.swift's
     # swift-tools-version and the release workflow's runner. macos-latest still
     # resolves to macos-14 (Swift 5.x) on GitHub-hosted runners.
@@ -235,6 +274,8 @@ jobs:
   # session so an .app can actually open a window. Both are image properties,
   # not promises — which is what the preflight step below is for.
   gui-golden-flows:
+    needs: changes
+    if: needs.changes.outputs.full_gate == 'true'
     # macos-15 for the same reason as the build job: Package.swift is
     # swift-tools-version 6.0, and macos-14 still defaults to Swift 5.x.
     runs-on: macos-15
@@ -606,5 +647,49 @@ jobs:
         run: |
           if [[ "$XCUI_OUTCOME" != success ]]; then
             echo "::error::Native XCUITest failed ($XCUI_OUTCOME)"
+            exit 1
+          fi
+
+  desktop-tests:
+    # Stable required-check facade. It is present even on non-desktop PRs,
+    # unlike workflow-level path filters, and upgrades merge-queue candidates
+    # to the complete GUI golden-flow gate.
+    needs:
+      - changes
+      - accessibility-identifiers
+      - accessibility-identifier-tests
+      - gui-harness-contracts
+      - build
+      - gui-golden-flows
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check desktop results
+        env:
+          DESKTOP_EXPECTED: ${{ needs.changes.outputs.desktop }}
+          FULL_GATE: ${{ needs.changes.outputs.full_gate }}
+          IDENTIFIERS: ${{ needs.accessibility-identifiers.result }}
+          IDENTIFIER_TESTS: ${{ needs.accessibility-identifier-tests.result }}
+          HARNESS_CONTRACTS: ${{ needs.gui-harness-contracts.result }}
+          BUILD: ${{ needs.build.result }}
+          GOLDEN_FLOWS: ${{ needs.gui-golden-flows.result }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = pull_request ] && [ "$FULL_GATE" != true ]; then
+            echo "PR gate passed; apply the full-ci label when this PR is ready to merge"
+            exit 1
+          fi
+          if [ "$DESKTOP_EXPECTED" != true ]; then
+            echo "Desktop lane not required for this PR"
+            exit 0
+          fi
+          for result in "$IDENTIFIERS" "$IDENTIFIER_TESTS" "$HARNESS_CONTRACTS" "$BUILD"; do
+            if [ "$result" != success ]; then
+              echo "A desktop PR gate failed: $result"
+              exit 1
+            fi
+          done
+          if [ "$FULL_GATE" = true ] && [ "$GOLDEN_FLOWS" != success ]; then
+            echo "GUI golden-flow merge gate failed: $GOLDEN_FLOWS"
             exit 1
           fi

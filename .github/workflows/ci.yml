@@ -5,11 +5,74 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+  # Merge queue candidates are synthetic commits.  They need their own trigger
+  # or GitHub waits forever for the required `tests` check.
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      engine: ${{ steps.policy.outputs.engine }}
+      desktop: ${{ steps.policy.outputs.desktop }}
+      docs_only: ${{ steps.policy.outputs.docs_only }}
+      full_gate: ${{ steps.policy.outputs.full_gate }}
+      l1_matrix: ${{ steps.policy.outputs.l1_matrix }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify validation lanes
+        id: policy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if [ "$FULL_CI" = true ]; then
+              # Empty input deliberately fails closed to every product lane.
+              python scripts/classify_ci_changes.py --github-output "$GITHUB_OUTPUT"
+              full_gate=true
+            else
+              # Disable rename folding so both the removed source path and the
+              # new destination participate in classification.
+              git diff --no-renames --name-only "$PR_BASE_SHA" "$GITHUB_SHA" > /tmp/changed-paths
+              python scripts/classify_ci_changes.py \
+                --paths-file /tmp/changed-paths \
+                --github-output "$GITHUB_OUTPUT"
+              full_gate=false
+            fi
+            echo "full_gate=$full_gate" >> "$GITHUB_OUTPUT"
+            if [ "$full_gate" = true ]; then
+              echo 'l1_matrix={"include":[{"model":"qwen3.5-4b-4bit","contract_only":"0"},{"model":"llama3-3b-4bit","contract_only":"0"},{"model":"gemma3-4b-qat-4bit","contract_only":"1"},{"model":"qwen3-4b-instruct-2507-4bit","contract_only":"1"},{"model":"qwen3-4b-thinking-2507-4bit","contract_only":"1"}]}' >> "$GITHUB_OUTPUT"
+            else
+              echo 'l1_matrix={"include":[{"model":"qwen3.5-4b-4bit","contract_only":"0"}]}' >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # A merge-group commit may contain several independently classified
+            # PRs.  Validate the combined candidate in full. Push-to-main keeps
+            # the same coverage as before this policy was introduced.
+            {
+              echo 'engine=true'
+              echo 'desktop=true'
+              echo 'docs_only=false'
+              echo 'full_gate=true'
+              echo 'l1_matrix={"include":[{"model":"qwen3.5-4b-4bit","contract_only":"0"},{"model":"llama3-3b-4bit","contract_only":"0"},{"model":"gemma3-4b-qat-4bit","contract_only":"1"},{"model":"qwen3-4b-instruct-2507-4bit","contract_only":"1"},{"model":"qwen3-4b-thinking-2507-4bit","contract_only":"1"}]}'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -163,6 +226,8 @@ jobs:
         continue-on-error: true
 
   test-matrix:
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -209,6 +274,7 @@ jobs:
             tests/test_release_baselines.py \
             tests/test_validate_release_subject.py \
             tests/test_check_gha_pinning.py \
+            tests/test_classify_ci_changes.py \
             tests/test_check_mlx_upstream_calls.py \
             tests/test_no_out_of_band_routing.py \
             tests/test_microbench_parsers.py \
@@ -234,6 +300,8 @@ jobs:
           fail_ci_if_error: false
 
   test-apple-silicon:
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -307,24 +375,15 @@ jobs:
     #
     # The aggregate ``tests`` job requires this matrix, so a contract failure is
     # release-blocking rather than an informational red check.
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
     runs-on: macos-14
     timeout-minutes: 20
     strategy:
       # Don't cancel the other legs when one family fails — we want to see
       # which families regressed, not just the first failure.
       fail-fast: false
-      matrix:
-        include:
-          - model: qwen3.5-4b-4bit  # hermes parser + GOLDEN coherence
-            contract_only: "0"
-          - model: llama3-3b-4bit  # llama parser + GOLDEN coherence
-            contract_only: "0"
-          - model: gemma3-4b-qat-4bit  # #1677 excluded G12 4B tier
-            contract_only: "1"
-          - model: qwen3-4b-instruct-2507-4bit
-            contract_only: "1"
-          - model: qwen3-4b-thinking-2507-4bit
-            contract_only: "1"
+      matrix: ${{ fromJSON(needs.changes.outputs.l1_matrix) }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
@@ -364,12 +423,42 @@ jobs:
         run: bash scripts/l1_smoke.sh "${{ matrix.model }}"
 
   tests:
-    needs: [test-matrix, test-apple-silicon, l1-smoke]
+    needs:
+      - changes
+      - lint
+      - mlx-bound-guard
+      - type-check
+      - test-matrix
+      - test-apple-silicon
+      - l1-smoke
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Check test results
         run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] \
+            && [ "${{ needs.changes.outputs.full_gate }}" != "true" ]; then
+            echo "PR gate passed; apply the full-ci label when this PR is ready to merge"
+            exit 1
+          fi
+          if [ "${{ needs.lint.result }}" != success ]; then
+            echo "Lint and static repository contracts failed"
+            exit 1
+          fi
+          if [ "${{ needs.type-check.result }}" != success ]; then
+            echo "Type-check job failed"
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = pull_request ] \
+            && [ "${{ needs.mlx-bound-guard.result }}" != success ]; then
+            echo "MLX dependency-bound guard failed"
+            exit 1
+          fi
+          expected="${{ needs.changes.outputs.engine }}"
+          if [ "$expected" != "true" ]; then
+            echo "Engine lanes not required for this change"
+            exit 0
+          fi
           if [ "${{ needs.test-matrix.result }}" != "success" ]; then
             echo "Unit tests failed"
             exit 1
