@@ -72,6 +72,21 @@ rather than repeatedly validating each PR against an obsolete base.
 
 Pushes to `main` retain the full engine coverage as a post-merge signal.
 
+### Desktop GUI artifact provenance
+
+The full Desktop gate builds one release-configured app with
+`SKIP_SIDECAR=1`, packages it, and uploads it under an artifact name containing
+the exact candidate SHA. GUI jobs do not rebuild the app. Before extraction,
+they verify a versioned manifest that binds the SHA, build mode, sidecar mode,
+archive filename, and SHA-256 digest; after extraction they verify the macOS
+code-signing seal. Missing, stale, malformed, or modified artifacts fail
+closed.
+
+This artifact is test-only and retained for one day. It is not signed for
+distribution, notarized, published, or eligible for release promotion. Release
+workflows continue to build their own Developer-ID-signed artifact with the
+bundled sidecar and release credentials.
+
 ## Repository configuration
 
 GitHub currently offers merge queues only to public repositories owned by an
@@ -100,3 +115,6 @@ lanes for every PR; this restores the previous validation coverage without
 renaming required checks. For GUI routing specifically, removing the
 `GUI_FLOWS` job environment or making `scripts/select_gui_flows.py` return the
 full manifest roster restores the previous all-journey behavior.
+If GUI artifact reuse is suspect, restore the build step inside
+`gui-golden-flows` and remove `gui-app-build` from its dependencies. This costs
+additional macOS build time but preserves the same release-shaped UI coverage.

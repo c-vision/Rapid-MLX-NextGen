@@ -275,10 +275,13 @@ def test_all_named_flows_run_before_one_blocking_verdict():
 
 def test_golden_job_builds_the_release_ui_surface():
     """Release baselines cannot be compared against Debug-only controls."""
+    workflow = yaml.safe_load(WORKFLOW.read_text())
     build_steps = [
         step
-        for step in workflow_steps()
-        if step.get("name") == "Build Rapid-MLX Desktop.app"
+        for step in workflow["jobs"]["gui-app-build"]["steps"]
+        if step.get("name") == "Build release-shaped GUI app"
     ]
     assert len(build_steps) == 1
     assert build_steps[0].get("env", {}).get("RAPID_BUILD_CONFIG") == "release"
+    assert build_steps[0].get("env", {}).get("SKIP_SIDECAR") == "1"
+    assert "gui-app-build" in workflow["jobs"]["gui-golden-flows"]["needs"]

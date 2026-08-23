@@ -197,6 +197,7 @@ jobs:
       - name: GUI golden-flow coverage contract
         run: |
           pytest \
+            tests/test_gui_app_artifact.py \
             tests/test_gui_golden_ci_coverage.py \
             tests/test_gui_flow_routing.py \
             -q
@@ -269,6 +270,52 @@ jobs:
       - name: verify chat timeout contract
         run: swift scripts/verify-chat-timeout.swift
 
+  # Build the release-shaped, sidecar-free app exactly once for every full
+  # Desktop gate. GUI consumers must use this commit-bound artifact instead of
+  # compiling their own copy. Keeping this as a dedicated producer makes the
+  # next step (parallel journey shards) cheap without trusting a cache as test
+  # evidence: the archive and its manifest are immutable outputs of this run.
+  gui-app-build:
+    needs: changes
+    if: >-
+      needs.changes.outputs.desktop == 'true' &&
+      needs.changes.outputs.full_gate == 'true'
+    runs-on: macos-15
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: apps/rapid-mac
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Build release-shaped GUI app
+        env:
+          SKIP_SIDECAR: "1"
+          RAPID_BUILD_CONFIG: release
+        run: ./scripts/build.sh
+
+      - name: Verify and package GUI app
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/gui-app-artifact
+        run: |
+          set -euo pipefail
+          app="build/Rapid-MLX Desktop.app"
+          codesign --verify --deep --strict "$app"
+          mkdir -p "$ARTIFACT_DIR"
+          ditto -c -k --keepParent "$app" "$ARTIFACT_DIR/Rapid-MLX-Desktop.zip"
+          python ../../scripts/gui_app_artifact.py create \
+            --archive "$ARTIFACT_DIR/Rapid-MLX-Desktop.zip" \
+            --source-sha "$GITHUB_SHA" \
+            --output "$ARTIFACT_DIR/manifest.json"
+
+      - name: Upload commit-bound GUI app
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: rapid-gui-app-${{ github.sha }}
+          path: ${{ runner.temp }}/gui-app-artifact
+          if-no-files-found: error
+          retention-days: 1
+
   # Drives the REAL .app through real user journeys and diffs the resulting
   # accessibility tree against committed structural baselines.
   #
@@ -288,7 +335,9 @@ jobs:
   # session so an .app can actually open a window. Both are image properties,
   # not promises — which is what the preflight step below is for.
   gui-golden-flows:
-    needs: changes
+    needs:
+      - changes
+      - gui-app-build
     if: >-
       needs.changes.outputs.desktop == 'true' &&
       needs.changes.outputs.full_gate == 'true'
@@ -331,21 +380,29 @@ jobs:
           echo "Dock pid: $dock_pid"
           "$RUNNER_TEMP/rapid-ax" trust "$dock_pid"
 
-      # SKIP_SIDECAR=1 drops the 5-10 min pip install of the bundled Python
-      # engine. The golden flows never touch it: every flow points RAPID_BIN
-      # at scripts/fake-rapid-mlx.sh, so there is no model download, no GPU
-      # work and no network in the run at all.
-      #
-      # Exercise the same compile-time surface users receive. Debug builds add
-      # Settings → Developer, so comparing a Debug app against release golden
-      # baselines makes every Settings journey fail even when the product is
-      # unchanged. Optimisation does not matter here; matching the shipped UI
-      # contract does.
-      - name: Build Rapid-MLX Desktop.app
+      - name: Download commit-bound GUI app
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5
+        with:
+          name: rapid-gui-app-${{ github.sha }}
+          path: ${{ runner.temp }}/gui-app-artifact
+
+      # Do not merely trust the artifact name. Verify both its declared source
+      # commit and its bytes before extraction, then verify the app's code seal.
+      # Missing, stale, corrupt, or substituted artifacts therefore fail the
+      # merge gate before any journey launches.
+      - name: Verify and extract GUI app
         env:
-          SKIP_SIDECAR: "1"
-          RAPID_BUILD_CONFIG: release
-        run: ./scripts/build.sh
+          ARTIFACT_DIR: ${{ runner.temp }}/gui-app-artifact
+        run: |
+          set -euo pipefail
+          python ../../scripts/gui_app_artifact.py verify \
+            --archive "$ARTIFACT_DIR/Rapid-MLX-Desktop.zip" \
+            --manifest "$ARTIFACT_DIR/manifest.json" \
+            --expected-source-sha "$GITHUB_SHA"
+          rm -rf "build/Rapid-MLX Desktop.app"
+          mkdir -p build
+          ditto -x -k "$ARTIFACT_DIR/Rapid-MLX-Desktop.zip" build
+          codesign --verify --deep --strict "build/Rapid-MLX Desktop.app"
 
       # #1719 — the first native XCUITest journey complements (and does not
       # replace) the AX flows below. XCTest can capture an individual element,
@@ -687,6 +744,7 @@ jobs:
       - accessibility-identifier-tests
       - gui-harness-contracts
       - build
+      - gui-app-build
       - gui-golden-flows
     if: always()
     runs-on: ubuntu-latest
@@ -699,6 +757,7 @@ jobs:
           IDENTIFIER_TESTS: ${{ needs.accessibility-identifier-tests.result }}
           HARNESS_CONTRACTS: ${{ needs.gui-harness-contracts.result }}
           BUILD: ${{ needs.build.result }}
+          GUI_APP_BUILD: ${{ needs.gui-app-build.result }}
           GOLDEN_FLOWS: ${{ needs.gui-golden-flows.result }}
         run: |
           set -euo pipefail
@@ -720,7 +779,13 @@ jobs:
               exit 1
             fi
           done
-          if [ "$FULL_GATE" = true ] && [ "$GOLDEN_FLOWS" != success ]; then
-            echo "GUI golden-flow merge gate failed: $GOLDEN_FLOWS"
-            exit 1
+          if [ "$FULL_GATE" = true ]; then
+            if [ "$GUI_APP_BUILD" != success ]; then
+              echo "GUI app artifact build failed: $GUI_APP_BUILD"
+              exit 1
+            fi
+            if [ "$GOLDEN_FLOWS" != success ]; then
+              echo "GUI golden-flow merge gate failed: $GOLDEN_FLOWS"
+              exit 1
+            fi
           fi
