@@ -93,19 +93,6 @@ jobs:
       - name: Run ruff format check
         run: ruff format --check .
 
-      # Structural check — catches "silent flag drop" bugs where a CLI
-      # arg is defined but never plumbed to its target config (#400).
-      # Pure stdlib + AST — no mlx import required, runs on Linux.
-      - name: CLI ↔ Config fidelity audit
-        run: python scripts/audit_cli_config_fidelity.py
-
-      # The engine and the desktop app ship ONE version number. Two
-      # hand-maintained sources (pyproject.toml and the app's Info.plist)
-      # had nothing between them and drifted to 0.12.5 vs 0.12.6, both
-      # called "the latest release". Stdlib only — no mlx, no macOS.
-      - name: Engine ↔ desktop app version sync
-        run: python scripts/check_version_sync.py
-
       # PF-3 — all GitHub Actions are immutable 40-char commit SHA pins.
       # Dependabot or a reviewed PR is required to advance an action.
       - name: GitHub Actions SHA pinning
@@ -124,6 +111,29 @@ jobs:
       # regenerating the GitHub-facing Mermaid/SVG views.
       - name: Model-management architecture SSOT
         run: python scripts/render_model_management_architecture.py --check
+
+      # The engine and the desktop app ship ONE version number. Keep this
+      # universal because either side of that cross-product contract can change.
+      - name: Engine ↔ desktop app version sync
+        run: python scripts/check_version_sync.py
+
+  engine-contracts:
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.13"
+
+      # Structural check — catches "silent flag drop" bugs where a CLI
+      # arg is defined but never plumbed to its target config (#400).
+      # Pure stdlib + AST — no mlx import required, runs on Linux.
+      - name: CLI ↔ Config fidelity audit
+        run: python scripts/audit_cli_config_fidelity.py
 
       # The release scripts cannot be exercised without cutting a release, so
       # their tag-claim, recovery and refuse-to-move paths are covered offline
@@ -174,7 +184,10 @@ jobs:
     # unless a guarded specifier actually changes. PR-only: it diffs the head
     # against the PR base, which a push-to-main event has no meaningful analogue
     # for (origin/main == the pushed commit).
-    if: github.event_name == 'pull_request'
+    needs: changes
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.changes.outputs.engine == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -204,6 +217,8 @@ jobs:
         run: python scripts/check_mlx_bound_move.py
 
   type-check:
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -424,6 +439,7 @@ jobs:
     needs:
       - changes
       - lint
+      - engine-contracts
       - mlx-bound-guard
       - type-check
       - test-matrix
@@ -434,8 +450,21 @@ jobs:
     steps:
       - name: Check test results
         run: |
+          if [ "${{ needs.changes.result }}" != success ]; then
+            echo "CI change classifier failed"
+            exit 1
+          fi
           if [ "${{ needs.lint.result }}" != success ]; then
-            echo "Lint and static repository contracts failed"
+            echo "Universal repository guards failed"
+            exit 1
+          fi
+          expected="${{ needs.changes.outputs.engine }}"
+          if [ "$expected" != "true" ]; then
+            echo "Engine lanes not required for this change"
+            exit 0
+          fi
+          if [ "${{ needs.engine-contracts.result }}" != success ]; then
+            echo "Engine lint and static contracts failed"
             exit 1
           fi
           if [ "${{ needs.type-check.result }}" != success ]; then
@@ -446,11 +475,6 @@ jobs:
             && [ "${{ needs.mlx-bound-guard.result }}" != success ]; then
             echo "MLX dependency-bound guard failed"
             exit 1
-          fi
-          expected="${{ needs.changes.outputs.engine }}"
-          if [ "$expected" != "true" ]; then
-            echo "Engine lanes not required for this change"
-            exit 0
           fi
           if [ "${{ github.event_name }}" = "pull_request" ] \
             && [ "${{ needs.changes.outputs.full_gate }}" != "true" ]; then

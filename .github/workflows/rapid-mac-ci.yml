@@ -681,6 +681,10 @@ jobs:
           GOLDEN_FLOWS: ${{ needs.gui-golden-flows.result }}
         run: |
           set -euo pipefail
+          if [ "${{ needs.changes.result }}" != success ]; then
+            echo "Desktop change classifier failed"
+            exit 1
+          fi
           if [ "$DESKTOP_EXPECTED" != true ]; then
             echo "Desktop lane not required for this PR"
             exit 0

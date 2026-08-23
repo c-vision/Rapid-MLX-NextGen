@@ -13,8 +13,18 @@ product area selects all applicable lanes.
   one representative L1 model (`qwen3.5-4b-4bit`).
 - Desktop changes run the Swift build/test and the inexpensive GUI harness
   contracts. They do not run engine model smokes.
-- Documentation-only changes run the common lightweight checks and stable
-  aggregate jobs, without allocating a macOS runner.
+- Documentation-only changes run universal repository guards and stable
+  aggregate jobs, without allocating an engine, type-check, MLX-bound, model,
+  or macOS runner. Universal guards retain workflow-expression, immutable
+  Action-pin, and architecture-SSOT checks.
+
+Engine-only contracts are admitted by the same fail-closed classifier as the
+engine test lanes. They include CLI/config fidelity, release and installer
+offline tests, and the parser microbenchmark. Desktop-only and
+documentation-only changes do not pay for those engine-specific dependencies
+and commands. Whole-repository Ruff and engine/Desktop version synchronization
+remain universal because Desktop support code includes Python and either side
+of the shared version contract may change.
 
 The required checks are the stable aggregate jobs `tests` and `desktop-tests`.
 They must not be renamed or hidden behind workflow-level path filters without a

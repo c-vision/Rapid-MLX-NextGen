@@ -41,20 +41,65 @@ def test_desktop_full_ci_still_classifies_the_pr_diff():
 
 def test_non_engine_change_exits_before_full_ci_requirement():
     run = _step_run(ENGINE_WORKFLOW, "tests", "Check test results")
+    classifier_gate = run.index("needs.changes.result")
     common_gate = run.index("needs.lint.result")
     no_lane = run.index('if [ "$expected" != "true" ]')
+    engine_gate = run.index("needs.engine-contracts.result")
     promotion = run.index("needs.changes.outputs.full_gate")
-    assert common_gate < no_lane < promotion
+    assert classifier_gate < common_gate < no_lane < engine_gate < promotion
 
 
 def test_non_desktop_change_exits_before_full_ci_requirement():
     run = _step_run(DESKTOP_WORKFLOW, "desktop-tests", "Check desktop results")
+    classifier_gate = run.index("needs.changes.result")
     no_lane = run.index('if [ "$DESKTOP_EXPECTED" != true ]')
     promotion = run.index('if [ "${{ github.event_name }}" = pull_request ]')
-    assert no_lane < promotion
+    assert classifier_gate < no_lane < promotion
 
 
 def test_gui_golden_job_requires_both_desktop_lane_and_full_promotion():
     condition = str(_job(DESKTOP_WORKFLOW, "gui-golden-flows")["if"])
     assert "needs.changes.outputs.desktop == 'true'" in condition
     assert "needs.changes.outputs.full_gate == 'true'" in condition
+
+
+def test_engine_only_contracts_are_not_universal_pr_guards():
+    universal_steps = {
+        step.get("name") for step in _job(ENGINE_WORKFLOW, "lint")["steps"]
+    }
+    engine_steps = {
+        step.get("name") for step in _job(ENGINE_WORKFLOW, "engine-contracts")["steps"]
+    }
+    assert {
+        "GitHub Actions SHA pinning",
+        "Workflow expression sanity",
+        "Model-management architecture SSOT",
+        "Run ruff lint",
+        "Run ruff format check",
+        "Engine ↔ desktop app version sync",
+    } <= universal_steps
+    assert {
+        "CLI ↔ Config fidelity audit",
+        "Release-script offline tests",
+        "Installer offline tests",
+        "Parser microbench",
+    } <= engine_steps
+    assert not universal_steps & {
+        "CLI ↔ Config fidelity audit",
+        "Release-script offline tests",
+        "Installer offline tests",
+        "Parser microbench",
+    }
+
+
+def test_engine_jobs_follow_fail_closed_engine_classification():
+    for job_name in ("engine-contracts", "type-check"):
+        job = _job(ENGINE_WORKFLOW, job_name)
+        assert job["needs"] == "changes"
+        assert str(job["if"]) == "needs.changes.outputs.engine == 'true'"
+
+    bound_guard = _job(ENGINE_WORKFLOW, "mlx-bound-guard")
+    assert bound_guard["needs"] == "changes"
+    condition = str(bound_guard["if"])
+    assert "github.event_name == 'pull_request'" in condition
+    assert "needs.changes.outputs.engine == 'true'" in condition
