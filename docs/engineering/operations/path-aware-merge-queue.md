@@ -76,11 +76,20 @@ Pushes to `main` retain the full engine coverage as a post-merge signal.
 
 The full Desktop gate builds one release-configured app with
 `SKIP_SIDECAR=1`, packages it, and uploads it under an artifact name containing
-the exact candidate SHA. GUI jobs do not rebuild the app. Before extraction,
-they verify a versioned manifest that binds the SHA, build mode, sidecar mode,
-archive filename, and SHA-256 digest; after extraction they verify the macOS
-code-signing seal. Missing, stale, malformed, or modified artifacts fail
-closed.
+the exact candidate SHA. Selected manifest journey groups run as independent
+matrix shards and reuse that artifact; GUI jobs do not rebuild the app. Before
+extraction, they verify a versioned manifest that binds the SHA, build mode,
+sidecar mode, archive filename, and SHA-256 digest; after extraction they
+verify the macOS code-signing seal. Missing, stale, malformed, or modified
+artifacts fail closed.
+
+The classifier emits the matrix from the same journey SSOT used for routing.
+Each selected flow appears in exactly one group shard. Matrix fail-fast is
+disabled so one failure cannot cancel evidence from sibling groups, while the
+stable `desktop-tests` facade remains red unless every selected shard passes.
+Hosted-runner isolation gives every shard a separate HOME, defaults database,
+ports, app processes, and result directory. Failure artifact names include the
+group so concurrent uploads cannot overwrite one another.
 
 This artifact is test-only and retained for one day. It is not signed for
 distribution, notarized, published, or eligible for release promotion. Release
@@ -115,6 +124,10 @@ lanes for every PR; this restores the previous validation coverage without
 renaming required checks. For GUI routing specifically, removing the
 `GUI_FLOWS` job environment or making `scripts/select_gui_flows.py` return the
 full manifest roster restores the previous all-journey behavior.
+If GUI matrix execution is suspect, remove the matrix strategy, restore
+`GUI_FLOWS` and `EXPECTED_FLOW_COUNT` to the classifier's whole-selection
+outputs, and remove group suffixes from evidence artifact names. This restores
+one serial consumer without changing which journeys are selected.
 If GUI artifact reuse is suspect, restore the build step inside
 `gui-golden-flows` and remove `gui-app-build` from its dependencies. This costs
 additional macOS build time but preserves the same release-shaped UI coverage.

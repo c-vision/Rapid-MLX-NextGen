@@ -85,6 +85,33 @@ def all_flows() -> list[str]:
     return [str(journey["name"]) for journey in _pr_journeys()]
 
 
+def shard_matrix(flows: Iterable[str]) -> dict[str, list[dict[str, object]]]:
+    """Partition selected flows by their manifest group for a CI matrix."""
+
+    selected = set(flows)
+    journeys = _pr_journeys()
+    known = {str(journey["name"]) for journey in journeys}
+    if not selected or not selected <= known:
+        raise ValueError("GUI shard input must contain known PR journeys")
+
+    groups: dict[str, list[str]] = {}
+    for journey in journeys:
+        name = str(journey["name"])
+        if name in selected:
+            groups.setdefault(str(journey["group"]), []).append(name)
+
+    return {
+        "include": [
+            {
+                "group": group,
+                "gui_flows": json.dumps(group_flows, separators=(",", ":")),
+                "flow_count": len(group_flows),
+            }
+            for group, group_flows in sorted(groups.items())
+        ]
+    }
+
+
 def _matches(path: str, declared: str) -> bool:
     # UI is a mixed-responsibility directory. A new file under it cannot
     # inherit ownership from the broad inventory prefix: only an explicit file
@@ -150,10 +177,12 @@ def main() -> int:
         paths.extend(args.paths_file.read().splitlines())
     flows = select(paths)
     payload = json.dumps(flows, separators=(",", ":"))
+    shards = json.dumps(shard_matrix(flows), separators=(",", ":"))
 
     if args.github_output:
         print(f"gui_flows={payload}", file=args.github_output)
         print(f"gui_flow_count={len(flows)}", file=args.github_output)
+        print(f"gui_shards={shards}", file=args.github_output)
     else:
         print(payload)
     return 0

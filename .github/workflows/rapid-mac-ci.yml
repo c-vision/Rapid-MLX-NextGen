@@ -47,6 +47,7 @@ jobs:
       full_gate: ${{ steps.policy.outputs.full_gate }}
       gui_flows: ${{ steps.policy.outputs.gui_flows }}
       gui_flow_count: ${{ steps.policy.outputs.gui_flow_count }}
+      gui_shards: ${{ steps.policy.outputs.gui_shards }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
@@ -344,17 +345,26 @@ jobs:
     # macos-15 for the same reason as the build job: Package.swift is
     # swift-tools-version 6.0, and macos-14 still defaults to Swift 5.x.
     runs-on: macos-15
-    # Build is ~the same cost as the build job; the flows are seconds each
-    # (6-11 s on an M3 Ultra). 30 leaves room for a cold package resolve
-    # without letting a wedged app sit on the 6-hour default.
+    strategy:
+      # A failure in one product journey must not cancel independent evidence
+      # from the other selected groups. The stable desktop-tests facade still
+      # blocks unless every matrix child succeeds.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.gui_shards) }}
+    # The shared app is already built. Individual flows are usually seconds
+    # each (6-11 s on an M3 Ultra), while hosted-runner launch variance can be
+    # much higher. 30 minutes catches a wedged shard far before the six-hour
+    # default without weakening the existing journey time budget.
     timeout-minutes: 30
     defaults:
       run:
         working-directory: apps/rapid-mac
     env:
-      # Compact JSON selected from the real PR diff. Every named step remains
-      # visible, but the harness exits before launch for unaffected journeys.
-      GUI_FLOWS: ${{ needs.changes.outputs.gui_flows }}
+      # Each matrix child receives only one manifest group. Every named step
+      # remains visible, but the harness exits before launch for journeys owned
+      # by another shard. Separate hosted VMs isolate HOME, defaults, ports,
+      # app processes, and result directories by construction.
+      GUI_FLOWS: ${{ matrix.gui_flows }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
@@ -410,7 +420,7 @@ jobs:
       # records actually draw different pixels rather than the same bitmap.
       - name: 'XCUITest: image-generation pixels'
         id: xcui
-        if: contains(fromJSON(needs.changes.outputs.gui_flows), 'image-generation')
+        if: contains(fromJSON(matrix.gui_flows), 'image-generation')
         continue-on-error: true
         env:
           RAPID_XCUI_RESULT_BUNDLE: ${{ runner.temp }}/RapidUITests.xcresult
@@ -420,7 +430,7 @@ jobs:
         if: steps.xcui.outcome == 'failure'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: rapid-xcui-evidence
+          name: rapid-xcui-evidence-${{ matrix.group }}
           path: ${{ runner.temp }}/RapidUITests.xcresult
           if-no-files-found: ignore
 
@@ -627,7 +637,7 @@ jobs:
         if: always()
         env:
           GOLDEN_ROOT: ${{ runner.temp }}/golden
-          EXPECTED_FLOW_COUNT: ${{ needs.changes.outputs.gui_flow_count }}
+          EXPECTED_FLOW_COUNT: ${{ matrix.flow_count }}
         run: |
           python3 - <<'PY'
           import json
@@ -707,7 +717,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: gui-golden-flow-evidence
+          name: gui-golden-flow-evidence-${{ matrix.group }}
           # Both halves: the failing flow's own dumps, and the full
           # runner-vs-committed regeneration from the diagnostic step above.
           path: |
@@ -723,7 +733,7 @@ jobs:
         if: always()
         env:
           XCUI_OUTCOME: ${{ steps.xcui.outcome }}
-          IMAGE_SELECTED: ${{ contains(fromJSON(needs.changes.outputs.gui_flows), 'image-generation') }}
+          IMAGE_SELECTED: ${{ contains(fromJSON(matrix.gui_flows), 'image-generation') }}
         run: |
           if [[ "$IMAGE_SELECTED" != true && "$XCUI_OUTCOME" == skipped ]]; then
             echo "Image-generation journey not selected; native XCUITest not required"

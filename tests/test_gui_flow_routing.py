@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from scripts.select_gui_flows import all_flows, select
+from scripts.select_gui_flows import all_flows, select, shard_matrix
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "apps/rapid-mac/Tests/GUIGoldenFlows/journeys.yaml"
@@ -120,6 +120,43 @@ def test_cli_emits_compact_json_and_github_outputs(tmp_path: Path):
     lines = output.read_text().splitlines()
     assert json.loads(lines[0].removeprefix("gui_flows=")) == ["image-generation"]
     assert lines[1] == "gui_flow_count=1"
+    assert json.loads(lines[2].removeprefix("gui_shards=")) == {
+        "include": [
+            {
+                "group": "images",
+                "gui_flows": '["image-generation"]',
+                "flow_count": 1,
+            }
+        ]
+    }
+
+
+def test_shards_partition_every_selected_flow_once_by_manifest_group():
+    selected = all_flows()
+    matrix = shard_matrix(selected)
+    shards = matrix["include"]
+    assert [shard["group"] for shard in shards] == sorted(_groups())
+
+    flattened = [
+        flow for shard in shards for flow in json.loads(str(shard["gui_flows"]))
+    ]
+    assert set(flattened) == set(selected)
+    assert len(flattened) == len(set(flattened))
+    assert all(
+        group_flows == sorted(group_flows, key=selected.index)
+        for group_flows in (json.loads(str(shard["gui_flows"])) for shard in shards)
+    )
+    assert all(
+        shard["flow_count"] == len(json.loads(str(shard["gui_flows"])))
+        for shard in shards
+    )
+
+
+def test_shard_matrix_rejects_empty_or_unknown_flow_sets():
+    with pytest.raises(ValueError, match="known PR journeys"):
+        shard_matrix([])
+    with pytest.raises(ValueError, match="known PR journeys"):
+        shard_matrix(["not-a-flow"])
 
 
 def test_unselected_harness_step_is_a_true_noop(tmp_path: Path):
@@ -145,4 +182,8 @@ def test_workflow_passes_real_diff_to_router_and_consumes_its_outputs():
     assert "python scripts/select_gui_flows.py" in workflow
     assert "--paths-file /tmp/changed-paths" in workflow
     assert "gui_flows: ${{ steps.policy.outputs.gui_flows }}" in workflow
-    assert "GUI_FLOWS: ${{ needs.changes.outputs.gui_flows }}" in workflow
+    assert "gui_shards: ${{ steps.policy.outputs.gui_shards }}" in workflow
+    assert "matrix: ${{ fromJSON(needs.changes.outputs.gui_shards) }}" in workflow
+    assert "GUI_FLOWS: ${{ matrix.gui_flows }}" in workflow
+    assert "EXPECTED_FLOW_COUNT: ${{ matrix.flow_count }}" in workflow
+    assert "fail-fast: false" in workflow
