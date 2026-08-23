@@ -19,6 +19,21 @@ FAKE_ALIAS="fake-alias"
 # baselines for the same reason as FAKE_ALIAS: renaming a fixture must not read
 # as a structural change to the UI.
 FAKE_IMAGE_ALIAS="fake-image-alias"
+# Phase B made the first-run wizard's "RECOMMENDED FOR YOUR N GB MAC" row
+# derive from the host's REAL physical RAM. A single committed golden
+# baseline therefore can't be host-independent: a 14 GB CI runner lands on
+# the 8 GB tier (lfm2.5-2.6B) while a 256 GB release Mac lands on 48+
+# (qwen3.8-27B + qwen3.6-35B). The golden gate runs in BOTH places (CI and
+# the operator's release Mac), so every persona that renders the chooser
+# pins the same tier to keep its AX baseline deterministic.
+# 8 = the 8 GB tier, which is exactly what the committed compact-chooser
+# baseline captures (smart lfm2.5-2.6B; its fast pick lfm2.5-1B equals the
+# starter, so the row renders just the one card). Pinning 8 also happens to
+# be the safe tier for cached-curated-tradeup: its assertion needs
+# qwen3.5-4b to stay a native curated trade-up, which 8 GB guarantees
+# (16/24/32 GB hosts fold qwen3.5-4b into the recommended row instead).
+GOLDEN_RAM_GB=8
+GOLDEN_BRAND="Apple M1"
 UPDATE_BASELINES=0
 FLOW="all"
 KEEP=0
@@ -1184,7 +1199,9 @@ flow_fresh_install() {
     # The real engine registry always contains the starter. Without this row,
     # the fake catalog makes the app correctly fall back to its only chat row
     # and the assertion below can never prove the production first-run rule.
-    start_persona fresh-install FAKE_INCLUDE_STARTER=1
+    start_persona fresh-install FAKE_INCLUDE_STARTER=1 \
+        RAPID_GUI_HARDWARE_FIXTURE=1 RAPID_HARDWARE_RAM_GB=$GOLDEN_RAM_GB \
+        RAPID_HARDWARE_BRAND="$GOLDEN_BRAND"
     see_main "$OUT/consent-visible.json"
     jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.DontShare")' "$OUT/consent-visible.json" >/dev/null \
         || die "fresh install did not show telemetry consent"
@@ -1335,7 +1352,9 @@ flow_cached_quickstart() {
     # never promote that notice into a selectable model named "No" (#1918).
     # A fresh persona keeps this onboarding assertion independent from the
     # launch-sweep assertion above.
-    start_persona cached-quickstart FAKE_EMPTY_CACHE_NOTICE=1
+    start_persona cached-quickstart FAKE_EMPTY_CACHE_NOTICE=1 \
+        RAPID_GUI_HARDWARE_FIXTURE=1 RAPID_HARDWARE_RAM_GB=$GOLDEN_RAM_GB \
+        RAPID_HARDWARE_BRAND="$GOLDEN_BRAND"
 
     see_main "$OUT/consent.json"
     if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.DontShare")' \
@@ -1411,7 +1430,9 @@ flow_cached_quickstart() {
 
 flow_cached_curated_tradeup() {
     log "cached curated trade-up keeps its on-disk state past the six-row cap"
-    start_persona cached-curated-tradeup FAKE_CACHED_CURATED_TRADEUP=1
+    start_persona cached-curated-tradeup FAKE_CACHED_CURATED_TRADEUP=1 \
+        RAPID_GUI_HARDWARE_FIXTURE=1 RAPID_HARDWARE_RAM_GB=$GOLDEN_RAM_GB \
+        RAPID_HARDWARE_BRAND="$GOLDEN_BRAND"
     see_main "$OUT/consent.json"
     if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.DontShare")' \
         "$OUT/consent.json" >/dev/null; then
@@ -1441,7 +1462,9 @@ flow_cached_curated_tradeup() {
 
 flow_cached_variant_collapse() {
     log "first-run chooser collapses cached quant siblings (#2033 finding 3)"
-    start_persona cached-variant-collapse FAKE_CACHED_VARIANTS=1
+    start_persona cached-variant-collapse FAKE_CACHED_VARIANTS=1 \
+        RAPID_GUI_HARDWARE_FIXTURE=1 RAPID_HARDWARE_RAM_GB=$GOLDEN_RAM_GB \
+        RAPID_HARDWARE_BRAND="$GOLDEN_BRAND"
     see_main "$OUT/consent.json"
     if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.DontShare")' \
         "$OUT/consent.json" >/dev/null; then
@@ -1466,7 +1489,9 @@ flow_cached_variant_collapse() {
 
 flow_download_progress() {
     log "download progress never shows observed bytes above its total (#1550)"
-    start_persona download-progress FAKE_DOWNLOAD_OVERRUN=1
+    start_persona download-progress FAKE_DOWNLOAD_OVERRUN=1 \
+        RAPID_GUI_HARDWARE_FIXTURE=1 RAPID_HARDWARE_RAM_GB=$GOLDEN_RAM_GB \
+        RAPID_HARDWARE_BRAND="$GOLDEN_BRAND"
 
     see_main "$OUT/consent.json"
     if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.DontShare")' \
@@ -1508,9 +1533,14 @@ flow_download_progress() {
         "$OUT/downloading.json" >/dev/null; then
         die "download progress still shows observed bytes above its displayed total"
     fi
-    jq -e -s 'any(.[]; .event == "command" and .subcommand == "pull")' \
-        "$OUT/fake-events.jsonl" >/dev/null \
-        || die "download-progress flow never exercised the pull subprocess"
+    # The progress pipe can become AX-visible a few milliseconds before the
+    # separately opened JSONL witness is observable after several personas
+    # have run back-to-back. Poll the independent witness like the image/audio
+    # flows do instead of treating that filesystem scheduling window as a
+    # product failure.
+    wait_fake_event \
+        '.event == "command" and .subcommand == "pull"' \
+        "download-progress flow never exercised the pull subprocess"
 
     # Onboarding covers the global DownloadStrip, so Step 3 must provide its
     # own reachable cancellation path. Exercise the live process rather than
@@ -2413,7 +2443,9 @@ flow_model_crash_recovery() {
 
 flow_low_memory_choice() {
     log "6/6 low-memory onboarding escape"
-    start_persona low-memory-choice
+    start_persona low-memory-choice \
+        RAPID_GUI_HARDWARE_FIXTURE=1 RAPID_HARDWARE_RAM_GB=$GOLDEN_RAM_GB \
+        RAPID_HARDWARE_BRAND="$GOLDEN_BRAND"
 
     local tree="$OUT/onboarding.json"
     see_main "$tree"
@@ -2921,7 +2953,9 @@ flow_browse_all_destination() {
     # supersedes it — the catalogue is now a micro-stage INSIDE Step 2. So the
     # assertions below are the same three questions, asked of the new
     # destination: did anything happen, did setup survive, did the pick.
-    start_persona browse-all-destination
+    start_persona browse-all-destination \
+        RAPID_GUI_HARDWARE_FIXTURE=1 RAPID_HARDWARE_RAM_GB=$GOLDEN_RAM_GB \
+        RAPID_HARDWARE_BRAND="$GOLDEN_BRAND"
 
     # Only the consent sheet — the wizard has to stay up, it is the subject.
     local tree="$OUT/ba-first-run.json"
