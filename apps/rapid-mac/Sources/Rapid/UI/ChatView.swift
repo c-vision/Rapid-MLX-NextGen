@@ -220,7 +220,7 @@ struct ChatView: View {
     @Environment(QuickstartCoordinator.self) private var quickstart
 
     @State private var draft: String = ""
-    @State private var attachmentDraft = ChatAttachmentDraft()
+    @State private var attachmentDrafts = ChatAttachmentDraftStore()
     @State private var isAttachmentDropTarget = false
     @State private var composeFocusToken: Int = 0
     /// Incremented every time the user tries to send while gated. Drives
@@ -248,6 +248,10 @@ struct ChatView: View {
     @State private var scrollToBottomRequest = 0
 
     private var messages: [ChatMessage] { viewModel.messages }
+    private var attachmentDraft: ChatAttachmentDraft {
+        get { attachmentDrafts[viewModel.activeConversationID] }
+        nonmutating set { attachmentDrafts[viewModel.activeConversationID] = newValue }
+    }
 
     var body: some View {
         // The reader exists for one value: the surface's own width, which
@@ -294,6 +298,8 @@ struct ChatView: View {
             guard request != 0 else { return }
             composeFocusToken &+= 1
         }
+        .onChange(of: viewModel.conversations.map(\.id)) { _, _ in pruneAttachmentDrafts() }
+        .onChange(of: viewModel.activeConversationID) { _, _ in pruneAttachmentDrafts() }
     }
 
     // MARK: - Transcript
@@ -858,14 +864,14 @@ struct ChatView: View {
         // tooltip carries.
         guard acknowledgeIfNotReady() else { return }
         draft = ""
-        let attachments = attachmentDraft.consume()
+        let submission = attachmentDraft.takeSubmission()
         composeFocusToken &+= 1
         viewModel.send(
             text,
             alias: alias,
             supportsImageInput: supportsImageInput,
-            imageAttachments: attachments.images,
-            fileAttachments: attachments.files
+            imageAttachments: submission.images,
+            fileAttachments: submission.files
         )
     }
 
@@ -1027,7 +1033,9 @@ struct ChatView: View {
             attachmentDraft.notice = "Attach up to \(ChatFileAttachment.maxAttachmentsPerMessage) PDF, CSV, or TXT files per message."
             return false
         }
-        attachmentDraft.isImportingFiles = true
+        guard let importRequest = attachmentDrafts.beginFileImport(
+            conversationID: viewModel.activeConversationID
+        ) else { return false }
         Task { @MainActor in
             let outcome = await Task.detached(priority: .userInitiated) {
                 Self.loadFileAttachments(selection.accepted)
@@ -1036,9 +1044,19 @@ struct ChatView: View {
             let notice = selection.rejectedCount > 0
                 ? "Attach up to \(ChatFileAttachment.maxAttachmentsPerMessage) PDF, CSV, or TXT files per message."
                 : outcome.1
-            attachmentDraft.finishFileImport(outcome.0, notice: notice)
+            attachmentDrafts.finishFileImport(
+                request: importRequest,
+                outcome.0,
+                notice: notice
+            )
         }
         return true
+    }
+
+    private func pruneAttachmentDrafts() {
+        attachmentDrafts.retainDrafts(
+            for: Set(viewModel.conversations.map(\.id)).union([viewModel.activeConversationID])
+        )
     }
 
     /// Parse candidates without losing which source produced each attachment.
