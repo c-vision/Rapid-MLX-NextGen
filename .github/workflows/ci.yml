@@ -41,19 +41,16 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            if [ "$FULL_CI" = true ]; then
-              # Empty input deliberately fails closed to every product lane.
-              python scripts/classify_ci_changes.py --github-output "$GITHUB_OUTPUT"
-              full_gate=true
-            else
-              # Disable rename folding so both the removed source path and the
-              # new destination participate in classification.
-              git diff --no-renames --name-only "$PR_BASE_SHA" "$GITHUB_SHA" > /tmp/changed-paths
-              python scripts/classify_ci_changes.py \
-                --paths-file /tmp/changed-paths \
-                --github-output "$GITHUB_OUTPUT"
-              full_gate=false
-            fi
+            # Classify the actual diff even during full-ci promotion. Promotion
+            # broadens coverage inside the affected lane; it must not turn an
+            # engine-only PR into a full Desktop run (or vice versa).
+            # Disable rename folding so both the removed source path and the
+            # new destination participate in classification.
+            git diff --no-renames --name-only "$PR_BASE_SHA" "$GITHUB_SHA" > /tmp/changed-paths
+            python scripts/classify_ci_changes.py \
+              --paths-file /tmp/changed-paths \
+              --github-output "$GITHUB_OUTPUT"
+            full_gate="$FULL_CI"
             echo "full_gate=$full_gate" >> "$GITHUB_OUTPUT"
             if [ "$full_gate" = true ]; then
               echo 'l1_matrix={"include":[{"model":"qwen3.5-4b-4bit","contract_only":"0"},{"model":"llama3-3b-4bit","contract_only":"0"},{"model":"gemma3-4b-qat-4bit","contract_only":"1"},{"model":"qwen3-4b-instruct-2507-4bit","contract_only":"1"},{"model":"qwen3-4b-thinking-2507-4bit","contract_only":"1"}]}' >> "$GITHUB_OUTPUT"
@@ -275,6 +272,7 @@ jobs:
             tests/test_validate_release_subject.py \
             tests/test_check_gha_pinning.py \
             tests/test_classify_ci_changes.py \
+            tests/test_ci_lane_promotion.py \
             tests/test_check_mlx_upstream_calls.py \
             tests/test_no_out_of_band_routing.py \
             tests/test_microbench_parsers.py \
@@ -436,11 +434,6 @@ jobs:
     steps:
       - name: Check test results
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ] \
-            && [ "${{ needs.changes.outputs.full_gate }}" != "true" ]; then
-            echo "PR gate passed; apply the full-ci label when this PR is ready to merge"
-            exit 1
-          fi
           if [ "${{ needs.lint.result }}" != success ]; then
             echo "Lint and static repository contracts failed"
             exit 1
@@ -458,6 +451,11 @@ jobs:
           if [ "$expected" != "true" ]; then
             echo "Engine lanes not required for this change"
             exit 0
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ] \
+            && [ "${{ needs.changes.outputs.full_gate }}" != "true" ]; then
+            echo "Engine PR gate passed; apply the full-ci label when this PR is ready to merge"
+            exit 1
           fi
           if [ "${{ needs.test-matrix.result }}" != "success" ]; then
             echo "Unit tests failed"

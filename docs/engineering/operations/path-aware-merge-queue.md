@@ -24,12 +24,21 @@ test lanes; `desktop-tests` includes every selected Desktop lane.
 
 ## Merge gate
 
-Adding the `full-ci` label upgrades a pull request to the full five-model L1
-matrix and complete GUI golden-flow job. Apply it only when the PR is ready to
-merge; removing it returns subsequent commits to the path-aware PR gate.
-The stable aggregate checks intentionally remain non-successful until this
-label is present, so branch protection cannot accidentally bypass the merge
-gate.
+Adding the `full-ci` label upgrades the lanes selected by the pull request's
+actual diff. Apply it only when the PR is ready to merge; removing it returns
+subsequent commits to the path-aware PR gate.
+
+- Engine changes expand to the full five-model L1 matrix.
+- Desktop changes expand to the complete GUI golden-flow job.
+- Cross-cutting or unknown changes expand both lanes.
+- Documentation-only changes require neither product lane and do not need the
+  label.
+
+The label never changes lane classification. This prevents an engine-only PR
+from allocating the full Desktop gate, or a Desktop-only PR from allocating
+the full model gate. The selected product aggregate intentionally remains
+non-successful until the label is present, so branch protection cannot bypass
+its merge gate.
 
 The workflows also subscribe to GitHub's `merge_group` event. After the
 repository becomes eligible for GitHub merge queues, every queue candidate will
