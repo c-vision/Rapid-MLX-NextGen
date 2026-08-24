@@ -136,4 +136,63 @@ struct MemoryLoadConfirmationQueueTests {
         queue.completeConfirmedLaunch(warningID: warning.id)
         #expect(queue.currentWarning == nil)
     }
+
+    @Test("live memory refresh updates facts without replacing the parked decision")
+    func liveRefreshPreservesDecisionIdentity() throws {
+        let gib = UInt64(1 << 30)
+        var queue = MemoryLoadConfirmationQueue()
+        let request = UUID()
+        let original = ModelSizing.MemoryWarning(
+            alias: "qwen3.5-9b-4bit",
+            hfPath: nil,
+            isAutoRespawn: false,
+            severity: .unsafe,
+            footprintGB: ModelSizing.estimate(alias: "qwen3.5-9b-4bit").totalGB,
+            freeGB: 2,
+            totalGB: 32
+        )
+        queue.enqueue(warning: original, requestID: request)
+
+        let refreshed = queue.refreshCurrentWarning(
+            snapshot: .init(totalBytes: 32 * gib, usedBytes: 2 * gib)
+        )
+        let transition = try #require(refreshed)
+        #expect(transition.old.severity == .unsafe)
+        #expect(transition.new.severity == .safe)
+        #expect(transition.new.id == original.id)
+        #expect(transition.new.freeGB == 30)
+        #expect(queue.currentWarning == transition.new)
+
+        let unsafeAgain = queue.refreshCurrentWarning(
+            snapshot: .init(totalBytes: 32 * gib, usedBytes: 30 * gib)
+        )
+        #expect(unsafeAgain?.old.severity == .safe)
+        #expect(unsafeAgain?.new.severity == .unsafe)
+        #expect(unsafeAgain?.new.id == original.id)
+
+        // Refreshing is not a decision: the original waiter remains parked
+        // until the user activates the newly-safe Load model action.
+        #expect(queue.takeDecision(for: request) == nil)
+        let current = try #require(unsafeAgain?.new)
+        let confirmed = queue.resolveCurrent(
+            warning: current,
+            decision: .confirmed(sequence: 12)
+        )
+        #expect(confirmed)
+        #expect(queue.takeDecision(for: request) == .confirmed(sequence: 12))
+    }
+
+    @Test("refresh is ignored after the visible decision starts launching")
+    func liveRefreshCannotRewriteLaunchingDecision() {
+        let gib = UInt64(1 << 30)
+        var queue = MemoryLoadConfirmationQueue()
+        let original = warning("qwen3.5-9b-4bit")
+        queue.enqueue(warning: original, requestID: nil)
+        let confirmed = queue.resolveCurrent(warning: original, decision: .confirmed(sequence: 2))
+        #expect(confirmed)
+        let refreshed = queue.refreshCurrentWarning(
+            snapshot: .init(totalBytes: 32 * gib, usedBytes: 2 * gib)
+        )
+        #expect(refreshed == nil)
+    }
 }

@@ -17,7 +17,7 @@ struct MemoryLoadConfirmationQueue {
             case launching
         }
 
-        let warning: ModelSizing.MemoryWarning
+        var warning: ModelSizing.MemoryWarning
         var requestID: UUID?
         var phase: Phase = .awaitingDecision
         var launchComplete = false
@@ -33,6 +33,32 @@ struct MemoryLoadConfirmationQueue {
 
     mutating func enqueue(warning: ModelSizing.MemoryWarning, requestID: UUID?) {
         pending.append(Pending(warning: warning, requestID: requestID))
+    }
+
+    /// Replace the measured facts for the visible decision without changing
+    /// its identity, waiter ownership, or queue position.
+    mutating func refreshCurrentWarning(
+        snapshot: MemoryProbe.Snapshot
+    ) -> (old: ModelSizing.MemoryWarning, new: ModelSizing.MemoryWarning)? {
+        guard pending.first?.phase == .awaitingDecision,
+              let old = pending.first?.warning else { return nil }
+        let footprint = ModelSizing.estimate(alias: old.alias)
+        let refreshed = ModelSizing.MemoryWarning(
+            id: old.id,
+            alias: old.alias,
+            hfPath: old.hfPath,
+            isAutoRespawn: old.isAutoRespawn,
+            severity: ModelSizing.memorySafety(
+                footprint: footprint,
+                usedBytes: snapshot.usedBytes,
+                totalBytes: snapshot.totalBytes
+            ),
+            footprintGB: old.footprintGB,
+            freeGB: Double(snapshot.freeBytes) / Double(1 << 30),
+            totalGB: Double(snapshot.totalBytes) / Double(1 << 30)
+        )
+        pending[0].warning = refreshed
+        return (old, refreshed)
     }
 
     func isPending(_ requestID: UUID) -> Bool {
@@ -162,8 +188,26 @@ final class ServerManager {
     /// launch auto-start semantics can be verified without depending on the
     /// runner's current pressure.
     @ObservationIgnored
-    internal var memorySnapshotProvider: () -> MemoryProbe.Snapshot? = {
+    internal var memorySnapshotProvider: @Sendable () -> MemoryProbe.Snapshot? = {
         MemoryProbe.snapshot()
+    }
+
+    /// Re-sample a parked memory decision while its owning UI is visible.
+    /// Returns a material safety-state transition for accessibility; metric
+    /// ticks within the same state deliberately return nil.
+    func refreshPendingMemoryWarning() async -> (
+        old: ModelSizing.MemorySafety,
+        new: ModelSizing.MemorySafety
+    )? {
+        guard pendingMemoryWarning != nil else { return nil }
+        let provider = memorySnapshotProvider
+        let snapshot = await Task.detached(priority: .utility) {
+            provider()
+        }.value
+        guard let snapshot,
+              let transition = memoryConfirmations.refreshCurrentWarning(snapshot: snapshot),
+              transition.old.severity != transition.new.severity else { return nil }
+        return (transition.old.severity, transition.new.severity)
     }
 
     /// Confirmed launches still running, by sequence number. Polled by
@@ -1384,6 +1428,11 @@ final class ServerManager {
     func confirmPendingMemoryLoad(_ warning: ModelSizing.MemoryWarning) {
         memoryConfirmSeq += 1
         let seq = memoryConfirmSeq
+        // A refreshed `.safe` action is an ordinary load, not a permanent
+        // waiver. Re-run the guard at activation so a sudden pressure spike
+        // between the last three-second sample and the click can present a
+        // fresh warning instead of silently loading under stale safe state.
+        let bypassMemoryGuard = warning.severity != .safe
         memoryConfirmRunning.insert(seq)
         guard memoryConfirmations.resolveCurrent(
             warning: warning,
@@ -1401,7 +1450,7 @@ final class ServerManager {
                 alias: warning.alias,
                 hfPath: warning.hfPath,
                 isAutoRespawn: warning.isAutoRespawn,
-                bypassMemoryGuard: true
+                bypassMemoryGuard: bypassMemoryGuard
             )
             self.memoryConfirmRunning.remove(seq)
             self.memoryConfirmations.completeConfirmedLaunch(warningID: warning.id)
