@@ -1,6 +1,17 @@
+from pathlib import Path
+
 import pytest
 
+import scripts.classify_ci_changes as ci_changes
 from scripts.classify_ci_changes import Lanes, classify
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_known_engine_roots_exist_in_the_repository():
+    assert {
+        root for root in ci_changes._ENGINE_ROOTS if not (ROOT / root).is_dir()
+    } == set()
 
 
 def test_docs_only_selects_no_product_lane():
@@ -19,6 +30,48 @@ def test_engine_only_does_not_select_desktop():
     assert classify(["vllm_mlx/server.py"]) == Lanes(
         engine=True, desktop=False, docs_only=False
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "bench/bench_spec_decode_mtp.py",
+        "community-benchmarks/schema.json",
+        "config/mypy-error-baseline.txt",
+        "config/mypy-requirements.txt",
+        "evals/coherence_gate.py",
+        "examples/tool_calling.py",
+        "harness/perf_floors.json",
+        "Makefile",
+        "reports/benchmarks/model.json",
+        "scripts/l1_smoke.sh",
+        "tests/test_coherence.py",
+        "videox_fun_mlx/pipeline/scheduler.py",
+        "vllm_mlx/server.py",
+    ],
+)
+def test_known_engine_area_does_not_select_desktop(path):
+    assert classify([path]) == Lanes(engine=True, desktop=False, docs_only=False)
+
+
+def test_evaluation_report_change_does_not_select_desktop():
+    assert classify(
+        [
+            "docs/engineering/performance/starter-model-bakeoff.md",
+            "evals/starter_experience.py",
+        ]
+    ) == Lanes(engine=True, desktop=False, docs_only=False)
+
+
+def test_engine_benchmark_evidence_change_does_not_select_desktop():
+    assert classify(
+        [
+            "bench/bench_spec_decode_mtp.py",
+            "reports/benchmarks/mtp/result.json",
+            "tests/test_mtp_spec_decode.py",
+            "vllm_mlx/spec_decode/mtp/generator.py",
+        ]
+    ) == Lanes(engine=True, desktop=False, docs_only=False)
 
 
 @pytest.mark.parametrize(

@@ -18,6 +18,11 @@ product area selects all applicable lanes.
   or macOS runner. Universal guards retain workflow-expression, immutable
   Action-pin, and architecture-SSOT checks.
 
+Engine classification includes the serving packages and their tests, scripts,
+examples, evaluations, benchmark inputs/results, regression harness, and
+engine-only type-check configuration. These paths must not allocate Desktop or
+GUI runners merely because they live outside the primary Python package.
+
 Engine-only contracts are admitted by the same fail-closed classifier as the
 engine test lanes. They include CLI/config fidelity, release and installer
 offline tests, and the parser microbenchmark. Desktop-only and

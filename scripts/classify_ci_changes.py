@@ -31,12 +31,20 @@ class Lanes:
 
 _ENGINE_ROOTS = {
     "vllm_mlx",
+    "videox_fun_mlx",
     "tests",
     "scripts",
-    "benchmarks",
+    "bench",
+    "community-benchmarks",
+    "evals",
     "examples",
+    "harness",
+    "reports",
 }
 _ENGINE_FILES = {
+    "Makefile",
+    "config/mypy-error-baseline.txt",
+    "config/mypy-requirements.txt",
     "pyproject.toml",
     "uv.lock",
     "pytest.ini",
