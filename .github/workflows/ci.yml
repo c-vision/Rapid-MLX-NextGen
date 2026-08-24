@@ -270,6 +270,16 @@ jobs:
             tests/test_mcp_security.py \
             tests/test_structured_output.py \
             tests/test_reasoning_parser.py \
+            tests/test_cohere_command_reasoning_parser.py \
+            tests/test_responses_route.py::TestResponsesNonStream::test_structured_output_keeps_bare_json_out_of_reasoning \
+            tests/test_responses_route.py::TestResponsesStream::test_structured_output_streams_bare_json_as_output_text \
+            tests/test_responses_route.py::TestResponsesStream::test_reasoning_cap_uses_command_protocol_boundary \
+            tests/test_responses_route.py::TestResponsesStream::test_reasoning_cap_injects_boundary_on_following_chunk \
+            tests/test_responses_route.py::TestResponsesStream::test_reasoning_cap_exact_terminal_boundary_finishes_cleanly \
+            tests/test_postprocessor.py \
+            tests/test_reasoning_parser_truncation_finalize.py \
+            tests/test_reasoning_finalize_stop_in_think.py \
+            tests/test_per_request_thinking_budget.py \
             tests/test_tool_parsers.py \
             tests/test_native_tool_format.py \
             tests/test_prefix_cache.py \
