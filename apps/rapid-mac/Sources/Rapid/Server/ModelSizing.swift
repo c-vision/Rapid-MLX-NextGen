@@ -203,6 +203,12 @@ enum ModelSizing {
         case unsafe
     }
 
+    /// Only the danger-line verdict parks a load for explicit confirmation.
+    /// Tight is advisory and must continue through the ordinary guarded path.
+    static func requiresMemoryConfirmation(_ safety: MemorySafety) -> Bool {
+        safety == .unsafe
+    }
+
     /// Project ``footprint`` onto ``usedBytes`` and bucket the result.
     /// Returns ``.safe`` when the numbers are unreadable or the param
     /// count is unknown — never block a load on missing data (the

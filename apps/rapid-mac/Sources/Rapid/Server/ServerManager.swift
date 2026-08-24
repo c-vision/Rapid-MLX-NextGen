@@ -1559,7 +1559,7 @@ final class ServerManager {
             // Every mature local-model app draws the same line: refuse
             // only what is genuinely dangerous, and surface "tight"
             // passively — the picker's static sizing bands already do.
-            if safety == .unsafe {
+            if ModelSizing.requiresMemoryConfirmation(safety) {
                 // A launch auto-start must never greet the user with a scary
                 // modal they did not ask for. Opening the app is not "I want to
                 // chat now" — they may be heading to Audio/Images, or just
