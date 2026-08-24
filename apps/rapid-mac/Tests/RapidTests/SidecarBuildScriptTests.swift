@@ -100,7 +100,7 @@ struct SidecarBuildScriptTests {
                 "The no-deps sidecar install must never float within a range.")
         // The Images tab is only shippable because mflux's module-level
         // `import torch` is deferred into the three torch-only loading modes —
-        // bundling torch itself would be +363 MB against a 500 MB cap. Both
+        // bundling torch itself would be +363 MB against a 550 MB cap. Both
         // halves of that argument have to fail closed, or a future mflux bump
         // ships an Images tab that dies on every generation: the patch must
         // refuse to guess when weight_loader.py has been reshaped, and the
