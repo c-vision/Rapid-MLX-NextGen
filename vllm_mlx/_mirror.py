@@ -1431,6 +1431,7 @@ def download_with_mirror_fallback(
     *,
     revision: str | None = None,
     on_pull_start: Callable[[], None] | None = None,
+    allow_patterns: list[str] | None = None,
 ) -> bool:
     """Download ``repo_id`` to the HF cache via R2-first / HF-fallback.
 
@@ -1460,7 +1461,19 @@ def download_with_mirror_fallback(
     round-trips resolve). The CLI uses it to retire a "Resolving…" spinner so
     it doesn't collide with the download output. It never fires on the
     ``return False`` fall-through path.
+
+    ``allow_patterns`` narrows the enumerated repo to a subset of files,
+    ``fnmatch``-ed against each sibling's in-repo path — the SAME contract as
+    ``snapshot_download(allow_patterns=…)``. A subfolder-per-quant repo
+    (``LiquidAI/LFM2.5-2.6B-MLX`` ships eight quants side by side, of which
+    ``4bit/`` is one) is mirrored a single quant at a time, so the caller
+    passes ``["4bit/*"]`` to fetch ONLY that quant from R2 — without it the
+    enumeration would list all ~20 GB of siblings, 404 the non-mirrored quants
+    on R2, and fall each back to HF. ``None`` (the default) keeps the whole
+    repo, correct for the one-quant-per-repo layout every other mirror uses.
     """
+    from fnmatch import fnmatch
+
     from ._hf_logging import silence_hf_unauthenticated_warning
 
     # Whether we pull via R2 + hf_hub_download below or bail (returning
@@ -1542,6 +1555,16 @@ def download_with_mirror_fallback(
             # malicious, refuse to act on it. Punt to HF's own loader,
             # which has its own checks.
             return False
+        # Narrow to the requested subset (a subfolder-per-quant repo asks for
+        # one quant's directory). Filter HERE, before every downstream
+        # consumer — the plan count, byte total, fetch loop and verify pass all
+        # read ``files`` — so a subfolder pull can never enumerate, fetch, or
+        # measure the quants the caller didn't ask for. Match ``snapshot_
+        # download``'s semantics: a file is kept if it matches ANY pattern.
+        if allow_patterns is not None and not any(
+            fnmatch(rname, pat) for pat in allow_patterns
+        ):
+            continue
         size = getattr(s, "size", None)
         size = size if isinstance(size, int) else None
         lfs = getattr(s, "lfs", None)

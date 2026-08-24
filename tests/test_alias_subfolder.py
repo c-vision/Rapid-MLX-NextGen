@@ -511,32 +511,40 @@ def test_cache_probe_does_not_invent_a_directory(tmp_path):
     assert _descend_to_checkpoint(str(snap), REPO) == str(snap)
 
 
-def test_mirror_declines_subfolder_repos(monkeypatch):
-    """The R2 mirror hydrates whole repos and has no per-folder mode.
+def test_mirror_runs_subfolder_repos_with_allow_patterns(monkeypatch):
+    """The mirror IS consulted for a subfolder repo — narrowed to its quant.
 
-    Letting it run on a subfolder repo would pull all eight quantizations
-    behind a progress bar that says "Pulling LiquidAI/LFM2.5-2.6B-MLX".
-    None of these repos is mirrored today; this guard is what keeps
-    mirroring one later from silently reintroducing the 20 GB pull.
+    A subfolder repo is mirrored one quant at a time (``mirror_to_r2.py
+    --subfolder 4bit``), so ``_try_mirror_prefetch`` hands the matching
+    ``allow_patterns`` down to the mirror instead of hard-declining it. The
+    ``allow_patterns`` is what stops the pull from enumerating all eight
+    quants (the 20 GB fear) — the mirror only fetches ``4bit/*``.
+
+    Regression guard: this used to ``return False`` for every subfolder repo
+    on the assumption none were mirrored, which stranded lfm2.5-2.6b-4bit's
+    R2 copy and routed the desktop through a HF path that could hang at
+    "Starting…".
     """
     import vllm_mlx.cli as cli
 
-    called: list[str] = []
+    seen: list[list[str] | None] = []
 
     def tripwire(*a, **kw):
-        called.append("mirror ran")
+        seen.append(kw.get("allow_patterns"))
         return True
 
     import vllm_mlx._mirror as mirror
 
     monkeypatch.setattr(mirror, "download_with_mirror_fallback", tripwire)
 
-    assert cli._try_mirror_prefetch(REPO) is False
-    assert called == [], "mirror must not be consulted for a subfolder repo"
+    # Subfolder repo → mirror runs, scoped to the declared quant.
+    assert cli._try_mirror_prefetch(REPO) is True
+    assert seen == [["4bit/*"]], "subfolder repo must reach the mirror with its glob"
 
-    # Control: a flat repo still goes through the mirror.
+    # Control: a flat repo still goes through the mirror with no filter.
+    seen.clear()
     assert cli._try_mirror_prefetch("mlx-community/LFM2.5-8B-A1B-MLX-4bit") is True
-    assert called == ["mirror ran"]
+    assert seen == [None], "flat repo must pull the whole repo (allow_patterns=None)"
 
 
 def test_registry_fails_closed_on_every_load_not_just_the_first(monkeypatch):

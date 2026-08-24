@@ -4073,3 +4073,79 @@ def test_metadata_hf_fallback_mutes_bar_but_weight_keeps_it(
     assert ok
     assert suppress_seen[".gitattributes"] is True  # metadata → bar muted
     assert suppress_seen["model.safetensors"] is False  # weight → bar kept
+
+
+# ---------------------------------------------------------------------------
+# 8. Subfolder-per-quant repo — allow_patterns narrows the mirror pull to
+#    one quant's directory (regression: the CLI used to hard-decline the
+#    mirror for every subfolder repo, stranding lfm2.5-2.6b-4bit's R2 copy).
+# ---------------------------------------------------------------------------
+
+
+def test_subfolder_allow_patterns_fetches_only_that_quant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """``allow_patterns=["4bit/*"]`` pulls ONLY the 4bit dir from R2.
+
+    The repo ships two quants (``4bit/`` + ``8bit/``) plus a root LICENSE;
+    only ``4bit/`` is mirrored. With the filter, the mirror must request and
+    land exactly the two ``4bit/`` files and NEVER touch ``8bit/`` or
+    ``LICENSE`` — proven by leaving those URLs unmocked, so any request for
+    them raises ``AssertionError`` from the router.
+    """
+    repo_id = "LiquidAI/LFM2.5-2.6B-MLX"
+    revision = "b41f2b65" * 5
+    # Full multi-quant sibling set as HF would report it.
+    files = [
+        ("4bit/config.json", 100),
+        ("4bit/model.safetensors", 200),
+        ("8bit/config.json", 110),
+        ("8bit/model.safetensors", 400),
+        ("LICENSE", 50),
+    ]
+    catalog = _catalog_payload([("lfm2.5-2.6b-4bit", repo_id, "mirrored")])
+
+    router = _UrlRouter()
+    router.add(
+        "https://models.rapidmlx.com/api/models",
+        _FakeResponse(200, json.dumps(catalog).encode()),
+    )
+    # ONLY the 4bit files are routed (mirrored). 8bit/* and LICENSE are left
+    # unmocked on purpose — requesting them would raise from the router.
+    for fname, size in files:
+        if fname.startswith("4bit/"):
+            url = f"https://models.rapidmlx.com/LiquidAI/LFM2.5-2.6B-MLX/{fname}"
+            router.add(url, _FakeResponse(200, b"x" * size))
+
+    def _fake_hf(repo_id, filename, revision, cache_dir=None, **kwargs):
+        raise AssertionError(f"HF fallback should not fire for {filename}")
+
+    monkeypatch.setenv("RAPID_MLX_MODEL_MIRROR", "https://models.rapidmlx.com")
+    with (
+        patch("urllib.request.urlopen", side_effect=router),
+        patch(
+            "huggingface_hub.model_info",
+            return_value=_mk_model_info(revision, files),
+        ),
+        patch("huggingface_hub.hf_hub_download", side_effect=_fake_hf),
+    ):
+        ok = _mirror.download_with_mirror_fallback(
+            repo_id, cache_dir=tmp_path, allow_patterns=["4bit/*"]
+        )
+
+    assert ok, "the 4bit quant is fully mirrored — pull must succeed from R2"
+    snap = tmp_path / "models--LiquidAI--LFM2.5-2.6B-MLX" / "snapshots" / revision
+    on_disk = sorted(
+        str(p.relative_to(snap))
+        for p in snap.rglob("*")
+        if p.is_file() and not p.name.endswith(".rapid-mlx-mirror.lock")
+    )
+    assert on_disk == ["4bit/config.json", "4bit/model.safetensors"], (
+        "only the 4bit quant should land — 8bit/ and LICENSE must be filtered out"
+    )
+    # The router recorded every request; assert 8bit/LICENSE were never asked
+    # for (the unmocked-URL guard would already have raised, but pin it).
+    requested = [r["url"] for r in router.requests]
+    assert not any("/8bit/" in u for u in requested)
+    assert not any(u.endswith("/LICENSE") for u in requested)

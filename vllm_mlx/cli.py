@@ -1620,23 +1620,28 @@ def _try_mirror_prefetch(
     bugs in the mirror module surface as real stack traces instead of
     silently routing to ``snapshot_download``.
     """
-    from vllm_mlx.model_aliases import resolve_subfolder
+    from vllm_mlx.model_aliases import subfolder_allow_patterns
 
-    # The mirror mirrors whole repos; it has no notion of "just this
-    # folder". For a repo that ships one checkpoint per quantization that
-    # would hydrate every quant, so decline and let the HF path run with
-    # ``allow_patterns``. None of these repos is mirrored today — this is
-    # here so that mirroring one later can't silently turn a 1.6 GB pull
-    # into a 20 GB one.
-    if resolve_subfolder(model_name):
-        return False
+    # A subfolder-per-quant repo ships several quants side by side, so the
+    # mirror holds ONE quant's directory (uploaded via
+    # ``mirror_to_r2.py --subfolder <quant>``) and we hand the same
+    # ``allow_patterns`` down so the R2 pull fetches only that directory —
+    # never the whole ~20 GB quant matrix. ``None`` for the ordinary
+    # one-quant-per-repo layout leaves the mirror serving the full repo.
+    # (This used to hard-decline the mirror for every subfolder repo on the
+    # assumption that none were mirrored; ``lfm2.5-2.6b-4bit`` is, and the
+    # decline stranded its R2 copy while the HF path could hang the desktop
+    # at "Starting…".)
+    allow_patterns = subfolder_allow_patterns(model_name)
     try:
         from vllm_mlx._mirror import download_with_mirror_fallback
     except ImportError:
         # Mirror module not available (minimal-deps install or
         # deliberately removed). Use the legacy HF path.
         return False
-    return download_with_mirror_fallback(model_name, on_pull_start=on_pull_start)
+    return download_with_mirror_fallback(
+        model_name, on_pull_start=on_pull_start, allow_patterns=allow_patterns
+    )
 
 
 def _ensure_model_downloaded(
