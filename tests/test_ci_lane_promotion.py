@@ -134,3 +134,36 @@ def test_type_check_enforces_shrink_only_error_budget():
         ENGINE_WORKFLOW, "test-matrix", "Run unit tests (no MLX required)"
     )
     assert "tests/test_check_mypy_error_budget.py" in unit_roster
+
+
+def test_python_311_enforces_changed_lines_coverage_without_repository_baseline():
+    test_matrix = _job(ENGINE_WORKFLOW, "test-matrix")
+    checkout = next(
+        step
+        for step in test_matrix["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    assert checkout["with"]["fetch-depth"] == 0
+
+    install = next(
+        step
+        for step in test_matrix["steps"]
+        if step.get("name") == "Install dependencies"
+    )
+    assert '"diff-cover==8.0.3"' in install["run"]
+
+    gate = next(
+        step
+        for step in test_matrix["steps"]
+        if step.get("name") == "Enforce changed-lines coverage"
+    )
+    assert gate["if"] == (
+        "github.event_name == 'pull_request' && matrix.python-version == '3.11'"
+    )
+    assert gate["env"] == {"PR_BASE_SHA": "${{ github.event.pull_request.base.sha }}"}
+    assert "continue-on-error" not in gate
+    assert "coverage.xml" in gate["run"]
+    assert '--compare-branch "$PR_BASE_SHA"' in gate["run"]
+    assert "--show-uncovered" in gate["run"]
+    assert "--fail-under 100" in gate["run"]
+    assert "--cov-fail-under" not in gate["run"]

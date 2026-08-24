@@ -246,6 +246,10 @@ jobs:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # diff-cover compares the PR head with the immutable base SHA. A
+          # shallow checkout can make that commit unavailable.
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -255,7 +259,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests pyyaml
+          pip install pytest pytest-asyncio pytest-cov "diff-cover==8.0.3" pydantic fastapi jsonschema httpx psutil transformers requests pyyaml
 
       - name: Run unit tests (no MLX required)
         # NOTE: tests in this list MUST not import mlx / mlx_lm at module
@@ -305,6 +309,17 @@ jobs:
             --cov=vllm_mlx \
             --cov-report=term-missing \
             --cov-report=xml
+
+      - name: Enforce changed-lines coverage
+        if: github.event_name == 'pull_request' && matrix.python-version == '3.11'
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python -m diff_cover.diff_cover_tool \
+            coverage.xml \
+            --compare-branch "$PR_BASE_SHA" \
+            --show-uncovered \
+            --fail-under 100
 
       - name: Upload coverage
         if: matrix.python-version == '3.11'
