@@ -425,6 +425,11 @@ class StreamingPostProcessor:
         # onboarding sweep finding #5.
         self.accumulated_reasoning = ""
         self.tool_calls_detected = False
+        # A malformed Hermes call is deliberately promoted into a rejected
+        # tool invocation so the model can retry. Preserve ordinary prose
+        # following that synthetic call without changing the long-standing
+        # suppression behavior for valid/channel-routed calls.
+        self._preserve_post_tool_content = False
         # R11-A invariant tracker (PR 0.8.13 hotfix). Counts ``tool_call``
         # StreamEvents the postprocessor has actually emitted to the wire
         # this turn (i.e. the route layer will serialize a ``delta.tool_calls``
@@ -2406,6 +2411,7 @@ class StreamingPostProcessor:
         self.tool_accumulated_text = ""
         self.accumulated_reasoning = ""
         self.tool_calls_detected = False
+        self._preserve_post_tool_content = False
         # R11-A invariant tracker — see ``__init__`` for the contract. The
         # reset MUST clear this so a re-used processor doesn't carry the
         # prior turn's emitted-count into a new stream and lie to
@@ -2869,6 +2875,9 @@ class StreamingPostProcessor:
                     ]
                 return []
             if result.get("tool_calls"):
+                self._preserve_post_tool_content = bool(
+                    result.get("preserve_post_tool_content")
+                )
                 # When the streaming parser carries BOTH a content
                 # delta AND a tool-call delta in one return (one
                 # delta carried ``preface + tool_close`` — codex r4
@@ -2957,6 +2966,19 @@ class StreamingPostProcessor:
             content = result.get("content", "")
 
         if self.tool_calls_detected:
+            if self._preserve_post_tool_content and content:
+                content = sanitize_output(content)
+                if content:
+                    if output.finished:
+                        return [
+                            StreamEvent(
+                                type="finish",
+                                finish_reason=self._compute_finish_reason(output),
+                                content=content,
+                                tool_calls_detected=True,
+                            )
+                        ]
+                    return [StreamEvent(type="content", content=content)]
             if output.finished:
                 # R11-A: route the finish through ``_compute_finish_reason``
                 # so the wire-truth gate (``_tool_calls_emitted_to_wire``)
@@ -3267,6 +3289,9 @@ class StreamingPostProcessor:
                     ]
                 return []
             if result.get("tool_calls"):
+                self._preserve_post_tool_content = bool(
+                    result.get("preserve_post_tool_content")
+                )
                 # Combined content+tool delta — emit content half
                 # regardless of how the parallel-cap rules out the
                 # tool half (codex r6 MAJOR: enabling
@@ -3352,6 +3377,19 @@ class StreamingPostProcessor:
             content = result.get("content", "")
 
         if self.tool_calls_detected:
+            if self._preserve_post_tool_content and content:
+                content = sanitize_output(content)
+                if content:
+                    if output.finished:
+                        return [
+                            StreamEvent(
+                                type="finish",
+                                finish_reason=self._compute_finish_reason(output),
+                                content=content,
+                                tool_calls_detected=True,
+                            )
+                        ]
+                    return [StreamEvent(type="content", content=content)]
             if output.finished:
                 # R11-A: route the finish through ``_compute_finish_reason``
                 # so the wire-truth gate (``_tool_calls_emitted_to_wire``)
@@ -3468,6 +3506,9 @@ class StreamingPostProcessor:
                     ]
                 return []
             if result.get("tool_calls"):
+                self._preserve_post_tool_content = bool(
+                    result.get("preserve_post_tool_content")
+                )
                 # Combined content+tool delta — emit content half
                 # regardless of how the parallel-cap rules out the
                 # tool half (codex r6 MAJOR). Match the plain-content
@@ -3563,6 +3604,19 @@ class StreamingPostProcessor:
             content = strip_special_tokens(result.get("content", ""))
 
         if self.tool_calls_detected:
+            if self._preserve_post_tool_content and content:
+                content = sanitize_output(content)
+                if content:
+                    if output.finished:
+                        return [
+                            StreamEvent(
+                                type="finish",
+                                finish_reason=self._compute_finish_reason(output),
+                                content=content,
+                                tool_calls_detected=True,
+                            )
+                        ]
+                    return [StreamEvent(type="content", content=content)]
             if output.finished:
                 # R11-A: route the finish through ``_compute_finish_reason``
                 # so the wire-truth gate (``_tool_calls_emitted_to_wire``)
