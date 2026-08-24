@@ -39,6 +39,18 @@ struct WebSearchProviderDescriptorTests {
         #expect(!WebSearchProvider.duckduckgo.acceptsKey)
     }
 
+    @Test("Only the optional-key backend advertises rejected-key keyless recovery")
+    func rejectedKeyRecoveryCapability() {
+        #expect(WebSearchProvider.keenable.recoversRejectedKeyKeylessly)
+        for provider in WebSearchProvider.allCases where provider.recoversRejectedKeyKeylessly {
+            #expect(provider.acceptsKey)
+            #expect(!provider.requiresKey)
+        }
+        for provider in WebSearchProvider.allCases where provider != .keenable {
+            #expect(!provider.recoversRejectedKeyKeylessly)
+        }
+    }
+
     @Test("Every key-accepting provider links a key dashboard")
     func dashboardsPresent() {
         for provider in WebSearchProvider.allCases where provider.acceptsKey {

@@ -29,6 +29,10 @@ struct WebSearchProviderDescriptor: Sendable {
     /// optional and lifts the shared keyless rate limit. Drives the
     /// Settings key field + Keychain prefetch.
     let acceptsKey: Bool
+    /// A rejected optional key can be removed and the same request can run in
+    /// this provider's supported keyless mode. This is deliberately narrower
+    /// than generic retry or fallback eligibility.
+    let recoversRejectedKeyKeylessly: Bool
     /// Keychain account label for this provider's API key. Distinct
     /// per-provider so one provider's key never leaks into another's
     /// call.
@@ -84,6 +88,7 @@ enum WebSearchProvider: String, CaseIterable, Codable, Identifiable, Sendable {
                 keyDashboardURL: URL(string: "https://keenable.ai/console"),
                 requiresKey: false,
                 acceptsKey: true,
+                recoversRejectedKeyKeylessly: true,
                 keychainAccount: "rapid.web-search.keenable"
             )
         case .parallel:
@@ -94,6 +99,7 @@ enum WebSearchProvider: String, CaseIterable, Codable, Identifiable, Sendable {
                 keyDashboardURL: URL(string: "https://platform.parallel.ai/"),
                 requiresKey: true,
                 acceptsKey: true,
+                recoversRejectedKeyKeylessly: false,
                 keychainAccount: "rapid.web-search.parallel"
             )
         case .tavily:
@@ -104,6 +110,7 @@ enum WebSearchProvider: String, CaseIterable, Codable, Identifiable, Sendable {
                 keyDashboardURL: URL(string: "https://app.tavily.com/home"),
                 requiresKey: true,
                 acceptsKey: true,
+                recoversRejectedKeyKeylessly: false,
                 keychainAccount: "rapid.web-search.tavily"
             )
         case .brave:
@@ -122,6 +129,7 @@ enum WebSearchProvider: String, CaseIterable, Codable, Identifiable, Sendable {
                 keyDashboardURL: URL(string: "https://api-dashboard.search.brave.com/app/keys"),
                 requiresKey: true,
                 acceptsKey: true,
+                recoversRejectedKeyKeylessly: false,
                 keychainAccount: "rapid.web-search.brave"
             )
         case .duckduckgo:
@@ -138,6 +146,7 @@ enum WebSearchProvider: String, CaseIterable, Codable, Identifiable, Sendable {
                 keyDashboardURL: nil,
                 requiresKey: false,
                 acceptsKey: false,
+                recoversRejectedKeyKeylessly: false,
                 keychainAccount: nil
             )
         }
@@ -151,6 +160,7 @@ enum WebSearchProvider: String, CaseIterable, Codable, Identifiable, Sendable {
     var keyDashboardURL: URL? { descriptor.keyDashboardURL }
     var requiresKey: Bool { descriptor.requiresKey }
     var acceptsKey: Bool { descriptor.acceptsKey }
+    var recoversRejectedKeyKeylessly: Bool { descriptor.recoversRejectedKeyKeylessly }
     var keychainAccount: String? { descriptor.keychainAccount }
 }
 
@@ -161,6 +171,11 @@ enum WebSearchProvider: String, CaseIterable, Codable, Identifiable, Sendable {
 @MainActor
 @Observable
 final class WebSearchConfig {
+    struct CredentialSnapshot: Equatable, Sendable {
+        let key: String?
+        let revision: UInt64
+    }
+
     /// Backed by ``UserDefaults`` under a single stable key so a
     /// reset-defaults action (or a corrupted prefs file) doesn't
     /// need to sweep multiple keys. The default is ``.keenable``
@@ -193,6 +208,10 @@ final class WebSearchConfig {
     /// looked" from "looked, no secret stored" — the latter must
     /// short-circuit ``apiKey(for:)`` without another keychain hit.
     private var probedAccounts: Set<String> = []
+    /// Process-local mutation generation per Keychain account. Value equality
+    /// cannot detect an ABA replacement (K → another value → K), so callers
+    /// that act on an async response capture this revision with the key.
+    private var keyRevisions: [String: UInt64] = [:]
 
     /// Injection points for tests. Default arguments use the real
     /// system Keychain + the host's standard UserDefaults; the
@@ -235,6 +254,19 @@ final class WebSearchConfig {
             keyCache[account] = value
         }
         return value?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+    }
+
+    /// Atomically capture the cached credential value and its mutation
+    /// generation on the main actor. External Keychain edits are intentionally
+    /// outside this process-owned cache contract, just like ``apiKey(for:)``.
+    func credentialSnapshot(for provider: WebSearchProvider) -> CredentialSnapshot {
+        guard let account = provider.keychainAccount else {
+            return CredentialSnapshot(key: nil, revision: 0)
+        }
+        return CredentialSnapshot(
+            key: apiKey(for: provider),
+            revision: keyRevisions[account, default: 0]
+        )
     }
 
     /// Write or clear the key for ``provider``. Passing an empty
@@ -283,6 +315,7 @@ final class WebSearchConfig {
             if keychain.delete(account: account) {
                 keyCache.removeValue(forKey: account)
                 probedAccounts.insert(account)
+                keyRevisions[account, default: 0] &+= 1
                 return true
             }
             return false
@@ -305,6 +338,7 @@ final class WebSearchConfig {
             if keychain.write(account: account, secret: trimmed) {
                 keyCache[account] = trimmed
                 probedAccounts.insert(account)
+                keyRevisions[account, default: 0] &+= 1
                 // Auto-promote happens AFTER a successful keychain
                 // write so the provider state can never get ahead of
                 // the stored key. Gate on ``provider.requiresKey``
