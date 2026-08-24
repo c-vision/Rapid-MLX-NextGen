@@ -309,8 +309,7 @@ enum ModelSizing {
         var confirmTitle: String {
             switch severity {
             case .unsafe: "Load anyway (risky)"
-            case .tight: "Load anyway"
-            case .safe: "Load model"
+            case .tight, .safe: "Load model"
             }
         }
     }

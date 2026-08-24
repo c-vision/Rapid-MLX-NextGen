@@ -1432,7 +1432,7 @@ final class ServerManager {
         // waiver. Re-run the guard at activation so a sudden pressure spike
         // between the last three-second sample and the click can present a
         // fresh warning instead of silently loading under stale safe state.
-        let bypassMemoryGuard = warning.severity != .safe
+        let bypassMemoryGuard = warning.severity == .unsafe
         memoryConfirmRunning.insert(seq)
         guard memoryConfirmations.resolveCurrent(
             warning: warning,

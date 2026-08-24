@@ -3931,7 +3931,7 @@ struct QuickstartView: View {
             .padding(.top, 30)
         } actions: {
             OnboardingActionLane {
-                if warning.severity == .safe {
+                if warning.severity != .unsafe {
                     Button(warning.confirmTitle) {
                         server.confirmPendingMemoryLoad(warning)
                     }
@@ -3940,7 +3940,7 @@ struct QuickstartView: View {
                     .accessibilityIdentifier("Quickstart.Memory.Load")
                 }
 
-                if let fallback, warning.severity != .safe {
+                if let fallback, warning.severity == .unsafe {
                     Button("Switch to \(fallback.displayName)") {
                         server.cancelPendingMemoryLoad(warning)
                         coordinator.returnToChooser()
@@ -3953,7 +3953,7 @@ struct QuickstartView: View {
                     .accessibilityLabel("Switch to \(fallback.displayName), the lowest-memory option")
                 }
 
-                if warning.severity != .safe {
+                if warning.severity == .unsafe {
                     Button(warning.confirmTitle) {
                         // Re-enters ``start`` with the guard bypassed. We stay in
                         // ``.starting``; ``handleServerStateChange`` seeds the
