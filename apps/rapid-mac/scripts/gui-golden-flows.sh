@@ -3586,6 +3586,7 @@ flow_image_generation() {
     # AX baseline normalization itself takes several seconds on a busy mini;
     # keep the synthetic decode tail long enough to observe after it.
     start_persona image-generation FAKE_IMAGE_STEPS=8 FAKE_IMAGE_STEP_MS=300 \
+        FAKE_IMAGE_FIRST_WARMUP_ACK="$OUT_ROOT/image-generation/ig-warmup-ack" \
         FAKE_IMAGE_FINISH_MS=15000 \
         RAPID_GUI_GOLDEN_MODE=1 \
         RAPID_SIMULATED_IMPORT_PATH="$ROOT/Tests/RapidTests/__Snapshots__/cheetah-logo-96.png"
@@ -3690,6 +3691,13 @@ flow_image_generation() {
     press "$OUT/ig-draft.json" Images.Generate "$OUT/ig-generate.json" \
         || die "Images.Generate is not pressable with a prompt and a ready model"
 
+    # Synchronize on the wire accepting the request before asking AX for the
+    # preparing card. The fake keeps this real protocol phase open long enough
+    # for one potentially expensive tree read; no retry count guesses whether
+    # the button action has reached the server yet.
+    wait_fake_event '.event == "image_request" and .operation == "generation"' \
+        "the image request never reached the sidecar"
+
     # The in-flight card. Asserted BEFORE the result so a render that returns
     # instantly (or a card that never appears) is a failure rather than a frame
     # nobody looked at.  SwiftUI mounts Cancel one layout pass before the
@@ -3707,6 +3715,7 @@ flow_image_generation() {
     done
     [[ "$inflight" == 1 ]] \
         || die "no settled in-flight progress card with Cancel and busy indicator"
+    : > "$OUT/ig-warmup-ack"
     baseline image-generation.inflight "$OUT/ig-inflight.json"
 
     # Sampling completion is followed by VAE decode / encoding. That tail must

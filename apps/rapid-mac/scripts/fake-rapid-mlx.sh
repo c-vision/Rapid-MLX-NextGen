@@ -340,10 +340,11 @@ class _ImageRenders:
         self.step = 0
         self.total = 0
         self.started_at = 0.0
+        self.warming_up = False
         self.cancelled = False
         self.count = 0
 
-    def begin(self, total):
+    def begin(self, total, hold_first_warmup=False):
         with self._lock:
             # One render at a time, decided atomically under the lock. The real
             # server is a single model in a single process; a second concurrent
@@ -357,6 +358,9 @@ class _ImageRenders:
             self.step = 0
             self.total = total
             self.started_at = time.time()
+            # Cold preparation is a first-render property. Later generations
+            # on the same resident model must not inherit that hold.
+            self.warming_up = hold_first_warmup and self.count == 0
             self.cancelled = False
             self.count += 1
             return self.count
@@ -366,9 +370,14 @@ class _ImageRenders:
             self.step += 1
             return self.cancelled
 
+    def finish_warmup(self):
+        with self._lock:
+            self.warming_up = False
+
     def end(self):
         with self._lock:
             self.running = False
+            self.warming_up = False
             self.step = self.total
 
     def cancel(self):
@@ -379,7 +388,12 @@ class _ImageRenders:
         with self._lock:
             elapsed = int((time.time() - self.started_at) * 1000) if self.started_at else 0
             return {
-                "running": self.running,
+                # Internally the request already owns the render slot, but
+                # externally denoising has not begun during admission/warmup.
+                # This mirrors a real cold image request and gives GUI fixtures
+                # an event-backed preparing phase without weakening the
+                # single-render concurrency gate.
+                "running": self.running and not self.warming_up,
                 "step": self.step,
                 "total": self.total,
                 "elapsed_ms": elapsed,
@@ -686,7 +700,8 @@ class Handler(BaseHTTPRequestHandler):
         count = raw_count if isinstance(raw_count, int) and raw_count > 0 else 1
         total = max(1, int(_setting("FAKE_IMAGE_STEPS", 8)))
         step_ms = max(0, int(_setting("FAKE_IMAGE_STEP_MS", 300)))
-        index = RENDERS.begin(total)
+        first_warmup_ack = _setting("FAKE_IMAGE_FIRST_WARMUP_ACK")
+        index = RENDERS.begin(total, bool(first_warmup_ack))
         if index is None:
             # A render is already in flight. The real server runs one model in
             # one process and refuses an overlapping generation rather than
@@ -710,6 +725,20 @@ class Handler(BaseHTTPRequestHandler):
             image_rgba_sha256=(_png_rgba_sha256(_extract_image_part(raw_body, self.headers.get("content-type")))
                                if editing else None),
         )
+        # A real engine may spend meaningful time admitting the request and
+        # preparing tensors before its first denoise step. The GUI fixture
+        # explicitly acknowledges its captured preparing state instead of
+        # racing an arbitrary delay on a loaded accessibility runner.
+        if index == 1 and first_warmup_ack:
+            deadline = time.monotonic() + 300
+            while not os.path.exists(first_warmup_ack):
+                if time.monotonic() >= deadline:
+                    RENDERS.end()
+                    _event("image_warmup_timeout")
+                    self._json(500, {"error": {"code": "fixture_warmup_timeout"}})
+                    return
+                time.sleep(0.05)
+            RENDERS.finish_warmup()
         cancelled = False
         for _ in range(total):
             time.sleep(step_ms / 1000)
