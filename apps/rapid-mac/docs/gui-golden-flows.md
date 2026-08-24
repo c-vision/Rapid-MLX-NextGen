@@ -285,9 +285,11 @@ walk both halves of the capability boundary:
    before a text-only request is encoded.
 
 The standard file picker itself remains outside the structural AX baseline, as
-with the Images-tab save panel. The flow drives it only to supply the fixture;
-the product assertions begin at the composer thumbnail and end at the recorded
-wire request.
+with the Images-tab save panel. A native XCUITest drives both **Upload photo**
+and **Upload file** through `NSOpenPanel`, then switches conversations and
+matches the visible chips to the fake sidecar's image hashes and document text.
+The AX journeys retain paste coverage and independent transcript/persistence
+evidence; neither layer substitutes for the other.
 
 Real-weight dogfood on 2026-08-09 used the locally built
 `rapid_mlx-0.12.7` wheel with its `[vision]` extra and

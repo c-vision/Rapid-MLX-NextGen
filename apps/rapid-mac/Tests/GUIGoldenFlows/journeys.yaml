@@ -192,7 +192,7 @@ journeys:
   - name: chat-document-attachment
     group: chat
     risk: high
-    driver: ax
+    driver: hybrid
     ci_tier: pr
     fixtures: [fake-sidecar, document, isolated-home]
     source_paths: [apps/rapid-mac/Sources/Rapid/Chat/]
@@ -200,7 +200,7 @@ journeys:
   - name: chat-multimodal-attachments
     group: chat
     risk: high
-    driver: ax
+    driver: hybrid
     ci_tier: pr
     fixtures: [fake-sidecar, two-images, document, isolated-home]
     source_paths: [apps/rapid-mac/Sources/Rapid/Chat/]

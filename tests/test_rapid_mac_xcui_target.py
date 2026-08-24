@@ -19,20 +19,31 @@ def test_xcui_target_is_checked_in_and_runs_in_gui_ci():
     assert project.is_file()
     assert "com.apple.product-type.bundle.ui-testing" in project.read_text()
     assert source.is_file()
+    assert (MAC / "Tests/RapidUITests/Tests/ChatAttachmentJourneyTests.swift").is_file()
     assert "./scripts/run-xcui-tests.sh" in workflow
-    assert "RapidUITests.xcresult" in workflow
+    assert "RapidImageUITests.xcresult" in workflow
+    assert "RapidChatAttachmentUITests.xcresult" in workflow
     xcui_index, xcui = named_steps["XCUITest: image-generation pixels"]
     upload_index, upload = named_steps["Upload XCUITest evidence"]
     verdict_index, verdict = named_steps["Require native XCUITest"]
     assert xcui["id"] == "xcui"
     assert "image-generation" in xcui["if"]
     assert xcui["continue-on-error"] is True
-    assert upload["if"] == "steps.xcui.outcome == 'failure'"
+    chat_xcui_index, chat_xcui = named_steps["XCUITest: chat attachment ownership"]
+    assert chat_xcui["id"] == "chat_xcui"
+    assert "chat-multimodal-attachments" in chat_xcui["if"]
+    assert "chat-document-attachment" in chat_xcui["if"]
+    assert chat_xcui["continue-on-error"] is True
+    assert upload["if"] == (
+        "steps.xcui.outcome == 'failure' || steps.chat_xcui.outcome == 'failure'"
+    )
     assert verdict["if"] == "always()"
     assert "steps.xcui.outcome" in verdict["env"]["XCUI_OUTCOME"]
+    assert "steps.chat_xcui.outcome" in verdict["env"]["CHAT_XCUI_OUTCOME"]
     assert "image-generation" in verdict["env"]["IMAGE_SELECTED"]
     assert "IMAGE_SELECTED" in verdict["run"]
-    assert xcui_index < upload_index < verdict_index
+    assert "CHAT_SELECTED" in verdict["run"]
+    assert xcui_index < chat_xcui_index < upload_index < verdict_index
 
 
 def test_pixel_assertion_uses_element_screenshots_and_crops_chrome():
@@ -64,6 +75,7 @@ def test_xcui_runner_launches_production_bundle_with_fake_sidecar():
     source = (
         MAC / "Tests/RapidUITests/Tests/ImageGenerationPixelTests.swift"
     ).read_text()
+    harness = (MAC / "Tests/RapidUITests/Tests/RapidUITestHarness.swift").read_text()
 
     assert "build/Rapid-MLX Desktop.app" in runner
     assert "lsregister" in runner
@@ -75,6 +87,10 @@ def test_xcui_runner_launches_production_bundle_with_fake_sidecar():
     assert "fake-rapid-mlx.sh" in source
     assert 'appendingPathComponent(".rapid-golden-fake.json")' in source
     assert '"FAKE_EVENT_LOG": eventLog.path' in source
+    assert 'config["FAKE_PID_FILE"] = sidecarPIDFile.path' in harness
+    assert "String(contentsOf: sidecarPIDFile" in harness
+    assert 'element("MemoryWarning.Confirm")' in harness
+    assert 'app.dialogs["open-panel"].buttons["OKButton"]' in harness
     assert '"RAPID_DESKTOP_PORT": "65000"' in source
     assert '"RAPID_DESKTOP_NO_PORT_SWEEP": "1"' in source
     assert (

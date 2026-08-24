@@ -1199,6 +1199,13 @@ def main():
         _emit_catalog(args.subcommand, args.alias)
         sys.exit(0)
 
+    # XCUITest cleanup must not depend on reaching the later readiness event:
+    # record ownership as soon as this process commits to the long-lived serve
+    # path, so a startup hang can still be reaped without touching real models.
+    if pid_path := _setting("FAKE_PID_FILE"):
+        with open(pid_path, "w", encoding="utf-8") as stream:
+            stream.write(f"{os.getpid()}\n")
+
     if _setting("FAKE_REJECT_IMAGE_SIDECAR") == "1" and args.alias == FAKE_IMAGE_ALIAS:
         _event("server_start_rejected", alias=args.alias, pid=os.getpid())
         print(FAKE_REJECTION_DETAIL, file=sys.stderr, flush=True)

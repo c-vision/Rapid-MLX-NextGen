@@ -423,15 +423,27 @@ jobs:
         if: contains(fromJSON(matrix.gui_flows), 'image-generation')
         continue-on-error: true
         env:
-          RAPID_XCUI_RESULT_BUNDLE: ${{ runner.temp }}/RapidUITests.xcresult
+          RAPID_XCUI_RESULT_BUNDLE: ${{ runner.temp }}/RapidImageUITests.xcresult
+          RAPID_XCUI_ONLY_TESTING: RapidUITests/ImageGenerationPixelTests
+        run: ./scripts/run-xcui-tests.sh
+
+      - name: 'XCUITest: chat attachment ownership'
+        id: chat_xcui
+        if: >-
+          contains(fromJSON(matrix.gui_flows), 'chat-multimodal-attachments') ||
+          contains(fromJSON(matrix.gui_flows), 'chat-document-attachment')
+        continue-on-error: true
+        env:
+          RAPID_XCUI_RESULT_BUNDLE: ${{ runner.temp }}/RapidChatAttachmentUITests.xcresult
+          RAPID_XCUI_ONLY_TESTING: RapidUITests/ChatAttachmentJourneyTests
         run: ./scripts/run-xcui-tests.sh
 
       - name: Upload XCUITest evidence
-        if: steps.xcui.outcome == 'failure'
+        if: steps.xcui.outcome == 'failure' || steps.chat_xcui.outcome == 'failure'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: rapid-xcui-evidence-${{ matrix.group }}
-          path: ${{ runner.temp }}/RapidUITests.xcresult
+          path: ${{ runner.temp }}/Rapid*UITests.xcresult
           if-no-files-found: ignore
 
       # One step per flow so a red check names the journey that broke rather
@@ -733,16 +745,19 @@ jobs:
         if: always()
         env:
           XCUI_OUTCOME: ${{ steps.xcui.outcome }}
+          CHAT_XCUI_OUTCOME: ${{ steps.chat_xcui.outcome }}
           IMAGE_SELECTED: ${{ contains(fromJSON(matrix.gui_flows), 'image-generation') }}
+          CHAT_SELECTED: ${{ contains(fromJSON(matrix.gui_flows), 'chat-multimodal-attachments') || contains(fromJSON(matrix.gui_flows), 'chat-document-attachment') }}
         run: |
-          if [[ "$IMAGE_SELECTED" != true && "$XCUI_OUTCOME" == skipped ]]; then
-            echo "Image-generation journey not selected; native XCUITest not required"
-            exit 0
-          fi
-          if [[ "$XCUI_OUTCOME" != success ]]; then
+          if [[ "$IMAGE_SELECTED" == true && "$XCUI_OUTCOME" != success ]]; then
             echo "::error::Native XCUITest failed ($XCUI_OUTCOME)"
             exit 1
           fi
+          if [[ "$CHAT_SELECTED" == true && "$CHAT_XCUI_OUTCOME" != success ]]; then
+            echo "::error::Native Chat attachment XCUITest failed ($CHAT_XCUI_OUTCOME)"
+            exit 1
+          fi
+          echo "All selected native XCUITests passed"
 
   desktop-tests:
     # Stable required-check facade. It is present even on non-desktop PRs,
