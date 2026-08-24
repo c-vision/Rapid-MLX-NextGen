@@ -103,3 +103,34 @@ def test_engine_jobs_follow_fail_closed_engine_classification():
     condition = str(bound_guard["if"])
     assert "github.event_name == 'pull_request'" in condition
     assert "needs.changes.outputs.engine == 'true'" in condition
+
+
+def test_type_check_enforces_shrink_only_error_budget():
+    type_check = _job(ENGINE_WORKFLOW, "type-check")
+    steps = type_check["steps"]
+    ratchet = next(
+        step
+        for step in steps
+        if step.get("name") == "Enforce shrink-only mypy error budget"
+    )
+
+    assert "continue-on-error" not in ratchet
+    assert ratchet["run"] == "python scripts/check_mypy_error_budget.py"
+    install = next(step for step in steps if step.get("name") == "Install dependencies")
+    assert "pip install --requirement config/mypy-requirements.txt" in install["run"]
+    requirements = (ROOT / "config/mypy-requirements.txt").read_text().splitlines()
+    pins = [line for line in requirements if line and not line.startswith("#")]
+    assert pins
+    assert all("==" in pin for pin in pins)
+    assert {pin.split("==", maxsplit=1)[0] for pin in pins} >= {
+        "mypy",
+        "pydantic",
+        "pydantic_core",
+        "fastapi",
+        "starlette",
+        "typing_extensions",
+    }
+    unit_roster = _step_run(
+        ENGINE_WORKFLOW, "test-matrix", "Run unit tests (no MLX required)"
+    )
+    assert "tests/test_check_mypy_error_budget.py" in unit_roster

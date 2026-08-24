@@ -32,6 +32,27 @@ matching branch-protection migration. `tests` includes lint, type-check job
 health, the MLX dependency-bound guard on pull requests, and all selected engine
 test lanes; `desktop-tests` includes every selected Desktop lane.
 
+### Type-error budget
+
+Engine changes run a shrink-only mypy debt ratchet. The checked-in
+`config/mypy-error-baseline.txt` records the current error count for each dirty
+file under the fully pinned Python 3.11 environment in
+`config/mypy-requirements.txt`. A new dirty file or an increase in any file's
+count blocks `tests`. When fixes reduce a count or clean a file completely, CI
+also blocks until the baseline is tightened with:
+
+```bash
+python scripts/check_mypy_error_budget.py --update
+```
+
+`--update` refuses growth and new dirty files, so it cannot be used as a casual
+bypass. The budget intentionally does not claim semantic identity for individual
+diagnostics: replacing one error with another while a dirty file's total stays
+flat is outside this first ratchet. This keeps the gate deterministic despite
+moving line numbers and messages while preventing debt from spreading or
+growing. As dirty files are repaired and removed from the baseline, they can
+never become dirty again without failing CI.
+
 ## Merge gate
 
 Adding the `full-ci` label upgrades the lanes selected by the pull request's
@@ -131,3 +152,6 @@ one serial consumer without changing which journeys are selected.
 If GUI artifact reuse is suspect, restore the build step inside
 `gui-golden-flows` and remove `gui-app-build` from its dependencies. This costs
 additional macOS build time but preserves the same release-shaped UI coverage.
+If the mypy budget gate is operationally broken, restore the prior advisory
+direct mypy command with `continue-on-error: true` while repairing the script.
+Do not increase counts or add files to the baseline merely to make a PR green.

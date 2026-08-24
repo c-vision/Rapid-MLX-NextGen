@@ -231,11 +231,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install mypy pydantic fastapi
+          # The checked-in budget belongs to this fully pinned type surface.
+          pip install --requirement config/mypy-requirements.txt
 
-      - name: Run mypy
-        run: mypy vllm_mlx/ --ignore-missing-imports --no-error-summary
-        continue-on-error: true
+      - name: Enforce shrink-only mypy error budget
+        run: python scripts/check_mypy_error_budget.py
 
   test-matrix:
     needs: changes
@@ -286,6 +286,7 @@ jobs:
             tests/test_release_baselines.py \
             tests/test_validate_release_subject.py \
             tests/test_check_gha_pinning.py \
+            tests/test_check_mypy_error_budget.py \
             tests/test_classify_ci_changes.py \
             tests/test_ci_lane_promotion.py \
             tests/test_check_mlx_upstream_calls.py \
