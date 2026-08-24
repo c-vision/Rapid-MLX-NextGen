@@ -17,14 +17,60 @@ can actually understand.
 
 ## [Unreleased]
 
+## [0.13.0-rc1] — 2026-08-24
+
+This first 0.13 release candidate broadens model coverage, makes local tools
+and reasoning more dependable, and removes several first-run and everyday Mac
+friction points. As a release candidate, it is published for validation and
+does not replace the stable updater feed.
+
+### Added
+
+- **Ornith 1.5 is available end to end.** The 9B dense and 35B-A3B
+  mixture-of-experts checkpoints are recognized by the engine and exposed in
+  the Mac model picker with the correct runtime routes.
+- **More local generation choices.** Nemotron Labs Diffusion 3B can generate
+  images through its autoregressive path, and Qwen3-Next can stream routed
+  experts from disk on memory-constrained machines.
+- **Agent health is visible and actionable.** The CLI reports integration
+  health and can re-run setup, while the Mac menu bar can copy the active API
+  endpoint for connecting another client.
+
 ### Changed
 
+- **Hybrid and recurrent models start answering sooner.** Verified model
+  profiles now select measured prefill chunk sizes automatically, while vision
+  and text budgets remain independently bounded.
+- **Chat attachments behave like native Mac inputs.** Files and images can be
+  chosen, dragged, or pasted into the composer, removed before sending, and
+  kept isolated from drafts in other conversations.
+- **Release validation is faster without reducing coverage.** Product lanes
+  and GUI journeys are selected from the real diff, GUI groups run in parallel,
+  and every selected journey still has a fail-closed result contract.
 - **The Mac installer now looks and behaves like a finished install page.**
   Opening the DMG presents Rapid-MLX on the left, Applications on the right,
   a clear drag-to-install arrow, concise instructions, and a branded local-AI
   background instead of Finder's blank auto-arranged window. Both the full and
   slim installers share the layout, and release validation now opens the final
   read-only image to verify the saved icon positions and window geometry.
+
+### Fixed
+
+- Gemma 4 chat templates are selected once from validated model profiles at
+  tokenizer or processor load time instead of being guessed on every request;
+  explicit custom templates continue to take precedence.
+- Tool calls malformed by a model can recover through the tool loop instead of
+  leaking protocol text into chat, and Cohere Command 4 reasoning now uses a
+  protocol-aware lifecycle across Chat and Responses streaming paths.
+- Persisted KV caches are isolated by exact model revision, preventing stale
+  state from crossing checkpoint updates; quantized KV cache corruption on MLX
+  0.32.1 is also blocked.
+- The Mac app now surfaces search-provider failure reasons, shows live model
+  readiness progress, keeps the first chat and bundled image generation path
+  usable, and explains when a model's tool capability is unavailable or only
+  verified for a specific checkpoint.
+- First-run model choices, model-variant presentation, speech-to-text setup,
+  and image defaults received a release-focused polish pass.
 
 ## [0.12.18] — 2026-08-20
 
