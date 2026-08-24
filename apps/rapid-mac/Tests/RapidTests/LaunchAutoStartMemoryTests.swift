@@ -101,6 +101,36 @@ struct LaunchAutoStartMemoryTests {
         #expect(rechecked.severity == .unsafe)
         #expect(rechecked.id != originalID)
     }
+
+    @MainActor
+    @Test("an older overlapping sample cannot overwrite a newer result")
+    func overlappingRefreshesKeepNewestResult() async throws {
+        let gib = UInt64(1_073_741_824)
+        let snapshots = OrderedMemorySnapshots(
+            initial: .init(totalBytes: 32 * gib, usedBytes: 30 * gib),
+            delayed: .init(totalBytes: 32 * gib, usedBytes: 16 * gib),
+            newest: .init(totalBytes: 32 * gib, usedBytes: 2 * gib)
+        )
+        let server = ServerManager(
+            testingState: .idle,
+            binaryPath: URL(fileURLWithPath: "/usr/bin/true")
+        )
+        server.memorySnapshotProvider = { snapshots.next() }
+
+        await server.start(alias: "qwen3.5-9b-4bit")
+        #expect(server.pendingMemoryWarning?.severity == .unsafe)
+
+        let older = Task { await server.refreshPendingMemoryWarning() }
+        await snapshots.waitForDelayedSample()
+        let newer = Task { await server.refreshPendingMemoryWarning() }
+        let newerTransition = await newer.value
+        snapshots.releaseDelayedSample()
+        let olderTransition = await older.value
+
+        #expect(newerTransition?.new == .safe)
+        #expect(olderTransition == nil)
+        #expect(server.pendingMemoryWarning?.severity == .safe)
+    }
 }
 
 private final class LockedMemorySnapshots: @unchecked Sendable {
@@ -114,5 +144,54 @@ private final class LockedMemorySnapshots: @unchecked Sendable {
     var current: MemoryProbe.Snapshot {
         get { lock.withLock { value } }
         set { lock.withLock { value = newValue } }
+    }
+}
+
+private final class OrderedMemorySnapshots: @unchecked Sendable {
+    private let lock = NSLock()
+    private let delayedRelease = DispatchSemaphore(value: 0)
+    private let initial: MemoryProbe.Snapshot
+    private let delayed: MemoryProbe.Snapshot
+    private let newest: MemoryProbe.Snapshot
+    private var callCount = 0
+    private var delayedSampleStarted = false
+
+    init(
+        initial: MemoryProbe.Snapshot,
+        delayed: MemoryProbe.Snapshot,
+        newest: MemoryProbe.Snapshot
+    ) {
+        self.initial = initial
+        self.delayed = delayed
+        self.newest = newest
+    }
+
+    func next() -> MemoryProbe.Snapshot {
+        let call = lock.withLock {
+            defer { callCount += 1 }
+            if callCount == 1 {
+                delayedSampleStarted = true
+            }
+            return callCount
+        }
+        switch call {
+        case 0:
+            return initial
+        case 1:
+            delayedRelease.wait()
+            return delayed
+        default:
+            return newest
+        }
+    }
+
+    func waitForDelayedSample() async {
+        while !lock.withLock({ delayedSampleStarted }) {
+            await Task.yield()
+        }
+    }
+
+    func releaseDelayedSample() {
+        delayedRelease.signal()
     }
 }

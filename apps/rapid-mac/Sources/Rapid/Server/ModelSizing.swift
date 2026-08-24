@@ -213,8 +213,25 @@ enum ModelSizing {
         totalBytes: UInt64
     ) -> MemorySafety {
         guard totalBytes > 0, footprint.paramsBillions != nil else { return .safe }
+        return memorySafety(
+            footprintGB: footprint.totalGB,
+            usedBytes: usedBytes,
+            totalBytes: totalBytes
+        )
+    }
+
+    /// Re-evaluate a warning using the exact footprint captured when the
+    /// guarded load was first classified. A warning can outlive catalog or
+    /// custom-path resolution, so refreshes must not derive a second estimate
+    /// from its alias.
+    static func memorySafety(
+        footprintGB: Double,
+        usedBytes: UInt64,
+        totalBytes: UInt64
+    ) -> MemorySafety {
+        guard totalBytes > 0 else { return .safe }
         let gib = Double(1 << 30)
-        let footprintBytes = footprint.totalGB * gib
+        let footprintBytes = footprintGB * gib
         let projected = (Double(usedBytes) + footprintBytes) / Double(totalBytes)
         if projected >= 0.85 { return .unsafe }
         if projected >= 0.75 { return .tight }

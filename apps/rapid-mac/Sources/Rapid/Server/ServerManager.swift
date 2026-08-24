@@ -42,14 +42,13 @@ struct MemoryLoadConfirmationQueue {
     ) -> (old: ModelSizing.MemoryWarning, new: ModelSizing.MemoryWarning)? {
         guard pending.first?.phase == .awaitingDecision,
               let old = pending.first?.warning else { return nil }
-        let footprint = ModelSizing.estimate(alias: old.alias)
         let refreshed = ModelSizing.MemoryWarning(
             id: old.id,
             alias: old.alias,
             hfPath: old.hfPath,
             isAutoRespawn: old.isAutoRespawn,
             severity: ModelSizing.memorySafety(
-                footprint: footprint,
+                footprintGB: old.footprintGB,
                 usedBytes: snapshot.usedBytes,
                 totalBytes: snapshot.totalBytes
             ),
@@ -192,6 +191,12 @@ final class ServerManager {
         MemoryProbe.snapshot()
     }
 
+    /// Orders overlapping timer and foreground refreshes. Sampling happens
+    /// off the main actor, so a slower older probe must not overwrite a newer
+    /// decision after actor re-entry.
+    @ObservationIgnored
+    private var memoryWarningRefreshGeneration = 0
+
     /// Re-sample a parked memory decision while its owning UI is visible.
     /// Returns a material safety-state transition for accessibility; metric
     /// ticks within the same state deliberately return nil.
@@ -199,12 +204,16 @@ final class ServerManager {
         old: ModelSizing.MemorySafety,
         new: ModelSizing.MemorySafety
     )? {
-        guard pendingMemoryWarning != nil else { return nil }
+        guard let warningID = pendingMemoryWarning?.id else { return nil }
+        memoryWarningRefreshGeneration += 1
+        let generation = memoryWarningRefreshGeneration
         let provider = memorySnapshotProvider
         let snapshot = await Task.detached(priority: .utility) {
             provider()
         }.value
-        guard let snapshot,
+        guard generation == memoryWarningRefreshGeneration,
+              pendingMemoryWarning?.id == warningID,
+              let snapshot,
               let transition = memoryConfirmations.refreshCurrentWarning(snapshot: snapshot),
               transition.old.severity != transition.new.severity else { return nil }
         return (transition.old.severity, transition.new.severity)

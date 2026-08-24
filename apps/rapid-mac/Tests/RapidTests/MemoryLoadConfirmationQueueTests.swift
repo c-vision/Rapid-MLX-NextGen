@@ -182,6 +182,31 @@ struct MemoryLoadConfirmationQueueTests {
         #expect(queue.takeDecision(for: request) == .confirmed(sequence: 12))
     }
 
+    @Test("live refresh reuses the originally captured footprint")
+    func liveRefreshPreservesOriginalFootprint() throws {
+        let gib = UInt64(1 << 30)
+        var queue = MemoryLoadConfirmationQueue()
+        let original = ModelSizing.MemoryWarning(
+            alias: "custom-local-model",
+            hfPath: "/models/custom-local-model",
+            isAutoRespawn: false,
+            severity: .unsafe,
+            footprintGB: 24,
+            freeGB: 2,
+            totalGB: 32
+        )
+        queue.enqueue(warning: original, requestID: nil)
+
+        let result = queue.refreshCurrentWarning(
+            snapshot: .init(totalBytes: 32 * gib, usedBytes: 2 * gib)
+        )
+        let refreshed = try #require(result)
+
+        #expect(refreshed.new.severity == .tight)
+        #expect(refreshed.new.footprintGB == 24)
+        #expect(refreshed.new.hfPath == original.hfPath)
+    }
+
     @Test("refresh is ignored after the visible decision starts launching")
     func liveRefreshCannotRewriteLaunchingDecision() {
         let gib = UInt64(1 << 30)
