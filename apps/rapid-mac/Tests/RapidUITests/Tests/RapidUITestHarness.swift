@@ -9,6 +9,7 @@ final class RapidUITestHarness {
     let rapidMacRoot: URL
 
     private let testHome: URL
+    private let conversationStore: URL
     private let sidecarAlias: String
     private let sidecarPIDFile: URL
     private var portReservation: Int32?
@@ -57,6 +58,9 @@ final class RapidUITestHarness {
         testHome = FileManager.default.temporaryDirectory
             .appendingPathComponent("rapid-xcui-\(testName)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: testHome, withIntermediateDirectories: true)
+        conversationStore = testHome
+            .appendingPathComponent("Library/Application Support/com.rapidmlx.rapid")
+            .appendingPathComponent("conversations.json")
 
         rapidMacRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent() // Tests
@@ -97,6 +101,23 @@ final class RapidUITestHarness {
         dismissFirstRunIfNeeded()
     }
 
+    func relaunch() {
+        app.terminate()
+        terminateFakeSidecars()
+        releasePortReservation()
+        do {
+            let reservedPort = try Self.reserveLoopbackPort()
+            portReservation = reservedPort.descriptor
+            app.launchEnvironment["RAPID_DESKTOP_PORT"] = String(reservedPort.port)
+        } catch {
+            XCTFail("Could not reserve a fresh loopback port for relaunch: \(error)")
+            return
+        }
+        app.launch()
+        XCTAssertTrue(app.windows["Rapid-MLX"].waitForExistence(timeout: 20))
+        dismissFirstRunIfNeeded()
+    }
+
     func shutDown() {
         app.terminate()
         releasePortReservation()
@@ -109,6 +130,7 @@ final class RapidUITestHarness {
         let readiness = element("Readiness.Action")
         XCTAssertTrue(readiness.waitForExistence(timeout: 20))
         XCTAssertTrue(waitUntil(timeout: 20) { readiness.isEnabled })
+        let priorServerStartCount = serverStartCount()
         // Hold the OS-selected port until the app is ready to spawn its fake
         // sidecar, reducing the bind race to the click-to-process-launch edge.
         releasePortReservation()
@@ -122,12 +144,47 @@ final class RapidUITestHarness {
                 memoryConfirmation.click()
                 confirmedMemoryWarning = true
             }
-            return self.events().contains { $0["event"] as? String == "server_started" }
+            return self.serverStartCount() > priorServerStartCount
+        })
+    }
+
+    func waitForConversationPersistence(containing markers: [String]) {
+        XCTAssertTrue(waitUntil(timeout: 20) {
+            guard let persisted = try? String(
+                contentsOf: self.conversationStore,
+                encoding: .utf8
+            ) else { return false }
+            return markers.allSatisfy(persisted.contains)
         })
     }
 
     func element(_ identifier: String) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+    }
+
+    func element(label: String) -> XCUIElement {
+        app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", label)
+        ).firstMatch
+    }
+
+    func staticText(valuePrefix prefix: String) -> XCUIElement {
+        // SwiftUI exposes a combined, line-limited accessibility label as the
+        // AX value of a StaticText on hosted macOS. Constraining the query to
+        // that element type also avoids an expensive value predicate across
+        // the entire application hierarchy.
+        app.staticTexts.matching(
+            NSPredicate(format: "value BEGINSWITH %@", prefix)
+        ).firstMatch
+    }
+
+    func messageAction(_ action: String) -> XCUIElement {
+        app.descendants(matching: .any).matching(
+            NSPredicate(
+                format: "identifier MATCHES %@",
+                "^ChatView\\.Message\\.\(action)\\.[0-9A-Fa-f-]{36}$"
+            )
+        ).firstMatch
     }
 
     func conversationRows() -> XCUIElementQuery {
@@ -239,6 +296,17 @@ final class RapidUITestHarness {
         })
     }
 
+    func retryResponse(expectedRequestCount: Int) {
+        let retry = messageAction("Retry")
+        XCTAssertTrue(retry.waitForExistence(timeout: 10))
+        XCTAssertTrue(waitUntil(timeout: 60) { retry.isEnabled })
+        retry.click()
+        XCTAssertTrue(waitUntil(timeout: 30) { self.chatRequests().count == expectedRequestCount })
+        XCTAssertTrue(waitUntil(timeout: 30) {
+            self.element("ChatView.SendOrStopButton").label == "Send message"
+        })
+    }
+
     func chatRequests() -> [[String: Any]] {
         events().filter { $0["event"] as? String == "chat_request" }
     }
@@ -266,6 +334,10 @@ final class RapidUITestHarness {
             guard let data = line.data(using: .utf8) else { return nil }
             return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         }
+    }
+
+    private func serverStartCount() -> Int {
+        events().count { $0["event"] as? String == "server_started" }
     }
 
     private func terminateFakeSidecars() {

@@ -93,6 +93,15 @@ def test_xcui_runner_launches_production_bundle_with_fake_sidecar():
     assert 'config["FAKE_PID_FILE"] = sidecarPIDFile.path' in harness
     assert "String(contentsOf: sidecarPIDFile" in harness
     assert 'element("MemoryWarning.Confirm")' in harness
+    assert "let priorServerStartCount = serverStartCount()" in harness
+    assert "self.serverStartCount() > priorServerStartCount" in harness
+    assert (
+        "func waitForConversationPersistence(containing markers: [String])" in harness
+    )
+    assert (
+        'app.launchEnvironment["RAPID_DESKTOP_PORT"] = String(reservedPort.port)'
+        in harness
+    )
     assert 'app.dialogs["open-panel"].buttons["OKButton"]' in harness
     assert (
         'XCUIApplication(bundleIdentifier: "com.rapidmlx.rapid-uitest-host")' in harness
@@ -111,7 +120,20 @@ def test_xcui_runner_launches_production_bundle_with_fake_sidecar():
     assert "restorePasteboardIfOwned" in harness
     assert "pasteboard.changeCount == ownedPasteboardChangeCount" in harness
     assert "originalPasteboardItems == nil || !stillOwnsPasteboard" in harness
+    assert "func relaunch()" in harness
+    relaunch_index = chat_source.index("harness.relaunch()")
+    restart_index = chat_source.index("harness.startModel()", relaunch_index)
+    assert relaunch_index < restart_index
+    assert "func staticText(valuePrefix prefix: String)" in harness
+    assert "app.staticTexts.matching(" in harness
+    assert 'NSPredicate(format: "value BEGINSWITH %@", prefix)' in harness
+    assert "terminateFakeSidecars()" in harness
+    assert 'messageAction("Retry")' in harness
     assert "testDragPasteAndRemovalPreserveWireIdentity" in chat_source
+    assert "testRetryAndRelaunchPreserveSentAttachmentIdentity" in chat_source
+    assert "assertCombinedIdentity" in chat_source
+    assert 'element(label: "Persist both attachments")' in chat_source
+    assert 'element("Sidebar.NewChat").click()' in chat_source
     assert 'element("ChatView.Attachment.Remove.Pasted image.png")' in chat_source
     assert "port: 65_001" not in chat_source
     assert "port: 65_002" not in chat_source
