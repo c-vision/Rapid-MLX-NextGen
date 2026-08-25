@@ -265,6 +265,11 @@ jobs:
         # NOTE: tests in this list MUST not import mlx / mlx_lm at module
         # load time — Linux CI doesn't have MLX (it's Apple-Silicon only).
         # Tests that need mlx live in the test-apple-silicon job below.
+        # Tests include the #2301 release-contract checks (test_release_version,
+        # test_check_main_head, test_check_release_blockers,
+        # test_check_release_environment, test_desktop_manifest) — pure stdlib,
+        # no MLX. The separate engine-contracts job runs the shell release
+        # scripts under tests/release/.
         run: |
           pytest \
             tests/test_mcp_security.py \
@@ -301,6 +306,11 @@ jobs:
             tests/test_validate_release_subject.py \
             tests/test_check_gha_pinning.py \
             tests/test_check_mypy_error_budget.py \
+            tests/test_release_version.py \
+            tests/test_check_main_head.py \
+            tests/test_check_release_blockers.py \
+            tests/test_check_release_environment.py \
+            tests/test_desktop_manifest.py \
             tests/test_classify_ci_changes.py \
             tests/test_ci_lane_promotion.py \
             tests/test_check_mlx_upstream_calls.py \
