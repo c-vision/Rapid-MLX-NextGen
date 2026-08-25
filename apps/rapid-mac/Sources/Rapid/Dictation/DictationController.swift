@@ -124,6 +124,7 @@ final class DictationController {
     private let testingPrewarm: (@MainActor () async -> Bool)?
     private let testingWarmup: (@MainActor () async -> Bool)?
     private let testingHotkeyStart: (@MainActor () -> Bool)?
+    private let testingRecorderStart: (@MainActor () throws -> Void)?
     private let testingRecorderCancel: (@MainActor () -> Void)?
     private let testingTranscribeCancel: (@MainActor () -> Void)?
 
@@ -170,6 +171,7 @@ final class DictationController {
         testingPrewarm: (@MainActor () async -> Bool)? = nil,
         testingWarmup: (@MainActor () async -> Bool)? = nil,
         testingHotkeyStart: (@MainActor () -> Bool)? = nil,
+        testingRecorderStart: (@MainActor () throws -> Void)? = nil,
         testingRecorderCancel: (@MainActor () -> Void)? = nil,
         testingTranscribeCancel: (@MainActor () -> Void)? = nil,
         audioCatalogLoader: @escaping @MainActor (URL) async -> [ModelEntry]? = {
@@ -185,6 +187,7 @@ final class DictationController {
         self.testingPrewarm = testingPrewarm
         self.testingWarmup = testingWarmup
         self.testingHotkeyStart = testingHotkeyStart
+        self.testingRecorderStart = testingRecorderStart
         self.testingRecorderCancel = testingRecorderCancel
         self.testingTranscribeCancel = testingTranscribeCancel
 
@@ -304,7 +307,7 @@ final class DictationController {
             selectedAlias: modelAlias,
             preparingAlias: preparingAlias,
             isPreparing: phase == .preparingModel,
-            servingAlias: server.servingAlias
+            voiceLaneReady: server.isVoiceLaneReady(for: preparingAlias)
         )) else {
             if isEnabled, enableRequestID == requestID, modelAlias == preparingAlias {
                 lastError = "\(preparingAlias) couldn't load. There may not be enough memory to start dictation."
@@ -417,10 +420,12 @@ final class DictationController {
 
     /// Brings the transcription model up.
     ///
-    /// Audio models must pass `residencyEligible: false`: the residency path
-    /// loads in-process, which the audio sidecar does not support, so the
-    /// server has to swap the whole process instead. Getting this wrong fails
-    /// at request time with nothing to distinguish it from a missing model.
+    /// Voice co-loading: when the app is already serving a chat LLM/VLM, the
+    /// voice lane mounts in that same process (``--enable-audio``), so dictation
+    /// reuses the primary server instead of swapping it away — LLM/VLM + speech
+    /// run side by side. Only when no primary model is up do we serve the
+    /// transcription model as its own audio process. See
+    /// ``ServerManager.ensureVoiceLane``.
     @discardableResult
     private func ensureModelServing(alias requestedAlias: String? = nil) async -> Bool {
         let alias = requestedAlias ?? modelAlias
@@ -432,11 +437,7 @@ final class DictationController {
         guard let facts = await catalogFacts(for: alias), facts.cached else {
             return false
         }
-        return await server.ensureServing(
-            alias: alias,
-            hfPath: facts.repo,
-            residencyEligible: false
-        )
+        return await server.ensureVoiceLane(alias: alias, hfPath: facts.repo)
     }
 
     private func catalogFacts(for alias: String) async -> CatalogFacts? {
@@ -460,21 +461,23 @@ final class DictationController {
     }
 
     /// Loads the model ahead of the first hotkey press. Without this the first
-    /// dictation of a session pays for a process swap while the user is
-    /// already talking. Never a download: ``ensureModelServing`` refuses
+    /// dictation of a session pays for loading the STT engine while the user
+    /// is already talking. Never a download: ``ensureModelServing`` refuses
     /// models that aren't on disk.
     ///
-    /// Three costs move off the hotkey path here, in order:
+    /// The costs move off the hotkey path here, in order:
     /// 1. The alias→repo catalog lookup. On a cache miss ``catalogFacts``
     ///    spawns `rapid-mlx` CLI subprocesses — one to three SECONDS of cold
     ///    interpreter — and the old early-return below skipped it exactly when
     ///    the sidecar was already serving this model, so the most common warm
     ///    session still paid it inside the first transcription.
-    /// 2. The process swap, when another model is being served.
+    /// 2. The STT engine co-load: when a primary chat model is up, dictation
+    ///    reuses its server (voice co-loading) and the engine lazy-loads on the
+    ///    first request; when nothing is up, a fresh audio server must start.
     /// 3. The STT weights: the engine loads them lazily on the first
     ///    transcription of each process lifetime (measured ~1.2 s for
     ///    parakeet), so ``warmUpEngine()`` sends a beat of silence to make
-    ///    the sidecar pay that now instead of inside the user's first real
+    ///    the server pay that now instead of inside the user's first real
     ///    dictation.
     /// - Parameter replacingCurrent: pass `true` when the model CHANGED —
     ///   an in-flight prewarm is then warming the wrong model and must be
@@ -521,7 +524,7 @@ final class DictationController {
         // disable() or a model change to land. Re-check before each step
         // that mutates the sidecar or touches the wire.
         guard !Task.isCancelled, isEnabled, modelAlias == alias else { return false }
-        if server.servingAlias != alias {
+        if !server.isVoiceLaneReady(for: alias) {
             guard await ensureModelServing(alias: alias) else { return false }
             guard !Task.isCancelled, isEnabled, modelAlias == alias else { return false }
         }
@@ -529,7 +532,7 @@ final class DictationController {
         guard !Task.isCancelled,
               isEnabled,
               modelAlias == alias,
-              server.servingAlias == alias else { return false }
+              server.isVoiceLaneReady(for: alias) else { return false }
         if warmed {
             lastWarmupWarning = nil
         } else {
@@ -546,7 +549,11 @@ final class DictationController {
     /// serialises transcriptions, so a probe would queue in front of it.
     private func warmUpEngine() async -> Bool {
         guard phase == .idle || phase == .preparingModel else { return false }
-        guard server.servingAlias == modelAlias else { return false }
+        // A live conversation server owns the lazy audio lane; otherwise the
+        // audio-only fallback must itself be serving this transcription model.
+        guard server.isVoiceLaneReady(for: modelAlias) else {
+            return false
+        }
         if let testingWarmup { return await testingWarmup() }
         do {
             _ = try await client.transcribe(
@@ -644,7 +651,7 @@ final class DictationController {
             return
         }
         let requestedAlias = modelAlias
-        guard server.servingAlias == requestedAlias else {
+        guard server.isVoiceLaneReady(for: requestedAlias) else {
             hotkey.stop()
             phase = .preparingModel
             beginRecordingTask = nil
@@ -673,7 +680,11 @@ final class DictationController {
             return
         }
         do {
-            try recorder.startCapture()
+            if let testingRecorderStart {
+                try testingRecorderStart()
+            } else {
+                try recorder.startCapture()
+            }
         } catch {
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             refreshReadiness()
@@ -757,8 +768,9 @@ final class DictationController {
 
         let started = Date()
         // Phase timing: "how long was that" is unanswerable from one opaque
-        // number when the cost can hide in catalog resolution, a model swap,
-        // or inference. The split is surfaced in the Dictation tab.
+        // number when the cost can hide in catalog resolution, a cold
+        // co-load of the STT engine, or inference. The split is surfaced in
+        // the Dictation tab.
         let ensureStarted = Date()
         guard await ensureModelServing(alias: alias) else {
             guard transcribeRequestID == requestID, modelAlias == alias else { return }
@@ -768,7 +780,7 @@ final class DictationController {
             } else if facts?.cached != true {
                 lastError = "\(alias) isn't downloaded. Open Rapid → Audio to download it."
             } else {
-                lastError = "\(alias) couldn't start. There may not be enough memory to swap models."
+                lastError = "\(alias) couldn't start. There may not be enough memory to load it alongside the conversation model."
             }
             // The user is mid-flow in another app with only the HUD visible.
             // Leaving "Transcribing…" up while silently failing reads as a

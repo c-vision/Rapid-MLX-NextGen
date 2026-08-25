@@ -51,12 +51,12 @@ struct DictationEnablePolicyTests {
     @Test(
         "hotkey registration requires every post-warmup identity boundary",
         arguments: [
-            (false, true, true, "whisper-small", "whisper-small", true, "whisper-small"),
-            (true, false, true, "whisper-small", "whisper-small", true, "whisper-small"),
-            (true, true, false, "whisper-small", "whisper-small", true, "whisper-small"),
-            (true, true, true, "qwen-asr", "whisper-small", true, "whisper-small"),
-            (true, true, true, "whisper-small", "whisper-small", false, "whisper-small"),
-            (true, true, true, "whisper-small", "whisper-small", true, "other-model"),
+            (false, true, true, "whisper-small", "whisper-small", true, true),
+            (true, false, true, "whisper-small", "whisper-small", true, true),
+            (true, true, false, "whisper-small", "whisper-small", true, true),
+            (true, true, true, "qwen-asr", "whisper-small", true, true),
+            (true, true, true, "whisper-small", "whisper-small", false, true),
+            (true, true, true, "whisper-small", "whisper-small", true, false),
         ]
     )
     func stalePreparedStateCannotArm(
@@ -66,7 +66,7 @@ struct DictationEnablePolicyTests {
         selectedAlias: String,
         preparingAlias: String,
         preparing: Bool,
-        servingAlias: String
+        voiceLaneReady: Bool
     ) {
         #expect(!DictationEnablePolicy.mayRegisterHotkey(after: .init(
             prewarmSucceeded: prewarm,
@@ -75,12 +75,12 @@ struct DictationEnablePolicyTests {
             selectedAlias: selectedAlias,
             preparingAlias: preparingAlias,
             isPreparing: preparing,
-            servingAlias: servingAlias
+            voiceLaneReady: voiceLaneReady
         )))
     }
 
-    @Test("only the current ready model may register the hotkey")
-    func currentPreparedModelMayArm() {
+    @Test("the current prepared voice lane may register the hotkey")
+    func currentPreparedVoiceLaneMayArm() {
         #expect(DictationEnablePolicy.mayRegisterHotkey(after: .init(
             prewarmSucceeded: true,
             isEnabled: true,
@@ -88,7 +88,7 @@ struct DictationEnablePolicyTests {
             selectedAlias: "whisper-small",
             preparingAlias: "whisper-small",
             isPreparing: true,
-            servingAlias: "whisper-small"
+            voiceLaneReady: true
         )))
     }
 }

@@ -54,10 +54,12 @@ struct DictationEnablePolicy {
         var selectedAlias: String
         var preparingAlias: String
         var isPreparing: Bool
-        var servingAlias: String?
+        var voiceLaneReady: Bool
     }
 
     /// The sole policy gate before installing the process-global hotkey.
+    /// Readiness is capability-based because a conversation process can own a
+    /// separate, lazily loaded voice lane without changing its serving alias.
     /// Every async identity must still match after model preparation; a stale
     /// completion is never allowed to arm input for a different user state.
     static func mayRegisterHotkey(after state: PreparedState) -> Bool {
@@ -66,6 +68,6 @@ struct DictationEnablePolicy {
             && state.requestIsCurrent
             && state.selectedAlias == state.preparingAlias
             && state.isPreparing
-            && state.servingAlias == state.preparingAlias
+            && state.voiceLaneReady
     }
 }

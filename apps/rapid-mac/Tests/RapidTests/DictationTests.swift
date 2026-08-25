@@ -410,6 +410,50 @@ struct DictationTests {
     }
 
     @MainActor
+    @Test("co-loaded dictation arms and records while the conversation alias stays primary")
+    func coLoadedConversationLaneArmsAndRecords() async {
+        var hotkeyStartCount = 0
+        var recorderStartCount = 0
+        let entry = cachedAudioEntry(alias: "whisper-small")
+        let server = ServerManager(
+            testingState: .ready(alias: "qwen3-0.6b-4bit"),
+            binaryPath: Self.tempDirectory().appendingPathComponent("rapid-mlx"),
+            activeBearer: "test-bearer"
+        )
+        let controller = DictationController(
+            server: server,
+            testingEnabled: true,
+            testingModelAlias: "whisper-small",
+            testingReadiness: .init(
+                microphone: true,
+                accessibility: true,
+                modelSelected: true,
+                modelOnDisk: true
+            ),
+            testingPrewarm: { true },
+            testingHotkeyStart: {
+                hotkeyStartCount += 1
+                return true
+            },
+            testingRecorderStart: { recorderStartCount += 1 },
+            audioCatalogLoader: { _ in [entry] }
+        )
+
+        await controller.enable()
+
+        #expect(controller.phase == .idle)
+        #expect(hotkeyStartCount == 1)
+        #expect(server.servingAlias == "qwen3-0.6b-4bit")
+
+        controller.toggleFromUI()
+        while recorderStartCount == 0 { await Task.yield() }
+
+        #expect(controller.phase == .starting)
+        #expect(recorderStartCount == 1)
+        #expect(server.servingAlias == "qwen3-0.6b-4bit")
+    }
+
+    @MainActor
     @Test("disabling during model warmup cannot register a stale hotkey")
     func disableDuringWarmupDoesNotArmHotkey() async {
         var continuation: CheckedContinuation<Bool, Never>?
