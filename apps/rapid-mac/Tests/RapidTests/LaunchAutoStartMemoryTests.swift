@@ -134,6 +134,47 @@ struct LaunchAutoStartMemoryTests {
     }
 
     @MainActor
+    @Test("activation invalidates an older periodic memory sample")
+    func activationInvalidatesOlderPeriodicSample() async throws {
+        let gib = UInt64(1_073_741_824)
+        let snapshots = ActivationRaceMemorySnapshots(
+            unsafe: .init(totalBytes: 32 * gib, usedBytes: 30 * gib),
+            safe: .init(totalBytes: 32 * gib, usedBytes: 2 * gib)
+        )
+        let server = ServerManager(
+            testingState: .idle,
+            binaryPath: URL(fileURLWithPath: "/usr/bin/true")
+        )
+        server.memorySnapshotProvider = { snapshots.next() }
+
+        await server.start(alias: "qwen3.5-9b-4bit")
+        #expect(server.pendingMemoryWarning?.severity == .unsafe)
+
+        _ = await server.refreshPendingMemoryWarning()
+        let safeWarning = try #require(server.pendingMemoryWarning)
+        #expect(safeWarning.severity == .safe)
+
+        let olderPeriodicRefresh = Task {
+            await server.refreshPendingMemoryWarning()
+        }
+        await snapshots.waitForPeriodicSample()
+
+        server.confirmPendingMemoryLoad(safeWarning)
+        for _ in 0 ..< 100 where server.pendingMemoryWarning?.severity != .unsafe {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(server.pendingMemoryWarning?.severity == .unsafe)
+
+        snapshots.releasePeriodicSample()
+        let olderTransition = await olderPeriodicRefresh.value
+
+        #expect(olderTransition == nil)
+        #expect(server.pendingMemoryWarning?.id == safeWarning.id)
+        #expect(server.pendingMemoryWarning?.severity == .unsafe)
+        #expect(server.state == .idle)
+    }
+
+    @MainActor
     @Test("a cancelled view-bound refresh cannot update the parked warning")
     func cancelledRefreshDoesNotApplyItsSample() async throws {
         let gib = UInt64(1_073_741_824)
@@ -256,6 +297,47 @@ private final class OrderedMemorySnapshots: @unchecked Sendable {
 
     func releaseDelayedSample() {
         delayedRelease.signal()
+    }
+}
+
+private final class ActivationRaceMemorySnapshots: @unchecked Sendable {
+    private let lock = NSLock()
+    private let periodicRelease = DispatchSemaphore(value: 0)
+    private let unsafe: MemoryProbe.Snapshot
+    private let safe: MemoryProbe.Snapshot
+    private var callCount = 0
+    private var periodicSampleStarted = false
+
+    init(unsafe: MemoryProbe.Snapshot, safe: MemoryProbe.Snapshot) {
+        self.unsafe = unsafe
+        self.safe = safe
+    }
+
+    func next() -> MemoryProbe.Snapshot {
+        let call = lock.withLock {
+            defer { callCount += 1 }
+            if callCount == 2 { periodicSampleStarted = true }
+            return callCount
+        }
+        switch call {
+        case 0, 3:
+            return unsafe
+        case 2:
+            periodicRelease.wait()
+            return safe
+        default:
+            return safe
+        }
+    }
+
+    func waitForPeriodicSample() async {
+        while !lock.withLock({ periodicSampleStarted }) {
+            await Task.yield()
+        }
+    }
+
+    func releasePeriodicSample() {
+        periodicRelease.signal()
     }
 }
 

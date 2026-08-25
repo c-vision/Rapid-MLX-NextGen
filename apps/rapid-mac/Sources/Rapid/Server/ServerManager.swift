@@ -1494,6 +1494,10 @@ final class ServerManager {
         // warning as Cancel; `.checkingDecision` makes that dismissal a no-op
         // while the activation probe runs off the main actor.
         guard memoryConfirmations.beginChecking(warningID: warning.id) else { return }
+        // The activation probe now owns the warning's measured facts. Any
+        // periodic sample that began before this click must not apply after a
+        // newly-unsafe activation restores the warning to awaitingDecision.
+        memoryWarningRefreshGeneration += 1
         Task { [weak self] in
             await self?.activatePendingMemoryLoad(warning)
         }
