@@ -2296,7 +2296,10 @@ async def _load_dynamic_resident_model(
             f"runtime residency loading is not available for modality {modality!r}"
         )
     else:
-        from .cli import _resolve_hybrid_cache_entries
+        from .cli import (
+            _needs_bounded_trim_free_reuse,
+            _resolve_hybrid_cache_entries,
+        )
         from .runtime.resident_models import resident_scheduler_kwargs
         from .scheduler import SchedulerConfig
 
@@ -2307,6 +2310,12 @@ async def _load_dynamic_resident_model(
             explicit_value=0,
             user_set_explicit=False,
             model_name=resolved_path,
+            model_config=model_config,
+        )
+        scheduler_kwargs["non_trimmable_exact_prefix_reuse"] = scheduler_kwargs[
+            "hybrid_cache_entries"
+        ] > 0 and _needs_bounded_trim_free_reuse(
+            resolved_path,
             model_config=model_config,
         )
 
@@ -3345,7 +3354,10 @@ Examples:
 
     if not auto_config_resolved:
         resolve_auto_config(non_fatal=True)
-    from .cli import _resolve_hybrid_cache_entries
+    from .cli import (
+        _needs_bounded_trim_free_reuse,
+        _resolve_hybrid_cache_entries,
+    )
 
     hybrid_cache_entries = _resolve_hybrid_cache_entries(
         enable_prefix_cache=True,
@@ -3361,6 +3373,13 @@ Examples:
         vision_min_pixels=args.vision_min_pixels,
         vision_max_pixels=args.vision_max_pixels,
         hybrid_cache_entries=hybrid_cache_entries,
+        non_trimmable_exact_prefix_reuse=(
+            hybrid_cache_entries > 0
+            and _needs_bounded_trim_free_reuse(
+                args.model,
+                model_config=auto_config,
+            )
+        ),
         pflash_config=server_pflash_config,
         **_server_turboquant_scheduler_kwargs(args),
     )

@@ -3992,7 +3992,8 @@ def serve_command(args):
         non_trimmable_exact_prefix_reuse=(
             _hybrid_cache_entries > 0
             and _needs_bounded_trim_free_reuse(
-                getattr(args, "_original_alias", None) or args.model
+                getattr(args, "_original_alias", None) or args.model,
+                model_config=auto_config,
             )
         ),
         # Opt-in prompt-deterministic response cache (exact-match short-circuit).

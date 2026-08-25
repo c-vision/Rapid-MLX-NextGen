@@ -388,6 +388,7 @@ def test_serve_command_threads_auto_detected_hybrid_into_cache_admission(
     assert detected_models == ["publisher/opaque-hybrid-checkpoint"]
     assert scheduler.enable_prefix_cache is True
     assert scheduler.hybrid_cache_entries == 8
+    assert scheduler.non_trimmable_exact_prefix_reuse is True
 
 
 def test_serve_command_explicit_zero_wins_over_auto_detected_hybrid(
@@ -430,6 +431,7 @@ def test_serve_command_explicit_zero_wins_over_auto_detected_hybrid(
         cli.serve_command(ns)
 
     assert captured["scheduler_config"].hybrid_cache_entries == 0
+    assert captured["scheduler_config"].non_trimmable_exact_prefix_reuse is False
 
 
 def test_serve_command_all_explicit_defaults_skip_model_detection(

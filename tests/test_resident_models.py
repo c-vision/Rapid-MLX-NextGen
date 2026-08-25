@@ -83,6 +83,7 @@ async def test_dynamic_resident_auto_detected_hybrid_gets_bounded_prefix_reuse(
     scheduler = captured["scheduler_config"]
     assert scheduler.enable_prefix_cache is True
     assert scheduler.hybrid_cache_entries == 8
+    assert scheduler.non_trimmable_exact_prefix_reuse is True
 
 
 @pytest.mark.asyncio
@@ -124,6 +125,7 @@ async def test_dynamic_resident_prefix_disable_keeps_hybrid_entries_zero(monkeyp
     scheduler = captured["scheduler_config"]
     assert scheduler.enable_prefix_cache is False
     assert scheduler.hybrid_cache_entries == 0
+    assert scheduler.non_trimmable_exact_prefix_reuse is False
 
 
 @pytest.mark.asyncio
@@ -154,7 +156,9 @@ async def test_dynamic_resident_full_attention_stays_unbounded(monkeypatch):
 
     await server._load_dynamic_resident_model("publisher/full-attention", None)
 
-    assert captured["scheduler_config"].hybrid_cache_entries == 0
+    scheduler = captured["scheduler_config"]
+    assert scheduler.hybrid_cache_entries == 0
+    assert scheduler.non_trimmable_exact_prefix_reuse is False
 
 
 class FakeEngine:

@@ -210,6 +210,7 @@ def test_server_module_applies_detected_hybrid_cache_default():
 
     assert scheduler.enable_prefix_cache is True
     assert scheduler.hybrid_cache_entries == 8
+    assert scheduler.non_trimmable_exact_prefix_reuse is True
     assert detect_calls == 1
 
 
@@ -226,4 +227,5 @@ def test_server_module_keeps_dense_cache_default_zero():
 
     assert scheduler.enable_prefix_cache is True
     assert scheduler.hybrid_cache_entries == 0
+    assert scheduler.non_trimmable_exact_prefix_reuse is False
     assert detect_calls == 1
