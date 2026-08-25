@@ -69,6 +69,7 @@ permissions:
 jobs:
   build:
     runs-on: macos-15   # default Xcode 16 → Swift 6.0 (Package.swift tools 6.0)
+    timeout-minutes: 120
     outputs:
       # Published so the release-creating job can decide "--prerelease" without
       # restating the secret expression below. Two copies of the same predicate
@@ -279,14 +280,8 @@ jobs:
           set -euo pipefail
           MANIFEST="${{ steps.releasable.outputs.manifest }}"
           M_SRC="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["source_sha"])' "$MANIFEST")"
-          TAG_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \
-            --jq '.object.sha')
-          TAG_TYPE=$(gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \
-            --jq '.object.type')
-          if [ "$TAG_TYPE" = "tag" ]; then
-            TAG_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_SHA}" \
-              --jq '.object.sha')
-          fi
+          source scripts/resolve_github_tag.sh
+          TAG_SHA=$(resolve_github_tag_commit "$TAG")
           echo "::notice::tag=$TAG sha=$TAG_SHA checkout=$CHECKOUT_SHA built=$BUILT_SHA manifest_source=$M_SRC"
           for ID in "$TAG_SHA" "$CHECKOUT_SHA" "$BUILT_SHA" "$M_SRC"; do
             [[ "$ID" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid SHA '$ID' in tag binding"; exit 1; }
@@ -341,6 +336,7 @@ jobs:
   mirror-dist:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Download the notarised DMG artifact
@@ -474,8 +470,15 @@ jobs:
   publish-updater-fallback:
     needs: [build, mirror-dist]
     runs-on: ubuntu-latest
+    # Includes the turnstyle queue plus final updater/Release publication.
+    timeout-minutes: 120
     if: startsWith(github.ref, 'refs/tags/')
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
       - name: Queue behind earlier updater publications
         uses: softprops/turnstyle@afaccda0f3c0136fb7cb4a734b9b96be03599948  # v3.3.2
         with:
@@ -522,14 +525,8 @@ jobs:
           MANIFEST="dist-dmg/rapid-mlx-desktop.manifest.json"
           [[ -f "$MANIFEST" ]] || { echo "::error::missing $MANIFEST"; exit 1; }
           M_SRC="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["source_sha"])' "$MANIFEST")"
-          TAG_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \
-            --jq '.object.sha')
-          TAG_TYPE=$(gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \
-            --jq '.object.type')
-          if [ "$TAG_TYPE" = "tag" ]; then
-            TAG_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_SHA}" \
-              --jq '.object.sha')
-          fi
+          source scripts/resolve_github_tag.sh
+          TAG_SHA=$(resolve_github_tag_commit "$TAG")
           echo "::notice::pre-publication tag ${TAG} resolves to ${TAG_SHA}; manifest source ${M_SRC}"
           if [ "$TAG_SHA" != "$M_SRC" ]; then
             echo "::error::tag ${TAG} now points at ${TAG_SHA}, not the validated ${M_SRC}; refusing to publish the updater pointer or GitHub Release." >&2

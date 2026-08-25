@@ -104,6 +104,8 @@ fi
 # The tag is built from this string, so a value the tag namespace cannot
 # carry has to fail here rather than produce ``rapid-mac-v0.12.7\n``.
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=scripts/resolve_github_tag.sh
+source "$REPO_ROOT/scripts/resolve_github_tag.sh"
 if ! python3 "$REPO_ROOT/scripts/release_version.py" validate "$VERSION" >/dev/null; then
   echo "❌ VERSION is '$VERSION', which is not X.Y.Z or X.Y.Z-rcN" >&2
   exit 1
@@ -117,44 +119,6 @@ if [ "$HAVE_PAT" != "true" ]; then
   exit 1
 fi
 
-# Follows at most this many annotated tag objects before giving up. Ordinary
-# tags peel in one hop; the bound only exists so a malformed chain cannot spin.
-MAX_TAG_PEEL_DEPTH=10
-
-resolve_tag_commit() {
-  # Start from the explicit tag namespace so a same-named branch can never
-  # satisfy verification, then peel annotated tag objects to a commit.
-  #
-  # The loop checks the type BEFORE following, and the counter bounds the
-  # number of FOLLOWS. Bounding iterations instead would reject a chain whose
-  # last hop lands on a commit — the answer was in hand and thrown away.
-  local object_line object_type object_sha depth=0
-  object_line=$(
-    "$GH_BIN" api "repos/$GITHUB_REPOSITORY/git/ref/tags/$APP_TAG" \
-      --jq '.object | [.type, .sha] | @tsv' 2>/dev/null
-  ) || return 1
-  IFS=$'\t' read -r object_type object_sha <<<"$object_line"
-  while true; do
-    case "$object_type" in
-      commit)
-        [ -n "$object_sha" ] || return 1
-        printf '%s\n' "$object_sha"
-        return 0
-        ;;
-      tag)
-        depth=$((depth + 1))
-        [ "$depth" -le "$MAX_TAG_PEEL_DEPTH" ] || return 1
-        object_line=$(
-          "$GH_BIN" api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
-            --jq '.object | [.type, .sha] | @tsv' 2>/dev/null
-        ) || return 1
-        IFS=$'\t' read -r object_type object_sha <<<"$object_line"
-        ;;
-      *) return 1 ;;
-    esac
-  done
-}
-
 # Print the exact identity being claimed BEFORE the irreversible POST, so the
 # run log and the environment-approval audit both carry the full commit that a
 # candidate build validated — never a branch name or short SHA.
@@ -167,7 +131,7 @@ if "$GH_BIN" api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
   exit 0
 fi
 
-EXISTING=$(resolve_tag_commit || true)
+EXISTING=$(resolve_github_tag_commit "$APP_TAG" 2>/dev/null || true)
 if [ -z "$EXISTING" ]; then
   echo "❌ could not create refs/tags/$APP_TAG and could not read it back — refusing to guess." >&2
   echo "   Check the token's contents:write scope, then re-run this workflow." >&2

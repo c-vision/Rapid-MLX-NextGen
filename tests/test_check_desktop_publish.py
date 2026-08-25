@@ -287,6 +287,23 @@ def test_success_waits_for_active_exact_rerun_then_uses_newest(gate, tmp_path):
     assert (state / "count").read_text().strip() == "2"
 
 
+def test_delayed_tag_run_appearance_is_polled_to_success(gate, tmp_path):
+    gh, state = _mock_state(tmp_path)
+    runs_script = textwrap.dedent(
+        f"""\
+        #!/usr/bin/env bash
+        n="$(cat "{state}/count")"
+        echo "$((n + 1))" > "{state}/count"
+        if [[ "$n" -lt 3 ]]; then echo '[]'; else echo '{json.dumps([_run_record(12)])}'; fi
+        """
+    )
+    _write(state, "runs.sh", runs_script)
+    _write(state, "release.json", _release_with(_asset()))
+    evidence = _verify(gate, gh, state, deadline_sec=10)
+    assert any("run 12 succeeded" in e for e in evidence)
+    assert (state / "count").read_text().strip() == "4"
+
+
 def test_only_failed_no_active_fails_closed(gate, tmp_path):
     gh, state = _mock_state(tmp_path)
     _write(state, "runs.sh", _runs_with(_run_record(10, conclusion="failure")))

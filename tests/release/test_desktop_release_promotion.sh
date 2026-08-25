@@ -159,8 +159,10 @@ contains "$PUBLISH_WAIT" 'ACCEPTED_SHA: ${{ needs.release-prep.outputs.accepted_
   "publication wait binds the validated candidate SHA"
 contains "$PUBLISH_WAIT" '--workflow rapid-mac-release.yml' \
   "publication wait binds the expected Desktop workflow"
-contains "$PUBLISH_WAIT" 'timeout-minutes: 60' \
-  "publication wait has a bounded workflow timeout"
+contains "$PUBLISH_WAIT" 'timeout-minutes: 360' \
+  "publication wait covers the bounded child release critical path"
+contains "$PUBLISH_WAIT" '--deadline-min 350' \
+  "publication poll leaves a ten-minute parent-job diagnostic margin"
 TAG_LINE=$(grep -n 'name: Tag the desktop app at the exact validated SHA' "$AUTO_RELEASE" | cut -d: -f1)
 WAIT_LINE=$(grep -n 'name: Wait for exact Desktop tagged publication' "$AUTO_RELEASE" | cut -d: -f1)
 ENGINE_LINE=$(grep -n 'name: Create tag and release' "$AUTO_RELEASE" | cut -d: -f1)
@@ -175,6 +177,23 @@ contains "$PUBLISH_STEP" 'asset.get("digest") != f"sha256:{digest}"' \
   "tagged rerun requires an existing canonical DMG to be byte-identical"
 lacks "$PUBLISH_STEP" '--clobber' \
   "tagged rerun never replaces an already-published Desktop DMG"
+
+RESOLVER_USES=$(grep -c 'resolve_github_tag_commit "$TAG"' "$RAPID_RELEASE")
+[[ "$RESOLVER_USES" == 2 ]] \
+  && ok "both tagged-lane tag checks use the bounded recursive resolver" \
+  || bad "both tagged-lane tag checks use the bounded recursive resolver (got $RESOLVER_USES)"
+lacks "$RAPID_RELEASE" 'git/refs/tags/${TAG}' \
+  "tagged lane has no remaining one-level tag resolver"
+
+BUILD_TIMEOUT=$(sed -n '/^  build:/,/^  mirror-dist:/p' "$RAPID_RELEASE" | awk '/timeout-minutes:/ {print $2; exit}')
+MIRROR_TIMEOUT=$(sed -n '/^  mirror-dist:/,/^  publish-updater-fallback:/p' "$RAPID_RELEASE" | awk '/timeout-minutes:/ {print $2; exit}')
+PUBLISH_TIMEOUT=$(sed -n '/^  publish-updater-fallback:/,$p' "$RAPID_RELEASE" | awk '/timeout-minutes:/ {print $2; exit}')
+if [[ "$BUILD_TIMEOUT" == 120 && "$MIRROR_TIMEOUT" == 30 && "$PUBLISH_TIMEOUT" == 120 \
+      && $((BUILD_TIMEOUT + MIRROR_TIMEOUT + PUBLISH_TIMEOUT)) -lt 350 ]]; then
+  ok "parent poll covers child build, mirror, turnstyle and publication budgets"
+else
+  bad "parent poll covers child build, mirror, turnstyle and publication budgets"
+fi
 
 # ---------------------------------------------------------------------------
 echo "== 5. tagged lane verifies tag binding before any publication =="

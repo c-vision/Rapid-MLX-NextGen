@@ -763,7 +763,7 @@ jobs:
       # closed. Recovery is an explicit rerun/dispatch at this immutable tag;
       # this gate never moves/deletes a tag or starts a workflow itself.
       - name: Wait for exact Desktop tagged publication
-        timeout-minutes: 60
+        timeout-minutes: 360
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APP_TAG: rapid-mac-v${{ needs.detect.outputs.version }}
@@ -776,7 +776,7 @@ jobs:
             --accepted-sha "$ACCEPTED_SHA" \
             --repo "$REPO" \
             --workflow rapid-mac-release.yml \
-            --deadline-min 55 \
+            --deadline-min 350 \
             --sleep-sec 20
 
       - name: Create tag and release
