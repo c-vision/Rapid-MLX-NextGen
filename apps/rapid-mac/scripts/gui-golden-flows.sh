@@ -4175,13 +4175,28 @@ flow_launch_integrations() {
     press "$OUT/main.json" Sidebar.Launch "$OUT/launch.json"
     wait_tree_text "Connect your agents" "$OUT/launch.json" 40
 
-    # Cold Launch is a beginner path, not a wall of dead commands. It should
-    # offer the same actionable readiness banner as Chat and reveal no setup
-    # snippets until the endpoint/key actually exist.
+    # Cold Launch is a beginner path, not a wall of live (copyable) commands.
+    # The stopped state now stays a useful setup destination (#2297): the
+    # endpoint shape and integration rows are shown as documentation, the
+    # inline model picker lets a user choose a different downloaded model,
+    # and the readiness banner offers Start. What must NOT happen is a
+    # command the user can paste while it is still a placeholder — so every
+    # `Launch.Integration.Copy.*` button must be present but `.enabled == false`
+    # until the endpoint/key actually exist (Copy on a placeholder is the
+    # silent-failure defect the disabled-Copy gate exists to prevent).
     count="$(jq '[.data.ui_elements[]? | (.identifier // "") | select(startswith("Launch.Integration.Copy."))] | unique | length' "$OUT/launch.json")"
-    [[ "$count" == 0 ]] || die "Cold Launch rendered $count dead integration commands"
+    [[ "$count" -gt 0 ]] || die "Cold Launch hid the integration setup rows entirely"
+    enabled_count="$(jq '[.data.ui_elements[]? | select(((.identifier // "") | startswith("Launch.Integration.Copy.")) and .enabled == true)] | length' "$OUT/launch.json")"
+    [[ "$enabled_count" == 0 ]] || die "Cold Launch offered $enabled_count copyable commands before the endpoint/key existed"
     jq -e '.data.ui_elements[]? | select(.identifier == "Readiness.Action")' "$OUT/launch.json" >/dev/null \
         || die "Cold Launch offered no primary model-start action"
+    # The inline picker is addressable by its own menu popup
+    # (``ModelPickerBar.ModelMenu``) — NOT by a composite id stamped on the
+    # whole bar, which `ModelPickerBar` deliberately avoids (it propagates one
+    # id onto both the popup and the (i) info button and makes them
+    # indistinguishable). Assert the popup itself is present.
+    jq -e '.data.ui_elements[]? | select(.identifier == "ModelPickerBar.ModelMenu")' "$OUT/launch.json" >/dev/null \
+        || die "Cold Launch offered no inline model picker"
     baseline launch-integrations.complete "$OUT/launch.json"
 
     press "$OUT/launch.json" Sidebar.NewChat "$OUT/launch-chat.json" \
@@ -4510,25 +4525,39 @@ flow_audio_readiness() {
 
     # A media resident is process-wide state, not the Chat model selection.
     # Launch commands must neither advertise the TTS alias to coding agents
-    # nor remain copyable while their selected chat model is not serving.
+    # nor be copyable while their selected chat model is not serving. Since
+    # #2297 the stopped Launch page renders the integration rows as
+    # documentation with Copy deliberately disabled, so the guard is the
+    # rows being present-but-not-copyable: the `Launch.Integration.Copy.*`
+    # rows must EXIST (count > 0) and every one of them must be disabled
+    # (enabled_count == 0), plus the Readiness start action must be present.
+    # Counting the rows (not just checking nothing is enabled) is what
+    # distinguishes "documentation rows rendered with Copy disabled" from a
+    # regression where the whole Launch surface silently vanished. The
+    # launch-integrations journey asserts the same present-but-not-copyable
+    # contract.
     press "$OUT/speech-resident.json" Sidebar.Launch "$OUT/launch-from-audio.json" \
         || die "Sidebar.Launch is not pressable from an Audio residency"
-    local launch_copy_count=0 launch_ready=0
+    local launch_ready=0
     for ((i=0; i<40; i++)); do
         see_main "$OUT/launch-from-audio.json"
-        launch_copy_count="$(jq '[.data.ui_elements[]?
-                                  | (.identifier // "")
-                                  | select(startswith("Launch.Integration.Copy."))]
-                                 | unique | length' "$OUT/launch-from-audio.json")"
-        if [[ "$launch_copy_count" == 0 ]] &&
-           jq -e '.data.ui_elements[]? | select(.identifier == "Readiness.Action")' \
-              "$OUT/launch-from-audio.json" >/dev/null; then
+        if jq -e '.data.ui_elements[]? | select(.identifier == "Readiness.Action")' \
+              "$OUT/launch-from-audio.json" >/dev/null \
+           && [[ "$(jq '[.data.ui_elements[]?
+                          | select(((.identifier // "")
+                                    | startswith("Launch.Integration.Copy.")))] | length' \
+                       "$OUT/launch-from-audio.json")" -gt 0 ]] \
+           && [[ "$(jq '[.data.ui_elements[]?
+                          | select(((.identifier // "")
+                                    | startswith("Launch.Integration.Copy."))
+                                   and .enabled == true)] | length' \
+                       "$OUT/launch-from-audio.json")" == 0 ]]; then
             launch_ready=1; break
         fi
         sleep 0.25
     done
     [[ "$launch_ready" == 1 ]] \
-        || die "Launch exposed dead commands or no chat-model start action from Audio"
+        || die "Launch exposed copyable commands, hid the launch rows, or had no chat-model start action from Audio"
     if jq -e '[.data.ui_elements[]? | .value? | strings]
               | any(contains("fake-qwen3-tts")
                     and (contains("--model")
