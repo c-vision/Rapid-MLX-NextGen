@@ -47,7 +47,7 @@ def test_resident_performance_maps_to_the_scheduler_contract():
     ],
 )
 async def test_dynamic_resident_auto_detected_hybrid_gets_bounded_prefix_reuse(
-    monkeypatch, model_name, model_path
+    monkeypatch, scheduler_config_stub, model_name, model_path
 ):
     """Runtime residency must consume the same architecture truth as serve."""
     from vllm_mlx import server
@@ -87,7 +87,9 @@ async def test_dynamic_resident_auto_detected_hybrid_gets_bounded_prefix_reuse(
 
 
 @pytest.mark.asyncio
-async def test_dynamic_resident_prefix_disable_keeps_hybrid_entries_zero(monkeypatch):
+async def test_dynamic_resident_prefix_disable_keeps_hybrid_entries_zero(
+    monkeypatch, scheduler_config_stub
+):
     from vllm_mlx import server
     from vllm_mlx.model_profile import ModelProfile
 
@@ -129,7 +131,9 @@ async def test_dynamic_resident_prefix_disable_keeps_hybrid_entries_zero(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_dynamic_resident_full_attention_stays_unbounded(monkeypatch):
+async def test_dynamic_resident_full_attention_stays_unbounded(
+    monkeypatch, scheduler_config_stub
+):
     from vllm_mlx import server
     from vllm_mlx.model_profile import ModelProfile
 

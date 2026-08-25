@@ -228,6 +228,51 @@ class TestResolveHybridCacheEntries:
             == _DEFAULT_HYBRID_CACHE_ENTRIES
         )
 
+    def test_linear_attention_wrapper_reuses_model_config_contract(self):
+        from vllm_mlx.cli import _config_declares_linear_attention
+
+        assert _config_declares_linear_attention(
+            {"text_config": {"layer_types": ["linear_attention"]}}
+        )
+        assert not _config_declares_linear_attention(None)
+
+    def test_turboquant_lazy_default_remains_available(self, scheduler_config_stub):
+        from types import SimpleNamespace
+
+        from vllm_mlx.turboquant import resolve_turboquant_mode_default
+
+        args = SimpleNamespace(
+            kv_cache_turboquant=None,
+            kv_cache_quantization=False,
+        )
+        assert (
+            resolve_turboquant_mode_default(args, model_name="qwen3.5-9b-4bit")
+            == "k8v4"
+        )
+
+    def test_turboquant_missing_auto_config_module_degrades_to_off(
+        self, monkeypatch, scheduler_config_stub
+    ):
+        import builtins
+        from types import SimpleNamespace
+
+        from vllm_mlx.turboquant import resolve_turboquant_mode_default
+
+        real_import = builtins.__import__
+
+        def block_auto_config(name, globals=None, locals=None, fromlist=(), level=0):
+            if level == 1 and name == "model_auto_config":
+                raise ImportError("model auto-config unavailable")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", block_auto_config)
+        args = SimpleNamespace(
+            kv_cache_turboquant=None,
+            kv_cache_quantization=False,
+        )
+
+        assert resolve_turboquant_mode_default(args, model_name="opaque") is None
+
     def test_no_auto_default_for_non_hybrid(self, monkeypatch):
         """Non-hybrid model → stays 0."""
         _patch_resolve_profile(monkeypatch, is_hybrid=False)

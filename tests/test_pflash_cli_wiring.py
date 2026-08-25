@@ -16,6 +16,7 @@ error so nothing past it (engine boot, uvicorn, weight load) runs.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from unittest import mock
 
@@ -23,8 +24,10 @@ import pytest
 
 import vllm_mlx.cli as cli
 
-# Bind the real engine_core before any test patches scheduler internals.
-import vllm_mlx.engine_core as _engine_core  # noqa: E402,F401
+# Bind the real engine_core on MLX hosts before any test patches scheduler
+# internals. Linux contract lanes deliberately have no MLX runtime.
+if importlib.util.find_spec("mlx") is not None:
+    import vllm_mlx.engine_core as _engine_core  # noqa: E402,F401
 
 
 class _StopError(Exception):
@@ -64,7 +67,9 @@ def _run_serve_capturing_pflash(argv: list[str], *, lane=(False, False)) -> dict
     return seen
 
 
-def test_serve_command_routes_pflash_through_resolve_pflash_config():
+def test_serve_command_routes_pflash_through_resolve_pflash_config(
+    scheduler_config_stub,
+):
     from vllm_mlx.model_aliases import resolve_model
 
     seen = _run_serve_capturing_pflash(["serve", "bonsai-27b-2bit"])

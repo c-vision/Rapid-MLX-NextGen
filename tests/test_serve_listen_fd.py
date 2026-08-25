@@ -352,7 +352,7 @@ def test_serve_command_dispatches_uvicorn_with_fd_when_listen_fd_set(
 
 
 def test_serve_command_threads_auto_detected_hybrid_into_cache_admission(
-    stub_heavy_serve_deps, monkeypatch
+    stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
 ):
     """The unified serve entrypoint must consume its one resolved profile."""
     from vllm_mlx import server as server_mod
@@ -369,6 +369,8 @@ def test_serve_command_threads_auto_detected_hybrid_into_cache_admission(
     def detect_model_config(model_name):
         detected_models.append(model_name)
         return ModelProfile(
+            tool_call_parser="hermes",
+            reasoning_parser="qwen3",
             is_hybrid=True,
             is_hybrid_explicit=True,
             supports_spec_decode=False,
@@ -391,8 +393,76 @@ def test_serve_command_threads_auto_detected_hybrid_into_cache_admission(
     assert scheduler.non_trimmable_exact_prefix_reuse is True
 
 
+def test_serve_command_cache_is_first_metadata_consumer(
+    stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
+):
+    """Fully pinned adjacent defaults leave cache admission as first reader."""
+    from vllm_mlx import server as server_mod
+    from vllm_mlx.model_profile import ModelProfile
+
+    captured = {}
+    monkeypatch.setattr(
+        server_mod,
+        "load_model",
+        lambda *_args, scheduler_config, **_kwargs: captured.update(
+            scheduler_config=scheduler_config
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.model_auto_config.detect_model_config",
+        lambda _name: ModelProfile(is_hybrid=True, is_hybrid_explicit=True),
+    )
+    _capture_uvicorn_run(monkeypatch)
+    ns = _minimal_serve_ns(port=_free_tcp_port())
+    ns.model = "publisher/cache-only-metadata"
+    ns._original_alias = None
+    ns.pflash = "off"
+    ns.pflash_keep_ratio = 0.2
+    ns.tool_call_parser = "hermes"
+    ns.reasoning_parser = "qwen3"
+    ns.kv_cache_turboquant = "none"
+
+    cli.serve_command(ns)
+
+    assert captured["scheduler_config"].hybrid_cache_entries == 8
+
+
+def test_serve_command_missing_auto_config_module_degrades_to_no_default(
+    stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
+):
+    """A partial install keeps the pre-existing optional-default fallback."""
+    import builtins
+
+    from vllm_mlx import server as server_mod
+
+    captured = {}
+    monkeypatch.setattr(
+        server_mod,
+        "load_model",
+        lambda *_args, scheduler_config, **_kwargs: captured.update(
+            scheduler_config=scheduler_config
+        ),
+    )
+    real_import = builtins.__import__
+
+    def block_auto_config(name, globals=None, locals=None, fromlist=(), level=0):
+        if level == 1 and name == "model_auto_config":
+            raise ImportError("model auto-config unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", block_auto_config)
+    _capture_uvicorn_run(monkeypatch)
+    ns = _minimal_serve_ns(port=_free_tcp_port())
+    ns.model = "publisher/opaque-checkpoint"
+    ns._original_alias = None
+
+    cli.serve_command(ns)
+
+    assert captured["scheduler_config"].hybrid_cache_entries == 0
+
+
 def test_serve_command_explicit_zero_wins_over_auto_detected_hybrid(
-    stub_heavy_serve_deps, monkeypatch
+    stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
 ):
     from vllm_mlx import server as server_mod
     from vllm_mlx.model_profile import ModelProfile
@@ -435,7 +505,7 @@ def test_serve_command_explicit_zero_wins_over_auto_detected_hybrid(
 
 
 def test_serve_command_all_explicit_defaults_skip_model_detection(
-    stub_heavy_serve_deps, monkeypatch
+    stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
 ):
     """Explicit operator choices must not make metadata availability fatal."""
 
@@ -471,7 +541,7 @@ def test_serve_command_all_explicit_defaults_skip_model_detection(
 
 
 def test_strict_auto_default_retries_failed_nonfatal_parser_detection(
-    stub_heavy_serve_deps, monkeypatch
+    stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
 ):
     """A parser probe failure must not suppress a later strict consumer."""
     attempts = []

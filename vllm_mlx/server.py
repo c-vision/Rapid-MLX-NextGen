@@ -3144,7 +3144,7 @@ Examples:
 
     def resolve_auto_config(*, non_fatal: bool):
         nonlocal auto_config, auto_config_resolved
-        if auto_config_resolved:
+        if auto_config_resolved:  # pragma: no cover - callers guard resolved state
             return auto_config
         try:
             from .model_auto_config import detect_model_config

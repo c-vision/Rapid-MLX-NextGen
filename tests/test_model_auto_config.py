@@ -1,6 +1,7 @@
 """Tests for model auto-config detection."""
 
 import logging
+from unittest import mock
 
 import pytest
 
@@ -2379,6 +2380,21 @@ class TestCheckpointMetadataFallback:
         assert config.is_hybrid is True
         assert config.is_hybrid_explicit is True
         assert config.supports_spec_decode is False
+
+    def test_metadata_detection_logs_when_called_directly(self, monkeypatch):
+        log = mock.Mock()
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda _name: self._metadata({"model_type": "qwen3_next"}, None),
+        )
+        monkeypatch.setattr(auto_config_mod, "_log_resolution_once", log)
+
+        config = auto_config_mod._detect_metadata_config("publisher/opaque")
+
+        assert config is not None
+        assert config.is_hybrid is True
+        log.assert_called_once()
 
     def test_pattern_match_preserves_authoritative_hybrid_metadata(self, monkeypatch):
         """A family parser fallback must not hide checkpoint architecture."""
