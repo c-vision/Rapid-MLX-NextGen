@@ -3586,10 +3586,16 @@ flow_image_generation() {
     # AX baseline normalization itself takes several seconds on a busy mini;
     # keep the synthetic decode tail long enough to observe after it.
     start_persona image-generation FAKE_IMAGE_STEPS=8 FAKE_IMAGE_STEP_MS=300 \
+        FAKE_IMAGE_STEP_MS_SEQUENCE=5000,300,5000,300,300,300,300,300 \
         FAKE_IMAGE_FIRST_WARMUP_ACK="$OUT_ROOT/image-generation/ig-warmup-ack" \
+        FAKE_IMAGE_STEP_HOLD_ACK="$OUT_ROOT/image-generation/ig-eta-hold-ack" \
         FAKE_IMAGE_FINISH_MS=15000 \
         RAPID_GUI_GOLDEN_MODE=1 \
         RAPID_SIMULATED_IMPORT_PATH="$ROOT/Tests/RapidTests/__Snapshots__/cheetah-logo-96.png"
+
+    # Existing renders pass step 2 immediately. Section 9 removes this file
+    # for one request so its two ETA reads are event-gated, not timing-gated.
+    : > "$OUT/ig-eta-hold-ack"
 
     dismiss_first_run
 
@@ -4067,6 +4073,98 @@ flow_image_generation() {
     done
     [[ "$import_exited" == 1 ]] \
         || die "exiting edit mode after an import did not restore generation controls"
+
+    # 9. ETA evidence across unchanged samples, cancellation, and restart.
+    # The fixture holds one reported step start. Capture the same
+    # structured step twice during that hold: the numeric ETA must remain
+    # identical even though the HUD's elapsed clock keeps advancing.
+    local cancel_prompt="a cheetah render to cancel after ETA appears"
+    rm -f "$OUT/ig-eta-hold-ack"
+    type_prompt "$cancel_prompt" ig-eta-cancel-draft
+    press "$OUT/ig-eta-cancel-draft.json" Images.Generate "$OUT/ig-eta-cancel-submit.json" \
+        || die "Images.Generate is not pressable for ETA cancellation evidence"
+    wait_fake_event \
+        ".event == \"image_request\" and .prompt == \"$cancel_prompt\"" \
+        "the ETA cancellation request never reached the sidecar"
+
+    local eta_ready=0 eta_step_a eta_value_a eta_step_b eta_value_b
+    for ((i=0; i<80; i++)); do
+        see_main "$OUT/ig-eta-sample-a.json"
+        eta_step_a="$(element_field "$OUT/ig-eta-sample-a.json" Images.Progress.Step value)"
+        eta_value_a="$(element_field "$OUT/ig-eta-sample-a.json" Images.Progress.ETA value)"
+        if [[ "$eta_step_a" == "2 / 8" && "$eta_value_a" == *"s left" ]]; then
+            eta_ready=1; break
+        fi
+        sleep 0.1
+    done
+    [[ "$eta_ready" == 1 ]] \
+        || die "the held denoise step never exposed a numeric ETA at step 2 / 8"
+    see_main "$OUT/ig-eta-sample-b.json"
+    eta_step_b="$(element_field "$OUT/ig-eta-sample-b.json" Images.Progress.Step value)"
+    eta_value_b="$(element_field "$OUT/ig-eta-sample-b.json" Images.Progress.ETA value)"
+    [[ "$eta_step_b" == "$eta_step_a" ]] \
+        || die "the deterministic unchanged-step fixture advanced unexpectedly ($eta_step_a -> $eta_step_b)"
+    [[ "$eta_value_b" == "$eta_value_a" ]] \
+        || die "ETA changed while reported progress stayed at $eta_step_a ($eta_value_a -> $eta_value_b)"
+    press "$OUT/ig-eta-sample-b.json" Images.Generate "$OUT/ig-eta-cancel-press.json" \
+        || die "the primary Stop control is not pressable after numeric ETA appears"
+    local cancel_requested=0
+    for ((i=0; i<40; i++)); do
+        see_main "$OUT/ig-eta-cancel-requested.json"
+        if jq -e 'any(.data.ui_elements[]?;
+                      .identifier == "Images.Generate" and .enabled == false)
+                  and any(.data.ui_elements[]?;
+                          .identifier == "Images.Cancel" and .enabled == false)' \
+               "$OUT/ig-eta-cancel-requested.json" >/dev/null; then
+            cancel_requested=1; break
+        fi
+        sleep 0.05
+    done
+    [[ "$cancel_requested" == 1 ]] \
+        || die "the primary Stop control did not enter the cancelling state"
+    wait_fake_event '.event == "image_cancel"' \
+        "the ETA-bearing render did not receive cancellation"
+    : > "$OUT/ig-eta-hold-ack"
+    local eta_cleared=0
+    for ((i=0; i<120; i++)); do
+        see_main "$OUT/ig-eta-cancelled.json"
+        if jq -e '.success == true and .data.walk.complete == true
+                  and (([.data.ui_elements[]? | .identifier // ""]
+                        | index("Images.Progress.ETA")) == null)
+                  and (([.data.ui_elements[]? | .identifier // ""]
+                        | index("Images.Cancel")) == null)' \
+               "$OUT/ig-eta-cancelled.json" >/dev/null; then
+            eta_cleared=1; break
+        fi
+        sleep 0.1
+    done
+    [[ "$eta_cleared" == 1 ]] \
+        || die "numeric ETA remained visible after cancellation completed"
+
+    # A restarted request begins at a new evidence window. The old numeric ETA
+    # must not flash on the new card before two completed samples exist.
+    local restart_prompt="a fresh cheetah render after cancellation"
+    type_prompt "$restart_prompt" ig-eta-restart-draft
+    press "$OUT/ig-eta-restart-draft.json" Images.Generate "$OUT/ig-eta-restart-submit.json" \
+        || die "Images.Generate is not pressable after ETA cancellation"
+    wait_fake_event \
+        ".event == \"image_request\" and .prompt == \"$restart_prompt\"" \
+        "the post-cancellation restart never reached the sidecar"
+    local restart_estimating=0
+    for ((i=0; i<40; i++)); do
+        see_main "$OUT/ig-eta-restart-estimating.json"
+        if [[ "$(element_field "$OUT/ig-eta-restart-estimating.json" Images.Progress.ETA value)" == "Estimating…" ]]; then
+            restart_estimating=1; break
+        fi
+        sleep 0.05
+    done
+    [[ "$restart_estimating" == 1 ]] \
+        || die "a restarted render reused stale numeric ETA instead of estimating from fresh progress"
+    press "$OUT/ig-eta-restart-estimating.json" Images.Cancel "$OUT/ig-eta-restart-cancel.json" \
+        || die "the restarted ETA fixture could not be cancelled for cleanup"
+    wait_fake_event \
+        ".event == \"image_response\" and .cancelled == true and .index == 6" \
+        "the restarted ETA fixture did not settle as cancelled"
 
     log "  image-generation OK"
 }
