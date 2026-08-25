@@ -2305,18 +2305,20 @@ async def _load_dynamic_resident_model(
 
         scheduler_kwargs = resident_scheduler_kwargs(performance)
         enable_prefix_cache = bool(scheduler_kwargs.get("enable_prefix_cache", True))
-        scheduler_kwargs["hybrid_cache_entries"] = _resolve_hybrid_cache_entries(
+        hybrid_cache_entries = _resolve_hybrid_cache_entries(
             enable_prefix_cache=enable_prefix_cache,
             explicit_value=0,
             user_set_explicit=False,
             model_name=resolved_path,
             model_config=model_config,
         )
-        scheduler_kwargs["non_trimmable_exact_prefix_reuse"] = scheduler_kwargs[
-            "hybrid_cache_entries"
-        ] > 0 and _needs_bounded_trim_free_reuse(
-            resolved_path,
-            model_config=model_config,
+        scheduler_kwargs["hybrid_cache_entries"] = hybrid_cache_entries
+        scheduler_kwargs["non_trimmable_exact_prefix_reuse"] = (
+            hybrid_cache_entries > 0
+            and _needs_bounded_trim_free_reuse(
+                resolved_path,
+                model_config=model_config,
+            )
         )
 
         engine = BatchedEngine(
