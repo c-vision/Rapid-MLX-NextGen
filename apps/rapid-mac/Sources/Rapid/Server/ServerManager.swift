@@ -1447,14 +1447,11 @@ final class ServerManager {
         // between the last three-second sample and the click can present a
         // fresh warning instead of silently loading under stale safe state.
         let bypassMemoryGuard = warning.severity == .unsafe
-        memoryConfirmRunning.insert(seq)
         guard memoryConfirmations.resolveCurrent(
             warning: warning,
             decision: .confirmed(sequence: seq)
-        ) else {
-            memoryConfirmRunning.remove(seq)
-            return
-        }
+        ) else { return }
+        memoryConfirmRunning.insert(seq)
         Task { [weak self] in
             guard let self else { return }
             if self.child != nil {
