@@ -71,7 +71,11 @@ and produces a Desktop manifest *before* the tag is claimed. The tag claim then:
 2. is bound to the exact **validated candidate SHA** *and* the **live `main`
    head** (TOCTOU-re-queried immediately before the claim), so a packaging fix
    landing on `main` while the candidate validated aborts the release rather
-   than tagging a candidate now behind head.
+   than tagging a candidate now behind head, and
+3. is followed by a bounded, fail-closed publication gate: the engine Release
+   is not created until the exact tagged Desktop workflow succeeds, the
+   canonical DMG is published and non-empty, and the tag still resolves to the
+   accepted SHA. A same-SHA tag no-op is never treated as proof of publication.
 
 On the bump PR only **PF-3** runs — a fail-closed read-back that the
 `rapid-mac-tag` environment exists and is protected (required reviewer,
@@ -82,6 +86,11 @@ identity gates (PF-4) run *after merge* in `release-prep`, then again
 immediately pre-tag. An RC that needs correcting is **superseded by the next
 RC** on its own validated commit — the old RC tag is immutable and is never
 moved, force-pushed, or deleted.
+
+If an exact Desktop tag exists but its tagged workflow is missing or failed,
+rerun that exact workflow (or explicitly dispatch `rapid-mac-release.yml` at
+the immutable tag ref), then rerun auto-release. Do not move/delete the tag and
+do not publish the engine half manually.
 
 `release-local.sh` dogfood builds are unaffected: they never create a tag, a
 GitHub Release, or an updater pointer.

@@ -132,8 +132,7 @@ print all of it — this exact SHA is what a reviewer approves.
    ▼
 release (environment: rapid-mac-tag — HUMAN APPROVAL on the printed SHA):
    re-verify live rapid-mac-tag protection, re-query live blockers + main head
-   (TOCTOU), then tag the desktop app at the exact validated SHA and create the
-   engine tag vX.Y.Z + GitHub Release (RELEASE_PAT) → publish.yml to PyPI.
+   (TOCTOU), then tag the desktop app at the exact validated SHA.
    │
    ▼
 rapid-mac-v* tag fires rapid-mac-release.yml: re-runs the SAME shared
@@ -141,6 +140,10 @@ desktop-releasable validation on the tagged commit and re-verifies the tag
 binding before upload. It mirrors the immutable DMG/Sparkle assets (as a
 GitHub prerelease for an RC); ONLY a non-RC stable release publishes the
 mutable appcast/latest.json updater pointers.
+   │ exact tagged run succeeded + published non-empty DMG + tag recheck
+   ▼
+release creates the engine tag vX.Y.Z + GitHub Release (RELEASE_PAT)
+→ publish.yml to PyPI.
 ```
 
 The two gates run **in parallel** (they share nothing — different runners,
@@ -254,6 +257,16 @@ exclusive with `force_version`**. Unlike the emergency path it bypasses
 signed Desktop candidate at the new head, the live blocker/main-head evidence,
 and the protected `rapid-mac-tag` approval are all re-required at the current
 `main` head.
+
+If the Desktop tag already exists at the accepted SHA, the tag claim is an
+idempotent no-op, not publication evidence. The release job waits (bounded) for
+an exact successful `rapid-mac-release.yml` run on that tag and a published,
+non-empty canonical DMG, then re-resolves the immutable tag before it creates
+the engine Release. A missing/failed tagged run, missing artifact, API/auth
+failure, timeout, or SHA mismatch stops the engine half. Recover by rerunning
+the failed exact tagged workflow (or explicitly dispatching it at
+`--ref rapid-mac-vX.Y.Z[-rcN]`) and then rerunning auto-release; never move or
+delete the tag.
 
 ## Related docs
 

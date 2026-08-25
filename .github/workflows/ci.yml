@@ -267,7 +267,8 @@ jobs:
         # Tests that need mlx live in the test-apple-silicon job below.
         # Tests include the #2301 release-contract checks (test_release_version,
         # test_check_main_head, test_check_release_blockers,
-        # test_check_release_environment, test_desktop_manifest) — pure stdlib,
+        # test_check_release_environment, test_check_desktop_publish,
+        # test_desktop_manifest) — pure stdlib,
         # no MLX. The separate engine-contracts job runs the shell release
         # scripts under tests/release/.
         run: |
@@ -310,6 +311,7 @@ jobs:
             tests/test_check_main_head.py \
             tests/test_check_release_blockers.py \
             tests/test_check_release_environment.py \
+            tests/test_check_desktop_publish.py \
             tests/test_desktop_manifest.py \
             tests/test_classify_ci_changes.py \
             tests/test_ci_lane_promotion.py \

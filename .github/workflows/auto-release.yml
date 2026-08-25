@@ -613,7 +613,8 @@ jobs:
   # 3b) Environment-gated production tag + engine release. The human approves
   #    the EXACT SHA the completed release-prep job printed (its summary + the
   #    evidence artifact show it), then tag_desktop_app.sh claims the tag at
-  #    that accepted SHA and Create tag and release publishes the engine.
+  #    that accepted SHA, waits for the exact tagged Desktop workflow and DMG
+  #    publication to succeed, and only then publishes the engine.
   release:
     needs: [detect, tier1-agent-gate, desktop-candidate-gate, release-prep]
     if: >-
@@ -754,6 +755,29 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/tag_desktop_app.sh
+
+      # An existing same-SHA tag is an idempotent success for the tag claim, but
+      # it does not prove the Desktop workflow ever completed. Wait for the exact
+      # tagged workflow run and its published non-empty DMG before exposing the
+      # engine release. API/auth/malformed/mismatch/failure/timeout all fail
+      # closed. Recovery is an explicit rerun/dispatch at this immutable tag;
+      # this gate never moves/deletes a tag or starts a workflow itself.
+      - name: Wait for exact Desktop tagged publication
+        timeout-minutes: 60
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_TAG: rapid-mac-v${{ needs.detect.outputs.version }}
+          ACCEPTED_SHA: ${{ needs.release-prep.outputs.accepted_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 scripts/check_desktop_publish.py \
+            --app-tag "$APP_TAG" \
+            --accepted-sha "$ACCEPTED_SHA" \
+            --repo "$REPO" \
+            --workflow rapid-mac-release.yml \
+            --deadline-min 55 \
+            --sleep-sec 20
 
       - name: Create tag and release
         env:

@@ -129,6 +129,30 @@ contains "$TAGSTEP" 'ACCEPTED_SHA: ${{ needs.release-prep.outputs.accepted_sha }
 contains "$TAGSTEP" 'scripts/tag_desktop_app.sh' "tag step invokes the tagged script"
 lacks "$TAGSTEP" "git push" "tag step never git pushes"
 
+# A same-SHA tag claim may no-op after a prior failed/missed Desktop workflow.
+# The engine must therefore wait for exact tagged Desktop publication evidence,
+# not treat ref identity alone as proof that the DMG shipped.
+PUBLISH_WAIT=$(sed -n '/name: Wait for exact Desktop tagged publication/,/name: Create tag and release/p' "$AUTO_RELEASE")
+contains "$PUBLISH_WAIT" 'scripts/check_desktop_publish.py' \
+  "engine release waits on the tested Desktop publication helper"
+contains "$PUBLISH_WAIT" 'APP_TAG: rapid-mac-v${{ needs.detect.outputs.version }}' \
+  "publication wait binds the exact Desktop tag"
+contains "$PUBLISH_WAIT" 'ACCEPTED_SHA: ${{ needs.release-prep.outputs.accepted_sha }}' \
+  "publication wait binds the validated candidate SHA"
+contains "$PUBLISH_WAIT" '--workflow rapid-mac-release.yml' \
+  "publication wait binds the expected Desktop workflow"
+contains "$PUBLISH_WAIT" 'timeout-minutes: 60' \
+  "publication wait has a bounded workflow timeout"
+TAG_LINE=$(grep -n 'name: Tag the desktop app at the exact validated SHA' "$AUTO_RELEASE" | cut -d: -f1)
+WAIT_LINE=$(grep -n 'name: Wait for exact Desktop tagged publication' "$AUTO_RELEASE" | cut -d: -f1)
+ENGINE_LINE=$(grep -n 'name: Create tag and release' "$AUTO_RELEASE" | cut -d: -f1)
+if [[ -n "$TAG_LINE" && -n "$WAIT_LINE" && -n "$ENGINE_LINE" \
+      && "$TAG_LINE" -lt "$WAIT_LINE" && "$WAIT_LINE" -lt "$ENGINE_LINE" ]]; then
+  ok "tag claim -> Desktop publication evidence -> engine release ordering"
+else
+  bad "tag claim -> Desktop publication evidence -> engine release ordering"
+fi
+
 # ---------------------------------------------------------------------------
 echo "== 5. tagged lane verifies tag binding before any publication =="
 # ---------------------------------------------------------------------------

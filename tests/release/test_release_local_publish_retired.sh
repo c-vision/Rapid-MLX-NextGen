@@ -65,7 +65,6 @@ chmod +x "$BIN/plutil"
 CALL_LOG="$TMP/calls"
 : > "$CALL_LOG"
 MARKER="$TMP/sourced-no"
-: > "$MARKER"
 
 # Run from the apps/rapid-mac dir so relative paths resolve like real usage.
 OUT=$(
@@ -90,7 +89,7 @@ else
 fi
 
 # 3) RAPID_RELEASE_ENV was NOT sourced (sentinel would have touched $MARKER).
-if [[ -s "$MARKER" ]]; then
+if [[ -e "$MARKER" ]]; then
   bad "--publish does not source the operator env file"
 else
   ok "--publish does not source the operator env file"
