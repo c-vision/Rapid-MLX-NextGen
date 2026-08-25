@@ -131,6 +131,33 @@ struct LaunchAutoStartMemoryTests {
         #expect(olderTransition == nil)
         #expect(server.pendingMemoryWarning?.severity == .safe)
     }
+
+    @MainActor
+    @Test("a cancelled view-bound refresh cannot update the parked warning")
+    func cancelledRefreshDoesNotApplyItsSample() async throws {
+        let gib = UInt64(1_073_741_824)
+        let snapshots = OrderedMemorySnapshots(
+            initial: .init(totalBytes: 32 * gib, usedBytes: 30 * gib),
+            delayed: .init(totalBytes: 32 * gib, usedBytes: 2 * gib),
+            newest: .init(totalBytes: 32 * gib, usedBytes: 2 * gib)
+        )
+        let server = ServerManager(
+            testingState: .idle,
+            binaryPath: URL(fileURLWithPath: "/usr/bin/true")
+        )
+        server.memorySnapshotProvider = { snapshots.next() }
+
+        await server.start(alias: "qwen3.5-9b-4bit")
+        #expect(server.pendingMemoryWarning?.severity == .unsafe)
+
+        let refresh = Task { await server.refreshPendingMemoryWarning() }
+        await snapshots.waitForDelayedSample()
+        refresh.cancel()
+        snapshots.releaseDelayedSample()
+
+        #expect(await refresh.value == nil)
+        #expect(server.pendingMemoryWarning?.severity == .unsafe)
+    }
 }
 
 private final class LockedMemorySnapshots: @unchecked Sendable {

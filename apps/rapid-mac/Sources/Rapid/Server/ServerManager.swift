@@ -208,10 +208,15 @@ final class ServerManager {
         memoryWarningRefreshGeneration += 1
         let generation = memoryWarningRefreshGeneration
         let provider = memorySnapshotProvider
-        let snapshot = await Task.detached(priority: .utility) {
-            provider()
-        }.value
-        guard generation == memoryWarningRefreshGeneration,
+        let snapshot = await withTaskGroup(
+            of: MemoryProbe.Snapshot?.self,
+            returning: MemoryProbe.Snapshot?.self
+        ) { group in
+            group.addTask(priority: .utility) { provider() }
+            return await group.next() ?? nil
+        }
+        guard !Task.isCancelled,
+              generation == memoryWarningRefreshGeneration,
               pendingMemoryWarning?.id == warningID,
               let snapshot,
               let transition = memoryConfirmations.refreshCurrentWarning(snapshot: snapshot),
