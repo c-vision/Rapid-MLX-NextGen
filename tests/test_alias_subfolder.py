@@ -547,6 +547,35 @@ def test_mirror_runs_subfolder_repos_with_allow_patterns(monkeypatch):
     assert seen == [None], "flat repo must pull the whole repo (allow_patterns=None)"
 
 
+def test_mirror_filter_discards_unselected_siblings_before_io(monkeypatch, tmp_path):
+    """The Linux gate exercises the real mirror-side filter, not only CLI wiring."""
+    from types import SimpleNamespace
+
+    import huggingface_hub
+
+    import vllm_mlx._mirror as mirror
+
+    info = SimpleNamespace(
+        sha="deadbeef",
+        siblings=[
+            SimpleNamespace(rfilename="8bit/model.safetensors", size=400, lfs=None),
+            SimpleNamespace(rfilename="LICENSE", size=50, lfs=None),
+        ],
+    )
+    monkeypatch.setenv("RAPID_MLX_MODEL_MIRROR", mirror.MIRROR_DEFAULT)
+    monkeypatch.setattr(huggingface_hub, "model_info", lambda *a, **kw: info)
+
+    assert (
+        mirror.download_with_mirror_fallback(
+            REPO, cache_dir=tmp_path, allow_patterns=["4bit/*"]
+        )
+        is False
+    )
+    assert list(tmp_path.iterdir()) == [], (
+        "an empty selection must fall through before creating cache state"
+    )
+
+
 def test_registry_fails_closed_on_every_load_not_just_the_first(monkeypatch):
     """A caught validation error must not leave a usable registry behind.
 
