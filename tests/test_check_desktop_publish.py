@@ -266,6 +266,18 @@ def test_old_failure_plus_success_prefers_success(gate, tmp_path):
     assert any("run 11 succeeded" in e for e in evidence)
 
 
+def test_newer_failed_rerun_invalidates_older_success(gate, tmp_path):
+    gh, state = _mock_state(tmp_path)
+    _write(
+        state,
+        "runs.sh",
+        _runs_with(_run_record(10), _run_record(11, conclusion="failure")),
+    )
+    _write(state, "release.json", _release_with(_asset()))
+    with pytest.raises(gate.PublishGateError, match="completed without success"):
+        _verify(gate, gh, state)
+
+
 def test_success_waits_for_active_exact_rerun_then_uses_newest(gate, tmp_path):
     gh, state = _mock_state(tmp_path)
     runs_script = textwrap.dedent(

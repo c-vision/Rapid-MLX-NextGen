@@ -177,6 +177,24 @@ contains "$PUBLISH_STEP" 'asset.get("digest") != f"sha256:{digest}"' \
   "tagged rerun requires an existing canonical DMG to be byte-identical"
 lacks "$PUBLISH_STEP" '--clobber' \
   "tagged rerun never replaces an already-published Desktop DMG"
+UPDATER_STEP=$(sed -n '/name: Publish updater fallback monotonically/,/name: Create the GitHub Release/p' "$RAPID_RELEASE")
+contains "$UPDATER_STEP" 'if [[ "$CURRENT_VERSION" == "$TARGET_VERSION" ]]' \
+  "equal-version rerun branches before the first mutable updater write"
+contains "$UPDATER_STEP" 'scripts/check_equal_version_republish.py' \
+  "equal-version rerun verifies pointer, exact DMG and existing Release identity"
+contains "$UPDATER_STEP" 'exit 0' \
+  "identical equal-version rerun no-ops the mutable updater transaction"
+IDENTITY_LINE=$(grep -n 'scripts/check_equal_version_republish.py' "$RAPID_RELEASE" | cut -d: -f1)
+LATEST_PUT_LINE=$(grep -n 'r2 object put "${R2_BUCKET}/latest.json"' "$RAPID_RELEASE" | tail -1 | cut -d: -f1)
+APPCAST_PUT_LINE=$(grep -n 'r2 object put "${R2_BUCKET}/appcast.xml"' "$RAPID_RELEASE" | tail -1 | cut -d: -f1)
+COMPAT_PUT_LINE=$(grep -n '"${R2_BUCKET}/rapid-mac/rapid-mlx-desktop.dmg"' "$RAPID_RELEASE" | tail -1 | cut -d: -f1)
+if [[ -n "$IDENTITY_LINE" && "$IDENTITY_LINE" -lt "$LATEST_PUT_LINE" \
+      && "$IDENTITY_LINE" -lt "$APPCAST_PUT_LINE" \
+      && "$IDENTITY_LINE" -lt "$COMPAT_PUT_LINE" ]]; then
+  ok "equal-version identity gate precedes latest, appcast and compatibility DMG writes"
+else
+  bad "equal-version identity gate precedes every mutable updater write"
+fi
 
 RESOLVER_USES=$(grep -c 'resolve_github_tag_commit "$TAG"' "$RAPID_RELEASE")
 [[ "$RESOLVER_USES" == 2 ]] \

@@ -543,6 +543,8 @@ jobs:
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           R2_BUCKET: ${{ vars.RAPID_MAC_DIST_R2_BUCKET }}
           CDN_BASE: ${{ vars.RAPID_MAC_DIST_CDN_BASE }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           [[ -n "${CLOUDFLARE_API_TOKEN:-}" && -n "${CLOUDFLARE_ACCOUNT_ID:-}" && -n "${CLOUDFLARE_ZONE_ID:-}" ]] || {
@@ -567,6 +569,25 @@ jobs:
             CURRENT_VERSION="$(jq -er '.version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' dist/current-latest.json)"
             if dpkg --compare-versions "$CURRENT_VERSION" gt "$TARGET_VERSION"; then
               echo "::notice::Skipping stale updater manifest ${TARGET_VERSION}; current is ${CURRENT_VERSION}"
+              exit 0
+            fi
+            if [[ "$CURRENT_VERSION" == "$TARGET_VERSION" ]]; then
+              RELEASE_ARGS=()
+              if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+                  > dist/current-release.json 2> dist/current-release.err; then
+                RELEASE_ARGS=(--release-json dist/current-release.json)
+              elif grep -Fq '(HTTP 404)' dist/current-release.err; then
+                echo "::notice::GitHub Release ${TAG} is absent; preserving updater bytes and continuing Release recovery"
+              else
+                cat dist/current-release.err >&2
+                exit 1
+              fi
+              python3 scripts/check_equal_version_republish.py \
+                --current dist/current-latest.json \
+                --candidate dist/latest.json \
+                --dmg dist-dmg/rapid-mlx-desktop.dmg \
+                "${RELEASE_ARGS[@]}"
+              echo "::notice::Equal-version updater transaction is already byte-identical; no mutable object will be rewritten"
               exit 0
             fi
           elif grep -Fq "The specified key does not exist." <<<"$GET_OUTPUT"; then

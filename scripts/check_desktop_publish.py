@@ -458,13 +458,17 @@ def verify(
             if r.get("status") in ("queued", "in_progress", "waiting", "pending")
         ]
 
-        success = [r for r in completed if r.get("conclusion") == "success"]
-        # A successful run is not stable publication evidence while another
-        # exact run can still reach the publication step. Wait for the exact
-        # run set to settle, then bind the newest success deterministically.
-        if success and not active:
-            success_run = max(success, key=lambda run: run["databaseId"])
-            break
+        # Once the set settles, its newest exact run is authoritative. A newer
+        # failed rerun invalidates an older success; otherwise engine/Desktop
+        # identity could be certified from stale publication evidence.
+        if bound and not active:
+            newest = max(bound, key=lambda run: run["databaseId"])
+            if (
+                newest.get("status") == "completed"
+                and newest.get("conclusion") == "success"
+            ):
+                success_run = newest
+                break
         # Still waiting: an exact run is active (e.g. a rerun in progress), or
         # the tag run hasn't appeared yet. Fail only when nothing exact is
         # active and a failure remains.
