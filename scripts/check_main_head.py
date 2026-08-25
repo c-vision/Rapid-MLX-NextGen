@@ -38,7 +38,11 @@ def _is_full_sha(value: str) -> bool:
 def check_live_head(*, main_sha: str, accepted_sha: str, release_sha: str) -> list[str]:
     """Verify main_sha == accepted_sha == release_sha; return evidence or raise."""
 
-    for label, value in (("main", main_sha), ("accepted", accepted_sha), ("release", release_sha)):
+    for label, value in (
+        ("main", main_sha),
+        ("accepted", accepted_sha),
+        ("release", release_sha),
+    ):
         if not isinstance(value, str) or not _is_full_sha(value):
             raise MainHeadGateError(
                 f"{label} SHA must be a full 40-character commit, got {value!r}"

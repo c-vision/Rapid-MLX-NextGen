@@ -41,9 +41,7 @@ def test_preceding_pretag_rc2_with_only_stable_baseline():
 def test_preceding_pretag_stable_with_only_earlier_stable():
     # A brand-new stable (0.13.0) that is not yet tagged still finds 0.12.18.
     assert (
-        preceding_stable_tag(
-            "0.13.0", ["rapid-mac-v0.12.18", "rapid-mac-v0.13.0-rc1"]
-        )
+        preceding_stable_tag("0.13.0", ["rapid-mac-v0.12.18", "rapid-mac-v0.13.0-rc1"])
         == "rapid-mac-v0.12.18"
     )
 

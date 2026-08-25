@@ -82,9 +82,7 @@ def sha256(path: Path) -> str:
 
 def _assert_commit_sha(source_sha: str) -> None:
     if len(source_sha) != 40 or any(ch not in "0123456789abcdef" for ch in source_sha):
-        raise ValueError(
-            "source SHA must be a 40-character lowercase Git commit SHA"
-        )
+        raise ValueError("source SHA must be a 40-character lowercase Git commit SHA")
 
 
 def _app_plist(app_dir: Path) -> dict[str, Any]:
@@ -100,7 +98,9 @@ def _app_plist(app_dir: Path) -> dict[str, Any]:
         with plist_path.open("rb") as handle:
             plist = plistlib.load(handle)
     except (OSError, plistlib.InvalidFileException, ValueError) as exc:
-        raise ValueError(f"cannot read built app Info.plist {plist_path}: {exc}") from exc
+        raise ValueError(
+            f"cannot read built app Info.plist {plist_path}: {exc}"
+        ) from exc
     if not isinstance(plist, dict):
         raise ValueError(f"built app Info.plist is not a dictionary: {plist_path}")
     return plist
@@ -177,13 +177,17 @@ def write_manifest(manifest: dict[str, Any], output: Path) -> None:
     output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
 
-def verify_manifest(*, app_dir: Path, dmg_path: Path, manifest_path: Path) -> dict[str, Any]:
+def verify_manifest(
+    *, app_dir: Path, dmg_path: Path, manifest_path: Path
+) -> dict[str, Any]:
     """Verify the built DMG against a stored manifest; return the manifest."""
 
     try:
         manifest = json.loads(manifest_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read desktop manifest {manifest_path}: {exc}") from exc
+        raise ValueError(
+            f"cannot read desktop manifest {manifest_path}: {exc}"
+        ) from exc
     if manifest.get("schema") != SCHEMA or manifest.get("project") != PROJECT:
         raise ValueError("desktop manifest has an unknown schema or project")
     if manifest.get("artifact_kind") != ARTIFACT_KIND:
@@ -255,7 +259,9 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--signed", action=argparse.BooleanOptionalAction)
     create.add_argument("--delta-compared", action=argparse.BooleanOptionalAction)
 
-    verify = subparsers.add_parser("verify", help="verify the built DMG against a manifest")
+    verify = subparsers.add_parser(
+        "verify", help="verify the built DMG against a manifest"
+    )
     verify.add_argument("--app-dir", type=Path, required=True)
     verify.add_argument("--dmg", type=Path, required=True)
     verify.add_argument("--manifest", type=Path, required=True)
@@ -275,7 +281,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             delta_compared=bool(args.delta_compared),
         )
         write_manifest(manifest, args.output)
-        print(f"wrote {args.output} for {manifest['version']} at {manifest['source_sha']}")
+        print(
+            f"wrote {args.output} for {manifest['version']} at {manifest['source_sha']}"
+        )
     else:
         manifest = verify_manifest(
             app_dir=args.app_dir, dmg_path=args.dmg, manifest_path=args.manifest

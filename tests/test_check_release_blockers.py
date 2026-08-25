@@ -57,7 +57,9 @@ def _waiver(tmp_path, ids, *, name="waivers-0.13.0-rc2.json") -> Path:
     return d
 
 
-def _issue(num, title="blocker title", url="https://github.com/x/y/issues/{num}", **extra):
+def _issue(
+    num, title="blocker title", url="https://github.com/x/y/issues/{num}", **extra
+):
     rec = {"number": num, "title": title, "url": url}
     rec.update(extra)
     return rec

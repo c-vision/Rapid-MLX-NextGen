@@ -27,14 +27,16 @@ def checker():
     return module
 
 
-def test_unchanged_head_A_passes(checker):
+def test_unchanged_head_a_passes(checker):
     env = checker.check_live_head(main_sha=A, accepted_sha=A, release_sha=A)
     assert A in "\n".join(env)
 
 
 def test_a_then_b_refuses(checker):
     # B landed on main while candidate A was validating -> A is now behind head.
-    with pytest.raises(checker.MainHeadGateError, match="no longer the validated candidate"):
+    with pytest.raises(
+        checker.MainHeadGateError, match="no longer the validated candidate"
+    ):
         checker.check_live_head(main_sha=B, accepted_sha=A, release_sha=A)
 
 

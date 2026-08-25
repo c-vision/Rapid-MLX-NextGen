@@ -80,7 +80,7 @@ def preceding_stable_tag(intended: str, existing_tags: Sequence[str]) -> str | N
     for tag in existing_tags:
         if not isinstance(tag, str) or not tag.startswith("rapid-mac-v"):
             continue
-        core = tag[len("rapid-mac-v"):]
+        core = tag[len("rapid-mac-v") :]
         if "-rc" in core:  # predecessor is always a stable release
             continue
         try:
@@ -111,7 +111,7 @@ def preceding_release_tag(intended: str, existing_tags: Sequence[str]) -> str | 
     for tag in existing_tags:
         if not isinstance(tag, str) or not tag.startswith("rapid-mac-v"):
             continue
-        core = tag[len("rapid-mac-v"):]
+        core = tag[len("rapid-mac-v") :]
         try:
             candidate = parse_version(core)
         except ValueError:

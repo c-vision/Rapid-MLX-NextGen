@@ -42,7 +42,9 @@ def _load(path: Path) -> dict:
     try:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        raise EnvironmentGateError(f"cannot read environment JSON {path}: {exc}") from exc
+        raise EnvironmentGateError(
+            f"cannot read environment JSON {path}: {exc}"
+        ) from exc
     if not isinstance(data, dict):
         raise EnvironmentGateError(f"environment JSON {path} is not an object")
     return data
@@ -71,7 +73,8 @@ def read_back(
     # malformed reviewer record fails closed — an extra read-access user or a
     # Team reviewer would otherwise silently ride along.
     rules = [
-        r for r in env.get("protection_rules", [])
+        r
+        for r in env.get("protection_rules", [])
         if isinstance(r, dict) and r.get("type") == "required_reviewers"
     ]
     if len(rules) != 1:
@@ -113,7 +116,10 @@ def read_back(
         raise EnvironmentGateError(
             f"environment deployment_branch_policy must be an object, got {dbp!r}"
         )
-    if dbp.get("custom_branch_policies") is not True or dbp.get("protected_branches") is not False:
+    if (
+        dbp.get("custom_branch_policies") is not True
+        or dbp.get("protected_branches") is not False
+    ):
         raise EnvironmentGateError(
             "deployment mode must be custom_branch_policies=true and "
             f"protected_branches=false, got {dbp!r}"
@@ -131,7 +137,11 @@ def read_back(
             f"deployment-branch-policy must list exactly one branch policy, got {branches!r}"
         )
     policy = branches[0]
-    if not isinstance(policy, dict) or policy.get("name") != expected_branch or policy.get("type") != "branch":
+    if (
+        not isinstance(policy, dict)
+        or policy.get("name") != expected_branch
+        or policy.get("type") != "branch"
+    ):
         raise EnvironmentGateError(
             f"deployment policy must be exactly {{name: {expected_branch!r}, type: branch}}, got {policy!r}"
         )

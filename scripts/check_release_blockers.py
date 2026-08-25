@@ -51,8 +51,10 @@ class BlockerCheckError(Exception):
 def _assert_commit_sha(source_sha: str) -> None:
     """Fail closed on a malformed source-sha rather than bind evidence to it."""
 
-    if not isinstance(source_sha, str) or len(source_sha) != 40 or any(
-        ch not in "0123456789abcdef" for ch in source_sha
+    if (
+        not isinstance(source_sha, str)
+        or len(source_sha) != 40
+        or any(ch not in "0123456789abcdef" for ch in source_sha)
     ):
         raise BlockerCheckError(
             "source-sha must be a 40-character lowercase Git commit SHA; "
@@ -73,11 +75,16 @@ def _run_gh(gh: str, repo: str) -> list[dict]:
         gh,
         "issue",
         "list",
-        "--repo", repo,
-        "--state", "open",
-        "--label", "release-blocker",
-        "--limit", "1000",
-        "--json", "number,title,url",
+        "--repo",
+        repo,
+        "--state",
+        "open",
+        "--label",
+        "release-blocker",
+        "--limit",
+        "1000",
+        "--json",
+        "number,title,url",
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -143,15 +150,23 @@ def _waivers(waivers_dir: Path, version: str) -> dict[int, dict]:
             raise BlockerCheckError(f"waiver file {path} has a non-object waiver")
         issue = w.get("issue")
         if isinstance(issue, bool) or not isinstance(issue, int) or issue <= 0:
-            raise BlockerCheckError(f"waiver file {path} has a waiver without an integer issue id")
+            raise BlockerCheckError(
+                f"waiver file {path} has a waiver without an integer issue id"
+            )
         reason = w.get("reason")
         by = w.get("by")
         if not isinstance(reason, str) or not reason.strip():
-            raise BlockerCheckError(f"waiver file {path} waiver #{issue} has no 'reason'")
+            raise BlockerCheckError(
+                f"waiver file {path} waiver #{issue} has no 'reason'"
+            )
         if not isinstance(by, str) or not by.strip():
-            raise BlockerCheckError(f"waiver file {path} waiver #{issue} has no 'by' owner")
+            raise BlockerCheckError(
+                f"waiver file {path} waiver #{issue} has no 'by' owner"
+            )
         if issue in out:
-            raise BlockerCheckError(f"waiver file {path} duplicates waiver for issue #{issue}")
+            raise BlockerCheckError(
+                f"waiver file {path} duplicates waiver for issue #{issue}"
+            )
         out[issue] = w
     return out
 
@@ -169,7 +184,9 @@ def check_live_blockers(
 
     _assert_commit_sha(source_sha)
     issues = _run_gh(gh, repo)
-    open_ids = sorted(issue["number"] for issue in issues if isinstance(issue.get("number"), int))
+    open_ids = sorted(
+        issue["number"] for issue in issues if isinstance(issue.get("number"), int)
+    )
 
     waivers = _waivers(waivers_dir, version)
 
@@ -200,7 +217,8 @@ def check_live_blockers(
 
     evidence = [
         f"live release blockers for {version} (source {source_sha})",
-        f"  open release-blocker issues: " + (", ".join(f"#{i}" for i in open_ids) or "<none>"),
+        "  open release-blocker issues: "
+        + (", ".join(f"#{i}" for i in open_ids) or "<none>"),
     ]
     for issue in issues:
         num = issue.get("number")

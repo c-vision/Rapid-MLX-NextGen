@@ -25,9 +25,14 @@ def checker():
     return module
 
 
-def _env(*, reviewers=("raullenchai",), prevent_self_review=False,
-         can_admins_bypass=True, name="rapid-mac-tag",
-         deployment_mode=None):
+def _env(
+    *,
+    reviewers=("raullenchai",),
+    prevent_self_review=False,
+    can_admins_bypass=True,
+    name="rapid-mac-tag",
+    deployment_mode=None,
+):
     body = {
         "name": name,
         "protection_rules": [
@@ -36,8 +41,7 @@ def _env(*, reviewers=("raullenchai",), prevent_self_review=False,
                 "type": "required_reviewers",
                 "prevent_self_review": prevent_self_review,
                 "reviewers": [
-                    {"type": "User", "id": 1000 + i,
-                     "reviewer": {"login": login}}
+                    {"type": "User", "id": 1000 + i, "reviewer": {"login": login}}
                     for i, login in enumerate(reviewers)
                 ],
             }
@@ -99,10 +103,17 @@ def test_extra_team_reviewer_fails(checker, tmp_path):
     env = {
         "name": "rapid-mac-tag",
         "protection_rules": [
-            {"id": 1, "type": "required_reviewers",
-             "prevent_self_review": False, "reviewers": reviewers}
+            {
+                "id": 1,
+                "type": "required_reviewers",
+                "prevent_self_review": False,
+                "reviewers": reviewers,
+            }
         ],
-        "deployment_branch_policy": {"custom_branch_policies": True, "protected_branches": False},
+        "deployment_branch_policy": {
+            "custom_branch_policies": True,
+            "protected_branches": False,
+        },
         "can_admins_bypass": True,
     }
     env = _write(tmp_path, env, "env.json")
@@ -117,10 +128,17 @@ def test_malformed_reviewer_entry_fails(checker, tmp_path):
     env = {
         "name": "rapid-mac-tag",
         "protection_rules": [
-            {"id": 1, "type": "required_reviewers",
-             "prevent_self_review": False, "reviewers": reviewers}
+            {
+                "id": 1,
+                "type": "required_reviewers",
+                "prevent_self_review": False,
+                "reviewers": reviewers,
+            }
         ],
-        "deployment_branch_policy": {"custom_branch_policies": True, "protected_branches": False},
+        "deployment_branch_policy": {
+            "custom_branch_policies": True,
+            "protected_branches": False,
+        },
         "can_admins_bypass": True,
     }
     env = _write(tmp_path, env, "env.json")
@@ -142,11 +160,18 @@ def test_wrong_deployment_mode_fails(checker, tmp_path):
     # protected-branches mode active (not custom branch policies) is a NO-GO.
     env = _write(
         tmp_path,
-        _env(deployment_mode={"custom_branch_policies": False, "protected_branches": True}),
+        _env(
+            deployment_mode={
+                "custom_branch_policies": False,
+                "protected_branches": True,
+            }
+        ),
         "env.json",
     )
     pol = _write(tmp_path, _policy(), "policy.json")
-    with pytest.raises(checker.EnvironmentGateError, match="custom_branch_policies=true"):
+    with pytest.raises(
+        checker.EnvironmentGateError, match="custom_branch_policies=true"
+    ):
         checker.read_back(env_json=env, policy_json=pol)
 
 
@@ -194,8 +219,11 @@ def test_prevent_self_review_true_fails(checker, tmp_path):
 
 def test_policy_total_count_not_one_fails(checker, tmp_path):
     env = _write(tmp_path, _env(), "env.json")
-    pol = _write(tmp_path, _policy(branches=(("main", "branch"), ("dev", "branch"))),
-                 "policy.json")
+    pol = _write(
+        tmp_path,
+        _policy(branches=(("main", "branch"), ("dev", "branch"))),
+        "policy.json",
+    )
     with pytest.raises(checker.EnvironmentGateError, match="total_count"):
         checker.read_back(env_json=env, policy_json=pol)
 
