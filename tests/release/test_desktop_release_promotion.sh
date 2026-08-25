@@ -60,6 +60,12 @@ contains "$MANIFEST_ACTION" '--signed' "manifest records the signed/delta gate s
 DELTA_GATE=$(sed -n '/name: Bundle size delta gate/,/name: Validate DMG contents/p' "$ACTION")
 contains "$DELTA_GATE" 'scripts/release_asset_size.sh' \
   "DMG delta gate uses the executable fail-closed asset resolver"
+contains "$DELTA_GATE" 'scripts/check_dmg_size_delta.sh' \
+  "DMG delta gate compares current and previous sizes in one byte unit"
+lacks "$DELTA_GATE" 'du -sm "$DMG"' \
+  "DMG delta gate does not mix du MiB with release asset bytes"
+lacks "$DELTA_GATE" 'b/1000000' \
+  "DMG delta gate does not convert only the previous size to decimal MB"
 lacks "$DELTA_GATE" 'gh release view' \
   "DMG delta gate does not mask an inline gh lookup"
 lacks "$DELTA_GATE" '|| true' \

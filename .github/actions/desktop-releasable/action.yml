@@ -78,7 +78,7 @@ inputs:
     required: false
     default: '550'
   bundle_size_delta_cap_mb:
-    description: Per-release DMG growth ceiling vs the previous rapid-mac release.
+    description: Per-release DMG growth ceiling in MiB vs the previous rapid-mac release.
     required: false
     default: '50'
   # Apple signing + notary secrets, passed through by the caller from secrets.*.
@@ -396,7 +396,6 @@ runs:
         DMG="build/rapid-mlx-desktop.dmg"
         DELTA_CAP_MB="${BUNDLE_SIZE_DELTA_CAP_MB:-50}"
         [[ -f "$DMG" ]] || { echo "::error::missing $DMG"; exit 1; }
-        CURRENT_DMG_MB=$(du -sm "$DMG" | awk '{print $1}')
         PREV_TAG="${PREVIOUS_TAG:-}"
         CANONICAL_DMG_NAME="rapid-mlx-desktop.dmg"
         ASSET_STATE=$(bash "${{ inputs.checkout_path }}/scripts/release_asset_size.sh" \
@@ -411,13 +410,12 @@ runs:
           exit 1
         }
         PREV_DMG_BYTES="${ASSET_STATE#*$'\t'}"
-        PREV_DMG_MB=$(awk -v b="$PREV_DMG_BYTES" 'BEGIN { printf "%d", (b/1000000) + 0.5 }')
-        DELTA_MB=$(( CURRENT_DMG_MB - PREV_DMG_MB ))
-        echo "::notice::DMG delta vs ${PREV_TAG}: ${CURRENT_DMG_MB} - ${PREV_DMG_MB} = ${DELTA_MB} MB (cap +${DELTA_CAP_MB} MB)"
-        if [[ "$DELTA_MB" -gt "$DELTA_CAP_MB" ]]; then
-          echo "::error::DMG grew by ${DELTA_MB} MB vs ${PREV_TAG}, exceeding +${DELTA_CAP_MB} MB (bump BUNDLE_SIZE_DELTA_CAP_MB if intentional)."
+        if ! DELTA_EVIDENCE=$(bash "${{ inputs.checkout_path }}/scripts/check_dmg_size_delta.sh" \
+          "$DMG" "$PREV_DMG_BYTES" "$DELTA_CAP_MB"); then
+          echo "::error::DMG growth vs ${PREV_TAG} exceeds +${DELTA_CAP_MB} MiB (bump BUNDLE_SIZE_DELTA_CAP_MB if intentional)."
           exit 1
         fi
+        echo "::notice::DMG delta vs ${PREV_TAG}: ${DELTA_EVIDENCE} (cap +${DELTA_CAP_MB} MiB)"
         echo "DELTA_COMPARED=true" >> "$GITHUB_ENV"
         echo "::notice::DMG size-delta gate COMPARED against ${PREV_TAG} (manifest will claim dmg-size-delta)"
 
