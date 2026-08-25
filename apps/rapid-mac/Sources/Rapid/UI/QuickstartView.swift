@@ -1549,10 +1549,10 @@ struct QuickstartView: View {
             // result of that action while this exact decision is visible.
             // The view-bound task cancels when onboarding unmounts; three
             // seconds matches the app's existing system-memory telemetry.
-            .task(id: server.pendingMemoryWarning?.id) {
-                guard server.pendingMemoryWarning != nil else { return }
-                while !Task.isCancelled, server.pendingMemoryWarning != nil {
-                    await refreshPendingMemoryWarning()
+            .task(id: visibleMemoryWarningID) {
+                guard let warningID = visibleMemoryWarningID else { return }
+                while !Task.isCancelled, visibleMemoryWarningID == warningID {
+                    await refreshPendingMemoryWarning(expectedID: warningID)
                     do {
                         try await Task.sleep(for: .seconds(3))
                     } catch {
@@ -1566,13 +1566,20 @@ struct QuickstartView: View {
                 )
             ) { _ in
                 foregroundMemoryRefreshTask?.cancel()
-                guard server.pendingMemoryWarning != nil else {
+                guard let warningID = visibleMemoryWarningID else {
                     foregroundMemoryRefreshTask = nil
                     return
                 }
                 foregroundMemoryRefreshTask = Task { @MainActor in
-                    await refreshPendingMemoryWarning()
+                    await refreshPendingMemoryWarning(expectedID: warningID)
                 }
+            }
+            .onChange(of: visibleMemoryWarningID) { _, _ in
+                // A foreground probe is not view-bound like `.task(id:)`.
+                // Cancel it when the rendered decision disappears or changes
+                // owner so it cannot update or announce a hidden warning.
+                foregroundMemoryRefreshTask?.cancel()
+                foregroundMemoryRefreshTask = nil
             }
             .onDisappear {
                 foregroundMemoryRefreshTask?.cancel()
@@ -3994,9 +4001,23 @@ struct QuickstartView: View {
         }
     }
 
+    /// Identity of the decision this onboarding surface actually renders.
+    /// A queued warning for another alias or another onboarding phase belongs
+    /// to a different surface and must not keep this view's sampler alive.
+    private var visibleMemoryWarningID: UUID? {
+        Self.memoryWarningToPresent(
+            phase: coordinator.phase,
+            pending: server.pendingMemoryWarning,
+            selectionAlias: coordinator.selection.alias
+        )?.id
+    }
+
     @MainActor
-    private func refreshPendingMemoryWarning() async {
-        guard let transition = await server.refreshPendingMemoryWarning(),
+    private func refreshPendingMemoryWarning(expectedID: UUID) async {
+        guard visibleMemoryWarningID == expectedID,
+              let transition = await server.refreshPendingMemoryWarning(),
+              !Task.isCancelled,
+              visibleMemoryWarningID == expectedID,
               NSWorkspace.shared.isVoiceOverEnabled else { return }
         let announcement = transition.new == .safe
             ? "Memory is now safe. Load model is available."
