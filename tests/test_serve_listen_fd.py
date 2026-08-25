@@ -429,6 +429,42 @@ def test_serve_command_explicit_zero_wins_over_auto_detected_hybrid(
     assert captured["scheduler_config"].hybrid_cache_entries == 0
 
 
+def test_serve_command_all_explicit_defaults_skip_model_detection(
+    stub_heavy_serve_deps, monkeypatch
+):
+    """Explicit operator choices must not make metadata availability fatal."""
+
+    def unexpected_detection(_model_name):
+        raise AssertionError("fully explicit serve must not detect model metadata")
+
+    monkeypatch.setattr(
+        "vllm_mlx.model_auto_config.detect_model_config", unexpected_detection
+    )
+    _capture_uvicorn_run(monkeypatch)
+    ns = _minimal_serve_ns()
+    ns.model = "publisher/explicitly-configured-checkpoint"
+    ns._original_alias = None
+    ns.pflash = "off"
+    ns.pflash_keep_ratio = 0.2
+    ns.tool_call_parser = "hermes"
+    ns.reasoning_parser = "qwen3"
+    ns.kv_cache_turboquant = "none"
+    ns.hybrid_cache_entries = 0
+
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "rapid-mlx",
+            "serve",
+            "publisher/explicitly-configured-checkpoint",
+            "--hybrid-cache-entries",
+            "0",
+        ],
+    ):
+        cli.serve_command(ns)
+
+
 def test_serve_command_dispatches_uvicorn_with_host_port_when_listen_fd_unset(
     stub_heavy_serve_deps,
 ):

@@ -3190,17 +3190,31 @@ def serve_command(args):
         validate_model_support,
     )
 
-    # Resolve checkpoint/profile metadata once for every serve-time default
-    # below. PFlash historically treated malformed alias metadata as fatal, so
-    # retain that behavior on its lane; the DFlash lane skips PFlash and keeps
-    # parser auto-detection's existing non-fatal fallback.
+    # Lazily resolve checkpoint/profile metadata at most once for the serve-time
+    # defaults below. Fully explicit startup must not inspect metadata at all.
+    # PFlash/TurboQuant historically propagate inspection failures (while a
+    # missing import degrades to no default); parser/cache detection is
+    # non-fatal. The first consumer keeps its established error policy.
     auto_config = None
     auto_config_resolved = False
-    if not args.enable_dflash:
-        from .model_auto_config import detect_model_config
 
-        auto_config = detect_model_config(args.model)
+    def resolve_auto_config(*, non_fatal: bool):
+        nonlocal auto_config, auto_config_resolved
+        if auto_config_resolved:
+            return auto_config
+        try:
+            from .model_auto_config import detect_model_config
+        except ImportError:
+            auto_config_resolved = True
+            return None
+        try:
+            auto_config = detect_model_config(args.model)
+        except Exception as e:
+            if not non_fatal:
+                raise
+            logger.debug(f"Auto-detection failed (non-fatal): {e}")
         auto_config_resolved = True
+        return auto_config
 
     # Resolve the FINAL serving lane ONCE (the model is already downloaded by
     # ``_ensure_model_downloaded`` above, so the offline probes have real
@@ -3218,11 +3232,16 @@ def serve_command(args):
         # bonsai-27b-2bit → always @ 0.50) and build the config in one shared
         # helper; an explicit --pflash / --pflash-keep-ratio still wins inside.
         try:
+            pflash_detection = {}
+            if args.pflash is None or args.pflash_keep_ratio is None:
+                pflash_detection["_detected_config"] = resolve_auto_config(
+                    non_fatal=False
+                )
             pflash_config = resolve_pflash_config(
                 args,
                 model_name=args.model,
                 is_multimodal=_serve_is_mllm,
-                _detected_config=auto_config,
+                **pflash_detection,
             )
             validate_model_support(
                 pflash_config,
@@ -3264,13 +3283,10 @@ def serve_command(args):
     # warning grounded in user intent even if a helper-side regression
     # ever started flagging in-spec cases.)
     _user_explicit_tool_call_parser = bool(args.tool_call_parser)
-    if not auto_config_resolved:
-        try:
-            from .model_auto_config import detect_model_config
-
-            auto_config = detect_model_config(args.model)
-        except Exception as e:
-            logger.debug(f"Auto-detection failed (non-fatal): {e}")
+    if not auto_config_resolved and (
+        not args.tool_call_parser or not args.reasoning_parser
+    ):
+        resolve_auto_config(non_fatal=True)
     if auto_config:
         if (
             not args.tool_call_parser
@@ -3790,8 +3806,15 @@ def serve_command(args):
         turboquant_scheduler_kwargs as _turboquant_scheduler_kwargs,
     )
 
+    turboquant_detection = {}
+    if auto_config_resolved:
+        turboquant_detection["_detected_config"] = auto_config
+    elif getattr(args, "kv_cache_turboquant", None) is None and not getattr(
+        args, "kv_cache_quantization", False
+    ):
+        turboquant_detection["_detected_config"] = resolve_auto_config(non_fatal=False)
     args.kv_cache_turboquant = resolve_turboquant_mode_default(
-        args, model_name=args.model, _detected_config=auto_config
+        args, model_name=args.model, **turboquant_detection
     )
 
     # Reject conflicting KV-cache flag combinations before anything else in
@@ -3892,11 +3915,21 @@ def serve_command(args):
     # #1122: when prefix cache is enabled for a hybrid model and the user
     # did NOT explicitly pass --hybrid-cache-entries, auto-default to 8 so
     # the cache actually stores entries instead of silently dropping them.
+    hybrid_cache_user_explicit = "--hybrid-cache-entries" in sys.argv or any(
+        a.startswith("--hybrid-cache-entries=") for a in sys.argv
+    )
+    hybrid_cache_explicit_value = getattr(args, "hybrid_cache_entries", 0)
+    if (
+        not auto_config_resolved
+        and enable_prefix_cache
+        and hybrid_cache_explicit_value == 0
+        and not hybrid_cache_user_explicit
+    ):
+        resolve_auto_config(non_fatal=True)
     _hybrid_cache_entries = _resolve_hybrid_cache_entries(
         enable_prefix_cache=enable_prefix_cache,
-        explicit_value=getattr(args, "hybrid_cache_entries", 0),
-        user_set_explicit="--hybrid-cache-entries" in sys.argv
-        or any(a.startswith("--hybrid-cache-entries=") for a in sys.argv),
+        explicit_value=hybrid_cache_explicit_value,
+        user_set_explicit=hybrid_cache_user_explicit,
         model_name=getattr(args, "_original_alias", None) or args.model,
         model_config=auto_config,
     )
