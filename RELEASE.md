@@ -222,6 +222,27 @@ time — the packaging and identity gates are unchanged. The bypass is
 **audited**: the actor + reason are logged and stamped into the GitHub Release
 notes as an "⚠️ Emergency release" banner. Use it sparingly.
 
+## Normal retry after main drift (no bypass)
+
+A different, everyday stall: the release aborted because `main` advanced past
+the validated candidate just before the tag claim (the pre-tag TOCTOU check —
+the candidate is no longer the live head). Nothing is broken; the ordering guard
+is doing its job. To proceed you want a **normal** re-run of the full chain at
+the *current* head — not the emergency bypass.
+
+```bash
+gh workflow run auto-release.yml -R raullenchai/Rapid-MLX \
+  -f retry_version=X.Y.Z \
+  -f reason="main advanced past the validated candidate; re-validating at new head"
+```
+
+`retry_version` runs on `main`, must equal `pyproject.toml`, and is **mutually
+exclusive with `force_version`**. Unlike the emergency path it bypasses
+**nothing**: `should_release=true` with `force=false`, so the Tier-1 gate, the
+signed Desktop candidate at the new head, the live blocker/main-head evidence,
+and the protected `rapid-mac-tag` approval are all re-required at the current
+`main` head.
+
 ## Related docs
 
 - `docs/release-notes/README.md` — how curated release notes are written.

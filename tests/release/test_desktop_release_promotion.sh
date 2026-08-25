@@ -206,6 +206,35 @@ contains "$RELPREP_IF" "needs.desktop-candidate-gate.result == 'success'" \
   "release-prep requires desktop-candidate success"
 
 # ---------------------------------------------------------------------------
+echo "== 7b. normal workflow_dispatch retry after main drift (no bypass) =="
+# ---------------------------------------------------------------------------
+# A release can stall when main advances past the validated candidate (the pre-
+# tag TOCTOU gate aborts). A maintainer needs a NORMAL re-run at the CURRENT
+# new main head, separate from the emergency force override. retry_version:
+# requires main, must equal pyproject, is mutually exclusive with force_version,
+# and sets force=false so Tier-1 + signed candidate + evidence + approval all
+# re-run. force=true is reserved for the emergency path only.
+RETRY_BLOCK=$(sed -n '/retry_version:$/,/force_version:$/p' "$AUTO_RELEASE")
+contains "$RETRY_BLOCK" "NORMAL retry" "retry_version input is a NORMAL (non-emergency) route"
+contains "$RETRY_BLOCK" "Mutually exclusive with force_version" "retry_version documented as mutually exclusive with force_version"
+DISPATCH=$(sed -n '/--- Manual workflow_dispatch/,/# --- Normal push path/p' "$AUTO_RELEASE")
+contains "$DISPATCH" 'if [ -n "$FORCE_VERSION" ] && [ -n "$RETRY_VERSION" ]' \
+  "dispatch refuses passing BOTH force_version and retry_version"
+contains "$DISPATCH" 'Forced/retry release must be dispatched on main' \
+  "retry requires dispatch on refs/heads/main"
+contains "$DISPATCH" 'retry_version $VERSION != pyproject.toml' \
+  "retry_version must equal pyproject.toml"
+contains "$DISPATCH" 'RETRY release requested' "retry is recognised distinctly from force"
+contains "$DISPATCH" 'if [ -n "$FORCE_VERSION" ]; then FORCE_BOOL=true; else FORCE_BOOL=false; fi' \
+  "force=true is reserved for the emergency override"
+lacks "$DISPATCH" 'echo "force=true" >>' "the retry path never emits a hardcoded force=true output"
+# The downstream gate contract: force=false (retry) must make Tier-1 a hard
+# requirement (never the force bypass).
+PREP_IF=$(sed -n '/^  release-prep:/,/runs-on:/p' "$AUTO_RELEASE")
+contains "$PREP_IF" "force == 'true' || needs.tier1-agent-gate.result == 'success'" \
+  "with retry (force=false) Tier-1 success is REQUIRED, not bypassed"
+
+# ---------------------------------------------------------------------------
 echo "== 7. release job re-verifies LIVE environment protection before claim =="
 # ---------------------------------------------------------------------------
 # PF-3 read the rapid-mac-tag environment back on the bump PR, which is days

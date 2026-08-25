@@ -29,11 +29,15 @@ on:
   workflow_dispatch:
     inputs:
       force_version:
-        description: "EMERGENCY only: release this exact version WITHOUT the Tier-1 gate (use when the Studio runner is down). Must equal pyproject.toml. Leave blank otherwise."
+        description: "EMERGENCY only: release this exact version WITHOUT the Tier-1 gate (use when the Studio runner is down). Must equal pyproject.toml. Leave blank otherwise. Mutually exclusive with retry_version."
+        required: false
+        default: ""
+      retry_version:
+        description: "NORMAL retry: re-run the full release at the CURRENT main head for this version (use when a release stalled because main advanced past the validated candidate). Must equal pyproject.toml, run on main, and bypass NOTHING (Tier-1 + signed candidate + evidence + approval all re-run). Mutually exclusive with force_version."
         required: false
         default: ""
       reason:
-        description: "Why the gate is being bypassed (recorded in the release notes for audit)."
+        description: "Optional note for force_version / retry_version dispatches (recorded for audit)."
         required: false
         default: ""
 
@@ -63,34 +67,65 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           FORCE_VERSION: ${{ github.event.inputs.force_version }}
+          RETRY_VERSION: ${{ github.event.inputs.retry_version }}
           REASON: ${{ github.event.inputs.reason }}
           ACTOR: ${{ github.actor }}
         run: |
-          # --- Emergency manual override (Studio down) ---------------------
+          # --- Manual workflow_dispatch (emergency force OR normal retry) --
           if [ "$EVENT" = "workflow_dispatch" ]; then
-            if [ -z "$FORCE_VERSION" ]; then
-              echo "workflow_dispatch with no force_version — nothing to do."
+            # force_version and retry_version are mutually exclusive routes.
+            if [ -n "$FORCE_VERSION" ] && [ -n "$RETRY_VERSION" ]; then
+              echo "❌ force_version and retry_version are mutually exclusive; provide at most one." >&2
+              exit 1
+            fi
+            if [ -z "$FORCE_VERSION" ] && [ -z "$RETRY_VERSION" ]; then
+              echo "workflow_dispatch with neither force_version nor retry_version — nothing to do."
               echo "should_release=false" >> "$GITHUB_OUTPUT"
               echo "force=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "⚠️  FORCED release requested by @$ACTOR → v$FORCE_VERSION"
-            echo "    reason: ${REASON:-<none given>}"
-            echo "⚠️  The Tier-1 agent gate will be BYPASSED for this release."
+
             # workflow_dispatch lets the operator pick any ref; a production
             # release must come from protected main, never a feature/stale
             # branch that happens to carry the same version in pyproject.toml.
             if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-              echo "❌ Forced release must be dispatched on main (got $GITHUB_REF)" >&2
+              echo "❌ Forced/retry release must be dispatched on main (got $GITHUB_REF)" >&2
               exit 1
             fi
-            VERSION="$FORCE_VERSION"
-            # Even a forced release must match pyproject and have a fresh tag.
+
+            # Both routes require the version to equal pyproject.toml.
             PROJECT_VER=$(grep -m1 '^version *=' pyproject.toml | awk -F'"' '{print $2}')
-            if [ "$PROJECT_VER" != "$VERSION" ]; then
-              echo "❌ force_version $VERSION != pyproject.toml $PROJECT_VER" >&2
-              exit 1
+
+            if [ -n "$FORCE_VERSION" ]; then
+              # --- Emergency override: bypass ONLY the Tier-1 gate ---------
+              echo "⚠️  FORCED release requested by @$ACTOR → v$FORCE_VERSION"
+              echo "    reason: ${REASON:-<none given>}"
+              echo "⚠️  The Tier-1 agent gate will be BYPASSED for this release."
+              VERSION="$FORCE_VERSION"
+              if [ "$PROJECT_VER" != "$VERSION" ]; then
+                echo "❌ force_version $VERSION != pyproject.toml $PROJECT_VER" >&2
+                exit 1
+              fi
+            else
+              # --- Normal retry after main drift: bypass NOTHING ------------
+              # Used when a release stalled because main advanced past the
+              # validated candidate (the pre-tag TOCTOU gate aborted). Re-run
+              # the FULL chain — Tier-1, signed Desktop candidate, live
+              # blocker/main evidence, protected approval — at the CURRENT NEW
+              # main head, so a healthy release can proceed without waiting for
+              # another bump PR and WITHOUT the emergency Tier-1 bypass.
+              echo "♻️  RETRY release requested by @$ACTOR → v$RETRY_VERSION (full gates, no bypass)"
+              echo "    reason: ${REASON:-<none given>}"
+              VERSION="$RETRY_VERSION"
+              if [ "$PROJECT_VER" != "$VERSION" ]; then
+                echo "❌ retry_version $VERSION != pyproject.toml $PROJECT_VER" >&2
+                exit 1
+              fi
             fi
+            # force=true ONLY for the emergency override; a retry re-runs the
+            # full chain (force=false) so Tier-1 + candidate + evidence +
+            # approval all apply.
+            if [ -n "$FORCE_VERSION" ]; then FORCE_BOOL=true; else FORCE_BOOL=false; fi
             if git ls-remote --tags origin "refs/tags/v$VERSION" | grep -q "v$VERSION"; then
               # The tag may already exist WITHOUT a Release (a prior run died
               # between tag and Release, or the Release was deleted). detect
@@ -107,12 +142,12 @@ jobs:
               echo "Tag v$VERSION exists without a published Release — will recover"
               echo "version=$VERSION" >> "$GITHUB_OUTPUT"
               echo "should_release=true" >> "$GITHUB_OUTPUT"
-              echo "force=true" >> "$GITHUB_OUTPUT"
+              echo "force=$FORCE_BOOL" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "should_release=true" >> "$GITHUB_OUTPUT"
-            echo "force=true" >> "$GITHUB_OUTPUT"
+            echo "force=$FORCE_BOOL" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
