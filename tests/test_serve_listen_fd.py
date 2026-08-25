@@ -468,6 +468,36 @@ def test_serve_command_all_explicit_defaults_skip_model_detection(
         cli.serve_command(ns)
 
 
+def test_strict_auto_default_retries_failed_nonfatal_parser_detection(
+    stub_heavy_serve_deps, monkeypatch
+):
+    """A parser probe failure must not suppress a later strict consumer."""
+    attempts = []
+
+    def broken_detection(model_name):
+        attempts.append(model_name)
+        raise RuntimeError("broken checkpoint metadata")
+
+    monkeypatch.setattr(
+        "vllm_mlx.model_auto_config.detect_model_config", broken_detection
+    )
+    _capture_uvicorn_run(monkeypatch)
+    ns = _minimal_serve_ns()
+    ns.model = "publisher/broken-checkpoint"
+    ns._original_alias = None
+    ns.pflash = "off"
+    ns.pflash_keep_ratio = 0.2  # Make parser detection the first metadata probe.
+    ns.kv_cache_turboquant = None  # TurboQuant remains a strict consumer.
+
+    with pytest.raises(RuntimeError, match="broken checkpoint metadata"):
+        cli.serve_command(ns)
+
+    assert attempts == [
+        "publisher/broken-checkpoint",
+        "publisher/broken-checkpoint",
+    ]
+
+
 def test_serve_command_dispatches_uvicorn_with_host_port_when_listen_fd_unset(
     stub_heavy_serve_deps,
 ):

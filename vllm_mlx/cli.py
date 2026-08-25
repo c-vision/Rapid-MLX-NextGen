@@ -3213,6 +3213,7 @@ def serve_command(args):
             if not non_fatal:
                 raise
             logger.debug(f"Auto-detection failed (non-fatal): {e}")
+            return None
         auto_config_resolved = True
         return auto_config
 

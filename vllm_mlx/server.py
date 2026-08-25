@@ -3146,6 +3146,7 @@ Examples:
             if not non_fatal:
                 raise
             logger.debug("Auto-detection failed (non-fatal): %s", exc)
+            return None
         auto_config_resolved = True
         return auto_config
 
