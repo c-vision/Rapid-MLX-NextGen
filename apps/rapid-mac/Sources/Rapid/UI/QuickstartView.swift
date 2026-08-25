@@ -1466,6 +1466,11 @@ struct QuickstartView: View {
     /// the transfer is the job's own status.
     @State private var cancelRequestedAlias: String?
 
+    /// A foreground-triggered probe is async, so retain its task only for the
+    /// view lifetime. The parked warning remains owned by ServerManager; this
+    /// handle exists solely to propagate SwiftUI teardown cancellation.
+    @State private var foregroundMemoryRefreshTask: Task<Void, Never>?
+
     /// First-run setup should present a decision, not mirror every cached
     /// quantization of that decision.  Sibling variants stay reachable behind
     /// one explicit disclosure; Settings → Models and Browse all remain the
@@ -1555,15 +1560,23 @@ struct QuickstartView: View {
                     }
                 }
             }
-            .task {
-                let activations = NotificationCenter.default.notifications(
-                    named: NSApplication.didBecomeActiveNotification
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: NSApplication.didBecomeActiveNotification
                 )
-                for await _ in activations {
-                    guard !Task.isCancelled else { return }
-                    guard server.pendingMemoryWarning != nil else { continue }
+            ) { _ in
+                foregroundMemoryRefreshTask?.cancel()
+                guard server.pendingMemoryWarning != nil else {
+                    foregroundMemoryRefreshTask = nil
+                    return
+                }
+                foregroundMemoryRefreshTask = Task { @MainActor in
                     await refreshPendingMemoryWarning()
                 }
+            }
+            .onDisappear {
+                foregroundMemoryRefreshTask?.cancel()
+                foregroundMemoryRefreshTask = nil
             }
     }
 
