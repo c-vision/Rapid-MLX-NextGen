@@ -247,16 +247,19 @@ def stub_heavy_serve_deps(monkeypatch):
     so the test stays faithful to the real execution path.
     """
     from vllm_mlx import _version_check
-    from vllm_mlx import cli as cli_mod
     from vllm_mlx import server as server_mod
 
     monkeypatch.setattr(_version_check, "prompt_upgrade_if_available", lambda: False)
     monkeypatch.setattr(
         _version_check, "print_staleness_warning_if_any", lambda **_kwargs: None
     )
-    monkeypatch.setattr(cli_mod, "_ensure_model_downloaded", lambda model: None)
-    monkeypatch.setattr(cli_mod, "_check_memory_capacity", lambda *a, **kw: None)
-    monkeypatch.setattr(cli_mod, "_check_disk_space", lambda *a, **kw: None)
+    # Patch the exact module object this test file calls. Earlier suites may
+    # deliberately reload ``vllm_mlx.cli`` and replace the package attribute;
+    # re-importing it here would patch that new object while the file-level
+    # ``cli`` reference below still invokes the old one.
+    monkeypatch.setattr(cli, "_ensure_model_downloaded", lambda model: None)
+    monkeypatch.setattr(cli, "_check_memory_capacity", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_check_disk_space", lambda *a, **kw: None)
     monkeypatch.setattr(server_mod, "configure_logging", lambda level: "info")
     monkeypatch.setattr(server_mod, "load_model", lambda *a, **kw: None)
     # ``serve_command`` calls ``server.configure_cors`` which does an
