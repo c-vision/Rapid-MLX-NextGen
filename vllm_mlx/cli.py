@@ -22,6 +22,7 @@ import sys
 from collections.abc import Callable
 
 from vllm_mlx._completion import alias_completer
+from vllm_mlx.model_profile import ModelProfile
 
 # Project-default mirror for ``RAPID_MLX_MODEL_MIRROR`` (consumed by
 # ``_try_mirror_prefetch``). Public Cloudflare Worker → R2 bucket, with
@@ -2500,6 +2501,7 @@ def _resolve_hybrid_cache_entries(
     explicit_value: int,
     user_set_explicit: bool,
     model_name: str,
+    model_config: ModelProfile | None = None,
 ) -> int:
     """Return the effective ``hybrid_cache_entries`` value.
 
@@ -2513,7 +2515,9 @@ def _resolve_hybrid_cache_entries(
     if not enable_prefix_cache or explicit_value != 0 or user_set_explicit:
         return explicit_value
 
-    needs_bounded_reuse = _needs_bounded_trim_free_reuse(model_name)
+    needs_bounded_reuse = _needs_bounded_trim_free_reuse(
+        model_name, model_config=model_config
+    )
     if needs_bounded_reuse:
         _logging.getLogger(__name__).info(
             "Non-trimmable model cache detected with --enable-prefix-cache: "
@@ -2615,28 +2619,9 @@ def _config_declares_linear_attention(config: dict | None) -> bool:
     variant accepts an already-resolved config so aliases and bare local paths
     can share the serve prefill policy without another metadata lookup.
     """
-    if not isinstance(config, dict):
-        return False
+    from .model_auto_config import config_declares_linear_attention
 
-    text_config = config.get("text_config")
-    language_config = text_config if isinstance(text_config, dict) else config
-    layer_types = language_config.get("layer_types") or []
-    if any(
-        isinstance(layer_type, str)
-        and any(
-            marker in layer_type.lower() for marker in ("linear", "mamba", "recurrent")
-        )
-        for layer_type in layer_types
-    ):
-        return True
-    return any(
-        isinstance(model_type, str)
-        and any(
-            marker in model_type.lower()
-            for marker in ("mamba", "recurrent", "qwen3_next")
-        )
-        for model_type in (language_config.get("model_type"), config.get("model_type"))
-    )
+    return config_declares_linear_attention(config)
 
 
 def _prefers_recurrent_prefill_chunks(model_name: str) -> bool:
@@ -2693,12 +2678,14 @@ def _resolve_vision_prefill_token_budget(
     return max(prefill_step_size, mllm_default)
 
 
-def _needs_bounded_trim_free_reuse(model_name: str) -> bool:
+def _needs_bounded_trim_free_reuse(
+    model_name: str, *, model_config: ModelProfile | None = None
+) -> bool:
     """Whether this model's cache can reuse prefixes but not trim exact hits."""
     from .model_aliases import resolve_profile as _resolve_alias
     from .utils.deepseek_v4_0731 import is_deepseek_v4_0731
 
-    profile = _resolve_alias(model_name)
+    profile = model_config if model_config is not None else _resolve_alias(model_name)
     if profile is not None:
         if profile.is_hybrid:
             return True
@@ -3203,6 +3190,18 @@ def serve_command(args):
         validate_model_support,
     )
 
+    # Resolve checkpoint/profile metadata once for every serve-time default
+    # below. PFlash historically treated malformed alias metadata as fatal, so
+    # retain that behavior on its lane; the DFlash lane skips PFlash and keeps
+    # parser auto-detection's existing non-fatal fallback.
+    auto_config = None
+    auto_config_resolved = False
+    if not args.enable_dflash:
+        from .model_auto_config import detect_model_config
+
+        auto_config = detect_model_config(args.model)
+        auto_config_resolved = True
+
     # Resolve the FINAL serving lane ONCE (the model is already downloaded by
     # ``_ensure_model_downloaded`` above, so the offline probes have real
     # evidence). PFlash defaulting and ``validate_model_support`` must both see
@@ -3220,7 +3219,10 @@ def serve_command(args):
         # helper; an explicit --pflash / --pflash-keep-ratio still wins inside.
         try:
             pflash_config = resolve_pflash_config(
-                args, model_name=args.model, is_multimodal=_serve_is_mllm
+                args,
+                model_name=args.model,
+                is_multimodal=_serve_is_mllm,
+                _detected_config=auto_config,
             )
             validate_model_support(
                 pflash_config,
@@ -3262,34 +3264,34 @@ def serve_command(args):
     # warning grounded in user intent even if a helper-side regression
     # ever started flagging in-spec cases.)
     _user_explicit_tool_call_parser = bool(args.tool_call_parser)
-    if not args.tool_call_parser or not args.reasoning_parser:
+    if not auto_config_resolved:
         try:
             from .model_auto_config import detect_model_config
 
             auto_config = detect_model_config(args.model)
-            if auto_config:
-                if (
-                    not args.tool_call_parser
-                    and not _opt_out_tool
-                    and auto_config.tool_call_parser
-                ):
-                    args.tool_call_parser = auto_config.tool_call_parser
-                    args.enable_auto_tool_choice = True
-                    logger.info(
-                        f"Auto-configured --tool-call-parser {auto_config.tool_call_parser}"
-                    )
-                if (
-                    not args.reasoning_parser
-                    and not _opt_out_reasoning
-                    and not args.no_thinking
-                    and auto_config.reasoning_parser
-                ):
-                    args.reasoning_parser = auto_config.reasoning_parser
-                    logger.info(
-                        f"Auto-configured --reasoning-parser {auto_config.reasoning_parser}"
-                    )
         except Exception as e:
             logger.debug(f"Auto-detection failed (non-fatal): {e}")
+    if auto_config:
+        if (
+            not args.tool_call_parser
+            and not _opt_out_tool
+            and auto_config.tool_call_parser
+        ):
+            args.tool_call_parser = auto_config.tool_call_parser
+            args.enable_auto_tool_choice = True
+            logger.info(
+                f"Auto-configured --tool-call-parser {auto_config.tool_call_parser}"
+            )
+        if (
+            not args.reasoning_parser
+            and not _opt_out_reasoning
+            and not args.no_thinking
+            and auto_config.reasoning_parser
+        ):
+            args.reasoning_parser = auto_config.reasoning_parser
+            logger.info(
+                f"Auto-configured --reasoning-parser {auto_config.reasoning_parser}"
+            )
     if _opt_out_tool:
         logger.info(
             "Tool-call parser auto-detection disabled via --no-tool-call-parser"
@@ -3789,7 +3791,7 @@ def serve_command(args):
     )
 
     args.kv_cache_turboquant = resolve_turboquant_mode_default(
-        args, model_name=args.model
+        args, model_name=args.model, _detected_config=auto_config
     )
 
     # Reject conflicting KV-cache flag combinations before anything else in
@@ -3896,6 +3898,7 @@ def serve_command(args):
         user_set_explicit="--hybrid-cache-entries" in sys.argv
         or any(a.startswith("--hybrid-cache-entries=") for a in sys.argv),
         model_name=getattr(args, "_original_alias", None) or args.model,
+        model_config=auto_config,
     )
     _prefill_user_set_explicit = "--prefill-step-size" in sys.argv or any(
         a.startswith("--prefill-step-size=") for a in sys.argv

@@ -348,6 +348,87 @@ def test_serve_command_dispatches_uvicorn_with_fd_when_listen_fd_set(
     assert cfg.bind_port is None
 
 
+def test_serve_command_threads_auto_detected_hybrid_into_cache_admission(
+    stub_heavy_serve_deps, monkeypatch
+):
+    """The unified serve entrypoint must consume its one resolved profile."""
+    from vllm_mlx import server as server_mod
+    from vllm_mlx.model_profile import ModelProfile
+
+    captured = {}
+    detected_models = []
+
+    def capture_load_model(*_args, scheduler_config, **_kwargs):
+        captured["scheduler_config"] = scheduler_config
+
+    monkeypatch.setattr(server_mod, "load_model", capture_load_model)
+
+    def detect_model_config(model_name):
+        detected_models.append(model_name)
+        return ModelProfile(
+            is_hybrid=True,
+            is_hybrid_explicit=True,
+            supports_spec_decode=False,
+        )
+
+    monkeypatch.setattr(
+        "vllm_mlx.model_auto_config.detect_model_config", detect_model_config
+    )
+    _capture_uvicorn_run(monkeypatch)
+    ns = _minimal_serve_ns()
+    ns.model = "publisher/opaque-hybrid-checkpoint"
+    ns._original_alias = None
+
+    cli.serve_command(ns)
+
+    scheduler = captured["scheduler_config"]
+    assert detected_models == ["publisher/opaque-hybrid-checkpoint"]
+    assert scheduler.enable_prefix_cache is True
+    assert scheduler.hybrid_cache_entries == 8
+
+
+def test_serve_command_explicit_zero_wins_over_auto_detected_hybrid(
+    stub_heavy_serve_deps, monkeypatch
+):
+    from vllm_mlx import server as server_mod
+    from vllm_mlx.model_profile import ModelProfile
+
+    captured = {}
+
+    def capture_load_model(*_args, scheduler_config, **_kwargs):
+        captured["scheduler_config"] = scheduler_config
+
+    monkeypatch.setattr(server_mod, "load_model", capture_load_model)
+    monkeypatch.setattr(
+        "vllm_mlx.model_auto_config.detect_model_config",
+        lambda _name: ModelProfile(
+            is_hybrid=True,
+            is_hybrid_explicit=True,
+            supports_spec_decode=False,
+        ),
+    )
+    _capture_uvicorn_run(monkeypatch)
+    ns = _minimal_serve_ns()
+    ns.model = "publisher/opaque-hybrid-checkpoint"
+    ns._original_alias = None
+    ns.hybrid_cache_entries = 0
+
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "rapid-mlx",
+            "serve",
+            "publisher/opaque-hybrid-checkpoint",
+            "--hybrid-cache-entries",
+            "0",
+        ],
+    ):
+        cli.serve_command(ns)
+
+    assert captured["scheduler_config"].hybrid_cache_entries == 0
+
+
 def test_serve_command_dispatches_uvicorn_with_host_port_when_listen_fd_unset(
     stub_heavy_serve_deps,
 ):

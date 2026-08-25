@@ -759,6 +759,37 @@ def _metadata_model_types(config: dict[str, Any]) -> frozenset[str]:
     return frozenset(types)
 
 
+def config_declares_linear_attention(config: dict | None) -> bool:
+    """Whether the language backbone declares recurrent/linear attention.
+
+    This architecture signal is shared by model auto-detection and prefix-cache
+    admission. Keeping it beside checkpoint metadata resolution prevents those
+    consumers from independently classifying the same config.
+    """
+    if not isinstance(config, dict):
+        return False
+
+    text_config = config.get("text_config")
+    language_config = text_config if isinstance(text_config, dict) else config
+    layer_types = language_config.get("layer_types") or []
+    if any(
+        isinstance(layer_type, str)
+        and any(
+            marker in layer_type.lower() for marker in ("linear", "mamba", "recurrent")
+        )
+        for layer_type in layer_types
+    ):
+        return True
+    return any(
+        isinstance(model_type, str)
+        and any(
+            marker in model_type.lower()
+            for marker in ("mamba", "recurrent", "qwen3_next")
+        )
+        for model_type in (language_config.get("model_type"), config.get("model_type"))
+    )
+
+
 def _chat_template_environment():
     """Build a Jinja environment that PARSES Transformers chat templates.
 
@@ -1184,6 +1215,13 @@ def _detect_metadata_config(model_path: str) -> ModelConfig | None:
             supports_spec_decode=False,
         )
         reasons.append("dense Qwen3.5 architecture")
+    elif config_declares_linear_attention(config):
+        settings.update(
+            is_hybrid=True,
+            is_hybrid_explicit=True,
+            supports_spec_decode=False,
+        )
+        reasons.append("linear/recurrent attention architecture")
 
     if _template_uses_parameterized_xml_tools(metadata.chat_template):
         settings["tool_call_parser"] = "hermes"

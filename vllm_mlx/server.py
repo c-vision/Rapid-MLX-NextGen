@@ -2265,6 +2265,11 @@ async def _load_dynamic_resident_model(
     resolved_path = model_path or (
         profile.hf_path if profile is not None else model_name
     )
+    model_config = profile
+    if model_config is None:
+        from .model_auto_config import detect_model_config
+
+        model_config = detect_model_config(resolved_path)
     modality = profile.modality if profile is not None else "text"
 
     if modality == "image-gen":
@@ -2291,8 +2296,19 @@ async def _load_dynamic_resident_model(
             f"runtime residency loading is not available for modality {modality!r}"
         )
     else:
+        from .cli import _resolve_hybrid_cache_entries
         from .runtime.resident_models import resident_scheduler_kwargs
         from .scheduler import SchedulerConfig
+
+        scheduler_kwargs = resident_scheduler_kwargs(performance)
+        enable_prefix_cache = bool(scheduler_kwargs.get("enable_prefix_cache", True))
+        scheduler_kwargs["hybrid_cache_entries"] = _resolve_hybrid_cache_entries(
+            enable_prefix_cache=enable_prefix_cache,
+            explicit_value=0,
+            user_set_explicit=False,
+            model_name=resolved_path,
+            model_config=model_config,
+        )
 
         engine = BatchedEngine(
             model_name=resolved_path,
@@ -2301,7 +2317,7 @@ async def _load_dynamic_resident_model(
             ),
             force_text=bool(profile is not None and profile.is_text_only),
             gpu_memory_utilization=_resident_gpu_memory_utilization,
-            scheduler_config=SchedulerConfig(**resident_scheduler_kwargs(performance)),
+            scheduler_config=SchedulerConfig(**scheduler_kwargs),
         )
         await engine.start()
         try:

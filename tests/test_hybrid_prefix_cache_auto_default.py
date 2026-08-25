@@ -12,10 +12,14 @@ Tests cover:
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 from vllm_mlx.cli import _DEFAULT_HYBRID_CACHE_ENTRIES, _resolve_hybrid_cache_entries
 from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+from vllm_mlx.model_auto_config import detect_model_config
+from vllm_mlx.model_metadata import ModelMetadata
+from vllm_mlx.model_profile import ModelProfile
 
 # ---------------------------------------------------------------------------
 # Mock cache layers (mirrors test_hybrid_prefix_cache_growth.py)
@@ -128,6 +132,101 @@ class TestResolveHybridCacheEntries:
             model_name="qwen3.5-9b-4bit",
         )
         assert result == _DEFAULT_HYBRID_CACHE_ENTRIES
+
+    def test_auto_detected_hybrid_metadata_defaults_entries(self, monkeypatch):
+        """The already-resolved checkpoint architecture must reach admission."""
+        monkeypatch.setattr(
+            "vllm_mlx.model_aliases.resolve_profile", lambda _name: None
+        )
+        result = _resolve_hybrid_cache_entries(
+            enable_prefix_cache=True,
+            explicit_value=0,
+            user_set_explicit=False,
+            model_name="publisher/opaque-checkpoint",
+            model_config=ModelProfile(
+                is_hybrid=True,
+                is_hybrid_explicit=True,
+                supports_spec_decode=False,
+            ),
+        )
+        assert result == _DEFAULT_HYBRID_CACHE_ENTRIES
+
+    def test_auto_detected_hybrid_metadata_respects_explicit_zero(self, monkeypatch):
+        monkeypatch.setattr(
+            "vllm_mlx.model_aliases.resolve_profile", lambda _name: None
+        )
+        result = _resolve_hybrid_cache_entries(
+            enable_prefix_cache=True,
+            explicit_value=0,
+            user_set_explicit=True,
+            model_name="publisher/opaque-checkpoint",
+            model_config=ModelProfile(
+                is_hybrid=True,
+                is_hybrid_explicit=True,
+                supports_spec_decode=False,
+            ),
+        )
+        assert result == 0
+
+    def test_direct_hf_metadata_detection_reaches_admission(self, monkeypatch):
+        """An unprofiled HF id is classified from offline checkpoint metadata."""
+        import vllm_mlx.model_auto_config as auto_config
+
+        monkeypatch.setattr(auto_config, "resolve_profile", lambda _name: None)
+        monkeypatch.setattr(
+            auto_config,
+            "read_model_metadata",
+            lambda _name: ModelMetadata(
+                config={
+                    "model_type": "publisher_novel_architecture",
+                    "layer_types": ["linear_attention", "full_attention"],
+                },
+                chat_template=None,
+                snapshot_dir=None,
+            ),
+        )
+        model_name = "publisher/opaque-hybrid-checkpoint"
+        model_config = detect_model_config(model_name)
+
+        assert model_config is not None
+        assert (
+            _resolve_hybrid_cache_entries(
+                enable_prefix_cache=True,
+                explicit_value=0,
+                user_set_explicit=False,
+                model_name=model_name,
+                model_config=model_config,
+            )
+            == _DEFAULT_HYBRID_CACHE_ENTRIES
+        )
+
+    def test_direct_local_metadata_detection_reaches_admission(self, tmp_path):
+        """A direct local path uses its config without an alias or network."""
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "publisher_novel_architecture",
+                    "text_config": {
+                        "model_type": "publisher_novel_text",
+                        "layer_types": ["linear_attention", "full_attention"],
+                    },
+                }
+            )
+        )
+        model_name = str(tmp_path)
+        model_config = detect_model_config(model_name)
+
+        assert model_config is not None
+        assert (
+            _resolve_hybrid_cache_entries(
+                enable_prefix_cache=True,
+                explicit_value=0,
+                user_set_explicit=False,
+                model_name=model_name,
+                model_config=model_config,
+            )
+            == _DEFAULT_HYBRID_CACHE_ENTRIES
+        )
 
     def test_no_auto_default_for_non_hybrid(self, monkeypatch):
         """Non-hybrid model → stays 0."""

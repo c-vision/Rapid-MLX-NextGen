@@ -2356,6 +2356,30 @@ class TestCheckpointMetadataFallback:
         assert config.is_moe is True
         assert config.supports_spec_decode is False
 
+    def test_unknown_linear_attention_checkpoint_is_hybrid(self, monkeypatch):
+        """Architecture metadata, not a family/name rule, owns hybrid truth."""
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "model_type": "publisher_novel_architecture",
+                    "text_config": {
+                        "model_type": "publisher_novel_text",
+                        "layer_types": ["linear_attention", "full_attention"],
+                    },
+                },
+                None,
+            ),
+        )
+
+        config = detect_model_config("publisher/opaque-checkpoint")
+
+        assert config is not None
+        assert config.is_hybrid is True
+        assert config.is_hybrid_explicit is True
+        assert config.supports_spec_decode is False
+
     def test_qwen38_local_snapshot_is_not_mislabeled_dense_qwen35(self, monkeypatch):
         """Qwen3.8 reuses qwen3_5 model_type but is a hybrid MTP target."""
         monkeypatch.setattr(
