@@ -459,8 +459,11 @@ def verify(
         ]
 
         success = [r for r in completed if r.get("conclusion") == "success"]
-        if success:
-            success_run = success[0]
+        # A successful run is not stable publication evidence while another
+        # exact run can still reach the publication step. Wait for the exact
+        # run set to settle, then bind the newest success deterministically.
+        if success and not active:
+            success_run = max(success, key=lambda run: run["databaseId"])
             break
         # Still waiting: an exact run is active (e.g. a rerun in progress), or
         # the tag run hasn't appeared yet. Fail only when nothing exact is

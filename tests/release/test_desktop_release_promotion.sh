@@ -170,6 +170,11 @@ if [[ -n "$TAG_LINE" && -n "$WAIT_LINE" && -n "$ENGINE_LINE" \
 else
   bad "tag claim -> Desktop publication evidence -> engine release ordering"
 fi
+PUBLISH_STEP=$(sed -n '/name: Create the GitHub Release/,/echo "::notice::Published GitHub Release/p' "$RAPID_RELEASE")
+contains "$PUBLISH_STEP" 'asset.get("digest") != f"sha256:{digest}"' \
+  "tagged rerun requires an existing canonical DMG to be byte-identical"
+lacks "$PUBLISH_STEP" '--clobber' \
+  "tagged rerun never replaces an already-published Desktop DMG"
 
 # ---------------------------------------------------------------------------
 echo "== 5. tagged lane verifies tag binding before any publication =="

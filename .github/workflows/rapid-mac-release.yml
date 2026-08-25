@@ -656,8 +656,39 @@ jobs:
           fi
           # A re-run of an already-published tag must stay idempotent.
           if gh release view "$TAG" >/dev/null 2>&1; then
+            ASSETS=$(gh release view "$TAG" --json assets --jq '.assets')
+            python3 - dist-dmg/rapid-mlx-desktop.dmg "$ASSETS" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          assets = json.loads(sys.argv[2])
+          name = "rapid-mlx-desktop.dmg"
+          matches = [
+              asset
+              for asset in assets
+              if isinstance(asset, dict) and asset.get("name") == name
+          ]
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"expected exactly one published {name}; found {len(matches)}"
+              )
+          asset = matches[0]
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          if (
+              asset.get("state") != "uploaded"
+              or type(asset.get("size")) is not int
+              or asset["size"] != path.stat().st_size
+              or asset.get("digest") != f"sha256:{digest}"
+          ):
+              raise SystemExit(
+                  f"published {name} does not match this exact run artifact"
+              )
+          print(f"{name} already published with identical sha256:{digest}")
+          PY
             gh release edit "$TAG" --notes-file "$NOTES_FILE" $PRERELEASE
-            gh release upload "$TAG" dist-dmg/rapid-mlx-desktop.dmg --clobber
           else
             gh release create "$TAG" dist-dmg/rapid-mlx-desktop.dmg \
               --title "$TAG" --notes-file "$NOTES_FILE" $PRERELEASE
