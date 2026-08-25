@@ -67,11 +67,12 @@ struct MemoryLoadConfirmationQueue {
     }
 
     mutating func resolveCurrent(
-        warning: ModelSizing.MemoryWarning,
+        warningID: UUID,
         decision: Decision
-    ) -> Bool {
-        guard pending.first?.warning.id == warning.id,
-              pending.first?.phase == .awaitingDecision else { return false }
+    ) -> ModelSizing.MemoryWarning? {
+        guard pending.first?.warning.id == warningID,
+              pending.first?.phase == .awaitingDecision else { return nil }
+        let currentWarning = pending[0].warning
         if let requestID = pending[0].requestID {
             decisions[requestID] = decision
         }
@@ -81,7 +82,14 @@ struct MemoryLoadConfirmationQueue {
         case .confirmed:
             pending[0].phase = .launching
         }
-        return true
+        return currentWarning
+    }
+
+    mutating func resolveCurrent(
+        warning: ModelSizing.MemoryWarning,
+        decision: Decision
+    ) -> Bool {
+        resolveCurrent(warningID: warning.id, decision: decision) != nil
     }
 
     mutating func completeConfirmedLaunch(warningID: UUID) {
@@ -1433,12 +1441,10 @@ final class ServerManager {
     /// transition (the bug Bug A removed), which incidentally also
     /// covered manual restarts. The default is ``false`` to make the
     /// behavior obvious at every public call site.
-    /// The user acknowledged the memory warning and wants to load
-    /// anyway. Takes the ``warning`` by value (not off ``pendingMemory-
-    /// Warning``) because the alert's dismissal clears that property on
-    /// the same run-loop turn the button fires — reading it here would
-    /// race to nil and silently drop the load. Re-enters ``start`` with
-    /// the guard bypassed.
+    /// Resolve the rendered action by stable warning identity, then launch
+    /// from the queue's latest measured facts. The captured severity records
+    /// whether the user actually chose the unsafe override; a stale ordinary
+    /// Load action can therefore never become a bypass after pressure rises.
     func confirmPendingMemoryLoad(_ warning: ModelSizing.MemoryWarning) {
         memoryConfirmSeq += 1
         let seq = memoryConfirmSeq
@@ -1446,11 +1452,13 @@ final class ServerManager {
         // waiver. Re-run the guard at activation so a sudden pressure spike
         // between the last three-second sample and the click can present a
         // fresh warning instead of silently loading under stale safe state.
-        let bypassMemoryGuard = warning.severity == .unsafe
-        guard memoryConfirmations.resolveCurrent(
-            warning: warning,
+        let requestedUnsafeOverride = warning.severity == .unsafe
+        guard let currentWarning = memoryConfirmations.resolveCurrent(
+            warningID: warning.id,
             decision: .confirmed(sequence: seq)
         ) else { return }
+        let bypassMemoryGuard = requestedUnsafeOverride
+            && currentWarning.severity == .unsafe
         memoryConfirmRunning.insert(seq)
         Task { [weak self] in
             guard let self else { return }
@@ -1458,13 +1466,13 @@ final class ServerManager {
                 await self.stop()
             }
             await self.start(
-                alias: warning.alias,
-                hfPath: warning.hfPath,
-                isAutoRespawn: warning.isAutoRespawn,
+                alias: currentWarning.alias,
+                hfPath: currentWarning.hfPath,
+                isAutoRespawn: currentWarning.isAutoRespawn,
                 bypassMemoryGuard: bypassMemoryGuard
             )
             self.memoryConfirmRunning.remove(seq)
-            self.memoryConfirmations.completeConfirmedLaunch(warningID: warning.id)
+            self.memoryConfirmations.completeConfirmedLaunch(warningID: currentWarning.id)
         }
     }
 
@@ -1477,7 +1485,7 @@ final class ServerManager {
         // to an EARLIER confirmation and its waiter must not be told it
         // finished.
         _ = memoryConfirmations.resolveCurrent(
-            warning: warning,
+            warningID: warning.id,
             decision: .cancelled
         )
     }

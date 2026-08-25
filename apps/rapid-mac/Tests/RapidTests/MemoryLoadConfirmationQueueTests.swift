@@ -173,12 +173,11 @@ struct MemoryLoadConfirmationQueueTests {
         // Refreshing is not a decision: the original waiter remains parked
         // until the user activates the newly-safe Load model action.
         #expect(queue.takeDecision(for: request) == nil)
-        let current = try #require(unsafeAgain?.new)
-        let confirmed = queue.resolveCurrent(
-            warning: current,
+        let current = queue.resolveCurrent(
+            warningID: original.id,
             decision: .confirmed(sequence: 12)
         )
-        #expect(confirmed)
+        #expect(current == unsafeAgain?.new)
         #expect(queue.takeDecision(for: request) == .confirmed(sequence: 12))
     }
 
