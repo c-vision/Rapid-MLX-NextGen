@@ -101,18 +101,73 @@ struct DownloadManagerTests {
         let mgr = DownloadManager(binaryPath: stale, binaryLocator: { fresh })
         let started = mgr.startDownload(alias: "fake-alias")
         #expect(started)
-
-        let done = await waitUntil(deadline: Date().addingTimeInterval(5)) {
-            guard let job = mgr.job(for: "fake-alias") else { return false }
-            if case .running = job.status { return false }
-            return true
+        // Reap the spawned child on EVERY exit path — success, an assertion
+        // failure, or the throwing ``#require`` below. `defer` registered
+        // right after the download spawns guarantees the subprocess (and its
+        // pipes / queued termination handler) cannot outlive this test into
+        // parallel siblings.
+        //
+        // This MUST be the SYNCHRONOUS teardown path — NOT
+        // ``cancelDownload``. ``cancelDownload`` only SIGTERMs the child and
+        // schedules an async @MainActor 2 s-grace → SIGKILL Task; it returns
+        // with the Process still in its grace window and the reaping deferred
+        // to a later ``terminationHandler`` hop. A `defer { cancelDownload }`
+        // would therefore return with the child (and its bookkeeping) still
+        // alive — exactly the cross-test pollution #2237 warns about.
+        // ``beginShutdown()`` (SIGTERM, non-blocking) + ``finishShutdown()``
+        // (blocking reap → SIGKILL survivor → ``cleanupProcessBookkeeping``)
+        // is production's own synchronous shutdown split (the
+        // ``applicationWillTerminate`` path): when ``finishShutdown`` returns
+        // the Process is dead AND its pipes / termination handler / job entry
+        // have been torn down, so nothing can outlive this test.
+        //
+        // In the success path this is near-instant: the fake binary writes the
+        // marker and ``exit 0``s immediately, so by teardown the child is
+        // already gone and ``finishShutdown``'s grace poll finds no running
+        // process (no ``Thread.sleep`` is actually spent).
+        defer {
+            mgr.beginShutdown()
+            mgr.finishShutdown()
         }
-        #expect(done)
-        #expect(mgr.job(for: "fake-alias")?.status == .completed)
 
-        let invocation = try String(contentsOf: marker, encoding: .utf8)
-        #expect(invocation.contains(fresh.path))
-        #expect(invocation.contains("pull fake-alias"))
+        // The behavior under test is that ``startDownload`` re-resolves to the
+        // fresh binary and invokes `pull fake-alias`. The DETERMINISTIC signal
+        // for that is the marker file the fake binary writes as its first act:
+        // it only exists if the fresh ``binaryLocator`` result actually ran.
+        // Do NOT gate on the job reaching ``.completed``: that requires the
+        // subprocess to exit AND the load-starved ``@MainActor``
+        // ``terminationHandler`` hop to run, which under the 28-worker full
+        // parallel suite can exceed any wall-clock bound and flake without the
+        // re-resolve contract being wrong (#2237). The real process → ``.completed``
+        // lifecycle is covered deterministically in DownloadManagerIntegrationTests.
+        //
+        // Poll on the marker's COMPLETE contents, not merely its existence:
+        // the fake script's `>` truncates/creates the file before the payload
+        // is written, so `fileExists` alone can race a partial read. Reading
+        // the contents each poll and waiting until both tokens are present is
+        // the write barrier — once both appear the line is fully on disk, and
+        // asserting that same captured content avoids a second racy read.
+        var invocation: String? = nil
+        let invoked = await waitUntil(deadline: Date().addingTimeInterval(10)) {
+            guard let data = try? Data(contentsOf: marker),
+                  let text = String(data: data, encoding: .utf8) else { return false }
+            if text.contains(fresh.path), text.contains("pull fake-alias") {
+                invocation = text
+                return true
+            }
+            return false
+        }
+        #expect(invoked, "the fresh binary was never invoked — startDownload did not re-resolve and run `pull fake-alias`")
+        let written = try #require(invocation, "invoked but the marker contents were not captured")
+        #expect(written.contains(fresh.path))
+        #expect(written.contains("pull fake-alias"))
+
+        // No intermediate ``isDownloading`` assertion here: the marker is the
+        // subprocess's FIRST act, so a check that the job is no longer running
+        // would race the still-active child (and its @MainActor termination
+        // handler) — reintroducing the load-sensitive timing this fix removes.
+        // The `defer` above owns the reap on every exit path via the
+        // synchronous ``beginShutdown`` + ``finishShutdown`` split.
     }
 
     @Test("Seeded running job → completed exit transitions cleanly")
