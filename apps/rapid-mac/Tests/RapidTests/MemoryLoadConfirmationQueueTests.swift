@@ -219,4 +219,33 @@ struct MemoryLoadConfirmationQueueTests {
         )
         #expect(refreshed == nil)
     }
+
+    @Test("activation check owns the warning before alert dismissal")
+    func activationCheckCannotBeCancelledByAlertDismissal() throws {
+        let gib = UInt64(1 << 30)
+        let request = UUID()
+        var queue = MemoryLoadConfirmationQueue()
+        let original = warning("qwen3.5-9b-4bit")
+        queue.enqueue(warning: original, requestID: request)
+
+        let beganChecking = queue.beginChecking(warningID: original.id)
+        #expect(beganChecking)
+        #expect(queue.currentWarning == nil)
+        #expect(queue.isPending(request))
+        let dismissed = queue.resolveCurrent(warning: original, decision: .cancelled)
+        #expect(!dismissed)
+        #expect(queue.isPending(request))
+
+        let checkedWarning = queue.checkingWarning(
+            warningID: original.id,
+            snapshot: .init(totalBytes: 32 * gib, usedBytes: 30 * gib)
+        )
+        let checked = try #require(checkedWarning)
+        #expect(checked.id == original.id)
+        #expect(checked.severity == .unsafe)
+
+        queue.restoreAwaiting(warningID: original.id)
+        #expect(queue.currentWarning == checked)
+        #expect(queue.takeDecision(for: request) == nil)
+    }
 }

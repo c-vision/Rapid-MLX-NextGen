@@ -159,6 +159,41 @@ struct LaunchAutoStartMemoryTests {
         #expect(await refresh.value == nil)
         #expect(server.pendingMemoryWarning?.severity == .unsafe)
     }
+
+    @MainActor
+    @Test("confirm survives SwiftUI's same-turn alert dismissal")
+    func confirmedWarningIsNotCancelledByAlertDismissal() async throws {
+        let gib = UInt64(1_073_741_824)
+        let snapshots = BlockingActivationSnapshots(
+            .init(totalBytes: 32 * gib, usedBytes: 30 * gib)
+        )
+        let completion = LockedCompletionFlag()
+        let server = ServerManager(
+            testingState: .idle,
+            binaryPath: URL(fileURLWithPath: "/usr/bin/true")
+        )
+        server.memorySnapshotProvider = { snapshots.next() }
+
+        let load = Task {
+            _ = await server.ensureServing(alias: "qwen3.5-9b-4bit")
+            completion.markComplete()
+        }
+        while server.pendingMemoryWarning == nil {
+            await Task.yield()
+        }
+        let warning = try #require(server.pendingMemoryWarning)
+
+        server.confirmPendingMemoryLoad(warning)
+        await snapshots.waitForActivationSample()
+        // SwiftUI writes false to the alert Binding after its button action.
+        // That same-turn dismissal must not reverse an accepted decision.
+        server.cancelPendingMemoryLoad(warning)
+        try await Task.sleep(for: .milliseconds(350))
+        #expect(!completion.isComplete)
+
+        snapshots.releaseActivationSample()
+        _ = await load.value
+    }
 }
 
 private final class LockedMemorySnapshots: @unchecked Sendable {
@@ -222,4 +257,44 @@ private final class OrderedMemorySnapshots: @unchecked Sendable {
     func releaseDelayedSample() {
         delayedRelease.signal()
     }
+}
+
+private final class BlockingActivationSnapshots: @unchecked Sendable {
+    private let lock = NSLock()
+    private let activationRelease = DispatchSemaphore(value: 0)
+    private let value: MemoryProbe.Snapshot
+    private var callCount = 0
+    private var activationStarted = false
+
+    init(_ value: MemoryProbe.Snapshot) {
+        self.value = value
+    }
+
+    func next() -> MemoryProbe.Snapshot {
+        let call = lock.withLock {
+            defer { callCount += 1 }
+            if callCount == 1 { activationStarted = true }
+            return callCount
+        }
+        if call == 1 { activationRelease.wait() }
+        return value
+    }
+
+    func waitForActivationSample() async {
+        while !lock.withLock({ activationStarted }) {
+            await Task.yield()
+        }
+    }
+
+    func releaseActivationSample() {
+        activationRelease.signal()
+    }
+}
+
+private final class LockedCompletionFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var complete = false
+
+    var isComplete: Bool { lock.withLock { complete } }
+    func markComplete() { lock.withLock { complete = true } }
 }

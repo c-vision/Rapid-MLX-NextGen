@@ -14,6 +14,7 @@ struct MemoryLoadConfirmationQueue {
     private struct Pending: Equatable {
         enum Phase: Equatable {
             case awaitingDecision
+            case checkingDecision
             case launching
         }
 
@@ -42,27 +43,14 @@ struct MemoryLoadConfirmationQueue {
     ) -> (old: ModelSizing.MemoryWarning, new: ModelSizing.MemoryWarning)? {
         guard pending.first?.phase == .awaitingDecision,
               let old = pending.first?.warning else { return nil }
-        let refreshed = ModelSizing.MemoryWarning(
-            id: old.id,
-            alias: old.alias,
-            hfPath: old.hfPath,
-            isAutoRespawn: old.isAutoRespawn,
-            severity: ModelSizing.memorySafety(
-                footprintGB: old.footprintGB,
-                usedBytes: snapshot.usedBytes,
-                totalBytes: snapshot.totalBytes
-            ),
-            footprintGB: old.footprintGB,
-            freeGB: Double(snapshot.freeBytes) / Double(1 << 30),
-            totalGB: Double(snapshot.totalBytes) / Double(1 << 30)
-        )
+        let refreshed = refreshedWarning(old, snapshot: snapshot)
         pending[0].warning = refreshed
         return (old, refreshed)
     }
 
     func isPending(_ requestID: UUID) -> Bool {
         pending.contains {
-            $0.requestID == requestID && $0.phase == .awaitingDecision
+            $0.requestID == requestID && $0.phase != .launching
         }
     }
 
@@ -83,6 +71,45 @@ struct MemoryLoadConfirmationQueue {
             pending[0].phase = .launching
         }
         return currentWarning
+    }
+
+    mutating func beginChecking(warningID: UUID) -> Bool {
+        guard pending.first?.warning.id == warningID,
+              pending.first?.phase == .awaitingDecision else { return false }
+        pending[0].phase = .checkingDecision
+        return true
+    }
+
+    mutating func checkingWarning(
+        warningID: UUID,
+        snapshot: MemoryProbe.Snapshot?
+    ) -> ModelSizing.MemoryWarning? {
+        guard pending.first?.warning.id == warningID,
+              pending.first?.phase == .checkingDecision else { return nil }
+        if let snapshot, let old = pending.first?.warning {
+            pending[0].warning = refreshedWarning(old, snapshot: snapshot)
+        }
+        return pending[0].warning
+    }
+
+    mutating func restoreAwaiting(warningID: UUID) {
+        guard pending.first?.warning.id == warningID,
+              pending.first?.phase == .checkingDecision else { return }
+        pending[0].phase = .awaitingDecision
+    }
+
+    mutating func confirmChecking(
+        warningID: UUID,
+        sequence: Int
+    ) -> ModelSizing.MemoryWarning? {
+        guard pending.first?.warning.id == warningID,
+              pending.first?.phase == .checkingDecision else { return nil }
+        let warning = pending[0].warning
+        if let requestID = pending[0].requestID {
+            decisions[requestID] = .confirmed(sequence: sequence)
+        }
+        pending[0].phase = .launching
+        return warning
     }
 
     mutating func resolveCurrent(
@@ -118,6 +145,26 @@ struct MemoryLoadConfirmationQueue {
             return
         }
         pending[index].requestID = nil
+    }
+
+    private func refreshedWarning(
+        _ old: ModelSizing.MemoryWarning,
+        snapshot: MemoryProbe.Snapshot
+    ) -> ModelSizing.MemoryWarning {
+        ModelSizing.MemoryWarning(
+            id: old.id,
+            alias: old.alias,
+            hfPath: old.hfPath,
+            isAutoRespawn: old.isAutoRespawn,
+            severity: ModelSizing.memorySafety(
+                footprintGB: old.footprintGB,
+                usedBytes: snapshot.usedBytes,
+                totalBytes: snapshot.totalBytes
+            ),
+            footprintGB: old.footprintGB,
+            freeGB: Double(snapshot.freeBytes) / Double(1 << 30),
+            totalGB: Double(snapshot.totalBytes) / Double(1 << 30)
+        )
     }
 }
 
@@ -1442,6 +1489,11 @@ final class ServerManager {
     /// whether the user actually chose the unsafe override; a stale ordinary
     /// Load action can therefore never become a bypass after pressure rises.
     func confirmPendingMemoryLoad(_ warning: ModelSizing.MemoryWarning) {
+        // Claim synchronously before SwiftUI dismisses its alert. The binding
+        // writes `false` on the same run-loop turn and treats an unclaimed
+        // warning as Cancel; `.checkingDecision` makes that dismissal a no-op
+        // while the activation probe runs off the main actor.
+        guard memoryConfirmations.beginChecking(warningID: warning.id) else { return }
         Task { [weak self] in
             await self?.activatePendingMemoryLoad(warning)
         }
@@ -1454,26 +1506,25 @@ final class ServerManager {
         let snapshot = await Task.detached(priority: .utility) {
             provider()
         }.value
-        guard pendingMemoryWarning?.id == warning.id else { return }
-        if let snapshot {
-            _ = memoryConfirmations.refreshCurrentWarning(snapshot: snapshot)
-        }
-        guard let latestWarning = pendingMemoryWarning,
-              latestWarning.id == warning.id else { return }
+        guard let latestWarning = memoryConfirmations.checkingWarning(
+            warningID: warning.id,
+            snapshot: snapshot
+        ) else { return }
 
         // Only the explicit unsafe action is a waiver. An ordinary Load that
         // became unsafe during this activation remains parked on the same
         // queue entry, preserving its waiter and presenting the new facts.
         let requestedUnsafeOverride = warning.severity == .unsafe
         guard requestedUnsafeOverride || latestWarning.severity != .unsafe else {
+            memoryConfirmations.restoreAwaiting(warningID: warning.id)
             return
         }
 
         memoryConfirmSeq += 1
         let seq = memoryConfirmSeq
-        guard let currentWarning = memoryConfirmations.resolveCurrent(
+        guard let currentWarning = memoryConfirmations.confirmChecking(
             warningID: warning.id,
-            decision: .confirmed(sequence: seq)
+            sequence: seq
         ) else { return }
         memoryConfirmRunning.insert(seq)
         if child != nil {
