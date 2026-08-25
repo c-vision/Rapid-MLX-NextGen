@@ -3124,6 +3124,31 @@ Examples:
     if args.mcp_config:
         os.environ["RAPID_MLX_MCP_CONFIG"] = args.mcp_config
 
+    # Resolve checkpoint/profile metadata lazily and at most once for every
+    # standalone-server default below. Cache admission is best-effort; parser,
+    # PFlash, and TurboQuant retain their existing error policy when they are
+    # the first consumer.
+    auto_config = None
+    auto_config_resolved = False
+
+    def resolve_auto_config(*, non_fatal: bool):
+        nonlocal auto_config, auto_config_resolved
+        if auto_config_resolved:
+            return auto_config
+        try:
+            from .model_auto_config import detect_model_config
+        except ImportError:
+            auto_config_resolved = True
+            return None
+        try:
+            auto_config = detect_model_config(args.model)
+        except Exception as exc:
+            if not non_fatal:
+                raise
+            logger.debug("Auto-detection failed (non-fatal): %s", exc)
+        auto_config_resolved = True
+        return auto_config
+
     # Auto-detect parser config from model name when not explicitly set.
     # SOP §10: honor --no-tool-call-parser / --no-reasoning-parser opt-
     # outs so this entrypoint matches the unified CLI behavior.
@@ -3138,9 +3163,7 @@ Examples:
             "--reasoning-parser and --no-reasoning-parser are mutually exclusive"
         )
     if not args.tool_call_parser or not args.reasoning_parser:
-        from .model_auto_config import detect_model_config
-
-        auto_config = detect_model_config(args.model)
+        resolve_auto_config(non_fatal=False)
         if auto_config:
             if (
                 not args.tool_call_parser
@@ -3253,8 +3276,16 @@ Examples:
     # two serving entrypoints must not drift. It mutates ``args.pflash`` and
     # ``args.pflash_keep_ratio`` in place so later readers see resolved values.
     try:
+        pflash_detection = {}
+        if auto_config_resolved:
+            pflash_detection["_detected_config"] = auto_config
+        elif args.pflash is None or args.pflash_keep_ratio is None:
+            pflash_detection["_detected_config"] = resolve_auto_config(non_fatal=False)
         server_pflash_config = _server_pflash_resolve_config(
-            args, model_name=args.model, is_multimodal=_srv_is_mllm
+            args,
+            model_name=args.model,
+            is_multimodal=_srv_is_mllm,
+            **pflash_detection,
         )
         _server_pflash_validate(
             server_pflash_config,
@@ -3278,8 +3309,15 @@ Examples:
         turboquant_scheduler_kwargs as _server_turboquant_scheduler_kwargs,
     )
 
+    turboquant_detection = {}
+    if auto_config_resolved:
+        turboquant_detection["_detected_config"] = auto_config
+    elif getattr(args, "kv_cache_turboquant", None) is None and not getattr(
+        args, "kv_cache_quantization", False
+    ):
+        turboquant_detection["_detected_config"] = resolve_auto_config(non_fatal=False)
     args.kv_cache_turboquant = _server_turboquant_resolve_default(
-        args, model_name=args.model
+        args, model_name=args.model, **turboquant_detection
     )
 
     if args.vision_min_pixels < 0 or args.vision_max_pixels < 0:
@@ -3304,11 +3342,24 @@ Examples:
     if vision_prefill_token_budget <= 0:
         parser.error("--vision-prefill-token-budget must be positive")
 
+    if not auto_config_resolved:
+        resolve_auto_config(non_fatal=True)
+    from .cli import _resolve_hybrid_cache_entries
+
+    hybrid_cache_entries = _resolve_hybrid_cache_entries(
+        enable_prefix_cache=True,
+        explicit_value=0,
+        user_set_explicit=False,
+        model_name=args.model,
+        model_config=auto_config,
+    )
+
     scheduler_config = SchedulerConfig(
         prefill_step_size=args.prefill_step_size,
         vision_prefill_token_budget=vision_prefill_token_budget,
         vision_min_pixels=args.vision_min_pixels,
         vision_max_pixels=args.vision_max_pixels,
+        hybrid_cache_entries=hybrid_cache_entries,
         pflash_config=server_pflash_config,
         **_server_turboquant_scheduler_kwargs(args),
     )

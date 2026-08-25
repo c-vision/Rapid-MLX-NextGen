@@ -132,6 +132,35 @@ def _run_server_main_capturing_config(argv: list[str], *, lane=(False, False)):
     return captured
 
 
+def _run_server_main_capturing_scheduler(argv: list[str], *, detected_config):
+    """Drive ``server.main()`` through scheduler construction, offline."""
+    captured: dict = {}
+    detect = mock.Mock(return_value=detected_config)
+
+    def _capture_load_model(_model, *, scheduler_config, **_kwargs):
+        captured["scheduler_config"] = scheduler_config
+        raise _StopError
+
+    server = _server_module()
+    with (
+        mock.patch("vllm_mlx.cli._port_preflight_or_die", lambda *a, **k: None),
+        mock.patch("vllm_mlx.server._ensure_routing_config", lambda *a, **k: None),
+        mock.patch(
+            "vllm_mlx.server.resolve_serving_lane", lambda _name, **_kw: (False, False)
+        ),
+        mock.patch(
+            "vllm_mlx.model_auto_config.detect_model_config",
+            detect,
+        ),
+        mock.patch("vllm_mlx.pflash.validate_model_support", lambda *a, **k: None),
+        mock.patch("vllm_mlx.server.load_model", _capture_load_model),
+        mock.patch.object(sys, "argv", ["vllm_mlx.server", *argv]),
+        pytest.raises(_StopError),
+    ):
+        server.main()
+    return captured["scheduler_config"], detect.call_count
+
+
 def test_server_module_applies_per_alias_keep_ratio_override():
     # bonsai-27b-2bit pins pflash_tier=verified + pflash_keep_ratio=0.50.
     # Text lane (is_mllm False) → verified tier auto-enables PFlash "always".
@@ -165,3 +194,36 @@ def test_server_module_forwards_multimodal_lane_verdict():
     assert cfg is not None
     assert captured["is_mllm"] is True
     assert cfg.mode == "off"
+
+
+def test_server_module_applies_detected_hybrid_cache_default():
+    from vllm_mlx.model_profile import ModelProfile
+
+    scheduler, detect_calls = _run_server_main_capturing_scheduler(
+        ["--model", "/models/linear-checkpoint"],
+        detected_config=ModelProfile(
+            hf_path="/models/linear-checkpoint",
+            is_hybrid=True,
+            is_hybrid_explicit=True,
+        ),
+    )
+
+    assert scheduler.enable_prefix_cache is True
+    assert scheduler.hybrid_cache_entries == 8
+    assert detect_calls == 1
+
+
+def test_server_module_keeps_dense_cache_default_zero():
+    from vllm_mlx.model_profile import ModelProfile
+
+    scheduler, detect_calls = _run_server_main_capturing_scheduler(
+        ["--model", "/models/dense-checkpoint"],
+        detected_config=ModelProfile(
+            hf_path="/models/dense-checkpoint",
+            is_hybrid=False,
+        ),
+    )
+
+    assert scheduler.enable_prefix_cache is True
+    assert scheduler.hybrid_cache_entries == 0
+    assert detect_calls == 1
