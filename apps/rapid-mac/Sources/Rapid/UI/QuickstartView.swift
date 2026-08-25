@@ -1555,13 +1555,15 @@ struct QuickstartView: View {
                     }
                 }
             }
-            .onReceive(
-                NotificationCenter.default.publisher(
-                    for: NSApplication.didBecomeActiveNotification
+            .task {
+                let activations = NotificationCenter.default.notifications(
+                    named: NSApplication.didBecomeActiveNotification
                 )
-            ) { _ in
-                guard server.pendingMemoryWarning != nil else { return }
-                Task { await refreshPendingMemoryWarning() }
+                for await _ in activations {
+                    guard !Task.isCancelled else { return }
+                    guard server.pendingMemoryWarning != nil else { continue }
+                    await refreshPendingMemoryWarning()
+                }
             }
     }
 
