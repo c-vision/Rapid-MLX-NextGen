@@ -561,34 +561,46 @@ jobs:
           }
           TARGET_VERSION="$(jq -er '.version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' dist/latest.json)"
 
+          # The tag-level Release is immutable evidence independent of pointer
+          # state. Verify it and this exact-run DMG before fetching/branching on
+          # latest.json, so missing/older/malformed pointers cannot reach any
+          # mutable write with mismatched canonical bytes.
+          RELEASE_ARGS=()
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+              > dist/current-release.json 2> dist/current-release.err; then
+            RELEASE_ARGS=(--release-json dist/current-release.json)
+          elif grep -Fq '(HTTP 404)' dist/current-release.err; then
+            echo "::notice::GitHub Release ${TAG} is absent; first publication/recovery remains available"
+          else
+            cat dist/current-release.err >&2
+            exit 1
+          fi
+          python3 scripts/check_equal_version_republish.py \
+            --candidate dist/latest.json \
+            --dmg dist-dmg/rapid-mlx-desktop.dmg \
+            "${RELEASE_ARGS[@]}"
+
           # Treat only a genuinely absent pointer as first publication. Auth,
           # network, and parse failures remain fatal rather than bypassing the
           # rollback guard.
           if GET_OUTPUT="$(npx --yes wrangler@4.120.0 r2 object get "${R2_BUCKET}/latest.json" \
               --file dist/current-latest.json --remote 2>&1)"; then
-            CURRENT_VERSION="$(jq -er '.version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' dist/current-latest.json)"
-            if dpkg --compare-versions "$CURRENT_VERSION" gt "$TARGET_VERSION"; then
-              echo "::notice::Skipping stale updater manifest ${TARGET_VERSION}; current is ${CURRENT_VERSION}"
-              exit 0
-            fi
-            if [[ "$CURRENT_VERSION" == "$TARGET_VERSION" ]]; then
-              RELEASE_ARGS=()
-              if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
-                  > dist/current-release.json 2> dist/current-release.err; then
-                RELEASE_ARGS=(--release-json dist/current-release.json)
-              elif grep -Fq '(HTTP 404)' dist/current-release.err; then
-                echo "::notice::GitHub Release ${TAG} is absent; preserving updater bytes and continuing Release recovery"
-              else
-                cat dist/current-release.err >&2
-                exit 1
+            if CURRENT_VERSION="$(jq -er '.version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' dist/current-latest.json)"; then
+              if dpkg --compare-versions "$CURRENT_VERSION" gt "$TARGET_VERSION"; then
+                echo "::notice::Skipping stale updater manifest ${TARGET_VERSION}; current is ${CURRENT_VERSION}"
+                exit 0
               fi
-              python3 scripts/check_equal_version_republish.py \
-                --current dist/current-latest.json \
-                --candidate dist/latest.json \
-                --dmg dist-dmg/rapid-mlx-desktop.dmg \
-                "${RELEASE_ARGS[@]}"
-              echo "::notice::Equal-version updater transaction is already byte-identical; no mutable object will be rewritten"
-              exit 0
+              if [[ "$CURRENT_VERSION" == "$TARGET_VERSION" ]]; then
+                python3 scripts/check_equal_version_republish.py \
+                  --current dist/current-latest.json \
+                  --candidate dist/latest.json \
+                  --dmg dist-dmg/rapid-mlx-desktop.dmg
+                echo "::notice::Equal-version updater transaction is already byte-identical; no mutable object will be rewritten"
+                exit 0
+              fi
+            else
+              echo "::error::Current latest.json is malformed; monotonic ordering is unprovable, refusing every mutable write" >&2
+              exit 1
             fi
           elif grep -Fq "The specified key does not exist." <<<"$GET_OUTPUT"; then
             echo "::notice::No current latest.json; publishing the initial pointer"

@@ -184,16 +184,20 @@ contains "$UPDATER_STEP" 'scripts/check_equal_version_republish.py' \
   "equal-version rerun verifies pointer, exact DMG and existing Release identity"
 contains "$UPDATER_STEP" 'exit 0' \
   "identical equal-version rerun no-ops the mutable updater transaction"
-IDENTITY_LINE=$(grep -n 'scripts/check_equal_version_republish.py' "$RAPID_RELEASE" | cut -d: -f1)
+contains "$UPDATER_STEP" 'monotonic ordering is unprovable' \
+  "malformed current pointer fails closed after Release identity verification"
+IDENTITY_LINE=$(grep -n 'scripts/check_equal_version_republish.py' "$RAPID_RELEASE" | head -1 | cut -d: -f1)
+POINTER_GET_LINE=$(grep -n 'r2 object get "${R2_BUCKET}/latest.json"' "$RAPID_RELEASE" | cut -d: -f1)
 LATEST_PUT_LINE=$(grep -n 'r2 object put "${R2_BUCKET}/latest.json"' "$RAPID_RELEASE" | tail -1 | cut -d: -f1)
 APPCAST_PUT_LINE=$(grep -n 'r2 object put "${R2_BUCKET}/appcast.xml"' "$RAPID_RELEASE" | tail -1 | cut -d: -f1)
 COMPAT_PUT_LINE=$(grep -n '"${R2_BUCKET}/rapid-mac/rapid-mlx-desktop.dmg"' "$RAPID_RELEASE" | tail -1 | cut -d: -f1)
-if [[ -n "$IDENTITY_LINE" && "$IDENTITY_LINE" -lt "$LATEST_PUT_LINE" \
+if [[ -n "$IDENTITY_LINE" && "$IDENTITY_LINE" -lt "$POINTER_GET_LINE" \
+      && "$IDENTITY_LINE" -lt "$LATEST_PUT_LINE" \
       && "$IDENTITY_LINE" -lt "$APPCAST_PUT_LINE" \
       && "$IDENTITY_LINE" -lt "$COMPAT_PUT_LINE" ]]; then
-  ok "equal-version identity gate precedes latest, appcast and compatibility DMG writes"
+  ok "canonical Release identity gate precedes pointer branching and every mutable write"
 else
-  bad "equal-version identity gate precedes every mutable updater write"
+  bad "canonical Release identity gate precedes pointer branching and every mutable write"
 fi
 
 RESOLVER_USES=$(grep -c 'resolve_github_tag_commit "$TAG"' "$RAPID_RELEASE")

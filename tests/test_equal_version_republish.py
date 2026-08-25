@@ -81,7 +81,7 @@ def test_mismatched_equal_version_fails_before_mutation(checker, tmp_path):
     value = json.loads(candidate.read_text())
     value["dmg_sha256"] = "a" * 64
     candidate.write_text(json.dumps(value))
-    with pytest.raises(ValueError, match="artifact identity differs"):
+    with pytest.raises(ValueError, match="exact-run DMG"):
         checker.verify(
             current_path=current,
             candidate_path=candidate,
@@ -96,6 +96,59 @@ def test_mismatched_existing_release_fails_before_mutation(checker, tmp_path):
     value["assets"][0]["digest"] = "sha256:" + "b" * 64
     release.write_text(json.dumps(value))
     with pytest.raises(ValueError, match="Release DMG identity differs"):
+        checker.verify(
+            current_path=current,
+            candidate_path=candidate,
+            dmg_path=dmg,
+            release_path=release,
+        )
+
+
+@pytest.mark.parametrize("pointer_state", ["missing", "older", "malformed"])
+def test_release_mismatch_fails_independent_of_pointer_state(
+    checker, tmp_path, pointer_state
+):
+    current, candidate, dmg, release = _fixtures(tmp_path)
+    if pointer_state == "missing":
+        current.unlink()
+    elif pointer_state == "older":
+        value = json.loads(current.read_text())
+        value["version"] = "0.12.17"
+        current.write_text(json.dumps(value))
+    else:
+        current.write_text("not json")
+    value = json.loads(release.read_text())
+    value["assets"][0]["digest"] = "sha256:" + "c" * 64
+    release.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="Release DMG identity differs"):
+        checker.verify_exact_artifact(
+            candidate_path=candidate,
+            dmg_path=dmg,
+            release_path=release,
+        )
+
+
+@pytest.mark.parametrize("pointer_state", ["missing", "older"])
+def test_matching_release_permits_pointer_recovery(checker, tmp_path, pointer_state):
+    current, candidate, dmg, release = _fixtures(tmp_path)
+    if pointer_state == "missing":
+        current.unlink()
+    elif pointer_state == "older":
+        value = json.loads(current.read_text())
+        value["version"] = "0.12.17"
+        current.write_text(json.dumps(value))
+    version, _, _ = checker.verify_exact_artifact(
+        candidate_path=candidate,
+        dmg_path=dmg,
+        release_path=release,
+    )
+    assert version == "0.13.0"
+
+
+def test_matching_release_does_not_authorize_malformed_pointer(checker, tmp_path):
+    current, candidate, dmg, release = _fixtures(tmp_path)
+    current.write_text("not json")
+    with pytest.raises(ValueError, match="cannot read current latest.json"):
         checker.verify(
             current_path=current,
             candidate_path=candidate,
