@@ -55,6 +55,18 @@ contains "$MANIFEST_ACTION" '--source-sha "$SOURCE_SHA"' "manifest records the c
 contains "$MANIFEST_ACTION" '--version "$RELEASE_VERSION"' "manifest records the release version"
 contains "$MANIFEST_ACTION" '--signed' "manifest records the signed/delta gate state"
 
+# The shared candidate/tag contract must distinguish a verified missing asset
+# (the only safe no-baseline skip) from auth/API/malformed lookup failures.
+DELTA_GATE=$(sed -n '/name: Bundle size delta gate/,/name: Validate DMG contents/p' "$ACTION")
+contains "$DELTA_GATE" 'scripts/release_asset_size.sh' \
+  "DMG delta gate uses the executable fail-closed asset resolver"
+lacks "$DELTA_GATE" 'gh release view' \
+  "DMG delta gate does not mask an inline gh lookup"
+lacks "$DELTA_GATE" '|| true' \
+  "DMG baseline lookup never turns API failure into a skip"
+contains "$DELTA_GATE" 'if [[ "$ASSET_STATE" == "absent" ]]' \
+  "only a verified absent canonical asset skips the comparison"
+
 # ---------------------------------------------------------------------------
 echo "== 2. live main head must equal validated candidate (TOCTOU) =="
 # ---------------------------------------------------------------------------

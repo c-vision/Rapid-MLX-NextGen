@@ -399,13 +399,18 @@ runs:
         CURRENT_DMG_MB=$(du -sm "$DMG" | awk '{print $1}')
         PREV_TAG="${PREVIOUS_TAG:-}"
         CANONICAL_DMG_NAME="rapid-mlx-desktop.dmg"
-        PREV_DMG_BYTES=$(gh release view "$PREV_TAG" --json assets \
-          -q ".assets[] | select(.name == \"${CANONICAL_DMG_NAME}\") | .size" | head -1 || true)
-        if [[ -z "$PREV_DMG_BYTES" ]]; then
+        ASSET_STATE=$(bash "${{ inputs.checkout_path }}/scripts/release_asset_size.sh" \
+          "$PREV_TAG" "$CANONICAL_DMG_NAME")
+        if [[ "$ASSET_STATE" == "absent" ]]; then
           echo "::notice::previous release ${PREV_TAG} has no '${CANONICAL_DMG_NAME}' asset — no DMG size baseline; skipping delta comparison."
           echo "DELTA_COMPARED=false" >> "$GITHUB_ENV"
           exit 0
         fi
+        [[ "$ASSET_STATE" == $'present\t'* ]] || {
+          echo "::error::unexpected release asset state for ${PREV_TAG}: ${ASSET_STATE}" >&2
+          exit 1
+        }
+        PREV_DMG_BYTES="${ASSET_STATE#*$'\t'}"
         PREV_DMG_MB=$(awk -v b="$PREV_DMG_BYTES" 'BEGIN { printf "%d", (b/1000000) + 0.5 }')
         DELTA_MB=$(( CURRENT_DMG_MB - PREV_DMG_MB ))
         echo "::notice::DMG delta vs ${PREV_TAG}: ${CURRENT_DMG_MB} - ${PREV_DMG_MB} = ${DELTA_MB} MB (cap +${DELTA_CAP_MB} MB)"
