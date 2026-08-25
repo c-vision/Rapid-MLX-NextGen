@@ -44,7 +44,7 @@ final class DeclinedToolDiagnosisTests {
 
     // MARK: - Declining the initial fetch
 
-    @Test("Clicking Don't allow on a browse prompt is a user decline, not a tool failure")
+    @Test("Clicking Don't allow on a browse prompt is a user decline, not a tool failure", .timeLimit(.minutes(1)))
     func declinedBrowseIsNotAFailure() async throws {
         let approval = BrowseApprovalStore(defaults: freshDefaults())
         async let pending = BrowseTool.run(
@@ -66,7 +66,7 @@ final class DeclinedToolDiagnosisTests {
         #expect(result.isError)
     }
 
-    @Test("A declined browse keeps its user-declined kind through tool dispatch")
+    @Test("A declined browse keeps its user-declined kind through tool dispatch", .timeLimit(.minutes(1)))
     func registryPreservesTheDeclinedKind() async throws {
         // ``BuiltinToolRegistry`` re-classifies every result at the dispatch
         // boundary. It must PREFER what the tool reported: re-deriving the kind
@@ -90,7 +90,7 @@ final class DeclinedToolDiagnosisTests {
 
     // MARK: - Only an actual "no" is a decline
 
-    @Test("A turn cancelled while the prompt is up is not blamed on the user")
+    @Test("A turn cancelled while the prompt is up is not blamed on the user", .timeLimit(.minutes(1)))
     func cancellationIsNotADecline() async throws {
         // Pressing Stop tears the approval sheet down. The store used to report
         // that as ``.deny``, which would now read back to the user as "you
@@ -112,7 +112,7 @@ final class DeclinedToolDiagnosisTests {
         #expect(result.isError)
     }
 
-    @Test("A second prompt while one is already open is refused, not counted as a decline")
+    @Test("A second prompt while one is already open is refused, not counted as a decline", .timeLimit(.minutes(1)))
     func reentrantApprovalIsNotADecline() async throws {
         // Tool execution is serial, so a second pending prompt means something
         // is wrong. The user never saw this URL, so the answer cannot be theirs.
@@ -135,7 +135,7 @@ final class DeclinedToolDiagnosisTests {
         #expect(decision == .allowOnce)
     }
 
-    @Test("Always allow approves the pending fetch and persists auto-approval")
+    @Test("Always allow approves the pending fetch and persists auto-approval", .timeLimit(.minutes(1)))
     func alwaysAllowPersistsAndSkipsFuturePrompts() async throws {
         let defaults = freshDefaults()
         let approval = BrowseApprovalStore(defaults: defaults)
@@ -161,7 +161,7 @@ final class DeclinedToolDiagnosisTests {
         #expect(restored.pendingRequest == nil)
     }
 
-    @Test("Cancelling a pending-request observer settles without a prompt")
+    @Test("Cancelling a pending-request observer settles without a prompt", .timeLimit(.minutes(1)))
     func cancelledPendingRequestObserverSettles() async {
         let approval = BrowseApprovalStore(defaults: freshDefaults())
         var observer: Task<Bool, Never>!
@@ -175,11 +175,17 @@ final class DeclinedToolDiagnosisTests {
         }
 
         observer.cancel()
+        async let pending = approval.requestApproval(
+            url: "https://example.com/after-cancel",
+            host: "example.com"
+        )
+        #expect(await approval.waitUntilPendingRequest())
         #expect(await observer.value == false)
-        #expect(approval.pendingRequest == nil)
+        approval.answer(.deny)
+        #expect(await pending == .deny)
     }
 
-    @Test("Publishing one prompt wakes every registered observer")
+    @Test("Publishing one prompt wakes every registered observer", .timeLimit(.minutes(1)))
     func pendingRequestPublicationWakesEveryObserver() async {
         let approval = BrowseApprovalStore(defaults: freshDefaults())
         var firstObserver: Task<Bool, Never>!
