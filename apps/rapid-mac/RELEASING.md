@@ -287,6 +287,16 @@ Watch it:
 gh run watch $(gh run list --workflow=auto-release.yml --limit=1 --json databaseId -q ".[0].databaseId")
 ```
 
+**During the final approval + claim, hold `main` merges.** Once `release-prep`
+prints the exact evidence for review, the sole owning reviewer keeps `main`
+frozen through the `rapid-mac-tag` approval and the tag claim. The blocker/head
+re-queries immediately before the claim are a **freshness/cutoff guard, not a
+transaction** — GitHub offers no single atomic op across Issues + `main` + the
+tag POST. If a blocker change is detected before the claim, abort and re-run
+normally at the new head; a change after the cutoff may be unobservable until
+post-claim, at which point it is a next-RC/release incident (a post-cut `main`
+commit is not part of this candidate).
+
 ---
 
 ## Who does what

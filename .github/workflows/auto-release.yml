@@ -680,12 +680,16 @@ jobs:
           name: rapid-mac-release-evidence
           path: evidence
 
-      # #2301 TOCTOU guard: re-query the live open release-blocker set IMMEDIATELY
-      # before the immutable tag is claimed, and require it to match the exact
-      # set the pre-approval job recorded at candidate time (``--expected-open-ids``
-      # from release-prep). Any issue opened/closed/waived in between fails closed.
-      # Passing an empty set explicitly still enforces the check — candidate-time
-      # zero is NOT licence to let the set change before the tag is claimed.
+      # #2301 FRESHNESS/CUTOFF guard: re-query the live open release-blocker set
+      # IMMEDIATELY before the immutable tag is claimed and require it to equal the
+      # candidate-time set (``--expected-open-ids``); any
+      # opened/closed/waived-in-between fails closed. This is a freshness cutoff,
+      # NOT a cross-resource transaction: GitHub exposes no single atomic op across
+      # Issues + refs/heads/main + POST /git/refs. The tag POST is atomic only for
+      # tag identity; the accepted SHA is already bound as the only claimable
+      # commit. Events AFTER this cutoff are post-cut changes (a new blocker ⇒
+      # follow-up/next RC; a new main commit ⇒ not part of this candidate) and
+      # cannot retroactively invalidate the exact validated artifact SHA.
       - name: Re-query release blockers immediately before tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -704,11 +708,16 @@ jobs:
             | tee /tmp/release-blocker-requery.txt
           echo "::notice::pre-tag release-blocker re-query matches candidate-time set (${EXPECTED:-none})"
 
-      # #2301 TOCTOU: re-resolve refs/heads/main IMMEDIATELY before the immutable
-      # tag claim. A commit landing on main in the seconds between approval and
-      # claim must abort, not tag a candidate that is behind the live head. Uses
-      # the same structured helper the pre-approval job ran, so the contract and
-      # its offline tests are shared.
+      # #2301 FRESHNESS cutoff: re-resolve refs/heads/main IMMEDIATELY before the
+      # immutable tag claim and require the candidate to equal live main AT THE
+      # CUTOFF — not a promise that main can't move after. Same structured helper
+      # the pre-approval job ran (shared offline tests). Residual race: this read
+      # and the tag POST are separate API calls; the ref race is covered by the
+      # operational main freeze during the interactive approval+claim window (sole
+      # owning reviewer). A commit landing on main after this cutoff is a post-cut
+      # change, not part of this candidate; a new blocker after the cutoff becomes
+      # an immediate next-RC/release incident once detected — never a retroactive
+      # invalidation of the exact validated SHA.
       - name: Re-query live main head immediately before tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -149,8 +149,9 @@ jobs:
     # environment must already exist with a required-reviewer rule, and its
     # deployment-branch policy must be exactly ``main``, or nothing may tag.
     # This read-back makes future deletion/drift a preflight NO-GO rather than a
-    # silent unprotected-approval path. Admin bypass is surfaced for the operator
-    # record (it is GitHub-default true and must never be used for an RC).
+    # silent unprotected-approval path. can_admins_bypass must be exactly false
+    # (GitHub supports disabling it) so an RC claim can never ride an admin who
+    # could approve without a required reviewer; missing or true fails closed.
     needs: detect-bump-pr
     if: needs.detect-bump-pr.outputs.is_bump == 'true'
     runs-on: ubuntu-latest
@@ -188,8 +189,8 @@ jobs:
           # environment.py is unit-tested with mocked responses so the contract
           # is pinned: exactly one required_reviewers rule, reviewer login exactly
           # raullenchai, prevent_self_review=false, exactly one branch policy
-          # {name: main, type: branch}, and can_admins_bypass surfaced as
-          # forbidden operational evidence.
+          # {name: main, type: branch}, and can_admins_bypass exactly false
+          # (admin bypass must be disabled; true or missing fails closed).
           python3 scripts/check_release_environment.py \
             --environment-json "$RUNNER_TEMP/pf3-env.json" \
             --policy-json "$RUNNER_TEMP/pf3-policy.json" \

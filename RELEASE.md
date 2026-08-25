@@ -45,8 +45,20 @@ signed/notarised/DMG-validated lane, and which is still the live `main` head**:
   `main`), after the pre-approval `release-prep` job has printed the exact
   validated SHA + live main head + live release-blocker evidence.
 - Release-blocker evidence and the live main-head identity are re-queried
-  **immediately before** the immutable claim (TOCTOU): a commit landing on
-  `main` between approval and claim aborts the release.
+  **immediately before** the immutable claim. This is a **freshness/cutoff
+  guard, not a transaction** — GitHub exposes no single atomic op across Issues,
+  `refs/heads/main`, and the tag POST (the POST is atomic only for tag
+  identity). It establishes the release cutoff right before the claim. Changes
+  **observed at the cutoff** abort the claim; changes *after* the cutoff are not
+  observable before the POST — they are post-cut, handled as a follow-up/next
+  RC once detected, and cannot retroactively invalidate the exact validated
+  artifact SHA the tag is bound to.
+- **Operational freeze:** once `release-prep` evidence is ready, **hold `main`
+  merges through environment approval and the tag claim** (sole owning reviewer
+  coordinates this). If a blocker change is **detected before** the claim,
+  abort and use the normal retry route at the new head; a change after the
+  cutoff may be unobservable until post-claim, at which point it is handled as
+  a next-RC/release incident.
 - An RC needing correction is **superseded by the next RC** on its own validated
   commit; an existing RC tag is never moved, force-pushed, or deleted.
 

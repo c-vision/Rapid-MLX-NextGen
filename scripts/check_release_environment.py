@@ -13,8 +13,9 @@ claim would not be human-authorized:
   * ``prevent_self_review`` must be false (a truthful owner-approval contract);
   * the deployment-branch policy must be exactly one branch policy ``{name:
     main, type: branch}`` (deployments may only be requested from main);
-  * ``can_admins_bypass`` is surfaced as FORBIDDEN operational evidence: it is
-    GitHub-default true and must never be used to approve an RC tag claim.
+  * ``can_admins_bypass`` must be exactly false (GitHub supports disabling admin
+    bypass); missing or true fails closed so a claim never rides an admin who
+    could approve without a required-reviewer approval.
 
 Inputs are the raw JSON responses (environment + deployment-branch-policies) read
 from the REST API by the caller; this script only evaluates structured JSON, never
@@ -150,22 +151,22 @@ def read_back(
         "custom_branch_policies=true, protected_branches=false"
     )
 
-    # can_admins_bypass must be present and boolean. Missing or non-boolean is
-    # malformed and fails closed (we can't assert on an absent field). When true
-    # it is surfaced as FORBIDDEN operational evidence — it is GitHub-default
-    # true and must never be used to approve an RC tag claim.
+    # can_admins_bypass must be present and EXACTLY false. GitHub supports
+    # disabling admin bypass for an environment, so an RC tag claim must require
+    # the normal required-reviewer flow — an admin who could approve without a
+    # review (or a drifted/missing field we cannot assert on) fails closed.
+    # prevent_self_review=false is intentionally UNCHANGED: the sole owning
+    # reviewer still needs the ordinary required-reviewer approval.
     admin_bypass = env.get("can_admins_bypass")
-    if not isinstance(admin_bypass, bool):
+    if admin_bypass is not False:
         raise EnvironmentGateError(
-            f"can_admins_bypass must be a boolean, got {admin_bypass!r}"
+            "can_admins_bypass must be exactly false (admin bypass must be "
+            "disabled); got "
+            f"{'missing' if admin_bypass is None else admin_bypass!r}"
         )
-    if admin_bypass is True:
-        evidence.append(
-            "WARNING: can_admins_bypass=true — FORBIDDEN operational evidence. "
-            "An RC tag claim must never be approved via an admin bypass."
-        )
-    else:
-        evidence.append("can_admins_bypass=false (admin bypass disabled)")
+    evidence.append(
+        "can_admins_bypass=false (admin bypass disabled; approval requires a reviewer)"
+    )
     return evidence
 
 

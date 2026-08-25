@@ -29,7 +29,7 @@ def _env(
     *,
     reviewers=("raullenchai",),
     prevent_self_review=False,
-    can_admins_bypass=True,
+    can_admins_bypass=False,
     name="rapid-mac-tag",
     deployment_mode=None,
 ):
@@ -76,7 +76,7 @@ def test_healthy_environment_reads_back(checker, tmp_path):
     joined = "\n".join(evidence)
     assert "raullenchai" in joined
     assert "main" in joined
-    assert "can_admins_bypass=true" in joined and "FORBIDDEN" in joined
+    assert "can_admins_bypass=false" in joined and "FORBIDDEN" not in joined
 
 
 def test_wrong_reviewer_fails(checker, tmp_path):
@@ -192,7 +192,9 @@ def test_nonboolean_can_admins_bypass_fails(checker, tmp_path):
         checker.read_back(env_json=env, policy_json=pol)
 
 
-def test_can_admins_bypass_false_is_not_forbidden(checker, tmp_path):
+def test_can_admins_bypass_false_is_required(checker, tmp_path):
+    # can_admins_bypass must be exactly false: admin bypass disabled is the only
+    # acceptable state (normal required-reviewer approval).
     env = _env(can_admins_bypass=False)
     env = _write(tmp_path, env, "env.json")
     pol = _write(tmp_path, _policy(), "policy.json")
@@ -200,6 +202,16 @@ def test_can_admins_bypass_false_is_not_forbidden(checker, tmp_path):
     joined = "\n".join(evidence)
     assert "can_admins_bypass=false" in joined
     assert "FORBIDDEN" not in joined
+
+
+def test_can_admins_bypass_true_fails_closed(checker, tmp_path):
+    # Admin bypass enabled means an admin could approve without the required
+    # reviewer flow — the RC claim gate must fail closed, not merely warn.
+    env = _env(can_admins_bypass=True)
+    env = _write(tmp_path, env, "env.json")
+    pol = _write(tmp_path, _policy(), "policy.json")
+    with pytest.raises(checker.EnvironmentGateError, match="can_admins_bypass"):
+        checker.read_back(env_json=env, policy_json=pol)
 
 
 def test_no_required_reviewers_rule_fails(checker, tmp_path):

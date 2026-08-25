@@ -263,6 +263,14 @@ if [ "${ENV_POS:-0}" -lt "${BLOCKER_POS:-0}" ] && [ "${ENV_POS:-0}" -lt "${MAINH
 else
   bad "live environment read-back runs BEFORE blocker/main re-queries and the tag claim (env=$ENV_POS blocker=$BLOCKER_POS main=$MAINHEAD_POS tag=$TAGPOS)"
 fi
+# Query-before-POST freshness ordering: BOTH the blocker and main-head re-queries
+# must precede the tag-data POST step (the immutable claim), so the cutoff is
+# established immediately before the write.
+if [ "${BLOCKER_POS:-0}" -lt "${TAGPOS:-0}" ] && [ "${MAINHEAD_POS:-0}" -lt "${TAGPOS:-0}" ]; then
+  ok "blocker + main-head freshness re-queries run BEFORE the tag claim (query-before-POST cutoff)"
+else
+  bad "blocker + main-head freshness re-queries run BEFORE the tag claim (blocker=$BLOCKER_POS main=$MAINHEAD_POS tag=$TAGPOS)"
+fi
 
 echo
 echo "passed: $PASS  failed: $FAIL"
