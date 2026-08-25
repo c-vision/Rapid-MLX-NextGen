@@ -478,7 +478,11 @@ jobs:
           ACTOR: ${{ github.actor }}
           REASON: ${{ github.event.inputs.reason }}
           EVENT_SHA: ${{ github.sha }}
-          NOTES_FILE: ${{ runner.temp }}/release-notes.md
+          # Keep every file in the evidence artifact under one workspace root.
+          # upload-artifact preserves paths relative to the files' common
+          # ancestor; mixing runner.temp with workspace files nests the notes
+          # under _temp/ and makes the protected release job unable to find it.
+          NOTES_FILE: ${{ github.workspace }}/release-notes.md
         run: |
           set -euo pipefail
 
@@ -607,7 +611,7 @@ jobs:
           path: |
             release-blocker-evidence.txt
             main-head-evidence.txt
-            ${{ runner.temp }}/release-notes.md
+            release-notes.md
           if-no-files-found: error
 
   # 3b) Environment-gated production tag + engine release. The human approves
