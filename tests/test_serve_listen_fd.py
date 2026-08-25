@@ -378,7 +378,7 @@ def test_serve_command_threads_auto_detected_hybrid_into_cache_admission(
         "vllm_mlx.model_auto_config.detect_model_config", detect_model_config
     )
     _capture_uvicorn_run(monkeypatch)
-    ns = _minimal_serve_ns()
+    ns = _minimal_serve_ns(port=_free_tcp_port())
     ns.model = "publisher/opaque-hybrid-checkpoint"
     ns._original_alias = None
 
@@ -411,7 +411,7 @@ def test_serve_command_explicit_zero_wins_over_auto_detected_hybrid(
         ),
     )
     _capture_uvicorn_run(monkeypatch)
-    ns = _minimal_serve_ns()
+    ns = _minimal_serve_ns(port=_free_tcp_port())
     ns.model = "publisher/opaque-hybrid-checkpoint"
     ns._original_alias = None
     ns.hybrid_cache_entries = 0
@@ -444,7 +444,7 @@ def test_serve_command_all_explicit_defaults_skip_model_detection(
         "vllm_mlx.model_auto_config.detect_model_config", unexpected_detection
     )
     _capture_uvicorn_run(monkeypatch)
-    ns = _minimal_serve_ns()
+    ns = _minimal_serve_ns(port=_free_tcp_port())
     ns.model = "publisher/explicitly-configured-checkpoint"
     ns._original_alias = None
     ns.pflash = "off"
