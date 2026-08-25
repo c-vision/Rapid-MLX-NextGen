@@ -216,13 +216,9 @@ final class ServerManager {
         memoryWarningRefreshGeneration += 1
         let generation = memoryWarningRefreshGeneration
         let provider = memorySnapshotProvider
-        let snapshot = await withTaskGroup(
-            of: MemoryProbe.Snapshot?.self,
-            returning: MemoryProbe.Snapshot?.self
-        ) { group in
-            group.addTask(priority: .utility) { provider() }
-            return await group.next() ?? nil
-        }
+        let snapshot = await Task.detached(priority: .utility) {
+            provider()
+        }.value
         guard !Task.isCancelled,
               generation == memoryWarningRefreshGeneration,
               pendingMemoryWarning?.id == warningID,
@@ -1446,34 +1442,54 @@ final class ServerManager {
     /// whether the user actually chose the unsafe override; a stale ordinary
     /// Load action can therefore never become a bypass after pressure rises.
     func confirmPendingMemoryLoad(_ warning: ModelSizing.MemoryWarning) {
+        Task { [weak self] in
+            await self?.activatePendingMemoryLoad(warning)
+        }
+    }
+
+    private func activatePendingMemoryLoad(
+        _ warning: ModelSizing.MemoryWarning
+    ) async {
+        let provider = memorySnapshotProvider
+        let snapshot = await Task.detached(priority: .utility) {
+            provider()
+        }.value
+        guard pendingMemoryWarning?.id == warning.id else { return }
+        if let snapshot {
+            _ = memoryConfirmations.refreshCurrentWarning(snapshot: snapshot)
+        }
+        guard let latestWarning = pendingMemoryWarning,
+              latestWarning.id == warning.id else { return }
+
+        // Only the explicit unsafe action is a waiver. An ordinary Load that
+        // became unsafe during this activation remains parked on the same
+        // queue entry, preserving its waiter and presenting the new facts.
+        let requestedUnsafeOverride = warning.severity == .unsafe
+        guard requestedUnsafeOverride || latestWarning.severity != .unsafe else {
+            return
+        }
+
         memoryConfirmSeq += 1
         let seq = memoryConfirmSeq
-        // A refreshed `.safe` action is an ordinary load, not a permanent
-        // waiver. Re-run the guard at activation so a sudden pressure spike
-        // between the last three-second sample and the click can present a
-        // fresh warning instead of silently loading under stale safe state.
-        let requestedUnsafeOverride = warning.severity == .unsafe
         guard let currentWarning = memoryConfirmations.resolveCurrent(
             warningID: warning.id,
             decision: .confirmed(sequence: seq)
         ) else { return }
-        let bypassMemoryGuard = requestedUnsafeOverride
-            && currentWarning.severity == .unsafe
         memoryConfirmRunning.insert(seq)
-        Task { [weak self] in
-            guard let self else { return }
-            if self.child != nil {
-                await self.stop()
-            }
-            await self.start(
-                alias: currentWarning.alias,
-                hfPath: currentWarning.hfPath,
-                isAutoRespawn: currentWarning.isAutoRespawn,
-                bypassMemoryGuard: bypassMemoryGuard
-            )
-            self.memoryConfirmRunning.remove(seq)
-            self.memoryConfirmations.completeConfirmedLaunch(warningID: currentWarning.id)
+        if child != nil {
+            await stop()
         }
+        // The activation sample above is the guard for this exact click.
+        // Avoid a second sample after the queue has entered `.launching`,
+        // which could otherwise park a duplicate warning behind its owner.
+        await start(
+            alias: currentWarning.alias,
+            hfPath: currentWarning.hfPath,
+            isAutoRespawn: currentWarning.isAutoRespawn,
+            bypassMemoryGuard: true
+        )
+        memoryConfirmRunning.remove(seq)
+        memoryConfirmations.completeConfirmedLaunch(warningID: currentWarning.id)
     }
 
     /// The user backed out of a memory-risky load. Just drops the

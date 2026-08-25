@@ -94,12 +94,13 @@ struct LaunchAutoStartMemoryTests {
         // clicks. The ordinary Load action must not carry a stale waiver.
         snapshots.current = .init(totalBytes: 32 * gib, usedBytes: 30 * gib)
         server.confirmPendingMemoryLoad(safeWarning)
-        for _ in 0 ..< 100 where server.pendingMemoryWarning == nil {
+        for _ in 0 ..< 100 where server.pendingMemoryWarning?.severity != .unsafe {
             try await Task.sleep(for: .milliseconds(10))
         }
         let rechecked = try #require(server.pendingMemoryWarning)
         #expect(rechecked.severity == .unsafe)
-        #expect(rechecked.id != originalID)
+        #expect(rechecked.id == originalID)
+        #expect(server.state == .idle)
     }
 
     @MainActor
