@@ -57,6 +57,7 @@ final class BrowseApprovalStore {
 
     private(set) var pendingRequest: PendingApproval?
     private var pendingContinuation: CheckedContinuation<Decision, Never>?
+    private var pendingRequestWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -88,6 +89,9 @@ final class BrowseApprovalStore {
                     fullURL: url,
                     host: host
                 )
+                let waiters = Array(self.pendingRequestWaiters.values)
+                self.pendingRequestWaiters.removeAll()
+                waiters.forEach { $0.resume(returning: true) }
             }
         } onCancel: { [weak self] in
             Task { @MainActor [weak self] in
@@ -101,6 +105,35 @@ final class BrowseApprovalStore {
                 }
             }
         }
+    }
+
+    /// Suspend until an approval prompt has been published.
+    ///
+    /// This is a lifecycle observation seam for deterministic callers such as
+    /// tests: it observes the same ``pendingRequest`` state the UI renders,
+    /// without guessing when publication happened from sleeps or deadlines.
+    /// Returns `false` when the observer itself is cancelled first.
+    func waitUntilPendingRequest(onWaiting: (() -> Void)? = nil) async -> Bool {
+        if pendingRequest != nil { return true }
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                    return
+                }
+                pendingRequestWaiters[waiterID] = continuation
+                onWaiting?()
+            }
+        } onCancel: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.cancelPendingRequestWaiter(waiterID)
+            }
+        }
+    }
+
+    private func cancelPendingRequestWaiter(_ waiterID: UUID) {
+        pendingRequestWaiters.removeValue(forKey: waiterID)?.resume(returning: false)
     }
 
     /// Called by the SwiftUI dialog with the user's choice; resumes the tool.

@@ -55,7 +55,7 @@ final class DeclinedToolDiagnosisTests {
 
         // The gate suspends on the user; answer it the way the sheet's
         // "Don't allow" button does.
-        try await waitForPendingApproval(approval)
+        #expect(await approval.waitUntilPendingRequest())
         approval.answer(.deny)
         let result = await pending
 
@@ -80,7 +80,7 @@ final class DeclinedToolDiagnosisTests {
         async let pending = registry.run(
             ToolCall(id: "call_1", name: "browse", arguments: #"{"url":"https://example.com"}"#)
         )
-        try await waitForPendingApproval(approval)
+        #expect(await approval.waitUntilPendingRequest())
         approval.answer(.deny)
         let result = await pending
 
@@ -104,7 +104,7 @@ final class DeclinedToolDiagnosisTests {
                 cache: cache
             )
         }
-        try await waitForPendingApproval(approval)
+        #expect(await approval.waitUntilPendingRequest())
         task.cancel()
         let result = await task.value
 
@@ -118,7 +118,7 @@ final class DeclinedToolDiagnosisTests {
         // is wrong. The user never saw this URL, so the answer cannot be theirs.
         let approval = BrowseApprovalStore(defaults: freshDefaults())
         async let first = approval.requestApproval(url: "https://example.com", host: "example.com")
-        try await waitForPendingApproval(approval)
+        #expect(await approval.waitUntilPendingRequest())
 
         let second = await approval.requestApproval(url: "https://other.example", host: "other.example")
         #expect(second == .unavailable)
@@ -144,7 +144,7 @@ final class DeclinedToolDiagnosisTests {
             url: "https://example.com/article",
             host: "example.com"
         )
-        try await waitForPendingApproval(approval)
+        #expect(await approval.waitUntilPendingRequest())
         approval.alwaysAllow()
 
         #expect(await pending == .allowOnce)
@@ -159,6 +159,55 @@ final class DeclinedToolDiagnosisTests {
         )
         #expect(next == .allowOnce)
         #expect(restored.pendingRequest == nil)
+    }
+
+    @Test("Cancelling a pending-request observer settles without a prompt")
+    func cancelledPendingRequestObserverSettles() async {
+        let approval = BrowseApprovalStore(defaults: freshDefaults())
+        var observer: Task<Bool, Never>!
+
+        await withCheckedContinuation { registered in
+            observer = Task {
+                await approval.waitUntilPendingRequest {
+                    registered.resume()
+                }
+            }
+        }
+
+        observer.cancel()
+        #expect(await observer.value == false)
+        #expect(approval.pendingRequest == nil)
+    }
+
+    @Test("Publishing one prompt wakes every registered observer")
+    func pendingRequestPublicationWakesEveryObserver() async {
+        let approval = BrowseApprovalStore(defaults: freshDefaults())
+        var firstObserver: Task<Bool, Never>!
+        var secondObserver: Task<Bool, Never>!
+
+        await withCheckedContinuation { registered in
+            firstObserver = Task {
+                await approval.waitUntilPendingRequest {
+                    registered.resume()
+                }
+            }
+        }
+        await withCheckedContinuation { registered in
+            secondObserver = Task {
+                await approval.waitUntilPendingRequest {
+                    registered.resume()
+                }
+            }
+        }
+
+        async let pending = approval.requestApproval(
+            url: "https://example.com/article",
+            host: "example.com"
+        )
+        #expect(await firstObserver.value)
+        #expect(await secondObserver.value)
+        approval.answer(.deny)
+        #expect(await pending == .deny)
     }
 
     // MARK: - Declining a cross-origin redirect
@@ -509,22 +558,6 @@ final class DeclinedToolDiagnosisTests {
         return try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
-    /// Suspend until the approval gate has published its prompt, so the test
-    /// answers a request that actually exists. Bounded by wall-clock rather
-    /// than by an iteration count — a loaded machine must not fail correct
-    /// code — and it still fails rather than hanging if the prompt never comes.
-    private func waitForPendingApproval(
-        _ approval: BrowseApprovalStore,
-        timeout: Duration = .seconds(10)
-    ) async throws {
-        let deadline = ContinuousClock.now.advanced(by: timeout)
-        while approval.pendingRequest == nil {
-            if ContinuousClock.now >= deadline { throw ApprovalNeverArrived() }
-            try await Task.sleep(for: .milliseconds(1))
-        }
-    }
-
-    private struct ApprovalNeverArrived: Error {}
 }
 
 /// Keychain double: the web-search key is irrelevant here, and the real
