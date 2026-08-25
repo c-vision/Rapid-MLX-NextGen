@@ -7,6 +7,7 @@ Exercises the exact-tagged-publication gate with a mock ``gh`` and --sleep-sec 0
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import pathlib
@@ -19,6 +20,8 @@ _SCRIPT = _REPO_ROOT / "scripts" / "check_desktop_publish.py"
 
 ACCEPTED = "a" * 40
 OTHER = "b" * 40
+DEFAULT_DMG = b"exact tagged desktop dmg"
+DEFAULT_DIGEST = hashlib.sha256(DEFAULT_DMG).hexdigest()
 
 
 def _load_module():
@@ -38,6 +41,13 @@ def _write(tree, rel, content):
     p = tree / rel
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content)
+    return p
+
+
+def _write_bytes(tree, rel, content):
+    p = tree / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(content)
     return p
 
 
@@ -64,6 +74,40 @@ def _mock_state(tree):
         json.dumps({"tag_name": "rapid-mac-v0.13.0-rc2", "draft": False, "assets": []}),
     )
     _write(state, "fail", "0")
+    artifacts = state / "artifacts"
+    artifacts.mkdir()
+    _write_bytes(artifacts, "rapid-mlx-desktop.dmg", DEFAULT_DMG)
+    _write(
+        artifacts,
+        "rapid-mlx-desktop.manifest.json",
+        json.dumps(
+            {
+                "schema": 1,
+                "project": "rapid-mlx",
+                "artifact_kind": "desktop-dmg",
+                "version": "0.13.0-rc2",
+                "app_tag": "rapid-mac-v0.13.0-rc2",
+                "source_sha": ACCEPTED,
+                "embedded_version": {
+                    "CFBundleShortVersionString": "0.13.0-rc2",
+                    "CFBundleVersion": "170",
+                },
+                "signed": True,
+                "dmg_size_delta_compared": True,
+                "validation_gate": (
+                    "signed-build|bundle-size|app-notarize|dmg-build|"
+                    "dmg-size-delta|validate-dmg|dmg-notarize|final-validate-dmg"
+                ),
+                "artifacts": [
+                    {
+                        "filename": "rapid-mlx-desktop.dmg",
+                        "size": len(DEFAULT_DMG),
+                        "sha256": DEFAULT_DIGEST,
+                    }
+                ],
+            }
+        ),
+    )
 
     gh = tree / "gh"
     # The absolute STATE path is EMBEDDED so the mock needs no global env (the
@@ -77,8 +121,18 @@ def _mock_state(tree):
             # The helper invokes "gh api <url> ...", so argv[1] is the "api"
             # subcommand and argv[2] is the URL. Validate/shift past it the way a
             # real gh expects, then dispatch on the URL.
+            if [[ "${{1:-}}" == "run" && "${{2:-}}" == "download" ]]; then
+              dest=""
+              while (( $# )); do
+                if [[ "$1" == "--dir" ]]; then dest="$2"; shift 2; else shift; fi
+              done
+              [[ -n "$dest" ]] || {{ echo "mock gh: missing --dir" >&2; exit 2; }}
+              mkdir -p "$dest"
+              for artifact in "$STATE/artifacts"/*; do cp "$artifact" "$dest/"; done
+              exit 0
+            fi
             if [[ "${{1:-}}" != "api" ]]; then
-              echo "mock gh: expected 'api' subcommand, got '${{1:-}}'" >&2; exit 2
+              echo "mock gh: expected 'api' or 'run download', got '${{1:-}}'" >&2; exit 2
             fi
             url="${{2:-}}"
             if [[ -f "${{STATE}}/fail" && "$(cat "${{STATE}}/fail")" == "1" ]]; then
@@ -136,9 +190,16 @@ def _release_with(*assets, draft=False):
     )
 
 
-def _asset(name="rapid-mlx-desktop.dmg", state="uploaded", size=123, digest=None):
+def _asset(
+    name="rapid-mlx-desktop.dmg",
+    state="uploaded",
+    size=len(DEFAULT_DMG),
+    digest="default",
+):
     a = {"name": name, "state": state, "size": size}
-    if digest is not None:
+    if digest == "default":
+        a["digest"] = "sha256:" + DEFAULT_DIGEST
+    elif digest is not None:
         a["digest"] = digest
     return a
 
@@ -161,7 +222,7 @@ def test_happy_path(gate, tmp_path):
     _write(state, "release.json", _release_with(_asset()))
     evidence = _verify(gate, gh, state)
     assert any("run" in e and "succeeded" in e for e in evidence)
-    assert any("published with non-zero rapid-mlx-desktop.dmg" in e for e in evidence)
+    assert any("publishes the exact run DMG" in e for e in evidence)
 
 
 def test_older_failure_plus_active_rerun_waits_then_succeeds(gate, tmp_path):
@@ -348,10 +409,51 @@ def test_bad_digest_fails(gate, tmp_path):
 def test_good_digest_passes(gate, tmp_path):
     gh, state = _mock_state(tmp_path)
     _write(state, "runs.sh", _runs_with(_run_record(1)))
-    digest = "sha256:" + "e" * 64
-    _write(state, "release.json", _release_with(_asset(digest=digest)))
+    _write(state, "release.json", _release_with(_asset()))
     evidence = _verify(gate, gh, state)
-    assert any("published with non-zero" in e for e in evidence)
+    assert any("publishes the exact run DMG" in e for e in evidence)
+
+
+def test_release_digest_must_match_exact_run_manifest(gate, tmp_path):
+    gh, state = _mock_state(tmp_path)
+    _write(state, "runs.sh", _runs_with(_run_record(1)))
+    _write(
+        state,
+        "release.json",
+        _release_with(_asset(digest="sha256:" + "e" * 64)),
+    )
+    with pytest.raises(gate.PublishGateError, match="does not match exact run"):
+        _verify(gate, gh, state)
+
+
+def test_run_dmg_bytes_must_match_manifest(gate, tmp_path):
+    gh, state = _mock_state(tmp_path)
+    _write(state, "runs.sh", _runs_with(_run_record(1)))
+    _write(state, "release.json", _release_with(_asset()))
+    _write_bytes(state / "artifacts", "rapid-mlx-desktop.dmg", b"tampered")
+    with pytest.raises(gate.PublishGateError, match="bytes do not match"):
+        _verify(gate, gh, state)
+
+
+def test_run_manifest_must_bind_signed_candidate(gate, tmp_path):
+    gh, state = _mock_state(tmp_path)
+    _write(state, "runs.sh", _runs_with(_run_record(1)))
+    _write(state, "release.json", _release_with(_asset()))
+    manifest_path = state / "artifacts" / "rapid-mlx-desktop.manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["signed"] = False
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(gate.PublishGateError, match="identity/signing"):
+        _verify(gate, gh, state)
+
+
+def test_run_artifact_requires_manifest(gate, tmp_path):
+    gh, state = _mock_state(tmp_path)
+    _write(state, "runs.sh", _runs_with(_run_record(1)))
+    _write(state, "release.json", _release_with(_asset()))
+    (state / "artifacts" / "rapid-mlx-desktop.manifest.json").unlink()
+    with pytest.raises(gate.PublishGateError, match="must contain one"):
+        _verify(gate, gh, state)
 
 
 def test_initial_tag_mismatch_fails(gate, tmp_path):

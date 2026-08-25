@@ -20,10 +20,10 @@ all of the following hold:
      Poll policy: prefer any exact success; keep waiting while an exact run is
      active (queued/in_progress); fail only when no exact run is active and a
      failed one remains.
-  3. A published GitHub Release for the tag exists with ``draft == false`` and
-     a ``rapid-mlx-desktop.dmg`` asset whose ``state`` is ``uploaded`` and
-     ``size > 0`` (a sha256 digest is accepted when the API supplies one), and
-     the tag still resolves to ``accepted_sha`` at that moment.
+  3. The exact successful run's immutable artifact manifest verifies the DMG
+     bytes, source SHA, tag, embedded version, signing status and completed gate
+     set. A published GitHub Release for the tag must expose that exact DMG
+     SHA-256 and byte size, and the tag must still resolve to ``accepted_sha``.
   4. Every API discontinuity (non-zero gh, auth failure, malformed response)
      fails immediately, not after a long retry; the whole poll is bounded by the
      deadline.
@@ -41,15 +41,20 @@ testable offline with a mock ``gh`` and --sleep-sec 0.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 # The immutable asset the tagged lane must publish for this to count as the
 # Desktop having shipped this tag's artifact.
 DMG_ASSET = "rapid-mlx-desktop.dmg"
+MANIFEST_ASSET = "rapid-mlx-desktop.manifest.json"
+WORKFLOW_ARTIFACT = "rapid-mlx-desktop-dmg"
 
 try:
     from release_version import parse_version  # run from scripts/
@@ -85,7 +90,7 @@ def _assert_app_tag(app_tag: str) -> None:
         ) from exc
 
 
-def _run(gh: str, args: list[str], *, repo: str) -> str:
+def _run(gh: str, args: list[str], *, repo: str, timeout_sec: int = 120) -> str:
     """Run a gh subcommand; return stdout or fail closed on ANY error.
 
     ``gh api`` has no ``--repo`` flag — the repo is resolved from the ``GH_REPO``
@@ -102,7 +107,7 @@ def _run(gh: str, args: list[str], *, repo: str) -> str:
             capture_output=True,
             text=True,
             env=env,
-            timeout=120,
+            timeout=timeout_sec,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PublishGateError(f"failed to run gh {args[0]}: {exc}") from exc
@@ -244,13 +249,116 @@ def _qualifying_runs(
     return bound
 
 
-def _published_release_dmg(gh: str, repo: str, app_tag: str) -> bool:
-    """True iff a NON-DRAFT GitHub Release for the tag has an uploaded non-zero dmg.
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _run_artifact_identity(
+    gh: str, repo: str, run_id: int, app_tag: str, accepted_sha: str
+) -> tuple[str, int]:
+    """Download the exact run artifact and return its verified DMG hash/size."""
+
+    with tempfile.TemporaryDirectory(prefix="rapid-desktop-publish-") as tmp:
+        root = Path(tmp)
+        _run(
+            gh,
+            [
+                "run",
+                "download",
+                str(run_id),
+                "--repo",
+                repo,
+                "--name",
+                WORKFLOW_ARTIFACT,
+                "--dir",
+                str(root),
+            ],
+            repo=repo,
+            timeout_sec=600,
+        )
+        dmgs = list(root.rglob(DMG_ASSET))
+        manifests = list(root.rglob(MANIFEST_ASSET))
+        if len(dmgs) != 1 or len(manifests) != 1:
+            raise PublishGateError(
+                f"exact run {run_id} artifact must contain one {DMG_ASSET} and one "
+                f"{MANIFEST_ASSET}; found {len(dmgs)} and {len(manifests)}"
+            )
+        dmg = dmgs[0]
+        try:
+            manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PublishGateError(
+                f"exact run {run_id} has an unreadable Desktop manifest: {exc}"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise PublishGateError(
+                f"exact run {run_id} Desktop manifest is not an object"
+            )
+        version = app_tag[len("rapid-mac-v") :]
+        embedded = manifest.get("embedded_version")
+        delta_compared = manifest.get("dmg_size_delta_compared")
+        expected_gates = [
+            "signed-build",
+            "bundle-size",
+            "app-notarize",
+            "dmg-build",
+        ]
+        if delta_compared is True:
+            expected_gates.append("dmg-size-delta")
+        expected_gates.extend(["validate-dmg", "dmg-notarize", "final-validate-dmg"])
+        if (
+            manifest.get("schema") != 1
+            or manifest.get("project") != "rapid-mlx"
+            or manifest.get("artifact_kind") != "desktop-dmg"
+            or manifest.get("version") != version
+            or manifest.get("source_sha") != accepted_sha
+            or manifest.get("app_tag") != app_tag
+            or manifest.get("signed") is not True
+            or type(delta_compared) is not bool
+            or manifest.get("validation_gate") != "|".join(expected_gates)
+            or not isinstance(embedded, dict)
+            or embedded.get("CFBundleShortVersionString") != version
+            or not isinstance(embedded.get("CFBundleVersion"), str)
+            or not embedded.get("CFBundleVersion")
+        ):
+            raise PublishGateError(
+                f"exact run {run_id} Desktop manifest identity/signing does not "
+                "match the accepted tagged candidate"
+            )
+        artifacts = manifest.get("artifacts")
+        if not isinstance(artifacts, list) or len(artifacts) != 1:
+            raise PublishGateError(
+                f"exact run {run_id} Desktop manifest must contain one artifact"
+            )
+        item = artifacts[0]
+        if not isinstance(item, dict) or item.get("filename") != DMG_ASSET:
+            raise PublishGateError(
+                f"exact run {run_id} Desktop manifest does not name {DMG_ASSET}"
+            )
+        size = item.get("size")
+        digest = item.get("sha256")
+        if type(size) is not int or size <= 0 or not _is_sha256_hex(digest):
+            raise PublishGateError(
+                f"exact run {run_id} Desktop manifest has invalid DMG size/digest"
+            )
+        if dmg.stat().st_size != size or _sha256(dmg) != digest:
+            raise PublishGateError(
+                f"exact run {run_id} DMG bytes do not match its Desktop manifest"
+            )
+        return digest, size
+
+
+def _published_release_dmg(gh: str, repo: str, app_tag: str) -> tuple[str, int] | None:
+    """Return release DMG digest/size iff published, uploaded and non-empty.
 
     Uses the release-by-tag REST endpoint. Requires ``draft == false`` and an
     asset named ``rapid-mlx-desktop.dmg`` whose ``state == "uploaded"`` and
-    ``size > 0``; a ``digest`` is accepted (checked for sha256 shape) when the API
-    supplies it.
+    ``size > 0`` and a valid SHA-256 ``digest``. The digest is mandatory because
+    it is the byte identity compared with the exact run's manifest.
     """
     out = _run(gh, ["api", f"repos/{repo}/releases/tags/{app_tag}"], repo=repo).strip()
     try:
@@ -267,7 +375,7 @@ def _published_release_dmg(gh: str, repo: str, app_tag: str) -> bool:
     # The release-by-tag REST endpoint names this field "draft" (not
     # "isDraft"); a draft is not published evidence.
     if rel.get("draft") is not False:
-        return False
+        return None
     assets = rel.get("assets")
     if not isinstance(assets, list):
         raise PublishGateError(f"release assets for {app_tag} is not a list")
@@ -279,17 +387,17 @@ def _published_release_dmg(gh: str, repo: str, app_tag: str) -> bool:
         if asset.get("name") != DMG_ASSET:
             continue
         if asset.get("state") != "uploaded":
-            return False
+            return None
         size = asset.get("size")
         # bool is an int subclass in Python; malformed ``size: true`` must not
         # count as a non-empty artifact.
         if type(size) is not int or size <= 0:
-            return False
+            return None
         digest = asset.get("digest")
-        if digest is not None and not _is_sha256_digest(digest):
-            return False  # a supplied digest must be a valid sha256 hex
-        return True
-    return False
+        if not _is_sha256_digest(digest):
+            return None
+        return digest[len("sha256:") :], size
+    return None
 
 
 def _is_sha256_digest(digest: object) -> bool:
@@ -298,6 +406,14 @@ def _is_sha256_digest(digest: object) -> bool:
         and digest.startswith("sha256:")
         and len(digest) == len("sha256:") + 64
         and all(ch in "0123456789abcdef" for ch in digest[len("sha256:") :])
+    )
+
+
+def _is_sha256_hex(digest: object) -> bool:
+    return (
+        isinstance(digest, str)
+        and len(digest) == 64
+        and all(ch in "0123456789abcdef" for ch in digest)
     )
 
 
@@ -373,9 +489,21 @@ def verify(
         f"(event {success_run.get('event')}) for {app_tag} at {accepted_sha}"
     )
 
-    # 3) Publication evidence: non-draft GitHub Release with an uploaded non-zero
-    #    dmg, then the tag must still resolve to accepted_sha.
-    if not _published_release_dmg(gh, repo, app_tag):
+    # 3) Bind the exact successful run's workflow artifact + manifest to the
+    #    published GitHub Release asset bytes, then re-resolve the tag.
+    run_digest, run_size = _run_artifact_identity(
+        gh,
+        repo,
+        success_run["databaseId"],
+        app_tag,
+        accepted_sha,
+    )
+    evidence.append(
+        f"exact run {success_run.get('databaseId')} artifact manifest binds "
+        f"{DMG_ASSET} sha256:{run_digest} ({run_size} bytes)"
+    )
+    release_identity = _published_release_dmg(gh, repo, app_tag)
+    if release_identity is None:
         raise PublishGateError(
             f"{app_tag}: the run succeeded but no published (non-draft) GitHub "
             "Release with an uploaded non-zero rapid-mlx-desktop.dmg asset exists. "
@@ -383,7 +511,18 @@ def verify(
             "Recovery: re-run the failed exact workflow, or dispatch "
             f"rapid-mac-release.yml at --ref {app_tag}, then re-run auto-release."
         )
-    evidence.append(f"GitHub Release {app_tag} is published with non-zero {DMG_ASSET}")
+    release_digest, release_size = release_identity
+    if (release_digest, release_size) != (run_digest, run_size):
+        raise PublishGateError(
+            f"{app_tag}: published {DMG_ASSET} identity "
+            f"sha256:{release_digest}/{release_size} does not match exact run "
+            f"{success_run.get('databaseId')} manifest "
+            f"sha256:{run_digest}/{run_size}. The engine must not release."
+        )
+    evidence.append(
+        f"GitHub Release {app_tag} publishes the exact run DMG "
+        f"sha256:{release_digest} ({release_size} bytes)"
+    )
 
     resolved_after = _resolve_tag(gh, repo, app_tag)
     if resolved_after != accepted_sha:
