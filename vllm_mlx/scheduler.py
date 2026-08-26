@@ -6112,7 +6112,6 @@ class Scheduler:
     def pause_generation_admission(self, admission_tokens: set[str], mode: str) -> None:
         """Close admission and preserve only pre-pause route reservations."""
 
-        del mode  # Both policies close admission; mode controls draining above.
         with self._request_state_lock():
             self._generation_paused = True
             owned = {
@@ -6120,7 +6119,8 @@ class Scheduler:
                 for request in self.requests.values()
                 if getattr(request, "lifecycle_admission_token", None) is not None
             }
-            self._paused_admission_tokens = set(admission_tokens) - owned
+            pending = set(admission_tokens) - owned
+            self._paused_admission_tokens = pending if mode == "wait" else set()
             self._paused_add_allowance = len(self._paused_admission_tokens)
 
     def request_ids_snapshot(self) -> tuple[str, ...]:

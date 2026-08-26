@@ -20,6 +20,7 @@ def _engine(*, reservations: int = 0, running: dict | None = None):
     engine._admission_lock = threading.Lock()
     engine._admission_reservations = reservations
     engine._admission_tokens = {f"reserved-{index}" for index in range(reservations)}
+    engine._admission_tasks = {}
     _admission_token_context.set(
         (id(engine), ("reserved-0",)) if reservations else None
     )
@@ -36,7 +37,18 @@ def _engine(*, reservations: int = 0, running: dict | None = None):
         scheduler.generation_paused = paused
         scheduler.add_allowance = add_allowance if paused else 0
 
+    def pause_generation_admission(tokens, mode):
+        scheduler.generation_paused = True
+        owned = {
+            getattr(request, "lifecycle_admission_token", None)
+            for request in scheduler.requests.values()
+        }
+        pending = set(tokens) - owned
+        scheduler._paused_admission_tokens = pending if mode == "wait" else set()
+        scheduler.add_allowance = len(scheduler._paused_admission_tokens)
+
     scheduler.set_generation_paused = set_generation_paused
+    scheduler.pause_generation_admission = pause_generation_admission
     engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=scheduler))
     engine.get_stats = lambda: {
         "num_running": len(scheduler.running),
@@ -91,6 +103,30 @@ async def test_abort_pause_rechecks_requests_that_arrive_after_pause_edge():
     status = await asyncio.wait_for(pause, timeout=1)
     assert aborted == ["late"]
     assert status["running_requests"] == 0
+    assert status["admitted_requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_abort_pause_cancels_request_stalled_before_scheduler_commit():
+    engine, scheduler = _engine()
+    admitted = asyncio.Event()
+
+    async def stalled_request():
+        engine.check_admission()
+        admitted.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            engine.release_admission_reservation()
+
+    request = asyncio.create_task(stalled_request())
+    await admitted.wait()
+
+    status = await asyncio.wait_for(engine.pause_generation("abort"), timeout=1)
+
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    assert scheduler._paused_admission_tokens == set()
     assert status["admitted_requests"] == 0
 
 
@@ -240,8 +276,9 @@ def test_scheduler_pause_accepts_only_uncommitted_pre_pause_token(scheduler_type
     scheduler.pause_generation_admission({"owned", "pending"}, mode)
 
     assert scheduler._generation_paused is True
-    assert scheduler._paused_add_allowance == 1
-    assert scheduler._paused_admission_tokens == {"pending"}
+    expected = {"pending"} if mode == "wait" else set()
+    assert scheduler._paused_add_allowance == len(expected)
+    assert scheduler._paused_admission_tokens == expected
 
     scheduler.set_generation_paused(False)
     assert scheduler._generation_paused is False

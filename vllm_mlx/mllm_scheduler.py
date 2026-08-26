@@ -649,7 +649,6 @@ class MLLMScheduler:
     def pause_generation_admission(self, admission_tokens: set[str], mode: str) -> None:
         """Close admission and preserve only pre-pause route reservations."""
 
-        del mode
         with self._request_state_lock():
             self._generation_paused = True
             owned = {
@@ -657,7 +656,8 @@ class MLLMScheduler:
                 for request in self.requests.values()
                 if request.lifecycle_admission_token is not None
             }
-            self._paused_admission_tokens = set(admission_tokens) - owned
+            pending = set(admission_tokens) - owned
+            self._paused_admission_tokens = pending if mode == "wait" else set()
             self._paused_add_allowance = len(self._paused_admission_tokens)
 
     def request_ids_snapshot(self) -> tuple[str, ...]:

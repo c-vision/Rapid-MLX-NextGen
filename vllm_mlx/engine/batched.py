@@ -898,6 +898,7 @@ class BatchedEngine(BaseEngine):
         self._admission_lock = threading.Lock()
         self._admission_reservations = 0
         self._admission_tokens: set[str] = set()
+        self._admission_tasks: dict[str, asyncio.Task] = {}
         self._generation_paused = False
         self._generation_pause_mode: str | None = None
 
@@ -999,6 +1000,18 @@ class BatchedEngine(BaseEngine):
                 self._admission_tokens = tokens
             token = uuid.uuid4().hex
             tokens.add(token)
+            try:
+                owner = asyncio.current_task()
+            except RuntimeError:
+                owner = None
+            if owner is not None:
+                tasks: dict[str, asyncio.Task] | None = getattr(
+                    self, "_admission_tasks", None
+                )
+                if tasks is None:
+                    tasks = {}
+                    self._admission_tasks = tasks
+                tasks[token] = owner
             context = _admission_token_context.get()
             stack = context[1] if context is not None and context[0] == id(self) else ()
             _admission_token_context.set((id(self), (*stack, token)))
@@ -1026,18 +1039,22 @@ class BatchedEngine(BaseEngine):
         """Release one route reservation while holding ``_admission_lock``."""
 
         tokens: set[str] = getattr(self, "_admission_tokens", set())
+        consumed_token: str | None = None
         if token is not None and token in tokens:
             tokens.remove(token)
+            consumed_token = token
             self._admission_reservations -= 1
         elif token is None and tokens:
             # The historical API permits release from a task that did not
             # inherit the reservation context.
-            tokens.pop()
+            consumed_token = tokens.pop()
             self._admission_reservations -= 1
         elif not tokens and self._admission_reservations > 0:
             # Minimal engine doubles created before lifecycle tokens still
             # exercise the public counter-based release contract.
             self._admission_reservations -= 1
+        if consumed_token is not None:
+            getattr(self, "_admission_tasks", {}).pop(consumed_token, None)
         if clear_context and token is not None and token in context_stack:
             remaining = tuple(value for value in context_stack if value != token)
             _admission_token_context.set((id(self), remaining) if remaining else None)
@@ -1109,10 +1126,20 @@ class BatchedEngine(BaseEngine):
             raise ValueError("pause mode must be 'wait' or 'abort'")
 
         scheduler = self._lifecycle_scheduler()
+        admitted_tasks: tuple[asyncio.Task, ...] = ()
         with self._admission_lock:
             self._generation_paused = True
             self._generation_pause_mode = mode
             admitted_tokens = set(getattr(self, "_admission_tokens", set()))
+            if mode == "abort":
+                task_by_token: dict[str, asyncio.Task] = getattr(
+                    self, "_admission_tasks", {}
+                )
+                admitted_tasks = tuple(
+                    task_by_token[token]
+                    for token in admitted_tokens
+                    if token in task_by_token
+                )
             pause_admission = getattr(scheduler, "pause_generation_admission", None)
             if callable(pause_admission):
                 pause_admission(admitted_tokens, mode)
@@ -1128,6 +1155,12 @@ class BatchedEngine(BaseEngine):
                             else 0
                         ),
                     )
+
+        if mode == "abort":
+            current = asyncio.current_task()
+            for task in admitted_tasks:
+                if task is not current and not task.done():
+                    task.cancel("request aborted for model replacement")
 
         async def _drain() -> dict[str, object]:
             while True:
