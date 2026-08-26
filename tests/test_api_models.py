@@ -50,6 +50,8 @@ from vllm_mlx.api.models import (
     ToolDefinition,
     Usage,
     VideoUrl,
+    _normalize_stop,
+    _validate_timeout,
 )
 
 
@@ -564,6 +566,122 @@ class TestTextCompletion:
         assert resp.object == "text_completion"
         assert resp.id.startswith("cmpl-")
         assert len(resp.choices) == 1
+
+
+def _chat(**kwargs):
+    return ChatCompletionRequest(
+        model="test-model", messages=[Message(role="user", content="Hi")], **kwargs
+    )
+
+
+def _completion(**kwargs):
+    return CompletionRequest(model="test-model", prompt="Once upon a time", **kwargs)
+
+
+class TestStopScalar:
+    """``stop`` must accept a scalar string as well as a list on both the
+    chat and legacy-completion surfaces, normalizing once to a list in the
+    request schema (OpenAI request shape: ``stop`` is ``str | list[str]``).
+    Downstream code (``SamplingParams.stop: list[str]``) reads only lists."""
+
+    @pytest.mark.parametrize("factory", [_chat, _completion])
+    def test_scalar_string_normalized_to_list(self, factory):
+        req = factory(stop="END")
+        assert req.stop == ["END"]
+
+    @pytest.mark.parametrize("factory", [_chat, _completion])
+    def test_list_preserved(self, factory):
+        req = factory(stop=["END", "STOP"])
+        assert req.stop == ["END", "STOP"]
+
+    @pytest.mark.parametrize("factory", [_chat, _completion])
+    def test_empty_list_ok(self, factory):
+        assert factory(stop=[]).stop == []
+
+    @pytest.mark.parametrize("factory", [_chat, _completion])
+    def test_none_default(self, factory):
+        assert factory().stop is None
+
+    @pytest.mark.parametrize("factory", [_chat, _completion])
+    def test_non_string_element_rejected(self, factory):
+        with pytest.raises(ValidationError):
+            factory(stop=["END", 42])
+
+    @pytest.mark.parametrize("factory", [_chat, _completion])
+    def test_stop_sequences_returns_normalized_list(self, factory):
+        """``stop_sequences()`` — the typed accessor used at the engine
+        boundary — returns the canonical normalized list even when the wire
+        input was a scalar string, so downstream ``SamplingParams.stop``
+        always sees a flat ``list[str]``."""
+        assert factory(stop="END").stop_sequences() == ["END"]
+        assert factory(stop=["END", "STOP"]).stop_sequences() == ["END", "STOP"]
+        assert factory().stop_sequences() is None
+
+    @pytest.mark.parametrize("req_model", [ChatCompletionRequest, CompletionRequest])
+    def test_openapi_schema_advertises_scalar_or_array(self, req_model):
+        """The OpenAPI/JSON schema for ``stop`` must advertise both a
+        scalar string and an array of strings (the accepted wire shapes),
+        so generated clients accept the newly supported scalar form."""
+        stop_prop = req_model.model_json_schema()["properties"]["stop"]
+        assert "anyOf" in stop_prop, f"stop schema is not a union: {stop_prop}"
+        type_set = {arm.get("type") for arm in stop_prop["anyOf"]}
+        # string or array are the OpenAI-accepted wire shapes; ``null`` is
+        # present because the field is optional (None = server default).
+        assert type_set == {"string", "array", "null"}, (
+            f"stop schema wrong: {stop_prop}"
+        )
+
+
+class TestTimeoutValidation:
+    """A non-positive / non-finite ``timeout`` must be rejected with a
+    4xx naming the field (schema layer) instead of firing an instant 504
+    when it reaches the request-timeout guard in the routes."""
+
+    @pytest.mark.parametrize("factory", [_chat, _completion])
+    @pytest.mark.parametrize("bad", [0, 0.0, -1, -0.5, -1.0])
+    def test_non_positive_rejected(self, factory, bad):
+        with pytest.raises(ValidationError) as excinfo:
+            factory(timeout=bad)
+        assert "timeout" in str(excinfo.value)
+
+    @pytest.mark.parametrize("factory", [_chat, _completion])
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_rejected(self, factory, bad):
+        with pytest.raises(ValidationError) as excinfo:
+            factory(timeout=bad)
+        assert "timeout" in str(excinfo.value)
+
+    @pytest.mark.parametrize("factory", [_chat, _completion])
+    @pytest.mark.parametrize("good", [0.1, 1, 30.0, 300])
+    def test_positive_accepted(self, factory, good):
+        assert factory(timeout=good).timeout == good
+
+    @pytest.mark.parametrize("factory", [_chat, _completion])
+    def test_none_default(self, factory):
+        assert factory().timeout is None
+
+
+class TestStopAndTimeoutHelpers:
+    """Direct coverage of the shared ``_normalize_stop`` /
+    ``_validate_timeout`` helpers. Pydantic skips field validators for
+    an *absent* optional field, so the ``None`` guards inside the
+    helpers are only exercised when called directly."""
+
+    def test_validate_timeout_none_passthrough(self):
+        assert _validate_timeout(None) is None
+
+    def test_validate_timeout_nonfinite_rejected(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError):
+                _validate_timeout(bad)
+
+    def test_normalize_stop_none_passthrough(self):
+        assert _normalize_stop(None) is None
+
+    def test_normalize_stop_non_string_type_rejected(self):
+        for bad in (42, [1, 2], True, 1.5):
+            with pytest.raises(ValueError):
+                _normalize_stop(bad)
 
 
 class TestModelsEndpoint:

@@ -32,10 +32,14 @@ struct ReonboardingResetTests {
         if let c = conversationsIndex, let s = settingsIndex { #expect(c < s) }
     }
 
-    /// Deleting conversations earns a different verb from restarting into a
-    /// wizard, because it is a different promise.
-    @Test("The confirm button escalates when conversations are included")
-    func confirmTitleEscalates() {
+    /// Re-running setup should sound like the safe recovery action it is;
+    /// scopes that erase user state keep the destructive warning.
+    @Test("The dialog copy distinguishes onboarding-only from state erasure")
+    func confirmationCopyMatchesScope() {
+        #expect(ReonboardingReset.confirmation(for: .onboarding).title
+            == "Run guided setup again?")
+        #expect(ReonboardingReset.confirmation(for: [.onboarding, .telemetry]).title
+            == "Erase this Mac's Rapid state and restart?")
         #expect(ReonboardingReset.confirmation(for: .onboarding).confirmTitle
             == "Restart into onboarding")
         #expect(ReonboardingReset.confirmation(for: [.onboarding, .conversations]).confirmTitle

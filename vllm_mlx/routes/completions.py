@@ -445,7 +445,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                     max_tokens=_resolve_max_tokens(request.max_tokens),
                     temperature=_resolve_temperature(request.temperature),
                     top_p=_resolve_top_p(request.top_p),
-                    stop=request.stop,
+                    stop=request.stop_sequences(),
                     **extended_kwargs,
                 )
 
@@ -520,7 +520,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                         max_tokens=_resolve_max_tokens(request.max_tokens),
                         temperature=_resolve_temperature(request.temperature),
                         top_p=_resolve_top_p(request.top_p),
-                        stop=request.stop,
+                        stop=request.stop_sequences(),
                         **extended_kwargs,
                     ),
                     raw_request,
@@ -771,7 +771,7 @@ async def stream_completion(
         max_tokens=_resolve_max_tokens(request.max_tokens),
         temperature=_resolve_temperature(request.temperature),
         top_p=_resolve_top_p(request.top_p),
-        stop=request.stop,
+        stop=request.stop_sequences(),
         **extended_kwargs,
     ):
         if _json_mode:

@@ -1541,6 +1541,66 @@ def test_residency_control_plane_load_pin_status_and_unload(monkeypatch):
         assert "image" not in registry
 
 
+def test_models_load_requires_strict_json_booleans(monkeypatch):
+    """``pin`` / ``pinned`` / ``reload_if_changed`` must be real JSON
+    booleans (issue #2362). Pydantic v2's lax mode coerced ``"yes"`` /
+    ``"on"`` / ``1`` / ``0`` onto ``bool``, so ``pin: "yes"`` silently
+    became ``True`` and triggered a real resident-model reload. With
+    ``StrictBool`` a non-boolean wire form is rejected by the schema with
+    a 4xx naming the field, while ``true`` / ``false`` behave identically.
+    """
+    from types import SimpleNamespace
+
+    from vllm_mlx.middleware.exception_handlers import install_exception_handlers
+    from vllm_mlx.routes.residency import router
+
+    manager, registry, _, _ = manager_fixture(limit_gib=12)
+    monkeypatch.setattr(
+        "vllm_mlx.routes.residency.get_config",
+        lambda: SimpleNamespace(residency_manager=manager),
+    )
+    app = FastAPI()
+    app.include_router(router)
+    install_exception_handlers(app)
+
+    def _assert_400_field(client, field):
+        for bad in ("yes", "on", "no", "off", 1, 0, 1.0):
+            resp = client.post("/v1/models/load", json={"model": "image", field: bad})
+            assert resp.status_code == 400, (
+                f"{field}={bad!r} expected 400; got {resp.status_code} {resp.text[:120]}"
+            )
+            body = resp.json()
+            assert body["error"]["type"] == "invalid_request_error"
+            assert field in body["error"]["message"]
+
+    def _pin_400(client, field, bad):
+        resp = client.put("/v1/models/image/pin", json={field: bad})
+        assert resp.status_code == 400, (
+            f"{field}={bad!r} expected 400; got {resp.status_code} {resp.text[:120]}"
+        )
+        assert "pinned" in resp.json()["error"]["message"]
+
+    with TestClient(app) as client:
+        _assert_400_field(client, "pin")
+        _assert_400_field(client, "reload_if_changed")
+        for bad in ("yes", "on", "no", "off", 1, 0, 1.0):
+            _pin_400(client, "pinned", bad)
+
+        # Real JSON booleans keep working identically (pin/reload on the
+        # load path; pinned on the pin path) and are not rejected.
+        ok = client.post(
+            "/v1/models/load",
+            json={"model": "image", "estimated_size_gb": 1, "pin": True},
+        )
+        assert ok.status_code == 200
+        ok_if = client.post(
+            "/v1/models/load", json={"model": "image", "reload_if_changed": False}
+        )
+        assert ok_if.status_code == 200
+        ok_pin = client.put("/v1/models/image/pin", json={"pinned": True})
+        assert ok_pin.status_code == 200
+
+
 def test_residency_snapshot_reports_primary_running_and_queued_requests(monkeypatch):
     """Primary requests bypass manager leases but still belong in residency."""
     from types import SimpleNamespace

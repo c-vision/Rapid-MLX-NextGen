@@ -5,10 +5,14 @@ from __future__ import annotations
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StrictBool, model_validator
 
 from ..config import get_config
 from ..middleware.auth import verify_api_key
+from ..middleware.exception_handlers import (
+    register_request_model,
+    register_request_path,
+)
 from ..model_aliases import resolve_profile
 from ..runtime.resident_models import (
     ResidentModelBusyError,
@@ -42,16 +46,36 @@ class ModelLoadRequest(BaseModel):
     model: str = Field(..., min_length=1)
     model_path: str | None = None
     estimated_size_gb: float | None = Field(default=None, gt=0, le=1024)
-    pin: bool = False
+    # ``StrictBool`` requires an actual JSON boolean on the wire. Pydantic
+    # v2's lax mode coerces ``"yes"`` / ``"on"`` / ``1`` / ``0`` onto
+    # ``bool``, so a string like ``"yes"`` silently became ``True`` and
+    # triggered a real resident-model reload (issue #2362). Strict mode
+    # keeps ``true``/``false`` identical while rejecting every non-boolean
+    # wire form with a 4xx naming the field via the unified validation
+    # envelope.
+    pin: StrictBool = False
     replace_group: str | None = Field(default=None, pattern="^(assistant)$")
     image_mode: Literal["generation", "editing"] | None = None
     performance: ModelPerformanceRequest | None = None
-    reload_if_changed: bool = False
+    reload_if_changed: StrictBool = False
     replace_mode: Literal["reject", "wait", "abort"] = "reject"
 
 
 class ModelPinRequest(BaseModel):
-    pinned: bool = True
+    pinned: StrictBool = True
+
+
+# Register the load-endpoint request model with the safe error-location
+# contract (D-ENVELOPE-FIELD-LEAK) so a validation 400 on a schema-owned
+# `performance` / `estimated_size_gb` / `replace_group` setting reports the
+# real field path in `error.message` and mirrors it into `error.param`,
+# exactly as the chat endpoints do for their request models. Without this,
+# every string loc component collapses to the `<field>` placeholder and
+# `error.param` stays null (VAL-2361). The plugin-style registration is
+# called at import time and stays idempotent; the middleware module itself
+# deliberately avoids importing this engine-heavy route module.
+register_request_model(ModelLoadRequest)
+register_request_path("/v1/models/load", ModelLoadRequest)
 
 
 def _manager():

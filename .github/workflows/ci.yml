@@ -320,6 +320,7 @@ jobs:
             tests/test_pflash_server_module_wiring.py::test_server_module_cache_metadata_failure_is_nonfatal \
             tests/test_pflash_server_module_wiring.py::test_server_module_missing_auto_config_module_degrades_to_no_default \
             tests/test_resident_models.py \
+            tests/test_residency_load_field_names.py \
             tests/test_serve_listen_fd.py::test_serve_command_threads_auto_detected_hybrid_into_cache_admission \
             tests/test_serve_listen_fd.py::test_serve_command_cache_is_first_metadata_consumer \
             tests/test_serve_listen_fd.py::test_serve_command_missing_auto_config_module_degrades_to_no_default \
@@ -334,6 +335,8 @@ jobs:
             tests/test_pr_validate_runner.py \
             tests/test_pr_validate_codex.py \
             tests/test_release_baselines.py \
+            tests/test_sidecar_distribution_constraints.py \
+            tests/test_sidecar_vision_smoke.py \
             tests/test_validate_release_subject.py \
             tests/test_check_gha_pinning.py \
             tests/test_check_mypy_error_budget.py \
@@ -359,6 +362,7 @@ jobs:
             tests/test_ram_tier_recommendations_agree.py \
             tests/test_version_sync.py \
             tests/test_pull_variant_selection.py \
+            tests/test_share_cli.py \
             -v --tb=short \
             -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache" \
             --cov=vllm_mlx \

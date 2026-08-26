@@ -73,7 +73,9 @@ enum ReonboardingReset {
         }
 
         return Confirmation(
-            title: "Erase this Mac's Rapid state and restart?",
+            title: scope == .onboarding
+                ? "Run guided setup again?"
+                : "Erase this Mac's Rapid state and restart?",
             message: message,
             confirmTitle: scope.contains(.conversations)
                 ? "Erase and restart"
