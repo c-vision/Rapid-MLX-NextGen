@@ -784,6 +784,25 @@ async def test_primary_replacement_rebinds_after_audio_work_finishes(monkeypatch
         )
         assert stt_after["model"] == "whisper"
         assert stt_after["state"] == "resident"
+
+        # Switching again, including back to the original assistant identity,
+        # must only replace the assistant engine. Dictation is product-wide
+        # process state and remains resident across every picker transition.
+        switched_back = await manager.load(
+            "chat-old",
+            estimated_bytes=1,
+            replace_group="assistant",
+        )
+        assert registry.default_name == "chat-old"
+        assert server._engine is switched_back.entry.engine
+        assert await run_audio_mlx("stt", "whisper", "infer", lambda: "back") == (
+            "back"
+        )
+        stt_switched_back = next(
+            lane for lane in audio_worker.snapshot() if lane["lane"] == "stt"
+        )
+        assert stt_switched_back["model"] == "whisper"
+        assert stt_switched_back["state"] == "resident"
     finally:
         bind_audio_worker(None)
 
@@ -878,7 +897,11 @@ async def test_primary_reload_rejects_active_audio_without_stopping_worker(
 @pytest.mark.asyncio
 async def test_primary_reload_commits_audio_worker_handoff(monkeypatch):
     import vllm_mlx.server as server
-    from vllm_mlx.runtime.audio_worker import bind_audio_worker, run_audio_mlx
+    from vllm_mlx.runtime.audio_worker import (
+        audio_worker,
+        bind_audio_worker,
+        run_audio_mlx,
+    )
     from vllm_mlx.runtime.resident_models import ResidentPerformanceConfig
 
     old_worker = _ReplacementWorker("chat-old")
@@ -886,6 +909,9 @@ async def test_primary_reload_commits_audio_worker_handoff(monkeypatch):
     manager, registry, loaded = _replacement_manager(server, old_worker)
     bind_audio_worker(old_worker)
     try:
+        assert await run_audio_mlx("stt", "whisper", "infer", lambda: "before") == (
+            "before"
+        )
         replacement = await manager.load(
             "chat-old",
             performance=ResidentPerformanceConfig(prefix_cache_enabled=True),
@@ -898,8 +924,13 @@ async def test_primary_reload_commits_audio_worker_handoff(monkeypatch):
         assert await run_audio_mlx("stt", "whisper", "infer", lambda: "after") == (
             "after"
         )
-        assert old_worker.async_calls == 0
+        assert old_worker.async_calls == 1
         assert loaded["chat-old"].async_calls == 1
+        stt_after = next(
+            lane for lane in audio_worker.snapshot() if lane["lane"] == "stt"
+        )
+        assert stt_after["model"] == "whisper"
+        assert stt_after["state"] == "resident"
     finally:
         bind_audio_worker(None)
 
