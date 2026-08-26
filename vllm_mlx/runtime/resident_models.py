@@ -9,7 +9,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from .model_registry import ModelEntry, ModelRegistry
@@ -160,6 +160,11 @@ class ResidencyRecord:
     state: str = "resident"
     measured_bytes: int = 0
     performance: ResidentPerformanceConfig | None = None
+    lease_idle: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.active_requests == 0:
+            self.lease_idle.set()
 
     @property
     def model_id(self) -> str:
@@ -846,6 +851,8 @@ class ResidentModelManager:
                         ) from exc
                 elif not _engine_is_idle(engine):
                     raise ResidentModelBusyError("model is serving an active request")
+                if record.active_requests:
+                    await record.lease_idle.wait()
         except BaseException:
             await self._resume_engines(paused_engines)
             raise
@@ -905,7 +912,6 @@ class ResidentModelManager:
                 await self._evict_locked(
                     record,
                     reason=f"replace_{group}",
-                    allow_active_lease=True,
                 )
         except BaseException:
             if old_primary is not None:
@@ -957,9 +963,8 @@ class ResidentModelManager:
         *,
         reason: str,
         count: bool = True,
-        allow_active_lease: bool = False,
     ) -> None:
-        if record.active_requests and not allow_active_lease:
+        if record.active_requests:
             raise ResidentModelBusyError("model is serving an active request")
         record.state = "evicting"
         self.registry.remove(record.model_id)
@@ -984,16 +989,21 @@ class ResidentModelManager:
             if record.state != "resident":
                 raise ResidentModelBusyError("model is being evicted")
             record.active_requests += 1
+            record.lease_idle.clear()
             record.last_used_at = self._clock()
             engine = record.entry.engine
         try:
             yield engine
         finally:
-            async with self._lock:
-                current = self._records.get(canonical)
-                if current is not None:
-                    current.active_requests = max(0, current.active_requests - 1)
-                    current.last_used_at = self._clock()
+            # Replacement may be holding the manager lock while it waits for
+            # this lease to finish. These synchronous event-loop operations
+            # are the release edge; no residency mutation can interleave.
+            current = self._records.get(canonical)
+            if current is record:
+                current.active_requests = max(0, current.active_requests - 1)
+                current.last_used_at = self._clock()
+                if current.active_requests == 0:
+                    current.lease_idle.set()
 
     def snapshot(self) -> dict:
         now = self._clock()

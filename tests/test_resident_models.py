@@ -863,9 +863,18 @@ async def test_wait_replacement_retires_drained_engine_with_http_lease_finalizin
     manager.register_primary(primary, estimated_bytes=4 * GIB)
 
     async with manager.lease("chat-old"):
-        await manager.load("chat-new", replace_group="assistant", replace_mode="wait")
+        replacement = asyncio.create_task(
+            manager.load("chat-new", replace_group="assistant", replace_mode="wait")
+        )
+        await asyncio.sleep(0)
 
-    assert old_engine.pauses == [("wait", None)]
+        assert replacement.done() is False
+        assert old_engine.pauses == [("wait", None)]
+        assert old_engine.stopped is False
+        assert registry.default_name == "chat-old"
+
+    await asyncio.wait_for(replacement, timeout=1)
+
     assert old_engine.stopped is True
     assert registry.default_name == "chat-new"
 
