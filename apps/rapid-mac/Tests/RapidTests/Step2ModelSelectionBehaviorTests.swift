@@ -573,13 +573,14 @@ struct Step2ModelSelectionBehaviorTests {
                 "32 GB shows the smart 27B; the fast 4B is already the starter")
     }
 
-    @Test("The starter is never duplicated inside the recommended row")
+    @Test("The safe 8 GB starter is not duplicated by its optional capability upgrade")
     func starterEqualFastPickIsDroppedFromRecommended() {
-        // At 8 GB the smart pick is the starter and the fast pick is the
-        // explicit low-memory card, so neither belongs in a duplicate row.
+        // At 8 GB the fast pick is the automatic starter. The smart pick stays
+        // visible once as an explicit, memory-guarded capability upgrade.
         let list = QuickstartView.shortlist(catalog: [], selection: "", physicalRAMGB: 8)
-        #expect(list.recommended.isEmpty,
-                "starter and low-memory picks are deduplicated against their authored cards")
+        #expect(list.starters.map(\.alias) == ["lfm2.5-1b-4bit"])
+        #expect(list.lowMemory.isEmpty)
+        #expect(list.recommended.map(\.alias) == ["lfm2.5-2.6b-4bit"])
     }
 
     @Test("No RAM argument means no recommended row")

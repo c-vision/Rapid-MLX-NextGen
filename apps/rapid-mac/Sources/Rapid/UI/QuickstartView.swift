@@ -260,7 +260,9 @@ final class QuickstartCoordinator {
         tier: .starter
     )
 
-    /// Smaller quality-floor starter for Macs below 16 GB RAM.
+    /// Smarter optional choice for Macs below 16 GB RAM. Clean 8 GB hardware
+    /// validation showed that loading it projects beyond the app's usable RAM
+    /// budget, so first run defaults to ``lowMemoryChoice`` instead.
     static let compactDefaultChoice = QuickstartModelChoice(
         alias: "lfm2.5-2.6b-4bit",
         displayName: "LFM2.5 · 2.6B",
@@ -323,16 +325,23 @@ final class QuickstartCoordinator {
 
     /// Hardware-aware first-run policy. The existing cache-aware policy is the
     /// eligibility SSOT for cached choices; onboarding adds only its explicit
-    /// 16 GB baseline and excludes the 1.2B manual fallback from automatic
-    /// selection.
+    /// 16 GB baseline. The 1.2B choice is automatic only when it is already
+    /// the sub-16 GB baseline; larger Macs keep it as an explicit fallback.
     static func defaultChoice(
         hardware: MacHardware,
         catalog: [ModelEntry]
     ) -> QuickstartModelChoice {
         let baseline = baselineChoice(hardware: hardware)
         let eligibleCatalog = catalog.filter { $0.kind == .chat }
-        let excluded = CacheAwareDefault.retiredAutomaticAliases
-            .union([lowMemoryChoice.alias])
+        var excluded = CacheAwareDefault.retiredAutomaticAliases
+        if baseline.alias != lowMemoryChoice.alias {
+            excluded.insert(lowMemoryChoice.alias)
+        } else {
+            // Clean 8 GB validation puts the 2.6B option beyond the usable-RAM
+            // guard. A cached copy still avoids a download, but does not make
+            // that load safe enough to become the automatic first run.
+            excluded.insert(compactDefaultChoice.alias)
+        }
         guard let alias = CacheAwareDefault.pick(
             catalog: eligibleCatalog,
             hardware: hardware,
@@ -355,9 +364,11 @@ final class QuickstartCoordinator {
     /// RAM-only baseline shared by onboarding and the persistent picker row.
     /// Cached preference is deliberately layered only by ``defaultChoice``.
     static func baselineChoice(hardware: MacHardware) -> QuickstartModelChoice {
-        hardware.physicalRAMGB < 16
-            ? compactDefaultChoice
-            : defaultChoice
+        baselineChoice(physicalRAMGB: hardware.physicalRAMGB)
+    }
+
+    static func baselineChoice(physicalRAMGB: Double) -> QuickstartModelChoice {
+        physicalRAMGB < 16 ? lowMemoryChoice : defaultChoice
     }
 
     /// UserDefaults key for the persistent "Quickstart already
@@ -383,7 +394,7 @@ final class QuickstartCoordinator {
     /// manually selected alternative gets a plainer intro without implying it
     /// was downloaded specifically for setup.
     var seedMessage: String {
-        if selection.isStarter {
+        if selection.alias == baselineStarterAlias {
             return """
 You're chatting with \(selection.displayName) — a model picked so you can start \
 chatting in about a minute. Open the picker any time to trade up to a larger \
@@ -407,6 +418,12 @@ Open the picker any time to switch models.
     /// ContentView visibility gate's alias check) reads this instead of
     /// a pinned constant.
     private(set) var selection: QuickstartModelChoice = QuickstartCoordinator.defaultChoice
+    /// RAM-only starter identity for this launch. Unlike ``choice.tier``, this
+    /// is contextual: 1.2B is the starter below 16 GB and remains the explicit
+    /// low-memory fallback everywhere else.
+    private var baselineStarterAlias = QuickstartCoordinator.defaultChoice.alias {
+        didSet { defaults.set(baselineStarterAlias, forKey: Self.baselineStarterAliasKey) }
+    }
     /// False after the user or persisted session chose a concrete model, so a
     /// later catalog refresh can never replace explicit intent.
     private var selectionUsesAutomaticPolicy = true
@@ -728,6 +745,7 @@ Open the picker any time to switch models.
     /// the selection is still automatic.
     func applyDefaultChoice(hardware: MacHardware, catalog: [ModelEntry]) {
         guard case .idle = phase, selectionUsesAutomaticPolicy else { return }
+        baselineStarterAlias = Self.baselineChoice(hardware: hardware).alias
         selection = Self.defaultChoice(hardware: hardware, catalog: catalog)
     }
 
@@ -735,6 +753,7 @@ Open the picker any time to switch models.
     /// cache refreshes must not retarget a starter the chooser already shows.
     func settleDefaultChoice(hardware: MacHardware, catalog: [ModelEntry]) {
         guard case .idle = phase, selectionUsesAutomaticPolicy else { return }
+        baselineStarterAlias = Self.baselineChoice(hardware: hardware).alias
         selection = Self.defaultChoice(hardware: hardware, catalog: catalog)
         selectionUsesAutomaticPolicy = false
     }
@@ -833,6 +852,7 @@ Open the picker any time to switch models.
     /// ``enterDownloading``, ``skipForNow``, selecting a different alias,
     /// and ``_testingReset``.
     static let pendingReadyAliasKey: String = "rapid.quickstart.v1.pendingReadyAlias"
+    static let baselineStarterAliasKey: String = "rapid.quickstart.v1.baselineStarterAlias"
 
     /// Provenance for "this install has been inside setup before and never
     /// finished it" (Paper 05.1 state 18 — "Relaunch, setup incomplete").
@@ -897,6 +917,8 @@ Open the picker any time to switch models.
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        self.baselineStarterAlias = defaults.string(forKey: Self.baselineStarterAliasKey)
+            ?? Self.defaultChoice.alias
         self.done = defaults.bool(forKey: Self.storageKey)
         self.legacyDone = defaults.bool(forKey: Self.legacyStorageKey)
         // History only. Nothing below reconstructs a phase, a selection or a
@@ -989,6 +1011,7 @@ Open the picker any time to switch models.
         catalogSort = .familyThenSize
         catalogScrollID = nil
         selection = Self.defaultChoice
+        baselineStarterAlias = Self.defaultChoice.alias
         selectionUsesAutomaticPolicy = true
         hasSeededWelcome = false
         awaitingWelcomeSeed = false
@@ -1013,6 +1036,7 @@ Open the picker any time to switch models.
         defaults.removeObject(forKey: Self.awaitingSeedKey)
         defaults.removeObject(forKey: Self.awaitingSeedAliasKey)
         defaults.removeObject(forKey: Self.pendingReadyAliasKey)
+        defaults.removeObject(forKey: Self.baselineStarterAliasKey)
     }
 
     /// The name 44 call sites in the suite and ``DevSnapshot`` already use.
@@ -2400,7 +2424,9 @@ struct QuickstartView: View {
 
                     if !list.recommended.isEmpty {
                         OnboardingGroupLabel(
-                            text: "RECOMMENDED FOR YOUR \(Self.wholeGB(hardware.physicalRAMGB)) MAC"
+                            text: Self.recommendedGroupLabel(
+                                physicalRAMGB: hardware.physicalRAMGB
+                            )
                         )
                         .padding(.top, 14)
                         ForEach(list.recommended) { choice in
@@ -2992,7 +3018,9 @@ struct QuickstartView: View {
                 }
                 if !list.recommended.isEmpty {
                     OnboardingGroupLabel(
-                        text: "RECOMMENDED FOR YOUR \(Self.wholeGB(hardware.physicalRAMGB)) MAC"
+                        text: Self.recommendedGroupLabel(
+                            physicalRAMGB: hardware.physicalRAMGB
+                        )
                     )
                     .padding(.top, 14)
                     ForEach(list.recommended) { choice in
@@ -3281,9 +3309,7 @@ struct QuickstartView: View {
     ) -> Shortlist {
         let choices = QuickstartCoordinator.onboardingChoices
         let starterAlias = physicalRAMGB.map {
-            $0 < 16
-                ? QuickstartCoordinator.compactDefaultChoice.alias
-                : QuickstartCoordinator.defaultChoice.alias
+            QuickstartCoordinator.baselineChoice(physicalRAMGB: $0).alias
         } ?? QuickstartCoordinator.defaultChoice.alias
         var cachedPresentation = quickstartCachedPresentation(catalog, limit: 6)
         // A catalog-preferred authored choice can sit just beyond the bounded
@@ -3308,9 +3334,10 @@ struct QuickstartView: View {
         var recommended: [QuickstartModelChoice] = []
         if let ram = physicalRAMGB {
             var excluded = existingAliases
-            excluded.formUnion(
-                choices.filter { $0.isStarter || $0.isLowMemory }.map(\.alias)
-            )
+            excluded.insert(starterAlias)
+            if starterAlias != QuickstartCoordinator.lowMemoryChoice.alias {
+                excluded.insert(QuickstartCoordinator.lowMemoryChoice.alias)
+            }
             recommended = Self.recommendedChoices(
                 from: RAMBucketedDefault.picks(forPhysicalRAMGB: ram),
                 authored: choices,
@@ -3334,17 +3361,29 @@ struct QuickstartView: View {
             cached: existing,
             cachedAlternates: cachedPresentation.alternates,
             starters: choices.filter {
-                $0.isStarter
-                    && $0.alias == starterAlias
-                    && !existingAliases.contains($0.alias)
+                $0.alias == starterAlias && !existingAliases.contains($0.alias)
             },
             recommended: recommended,
-            lowMemory: choices.filter { $0.isLowMemory && !existingAliases.contains($0.alias) },
+            lowMemory: choices.filter {
+                $0.isLowMemory
+                    && $0.alias != starterAlias
+                    && !existingAliases.contains($0.alias)
+            },
             tradeUps: tradeUps,
             yourPick: native.contains(selection)
                 ? nil
                 : onboardingCatalogModels(catalog).first { $0.alias == selection }
         )
+    }
+
+    /// The smallest tier's smart pick remains an explicit capability upgrade,
+    /// not the automatic recommendation: clean 8 GB validation showed that it
+    /// crosses the usable-memory guard. The row itself still owns the exact
+    /// measured warning and Load Anyway decision.
+    static func recommendedGroupLabel(physicalRAMGB: Double) -> String {
+        physicalRAMGB < 16
+            ? "OPTIONAL — MORE CAPABLE, USES MORE MEMORY"
+            : "RECOMMENDED FOR YOUR \(wholeGB(physicalRAMGB)) MAC"
     }
 
     /// Map the SSOT's RAM-tier picks into renderable wizard choices.

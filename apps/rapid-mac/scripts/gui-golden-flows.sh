@@ -27,8 +27,8 @@ FAKE_IMAGE_ALIAS="fake-image-alias"
 # the operator's release Mac), so every persona that renders the chooser
 # pins the same tier to keep its AX baseline deterministic.
 # 8 = the 8 GB tier, which is exactly what the committed compact-chooser
-# baseline captures (smart lfm2.5-2.6B; its fast pick lfm2.5-1B equals the
-# starter, so the row renders just the one card). Pinning 8 also happens to
+# baseline captures (safe fast pick lfm2.5-1B as the starter; smart
+# lfm2.5-2.6B as the optional memory-guarded capability upgrade). Pinning 8 also happens to
 # be the safe tier for cached-curated-tradeup: its assertion needs
 # qwen3.5-4b to stay a native curated trade-up, which 8 GB guarantees
 # (16/24/32 GB hosts fold qwen3.5-4b into the recommended row instead).
@@ -1280,14 +1280,14 @@ flow_fresh_install() {
     see_main "$OUT/compact.json"
     baseline onboarding-direction-d.compact "$OUT/compact.json"
     press "$OUT/compact.json" Quickstart.GetStarted "$OUT/get-started.json"
-    wait_selected Quickstart.Choice.lfm2.5-2.6b-4bit "$OUT/chooser-settled.json"
+    wait_selected Quickstart.Choice.lfm2.5-1b-4bit "$OUT/chooser-settled.json"
     baseline onboarding-direction-d.compact-chooser "$OUT/chooser-settled.json"
     press "$OUT/chooser-settled.json" Quickstart.Footer.Back "$OUT/chooser-back.json"
     wait_identifier Quickstart.Skip "$OUT/welcome-returned.json"
     press "$OUT/welcome-returned.json" Quickstart.Skip "$OUT/quickstart-skip.json"
     wait_identifier rapid.chat.compose "$OUT/steady.json"
     selected_model="$(element_field "$OUT/steady.json" ModelPickerBar.ModelMenu value)"
-    [[ "$selected_model" == *"lfm2.5-2.6b-4bit"* ]] \
+    [[ "$selected_model" == *"lfm2.5-1b-4bit"* ]] \
         || die "#2219: 8 GB onboarding selected '$selected_model' instead of the compact starter"
     for id in Sidebar.NewChat Sidebar.Launch rapid.chat.compose ChatView.SendOrStopButton ModelPickerBar.ModelMenu; do
         jq -e --arg id "$id" '.data.ui_elements[]? | select(.identifier == $id)' "$OUT/steady.json" >/dev/null \

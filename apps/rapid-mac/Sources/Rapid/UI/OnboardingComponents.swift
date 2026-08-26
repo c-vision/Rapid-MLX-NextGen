@@ -167,9 +167,7 @@ struct QuickstartRecommendedCard: View {
                         Text(choice.displayName)
                             .scaledSystemFont(15, weight: .semibold)
                             .foregroundStyle(RapidTheme.textPrimary)
-                        if choice.isStarter {
-                            OnboardingBadge(text: "START HERE", tone: .ink)
-                        }
+                        OnboardingBadge(text: "START HERE", tone: .ink)
                         Spacer(minLength: 8)
                         if !sizeText.isEmpty {
                             Text(sizeText)
@@ -196,15 +194,25 @@ struct QuickstartRecommendedCard: View {
         .modelRowActivation(onActivate)
         .accessibilityIdentifier("Quickstart.Choice.\(choice.alias)")
         .accessibilityAddTraits(selected ? .isSelected : [])
-        .accessibilityLabel(accessibilityText)
+        .accessibilityLabel(Self.accessibilityText(for: choice, sizeText: sizeText))
     }
 
     /// Fold the framing, size and attribute pills into the spoken label — the
     /// button overrides its children, so VoiceOver otherwise hears the name
     /// and blurb only.
-    private var accessibilityText: String {
+    static func accessibilityText(
+        for choice: QuickstartModelChoice,
+        sizeText: String
+    ) -> String {
         var parts = [choice.displayName]
-        if choice.isStarter { parts.append("recommended starter") }
+        // Below 16 GB the existing lowest-memory choice is deliberately the
+        // automatic starter. Preserve both facts in its spoken category: the
+        // visual START HERE badge must not erase the capability trade-off that
+        // this same row announces when it is an optional fallback.
+        if choice.alias == QuickstartCoordinator.lowMemoryChoice.alias {
+            parts.append("Lowest memory")
+        }
+        parts.append("recommended starter")
         parts.append(choice.blurb)
         if !sizeText.isEmpty { parts.append("download \(sizeText)") }
         parts.append("on-device, fits this Mac")
