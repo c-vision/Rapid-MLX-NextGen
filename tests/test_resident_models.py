@@ -395,10 +395,15 @@ class FailingStopLifecycleEngine(FakeLifecycleEngine):
         raise RuntimeError("stop failed")
 
 
-class CancellingStopLifecycleEngine(FakeLifecycleEngine):
+class BlockingStopLifecycleEngine(FakeLifecycleEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stop_started = asyncio.Event()
+
     async def stop(self) -> None:
         self.stopped = True
-        raise asyncio.CancelledError
+        self.stop_started.set()
+        await asyncio.Event().wait()
 
 
 class Clock:
@@ -1008,14 +1013,11 @@ async def test_committed_replacement_does_not_rollback_to_stopped_sibling(caplog
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "engine_type", [FailingStopLifecycleEngine, CancellingStopLifecycleEngine]
-)
 async def test_primary_stop_failure_keeps_committed_replacement_routable(
-    caplog, engine_type
+    caplog,
 ):
     registry = ModelRegistry()
-    old_engine = engine_type()
+    old_engine = FailingStopLifecycleEngine()
     primary = entry("chat-old", old_engine)
     registry.add(primary, is_default=True)
     handoff_events: list[str] = []
@@ -1048,6 +1050,35 @@ async def test_primary_stop_failure_keeps_committed_replacement_routable(
     assert {item["id"] for item in manager.snapshot()["models"]} == {"chat-new"}
     assert handoff_events == ["commit:chat-new"]
     assert "Failed to stop replaced primary 'chat-old'" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_after_primary_commit_preserves_new_route():
+    registry = ModelRegistry()
+    old_engine = BlockingStopLifecycleEngine()
+    primary = entry("chat-old", old_engine)
+    registry.add(primary, is_default=True)
+    loaded: dict[str, FakeEngine] = {}
+
+    async def loader(name: str, path: str | None, performance=None):
+        loaded[name] = FakeEngine()
+        return entry(name, loaded[name])
+
+    manager = ResidentModelManager(registry, loader, memory_reader=lambda: 0)
+    manager.register_primary(primary, estimated_bytes=4 * GIB)
+    replacement = asyncio.create_task(
+        manager.load("chat-new", replace_group="assistant", replace_mode="wait")
+    )
+    await old_engine.stop_started.wait()
+
+    replacement.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await replacement
+
+    assert registry.default_name == "chat-new"
+    assert registry.get_engine("chat-new") is loaded["chat-new"]
+    assert [item.model_name for item in registry.list_entries()] == ["chat-new"]
+    assert {item["id"] for item in manager.snapshot()["models"]} == {"chat-new"}
 
 
 @pytest.mark.asyncio

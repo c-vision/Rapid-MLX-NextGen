@@ -34,6 +34,10 @@ class ResidentModelBusyError(ResidentModelError):
     """A model cannot be removed while it owns active work."""
 
 
+class _CommittedReplacementCancelled(asyncio.CancelledError):
+    """Cancellation observed after replacement routing became authoritative."""
+
+
 @dataclass(frozen=True)
 class ResidentPerformanceConfig:
     """Audited scheduler overrides attached to one resident text model.
@@ -667,6 +671,12 @@ class ResidentModelManager:
                     await self._commit_group_replacement_locked(
                         record, group, candidates
                     )
+            except _CommittedReplacementCancelled:
+                # Routing already names the new target. Preserve that truth,
+                # reopen any sibling engines not yet retired, and propagate
+                # cancellation without treating the target as a failed load.
+                await self._resume_engines(paused_engines)
+                raise
             except BaseException:
                 # Once the loader returns, this manager owns the engine.  A
                 # later admission/replacement failure must not leave a model
@@ -1010,7 +1020,13 @@ class ResidentModelManager:
                         old_primary,
                         reason=f"replace_{group}",
                     )
-                except (Exception, asyncio.CancelledError):
+                except asyncio.CancelledError as exc:
+                    logger.warning(
+                        "Primary retirement cancelled after routing commit: %r",
+                        old_primary.model_id,
+                    )
+                    raise _CommittedReplacementCancelled from exc
+                except Exception:
                     logger.exception(
                         "Failed to stop replaced primary %r after routing commit",
                         old_primary.model_id,
@@ -1027,7 +1043,13 @@ class ResidentModelManager:
                         record,
                         reason=f"replace_{group}",
                     )
-                except (Exception, asyncio.CancelledError):
+                except asyncio.CancelledError as exc:
+                    logger.warning(
+                        "Replacement cleanup cancelled after routing commit: %r",
+                        record.model_id,
+                    )
+                    raise _CommittedReplacementCancelled from exc
+                except Exception:
                     logger.exception(
                         "Failed to stop replaced model %r after routing retirement",
                         record.model_id,
