@@ -1980,6 +1980,11 @@ def load_model(
     # resolve_profile handles both alias-name and HF-path lookups, so a
     # single call suffices regardless of which form load_model was passed.
     _profile = resolve_profile(effective_model_alias or requested_model_name)
+    _model_config = _profile
+    if _model_config is None:
+        from .model_auto_config import detect_model_config
+
+        _model_config = detect_model_config(model_name)
     if _profile is not None and _profile.recommended_sampling:
         _alias_recommended_sampling = dict(_profile.recommended_sampling)
 
@@ -2338,6 +2343,7 @@ def load_model(
         tool_call_parser=_tool_call_parser,
         reasoning_parser=_reasoning_parser_name,
         is_mllm=getattr(_engine, "is_mllm", False),
+        experimental=bool(_model_config is not None and _model_config.experimental),
         max_tokens=_default_max_tokens,
     )
     _model_registry.add(entry, is_default=True)
@@ -2475,6 +2481,7 @@ async def _load_dynamic_resident_model(
         tool_call_parser=(profile.tool_call_parser if profile is not None else None),
         reasoning_parser=(profile.reasoning_parser if profile is not None else None),
         is_mllm=getattr(engine, "is_mllm", False),
+        experimental=bool(model_config is not None and model_config.experimental),
         max_tokens=_default_max_tokens,
     )
 

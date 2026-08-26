@@ -162,6 +162,12 @@ final class MemoryLoadConfirmationQueue {
         _ old: ModelSizing.MemoryWarning,
         snapshot: MemoryProbe.Snapshot
     ) -> ModelSizing.MemoryWarning {
+        // Replacement admission reaches this queue only after `ensureServing`
+        // has awaited `stop()`. The fresh host sample therefore already
+        // reflects whatever memory macOS has reclaimed from the old process;
+        // subtracting `plannedReleaseGB` again would understate live use. Keep
+        // the value solely to explain which release the initial projection
+        // accounted for.
         ModelSizing.MemoryWarning(
             id: old.id,
             alias: old.alias,
@@ -174,7 +180,8 @@ final class MemoryLoadConfirmationQueue {
             ),
             footprintGB: old.footprintGB,
             freeGB: Double(snapshot.freeBytes) / Double(1 << 30),
-            totalGB: Double(snapshot.totalBytes) / Double(1 << 30)
+            totalGB: Double(snapshot.totalBytes) / Double(1 << 30),
+            plannedReleaseGB: old.plannedReleaseGB
         )
     }
 }
@@ -1382,6 +1389,7 @@ final class ServerManager {
                 hfPath: hfPath,
                 estimatedSizeGB: estimate,
                 replaceGroup: replacementGroup,
+                memoryPolicy: replacementGroup == .assistant ? .evictFirstIfNeeded : nil,
                 imageMode: imageMode,
                 performance: perfConfigProvider?(trimmed),
                 port: activePort,
@@ -1453,6 +1461,7 @@ final class ServerManager {
         // mid-``.starting``). ``stop()`` is a noop if child is nil, so
         // the idle/stopped/missing cases just fall through to
         // ``start(alias:)``.
+        var replacementMemoryAdmission: MemoryAdmissionContext?
         if child != nil {
             // `ensureServing` can re-enter while a dialog or residency refresh
             // is awaiting. Repeat until the alias we validated is still the
@@ -1480,6 +1489,21 @@ final class ServerManager {
                 }
                 return isServing(trimmed)
             }
+            // The process-replacement path releases the current assistant
+            // before loading its successor. Admission must therefore project
+            // the successor on top of memory *after* that release, not stack
+            // both chat models as if they would coexist. Capture this before
+            // stopping while the residency row and host sample describe the
+            // same live process. Because this branch replaces the whole
+            // sidecar, every resident model row belongs to the release plan;
+            // in-process multi-model loads never receive this credit.
+            replacementMemoryAdmission = memorySnapshotProvider().flatMap {
+                Self.memoryAdmissionForTransition(
+                    host: $0,
+                    residency: residency,
+                    plan: .releaseResidentModels
+                )
+            }
             await stop(preservingLastServedAlias: true)
         }
         let memoryRequestID = UUID()
@@ -1487,6 +1511,7 @@ final class ServerManager {
             alias: trimmed,
             hfPath: hfPath,
             memoryRequestID: memoryRequestID,
+            memoryAdmission: replacementMemoryAdmission,
             catalogEntryHint: provenCatalogEntry
         )
         // ``start`` also returns without spawning when the pre-load
@@ -1515,6 +1540,68 @@ final class ServerManager {
             await awaitStartupSettled(alias: trimmed)
         }
         return isServing(trimmed)
+    }
+
+    enum MemoryResidencyPlan: Sendable, Equatable {
+        case keepResidentModels
+        case releaseResidentModels
+    }
+
+    struct MemoryAdmissionContext: Sendable, Equatable {
+        let snapshot: MemoryProbe.Snapshot
+        let plannedReleaseBytes: UInt64
+    }
+
+    /// Resolve one process-replacement admission against post-stop host truth.
+    /// The projected pre-stop sample knows which model bytes the transition
+    /// releases; the live sample catches memory another process consumed while
+    /// `stop()` was awaiting termination. The larger used value is the safe
+    /// answer. If either probe is unavailable, retain the evidence we do have.
+    nonisolated static func memorySnapshotForAdmission(
+        planned: MemoryAdmissionContext?,
+        live: MemoryProbe.Snapshot?
+    ) -> MemoryProbe.Snapshot? {
+        guard let planned else { return live }
+        guard let live else { return planned.snapshot }
+        return MemoryProbe.Snapshot(
+            totalBytes: live.totalBytes,
+            usedBytes: min(
+                live.totalBytes,
+                max(live.usedBytes, planned.snapshot.usedBytes)
+            )
+        )
+    }
+
+    /// One-shot host-memory view for the transition the lifecycle will run.
+    ///
+    /// A process replacement releases every resident engine before spawning
+    /// the target, regardless of whether the outgoing lane is chat, image, or
+    /// audio. An in-process load keeps its residents and therefore receives no
+    /// credit here; the residency loader owns its own admission/eviction plan.
+    /// Returning `nil` for a release with no trustworthy residency evidence
+    /// deliberately preserves the ordinary post-stop live probe.
+    nonisolated static func memoryAdmissionForTransition(
+        host: MemoryProbe.Snapshot,
+        residency: ModelResidencySnapshot,
+        plan: MemoryResidencyPlan
+    ) -> MemoryAdmissionContext? {
+        guard plan == .releaseResidentModels else {
+            return MemoryAdmissionContext(snapshot: host, plannedReleaseBytes: 0)
+        }
+        var reclaimableBytes: UInt64 = 0
+        for resident in residency.models where resident.state != "evicting" {
+            let bytes = resident.displayBytes
+            reclaimableBytes += min(bytes, host.usedBytes - reclaimableBytes)
+            if reclaimableBytes == host.usedBytes { break }
+        }
+        guard reclaimableBytes > 0 else { return nil }
+        return MemoryAdmissionContext(
+            snapshot: MemoryProbe.Snapshot(
+                totalBytes: host.totalBytes,
+                usedBytes: host.usedBytes - reclaimableBytes
+            ),
+            plannedReleaseBytes: reclaimableBytes
+        )
     }
 
     /// Rebuild only the named resident engine with its current performance
@@ -1823,6 +1910,7 @@ final class ServerManager {
         bypassMemoryGuard: Bool = false,
         memoryRequestID: UUID? = nil,
         isLaunchAutoStart: Bool = false,
+        memoryAdmission: MemoryAdmissionContext? = nil,
         catalogEntryHint: ModelEntry? = nil
     ) async {
         // Issue #278: a manual restart is the user taking over the
@@ -1868,9 +1956,8 @@ final class ServerManager {
         }
 
         // Pre-load memory guard (#324). Loading a model whose footprint,
-        // stacked on top of what is ALREADY resident, would push unified
-        // memory past ~85% of total can freeze or kernel-panic the whole
-        // Mac — a far worse outcome than declining to load. This is the
+        // stacked on top of what is ALREADY resident, would require more than
+        // physical unified memory is held for explicit confirmation. This is the
         // single choke point every start path funnels through (picker,
         // first message, auto-restart, quickstart), so the check + the
         // confirmation prompt live here once instead of at each call site.
@@ -1888,15 +1975,19 @@ final class ServerManager {
         // Respawn is also recovering a model that ALREADY fit when it first
         // started; a genuine free-RAM drop is bounded by the respawn-attempt
         // budget, and the user's manual restart still routes through the guard.
-        if !bypassMemoryGuard, !isAutoRespawn, let snapshot = memorySnapshotProvider() {
+        if !bypassMemoryGuard, !isAutoRespawn,
+           let snapshot = Self.memorySnapshotForAdmission(
+               planned: memoryAdmission,
+               live: memorySnapshotProvider()
+           ) {
             let footprint = ModelSizing.estimate(alias: trimmedAlias)
             let safety = ModelSizing.memorySafety(
                 footprint: footprint,
                 usedBytes: snapshot.usedBytes,
                 totalBytes: snapshot.totalBytes
             )
-            // Only ``.unsafe`` (>= 85%, the panic line) blocks. ``.tight``
-            // is defined as "will load but risks swap / stalls" — holding
+            // Only ``.unsafe`` (> 100%, beyond physical RAM) blocks. ``.tight``
+            // is defined as "will load but may compress / swap" — holding
             // it behind a modal would fire on ordinary loads (13 GiB used
             // on a 32 GiB Mac + an 11.8 GiB model projects to 77.5%) and
             // train the user to click through the one prompt that matters.
@@ -1923,7 +2014,9 @@ final class ServerManager {
                     severity: safety,
                     footprintGB: footprint.totalGB,
                     freeGB: Double(snapshot.freeBytes) / Double(1 << 30),
-                    totalGB: Double(snapshot.totalBytes) / Double(1 << 30)
+                    totalGB: Double(snapshot.totalBytes) / Double(1 << 30),
+                    plannedReleaseGB: Double(memoryAdmission?.plannedReleaseBytes ?? 0)
+                        / Double(1 << 30)
                 )
                 memoryConfirmations.enqueue(
                     warning: warning,

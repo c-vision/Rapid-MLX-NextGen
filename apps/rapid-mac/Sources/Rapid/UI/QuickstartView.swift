@@ -4135,8 +4135,8 @@ struct QuickstartView: View {
 
     /// Return the curated low-memory fallback only when the same snapshot
     /// that blocked the original load says the replacement falls below the
-    /// 85% danger line. This prevents a reassuring "Switch" button from
-    /// merely leading to a second warning. If the snapshot is unavailable,
+    /// blocking beyond-physical-RAM line. This prevents a reassuring "Switch"
+    /// button from merely leading to a second warning. If the snapshot is unavailable,
     /// Cancel still returns to the chooser and the fallback remains visible,
     /// but the warning does not claim it is safe.
     static func lowMemoryRecoveryChoice(

@@ -276,12 +276,16 @@ async def test_startup_and_runtime_use_identical_checkpoint_lane_contract(
     monkeypatch.setattr("vllm_mlx.model_aliases.resolve_profile", lambda _name: None)
     monkeypatch.setattr(
         "vllm_mlx.model_auto_config.detect_model_config",
-        lambda _name: ModelProfile(is_hybrid=False),
+        lambda _name: ModelProfile(is_hybrid=False, experimental=True),
     )
 
     server.load_model("publisher/model")
     startup_kwargs = dict(server._engine.kwargs)
     runtime = await server._load_dynamic_resident_model("publisher/model", None)
+
+    startup = server._model_registry.get_entry("publisher/model")
+    assert startup.experimental is True
+    assert runtime.experimental is True
 
     assert calls == [
         (

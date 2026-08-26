@@ -250,6 +250,11 @@ class ModelProfile:
     # automatic vision admission when no catalog measurement is available;
     # explicit ``--mllm`` always remains the operator override.
     vision_min_memory_gb: float | None = None
+    # Experimental architecture implementations require explicit operator
+    # awareness. The value is resolved from trusted checkpoint metadata or an
+    # explicit closed-schema alias and carried by the live model entry so
+    # /v1/models can expose that lifecycle truth.
+    experimental: bool = False
     # ``is_text_only`` = this checkpoint is served through the
     # auto-regressive text (mlx-lm) lane even though its ``config.json``
     # declares a ``vision_config`` (and may ship ``vision_tower`` weights)

@@ -517,7 +517,7 @@ struct QuickstartViewTests {
 
     /// Build an ``.unsafe`` memory warning for an alias — the shape
     /// ``ServerManager.start`` parks on when a Quickstart serve would push
-    /// live memory past the 85% panic line.
+    /// live memory beyond physical RAM.
     private func makeWarning(alias: String) -> ModelSizing.MemoryWarning {
         ModelSizing.MemoryWarning(
             alias: alias,
@@ -548,7 +548,7 @@ struct QuickstartViewTests {
                 == QuickstartCoordinator.lowMemoryChoice.alias
         )
 
-        // Under heavier pressure the 0.6B would trip the same guard. Do not
+        // Under heavier pressure the 1.2B would trip the same guard. Do not
         // advertise a reassuring switch that merely opens a second warning.
         let noSafeEscape = ModelSizing.MemoryWarning(
             alias: QuickstartCoordinator.defaultChoice.alias,
@@ -556,7 +556,7 @@ struct QuickstartViewTests {
             isAutoRespawn: false,
             severity: .unsafe,
             footprintGB: recoverable.footprintGB,
-            freeGB: 5.0,
+            freeGB: 3.0,
             totalGB: 18
         )
         #expect(QuickstartView.lowMemoryRecoveryChoice(for: noSafeEscape) == nil)

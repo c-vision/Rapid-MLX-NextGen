@@ -373,6 +373,17 @@
     "mtp_draft_model": "rapid-mlx/Qwen3.8-27B-mixed-3.5bpw-MLX",
     "mtp_speculative_tokens": 3
   },
+  "qwen3.8-flash-next-4bit": {
+    "hf_path": "rapid-mlx/Qwen3.8-Flash-Next-4bit",
+    "tool_call_parser": "hermes",
+    "reasoning_parser": "qwen3",
+    "is_hybrid": true,
+    "is_hybrid_explicit": true,
+    "is_moe": true,
+    "supports_spec_decode": false,
+    "min_memory_gb": 128,
+    "experimental": true
+  },
   "qwen3.6-35b-nvfp4": {
     "hf_path": "mlx-community/Qwen3.6-35B-A3B-nvfp4",
     "tool_call_parser": "qwen3_coder_xml",
