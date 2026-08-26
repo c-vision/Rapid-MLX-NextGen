@@ -20,7 +20,7 @@ import os
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -1091,6 +1091,7 @@ class EngineCore:
         reasoning_budget_logits_processor: Any | None = None,
         suppressed_tokens_logits_processor: Any | None = None,
         lifecycle_admission_token: str | None = None,
+        on_request_committed: Callable[[], None] | None = None,
     ) -> str:
         """
         Add a request for processing.
@@ -1295,6 +1296,9 @@ class EngineCore:
                 raise
         else:
             self.scheduler.add_request(request)
+
+        if on_request_committed is not None:
+            on_request_committed()
 
         # Wake the engine loop if it's blocked on the idle event.
         # asyncio.Event.set() is loop-thread-safe when called from coros

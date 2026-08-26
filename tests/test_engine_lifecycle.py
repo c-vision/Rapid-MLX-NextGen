@@ -217,6 +217,89 @@ async def test_pre_scheduler_abort_emits_terminal_streaming_error():
 
 
 @pytest.mark.asyncio
+async def test_text_core_reports_scheduler_commit_before_waiting_for_output():
+    from vllm_mlx.request import SamplingParams
+
+    core = EngineCore.__new__(EngineCore)
+    committed = []
+
+    class SchedulerStub:
+        def __init__(self):
+            self.requests = {}
+
+        def add_request(self, request):
+            self.requests[request.request_id] = request
+
+    core.scheduler = SchedulerStub()
+    core._hybrid_throttle = False
+    core._output_collectors = {}
+    core._stream_states = {}
+    core._finished_events = {}
+    core._mlx_executor = None
+    core._idle_event = asyncio.Event()
+    core.config = SimpleNamespace(stream_interval=1)
+
+    request_id = await core.add_request(
+        "prompt",
+        SamplingParams(max_tokens=1),
+        request_id="committed",
+        on_request_committed=lambda: committed.append(
+            "committed" if "committed" in core.scheduler.requests else "too-early"
+        ),
+    )
+
+    assert request_id == "committed"
+    assert committed == ["committed"]
+
+
+@pytest.mark.asyncio
+async def test_mllm_reports_commit_after_output_queue_is_ready():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.output_queues = {}
+    scheduler.add_request = lambda **_kwargs: "committed"
+    committed = []
+
+    request_id = await scheduler.add_request_async(
+        "prompt",
+        on_request_committed=lambda: committed.append(
+            "committed" if "committed" in scheduler.output_queues else "too-early"
+        ),
+    )
+
+    assert request_id == "committed"
+    assert committed == ["committed"]
+
+
+@pytest.mark.asyncio
+async def test_direct_non_stream_generation_transfers_admission_at_commit():
+    engine, scheduler = _engine()
+    committed = asyncio.Event()
+
+    class AsyncCoreStub:
+        def __init__(self):
+            self.engine = SimpleNamespace(scheduler=scheduler)
+
+        async def generate(self, **kwargs):
+            kwargs["on_request_committed"]()
+            committed.set()
+            await asyncio.Event().wait()
+
+    engine._engine = AsyncCoreStub()
+    engine._loaded = True
+
+    generation = asyncio.create_task(engine.generate("prompt", max_tokens=1))
+    await committed.wait()
+
+    assert engine._admission_reservations == 0
+    assert engine._admission_tokens == set()
+    assert engine._current_admission_token() is None
+
+    generation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await generation
+
+
+@pytest.mark.asyncio
 async def test_wait_pause_allows_request_reserved_before_pause_to_enter_scheduler():
     engine, scheduler = _engine(reservations=1)
 

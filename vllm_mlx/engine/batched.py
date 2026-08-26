@@ -1074,6 +1074,19 @@ class BatchedEngine(BaseEngine):
             return None
         return context[1][-1]
 
+    def _ensure_generation_admission(self) -> tuple[str, bool]:
+        """Return an active token, reserving one for direct/repeated calls."""
+
+        token = self._current_admission_token()
+        with self._admission_lock:
+            if token is not None and token in self._admission_tokens:
+                return token, False
+        self.check_admission()
+        token = self._current_admission_token()
+        if token is None:  # pragma: no cover - check_admission always publishes it
+            raise RuntimeError("admission reservation did not publish a token")
+        return token, True
+
     def bind_admission_task(self, task: asyncio.Task) -> None:
         """Transfer a route reservation to its actual generation task."""
 
@@ -1096,7 +1109,9 @@ class BatchedEngine(BaseEngine):
             aborted.remove(task)
             return True
 
-    def _transfer_admission_to_scheduler(self, token: str | None) -> None:
+    def _transfer_admission_to_scheduler(
+        self, token: str | None, *, clear_context: bool = False
+    ) -> None:
         """End route ownership once the scheduler has committed the request."""
 
         if token is None:
@@ -1104,11 +1119,13 @@ class BatchedEngine(BaseEngine):
         with self._admission_lock:
             context = _admission_token_context.get()
             stack = context[1] if context is not None and context[0] == id(self) else ()
-            # The streaming route still calls release in its terminal guard.
-            # Keep this task's consumed token in context as a tombstone so that
-            # terminal release is an exact no-op instead of popping a token
-            # owned by a concurrent request with a different context.
-            self._consume_admission_token_locked(token, stack, clear_context=False)
+            # Route-owned streaming requests still release in their terminal
+            # guard, so their consumed token remains as a tombstone and makes
+            # that release an exact no-op. Direct/repeated generate calls own
+            # their token and clear it at commit.
+            self._consume_admission_token_locked(
+                token, stack, clear_context=clear_context
+            )
 
     def lifecycle_status(self) -> dict[str, object]:
         """Return engine-owned admission and scheduler activity."""
@@ -2052,7 +2069,12 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
-        admission_token = self._current_admission_token()
+        admission_token, owns_admission = self._ensure_generation_admission()
+
+        def request_committed() -> None:
+            self._transfer_admission_to_scheduler(
+                admission_token, clear_context=owns_admission
+            )
 
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all requests when model is multimodal.
@@ -2080,19 +2102,25 @@ class BatchedEngine(BaseEngine):
                 for k in ("repetition_penalty", "presence_penalty", "frequency_penalty")
                 if k in kwargs
             }
-            output = await self._mllm_scheduler.generate(
-                prompt=prompt,
-                images=images,
-                videos=videos,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stop=stop,
-                video_fps=kwargs.pop("video_fps", None),
-                video_max_frames=kwargs.pop("video_max_frames", None),
-                lifecycle_admission_token=admission_token,
-                **_mllm_penalty_kwargs,
-            )
+            try:
+                output = await self._mllm_scheduler.generate(
+                    prompt=prompt,
+                    images=images,
+                    videos=videos,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop,
+                    video_fps=kwargs.pop("video_fps", None),
+                    video_max_frames=kwargs.pop("video_max_frames", None),
+                    lifecycle_admission_token=admission_token,
+                    on_request_committed=request_committed,
+                    **_mllm_penalty_kwargs,
+                )
+            except BaseException:
+                if owns_admission:
+                    self.release_admission_reservation()
+                raise
             mllm_full_text = output.output_text or ""
             if mllm_assistant_text_prefix:
                 mllm_full_text = mllm_assistant_text_prefix + mllm_full_text
@@ -2185,17 +2213,23 @@ class BatchedEngine(BaseEngine):
                     has_tools=False,
                     as_token_ids=False,
                 )
-        output = await self._engine.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            prefix_boundary=prefix_boundary,
-            has_tools=has_tools,
-            requires_prompt_integrity=requires_prompt_integrity,
-            grammar_logits_processor=grammar_logits_processor,
-            reasoning_budget_logits_processor=reasoning_budget_logits_processor,
-            suppressed_tokens_logits_processor=suppressed_tokens_logits_processor,
-            lifecycle_admission_token=admission_token,
-        )
+        try:
+            output = await self._engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                prefix_boundary=prefix_boundary,
+                has_tools=has_tools,
+                requires_prompt_integrity=requires_prompt_integrity,
+                grammar_logits_processor=grammar_logits_processor,
+                reasoning_budget_logits_processor=reasoning_budget_logits_processor,
+                suppressed_tokens_logits_processor=suppressed_tokens_logits_processor,
+                lifecycle_admission_token=admission_token,
+                on_request_committed=request_committed,
+            )
+        except BaseException:
+            if owns_admission:
+                self.release_admission_reservation()
+            raise
 
         if assistant_text_prefix:
             # Prepend the forced prefix to the raw text so the tool

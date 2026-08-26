@@ -24,7 +24,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -1862,6 +1862,7 @@ class MLLMScheduler:
         stop: list[str] | None = None,
         video_fps: float | None = None,
         video_max_frames: int | None = None,
+        on_request_committed: Callable[[], None] | None = None,
         **kwargs,
     ) -> str:
         """
@@ -1897,6 +1898,8 @@ class MLLMScheduler:
 
         # Create output queue for streaming
         self.output_queues[request_id] = asyncio.Queue()
+        if on_request_committed is not None:
+            on_request_committed()
 
         return request_id
 
