@@ -1082,6 +1082,51 @@ async def test_task_cancel_after_primary_commit_preserves_new_route():
 
 
 @pytest.mark.asyncio
+async def test_task_cancel_during_sibling_cleanup_reopens_remaining_sibling():
+    registry = ModelRegistry()
+    primary_engine = FakeLifecycleEngine()
+    primary = entry("chat-old", primary_engine)
+    blocking_engine = BlockingStopLifecycleEngine()
+    blocking = entry("chat-blocking", blocking_engine)
+    remaining_engine = FakeLifecycleEngine()
+    remaining = entry("chat-remaining", remaining_engine)
+    registry.add(primary, is_default=True)
+    registry.add(blocking)
+    registry.add(remaining)
+
+    async def loader(name: str, path: str | None, performance=None):
+        return entry(name)
+
+    manager = ResidentModelManager(registry, loader, memory_reader=lambda: 0)
+    manager.register_primary(primary, estimated_bytes=4 * GIB)
+    for sibling in (blocking, remaining):
+        manager._index_record(
+            ResidencyRecord(
+                entry=sibling,
+                estimated_bytes=4 * GIB,
+                loaded_at=0,
+                last_used_at=0,
+            )
+        )
+
+    replacement = asyncio.create_task(
+        manager.load("chat-new", replace_group="assistant", replace_mode="wait")
+    )
+    await blocking_engine.stop_started.wait()
+
+    replacement.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await replacement
+
+    assert registry.default_name == "chat-new"
+    assert [item.model_name for item in registry.list_entries()] == [
+        "chat-remaining",
+        "chat-new",
+    ]
+    assert remaining_engine.paused is False
+
+
+@pytest.mark.asyncio
 async def test_wait_replacement_retires_drained_engine_with_http_lease_finalizing():
     registry = ModelRegistry()
     old_engine = FakeLifecycleEngine()
