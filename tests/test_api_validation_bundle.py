@@ -285,6 +285,11 @@ def _build_embed_app(patch_cfg, monkeypatch, embed_return):
 
 
 class TestEmbeddingsRoute:
+    def setup_method(self):
+        # Embeddings route + L2-normalize touch mlx tensors; skip on the
+        # no-MLX coverage job rather than crash it (issue #2395 enrollment).
+        pytest.importorskip("mlx")
+
     def test_dimensions_truncates_vector(self, patched_config, monkeypatch):
         """Slice to the requested length, then L2-normalize so the
         result is still a valid embedding (see
@@ -660,6 +665,54 @@ class TestPsCommandPortParsing:
         assert port == "8000"
 
 
+class TestPsCommandServedNameDisplay:
+    """Issue #2353: ``rapid-mlx ps`` must surface ``--served-model-name`` as the
+    API identity, with the requested alias/checkpoint shown as secondary."""
+
+    def _serve(self, capsys, *extra: str):
+        """Run ``ps_command`` against a single fake serve process with ``extra``
+        argv appended, and return its printed rows."""
+        import time as _time
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from vllm_mlx import cli
+
+        class _Proc:
+            info = {
+                "pid": 1234,
+                "cmdline": ["rapid-mlx", "serve", "lfm2.5-1b-4bit", *extra],
+                "create_time": _time.time() - 60,
+            }
+
+        with patch("psutil.process_iter", return_value=[_Proc()]):
+            cli.ps_command(SimpleNamespace())
+        return capsys.readouterr().out
+
+    def test_served_model_name_leads_the_model_cell(self, capsys):
+        out = self._serve(
+            capsys,
+            "--port",
+            "8123",
+            "--served-model-name",
+            "studio-assistant",
+        )
+        assert "studio-assistant (lfm2.5-1b-4bit)" in out, out
+        # The API identity is what the process row leads with.
+        assert "MODEL" in out
+
+    def test_no_served_model_name_shows_alias(self, capsys):
+        out = self._serve(capsys)
+        assert "lfm2.5-1b-4bit" in out, out
+        assert "studio-assistant" not in out
+
+    def test_served_model_name_equals_form(self, capsys):
+        """The ``--served-model-name=NAME`` syntax must produce the same MODEL
+        cell as the split form."""
+        out = self._serve(capsys, "--served-model-name=studio-assistant")
+        assert "studio-assistant (lfm2.5-1b-4bit)" in out, out
+
+
 class TestCompletionsSuffixRejection:
     def _build_completions_app(self, patch_cfg, monkeypatch):
         from vllm_mlx.routes import completions as comp_route
@@ -753,6 +806,11 @@ class TestMLLMBatchGeneratorFailsLoud:
         import vllm_mlx
 
         return Path(vllm_mlx.__file__).with_name("mllm_batch_generator.py").read_text()
+
+    def setup_method(self):
+        # MLLM batch-generator error paths touch mlx multimodal preprocessing;
+        # skip on the no-MLX coverage job rather than crash it (#2395).
+        pytest.importorskip("mlx")
 
     def test_image_branch_raises_explicit_client_error(self):
         src = self._source()

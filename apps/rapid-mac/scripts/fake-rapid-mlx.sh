@@ -90,6 +90,17 @@ def _pulled_audio_aliases():
         return set()
 
 
+def _pulled_model_aliases():
+    state_path = _setting("FAKE_PULL_STATE")
+    if not state_path:
+        return set()
+    try:
+        with open(state_path) as stream:
+            return {line.strip() for line in stream if line.strip()}
+    except OSError:
+        return set()
+
+
 def _parse_args(argv):
     """Match the real rapid-mlx CLI shape closely enough that
     ServerManager's spawn arguments work unmodified.
@@ -1159,6 +1170,11 @@ def _emit_catalog(subcommand, alias):
         print("Cached models")
         print("Alias                  Repo                   Size")
         print("---------------------  ---------------------  ------")
+        pulled_models = _pulled_model_aliases()
+        if "lfm2.5-2.6b-4bit" in pulled_models:
+            print("lfm2.5-2.6b-4bit      fake-org/fake-repo        1.6 GB")
+        if "lfm2.5-1b-4bit" in pulled_models:
+            print("lfm2.5-1b-4bit        fake-org/fake-repo        720 MB")
         if _setting("FAKE_SETTINGS_MTP") != "1":
             if _setting("FAKE_VISION_CHAT") == "1":
                 # This is a behavioural fixture, not a real checkpoint.  Keep
@@ -1272,6 +1288,11 @@ def main():
                 with open(state_path, "a") as stream:
                     stream.write(f"{args.alias}\n")
             sys.exit(0)
+        if args.subcommand == "pull":
+            state_path = _setting("FAKE_PULL_STATE")
+            if state_path:
+                with open(state_path, "a") as stream:
+                    stream.write(f"{args.alias}\n")
         _emit_catalog(args.subcommand, args.alias)
         sys.exit(0)
 

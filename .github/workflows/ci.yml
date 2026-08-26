@@ -274,6 +274,8 @@ jobs:
         run: |
           pytest \
             tests/test_cli_connect.py \
+            tests/test_cli_offline_serve.py \
+            tests/test_cli_chat.py \
             tests/test_mcp_security.py \
             tests/test_structured_output.py \
             tests/test_reasoning_parser.py \
@@ -357,16 +359,23 @@ jobs:
             tests/test_community_bench_upload.py \
             tests/test_music_engine.py \
             tests/test_audio_model_worker.py \
+            tests/test_server_load_model_order.py \
+            tests/test_ready_banner_timing.py \
+            tests/test_api_validation_bundle.py \
             tests/test_aliases_contract.py \
             tests/test_chat_template_registry.py \
             tests/test_alias_subfolder.py \
             tests/test_download_gate.py \
+            tests/test_cli_models.py \
             tests/test_first_run_guide.py \
+            tests/test_mirror_pull.py \
+            tests/test_pull_summary.py \
             tests/test_ram_tier_recommendations_agree.py \
             tests/test_version_sync.py \
             tests/test_pull_variant_selection.py \
             tests/test_share_cli.py \
             tests/test_cli_models.py \
+            tests/test_doctor_env_health.py \
             -v --tb=short \
             -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache" \
             --cov=vllm_mlx \

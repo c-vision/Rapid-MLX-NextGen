@@ -76,10 +76,6 @@ struct ModelPickerBar: View {
     /// send). All the catalog/recommendation/download/delete logic still
     /// applies; only the surrounding control strip is dropped.
     var composerStyle: Bool = false
-    /// False while a first-launch decision sheet is still pending. Catalog
-    /// refresh shells out to `rapid-mlx models/ls`, which can inspect model
-    /// caches and must not run before the user's first interaction (#1560).
-    var catalogRefreshEnabled: Bool = true
     /// Called only for explicit model-row gestures, never when catalog
     /// initialization fills an empty selection.
     var onUserSelection: (String) -> Void = { _ in }
@@ -305,9 +301,8 @@ struct ModelPickerBar: View {
         .task(id: PickerCatalogKey(
             binaryPath: server.binaryPath,
             cacheGeneration: downloads.cacheGeneration,
-            refreshEnabled: catalogRefreshEnabled
+            refreshEnabled: true
         )) {
-            guard catalogRefreshEnabled else { return }
             await refreshCatalog(force: true)
         }
         // F-LWT-1: mirror the picker selection to the Quickstart

@@ -92,6 +92,31 @@ def test_load_model_enables_native_tool_format_when_parser_supports_it(monkeypat
     assert server._engine.preserve_native_tool_format is True
 
 
+@pytest.mark.parametrize("served,expected", [("studio-assistant", True), (None, False)])
+def test_load_model_tracks_explicit_served_model_name(monkeypatch, served, expected):
+    """Issue #2353: ``load_model(..., served_model_name=...)`` must set the
+    flag the readiness banner consumes, and leave it clear when no override
+    is supplied — otherwise the banner would silently fall back to the
+    catalog alias."""
+    from vllm_mlx import server
+
+    monkeypatch.setattr(server, "BatchedEngine", _StubEngine)
+    monkeypatch.setattr(server, "_engine", None, raising=False)
+    monkeypatch.setattr(server, "_enable_auto_tool_choice", False, raising=False)
+    monkeypatch.setattr(server, "_tool_call_parser", None, raising=False)
+    monkeypatch.setattr(server, "_reasoning_parser_name", None, raising=False)
+    monkeypatch.setattr(server, "_reasoning_parser", None, raising=False)
+    monkeypatch.setattr(server, "_tool_parser_instance", None, raising=False)
+    monkeypatch.setattr(server, "_mcp_manager", None, raising=False)
+    monkeypatch.setattr(server, "_enable_tool_logits_bias", False, raising=False)
+    monkeypatch.setattr(server, "_model_alias", None, raising=False)
+    monkeypatch.setattr(server, "_served_model_name_set", not expected, raising=False)
+
+    server.load_model("mlx-community/Qwen3.5-9B-4bit", served_model_name=served)
+
+    assert server._served_model_name_set is expected
+
+
 def _stub_routing_globals(monkeypatch, server):
     """Neutralize the load_model globals that the routing tests don't exercise."""
     monkeypatch.setattr(server, "BatchedEngine", _StubEngine)
@@ -230,6 +255,7 @@ async def test_startup_and_runtime_use_identical_checkpoint_lane_contract(
     expected_force_text,
 ):
     """Startup and residency must hand the same resolved path/lane to engine."""
+    pytest.importorskip("mlx")  # checkpoint-lane contract drives real mlx engine
     from vllm_mlx import server
     from vllm_mlx.model_profile import ModelProfile
 
@@ -463,6 +489,7 @@ def test_load_model_infers_programmatic_max_tokens_explicit(monkeypatch):
 def test_load_model_mtp_kwarg_translates_to_scheduler_config(
     monkeypatch, scheduler_config_stub
 ):
+    pytest.importorskip("mlx")  # mtp spec-decode path imports mlx.core (no-MLX job)
     from vllm_mlx import server
 
     monkeypatch.setattr(server, "BatchedEngine", _StubEngine)
@@ -486,6 +513,9 @@ def test_load_model_mtp_kwarg_translates_to_scheduler_config(
 
 
 def test_load_model_mtp_kwarg_rejects_conflicting_spec_decode(scheduler_config_stub):
+    pytest.importorskip(
+        "mlx"
+    )  # scheduler/spec-decode path requires mlx (no-MLX coverage job)
     from vllm_mlx import server
 
     cfg = scheduler_config_stub()
@@ -502,6 +532,9 @@ def test_load_model_mtp_kwarg_rejects_conflicting_spec_decode(scheduler_config_s
 def test_load_model_mtp_kwarg_rejects_conflicting_suffix_config(
     scheduler_config_stub,
 ):
+    pytest.importorskip(
+        "mlx"
+    )  # scheduler/spec-decode path requires mlx (no-MLX coverage job)
     from vllm_mlx import server
 
     with pytest.raises(ValueError, match="enable_suffix_decoding=True"):
@@ -515,6 +548,9 @@ def test_load_model_mtp_kwarg_rejects_conflicting_suffix_config(
 def test_load_model_mtp_kwarg_rejects_conflicting_dflash_config(
     scheduler_config_stub,
 ):
+    pytest.importorskip(
+        "mlx"
+    )  # scheduler/spec-decode path requires mlx (no-MLX coverage job)
     from vllm_mlx import server
 
     with pytest.raises(ValueError, match="dflash_drafter_path"):
@@ -597,6 +633,9 @@ def test_load_model_mtp_kwarg_rejects_legacy_optimistic_config(
     scheduler_config carrying ``mtp_optimistic=True`` must fail because
     the direct mutation of ``spec_decode='mtp'`` below would bypass
     ``__post_init__`` and silently drop the flag under the vendored path."""
+    pytest.importorskip(
+        "mlx"
+    )  # scheduler/spec-decode path requires mlx (no-MLX coverage job)
     from vllm_mlx import server
 
     # SchedulerConfig(mtp_optimistic=True) alone (spec_decode="none") is

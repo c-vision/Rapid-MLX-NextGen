@@ -195,6 +195,7 @@ final class DictationController {
         let cached: Bool
     }
     private var catalogByAlias: [String: CatalogFacts] = [:]
+    private let onProductValueDelivered: @MainActor (ProductValueKind) -> Void
 
     init(
         server: ServerManager,
@@ -212,6 +213,7 @@ final class DictationController {
         testingRecorderCancel: (@MainActor () -> Void)? = nil,
         testingTranscribeCancel: (@MainActor () -> Void)? = nil,
         testingInitialModelPreparationDeferred: Bool? = nil,
+        onProductValueDelivered: @escaping @MainActor (ProductValueKind) -> Void = { _ in },
         audioCatalogLoader: @escaping @MainActor (URL) async -> [ModelEntry]? = {
             await ModelCatalog.audioEntriesIfAvailable(binary: $0)
         }
@@ -228,6 +230,7 @@ final class DictationController {
         self.testingRecorderStart = testingRecorderStart
         self.testingRecorderCancel = testingRecorderCancel
         self.testingTranscribeCancel = testingTranscribeCancel
+        self.onProductValueDelivered = onProductValueDelivered
 
         let defaults = UserDefaults.standard
         let restoredIsEnabled = testingEnabled ?? defaults.bool(forKey: Keys.enabled)
@@ -993,6 +996,7 @@ final class DictationController {
                 appName: appName,
                 archiveAudio: archiveAudio
             )
+            onProductValueDelivered(.dictationTranscript)
         } catch {
             guard !Task.isCancelled,
                   transcribeRequestID == requestID,

@@ -402,6 +402,65 @@ def test_cached_view_recognizes_complete_unmapped_whisper_npz(
     assert repo in out
 
 
+# --- #2406 part A: _cache_entry_is_runnable routes audio families -----------
+
+
+def test_cache_entry_runnable_for_cached_kokoro(tmp_path, monkeypatch):
+    """A cached Kokoro repo (``kokoro-v1_0.safetensors``) is runnable — the
+    audio-family branch, not the text ``model*.safetensors`` probe."""
+    repo = "mlx-community/Kokoro-82M-bf16"
+    cache_root = tmp_path / "hf-cache"
+    repo_root = cache_root / "models--mlx-community--Kokoro-82M-bf16"
+    sha = "kokoro123"
+    snap = repo_root / "snapshots" / sha
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text("{}")
+    (snap / "kokoro-v1_0.safetensors").write_bytes(b"k" * 4096)
+    refs = repo_root / "refs"
+    refs.mkdir()
+    (refs / "main").write_text(sha)
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache_root))
+
+    assert cli._cache_entry_is_runnable(repo) is True
+
+
+def test_cache_entry_runnable_for_cached_whisper_turbo(tmp_path, monkeypatch):
+    """A cached whisper-large-v3-turbo (``weights.safetensors``, not NPZ) is
+    runnable via the audio-family branch."""
+    repo = "mlx-community/whisper-large-v3-turbo"
+    cache_root = tmp_path / "hf-cache"
+    repo_root = cache_root / "models--mlx-community--whisper-large-v3-turbo"
+    sha = "w12345"
+    snap = repo_root / "snapshots" / sha
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text("{}")
+    (snap / "weights.safetensors").write_bytes(b"w" * 4096)
+    refs = repo_root / "refs"
+    refs.mkdir()
+    (refs / "main").write_text(sha)
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache_root))
+
+    assert cli._cache_entry_is_runnable(repo) is True
+
+
+def test_cache_entry_not_runnable_for_metadata_only_kokoro(tmp_path, monkeypatch):
+    """A Kokoro repo with only config.json (no weights) is NOT runnable — the
+    weightless-cache guard must hold for audio families too."""
+    repo = "mlx-community/Kokoro-82M-bf16"
+    cache_root = tmp_path / "hf-cache"
+    repo_root = cache_root / "models--mlx-community--Kokoro-82M-bf16"
+    sha = "kokoro-stub"
+    snap = repo_root / "snapshots" / sha
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text("{}")
+    refs = repo_root / "refs"
+    refs.mkdir()
+    (refs / "main").write_text(sha)
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache_root))
+
+    assert cli._cache_entry_is_runnable(repo) is False
+
+
 def test_cached_view_marks_known_partial_repo_incomplete(tmp_path, monkeypatch, capsys):
     """Metadata-only cache directories must not advertise an alias as ready."""
     from vllm_mlx.model_aliases import list_profiles

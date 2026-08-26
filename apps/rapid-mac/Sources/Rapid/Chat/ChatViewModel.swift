@@ -255,6 +255,10 @@ final class ChatViewModel {
     /// process; production wires this from ``RapidApp.init``.
     private weak var server: ServerManager?
 
+    /// App-owned lifecycle signal for a real, visible assistant completion.
+    /// Kept as a callback so chat has no dependency on telemetry policy.
+    private let onProductValueDelivered: @MainActor (ProductValueKind) -> Void
+
     init(
         client: ChatStreamClient = ChatStreamClient(),
         tools: any ToolRegistry = EmptyToolRegistry(),
@@ -263,7 +267,8 @@ final class ChatViewModel {
         customInstructions: CustomInstructionsConfig? = nil,
         server: ServerManager? = nil,
         persistsConversations: Bool = true,
-        conversationStoreURL: URL? = nil
+        conversationStoreURL: URL? = nil,
+        onProductValueDelivered: @escaping @MainActor (ProductValueKind) -> Void = { _ in }
     ) {
         self.client = client
         self.tools = tools
@@ -273,6 +278,7 @@ final class ChatViewModel {
         self.server = server
         self.persistsConversations = persistsConversations
         self.conversationStoreURL = conversationStoreURL
+        self.onProductValueDelivered = onProductValueDelivered
         // Seed disabledTools from the persistent store. Anything explicitly set
         // to ``false`` in UserDefaults goes in; unknown keys default to enabled.
         var disabled = Set<String>()
@@ -1846,6 +1852,7 @@ final class ChatViewModel {
         globalInstruction: String = "",
         conversationInstruction: String = ""
     ) async {
+        var currentPlaceholder = initialPlaceholder
         defer {
             // A stream that outlived a conversation switch must not reset
             // the NEW conversation's streaming state or clear a newer
@@ -1853,9 +1860,14 @@ final class ChatViewModel {
             if epoch == conversationEpoch {
                 isStreaming = false
                 inflight = nil
+                if !Task.isCancelled,
+                   let delivered = currentMessage(index: currentPlaceholder),
+                   delivered.status == .complete,
+                   !delivered.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    onProductValueDelivered(.chatReply)
+                }
             }
         }
-        var currentPlaceholder = initialPlaceholder
         var toolExecutionsLeft = maxToolExecutions
         let toolExecutor = NativeToolCallExecutor(registry: tools)
         var appGroundingSources: [GroundingSource] = []

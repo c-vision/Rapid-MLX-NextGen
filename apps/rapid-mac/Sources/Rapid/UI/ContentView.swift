@@ -53,6 +53,7 @@ struct ContentView: View {
     @Environment(BrowseApprovalStore.self) private var browseApproval
     @Environment(MCPCatalog.self) private var mcpCatalog
     @Environment(MCPToolApprovalStore.self) private var mcpApproval
+    @Environment(DeferredTelemetryConsentCoordinator.self) private var deferredTelemetryConsent
     @Environment(\.openWindow) private var openWindow
 
     @State private var alias: String = ""
@@ -64,9 +65,6 @@ struct ContentView: View {
     @State private var section: SidebarSection = .chat
     /// Window-level conversation search, opened from the toolbar.
     @State private var showConversationSearch = false
-    /// An absent telemetry preference is an undecided first run, not
-    /// implicit consent.
-    @State private var telemetryConsentPending = TelemetryConsent.needsDecision()
     @SceneStorage("Rapid.showLogs") private var showLogs: Bool = false
     /// Per-session "browse all models" dismissal of the Quickstart card.
     @State private var quickstartDismissedThisSession: Bool = false
@@ -116,9 +114,7 @@ struct ContentView: View {
         // model comes up on first send (implicit lifecycle). Search belongs
         // to the sidebar column beside macOS's native collapse control.
         Group {
-            if telemetryConsentPending {
-                firstRunConsentGate
-            } else if quickstartVisible {
+            if quickstartVisible {
                 // Setup owns the window (Paper 05.1.A). See ``onboardingShell``.
                 onboardingShell
             } else {
@@ -277,14 +273,7 @@ struct ContentView: View {
         // the browse sheet above — an MCP server is an arbitrary local process,
         // so "may the model run this" is a decision that belongs on screen.
         .modifier(MCPToolApprovalDialog(store: mcpApproval))
-        // #1589: keyed on the consent decision rather than fire-once, so
-        // the launch auto-start that stood down for the consent gate gets
-        // its turn the moment the user answers it. The value only ever
-        // moves true → false (once per install), so this is a single
-        // re-run, and the first pass returns at the gate without an
-        // in-flight `server.start` for SwiftUI's task cancellation to
-        // interrupt. Users with no pending decision see one run, as before.
-        .task(id: telemetryConsentPending) { await restorePersistedSession() }
+        .task { await restorePersistedSession() }
         // Keyed exactly as the picker's own catalog task: re-fetch when
         // the engine binary appears and whenever the set of models on
         // disk changes anywhere in the app. Routed through the shared
@@ -293,9 +282,8 @@ struct ContentView: View {
         .task(id: ModelPickerBar.PickerCatalogKey(
             binaryPath: server.binaryPath,
             cacheGeneration: downloads.cacheGeneration,
-            refreshEnabled: !telemetryConsentPending
+            refreshEnabled: true
         )) {
-            guard !telemetryConsentPending else { return }
             await refreshCatalogSnapshot()
         }
         // The selected chat alias may be a secondary resident model rather
@@ -370,8 +358,8 @@ struct ContentView: View {
     ///
     /// Nothing about the state machine moves with it. ``quickstartVisible`` is
     /// the same predicate that gated the sheet, and every alert, dialog and
-    /// task modifier stays attached to the root above this branch, so consent,
-    /// approvals and the launch auto-start all behave exactly as before.
+    /// task modifier stays attached to the root above this branch, so approval
+    /// dialogs and launch auto-start behave exactly as before.
     @ViewBuilder
     private var onboardingShell: some View {
         quickstartSurface
@@ -402,8 +390,10 @@ struct ContentView: View {
             // but was never mounted, so a failed Finder replacement was
             // detected and then silently discarded.
             FailedReplaceBanner()
+            if deferredTelemetryConsent.isPresented {
+                DeferredTelemetryConsentBanner()
+            }
             if let campaign,
-               !telemetryConsentPending,
                !UserDefaults.standard.bool(forKey: campaign.dismissalKey) {
                 CampaignBanner(
                     campaign: campaign,
@@ -836,7 +826,6 @@ struct ContentView: View {
                 readiness: readiness,
                 supportsImageInput: imageAvailability.isAvailable,
                 imageInputUnavailableMessage: imageAvailability.unavailableMessage,
-                catalogRefreshEnabled: !telemetryConsentPending,
                 onUserModelSelection: selectChatModel,
                 onReadinessAction: performReadinessAction,
                 composerFocusRequest: composerFocusRequest
@@ -937,13 +926,6 @@ struct ContentView: View {
         // global onboarding sheet.
         guard ContentView.quickstartCanPresent(in: section) else { return false }
         guard !quickstartDismissedThisSession else { return false }
-        // Telemetry consent comes first. Both surfaces used to be able to fire
-        // together (nothing referenced the other's condition) — tolerable when
-        // Quickstart merely filled the detail pane behind the consent sheet,
-        // but now they compete for the same presentation channel, and macOS
-        // grants that to whichever asks first. Deferring here keeps the order
-        // deterministic: decide on telemetry, then pick a model.
-        guard !telemetryConsentPending else { return false }
         if ContentView.serverEngagedWithDifferentAlias(
             state: server.state,
             quickstartAlias: quickstart.selection.alias
@@ -1036,25 +1018,6 @@ struct ContentView: View {
         case .idle, .stopped, .missing, .crashed:
             return nil
         }
-    }
-
-    // MARK: - First-run telemetry consent
-
-    @ViewBuilder
-    private var firstRunConsentGate: some View {
-        TelemetryConsentView(onDecision: decideTelemetry)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-            .shadow(color: .black.opacity(0.16), radius: 24, y: 8)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(RapidTheme.surfaceCanvas)
-        .accessibilityAddTraits(.isModal)
-    }
-
-    private func decideTelemetry(_ enabled: Bool) {
-        TelemetryConsent.record(enabled: enabled)
-        telemetryConsentPending = false
-        guard enabled else { return }
-        Task { await TelemetrySession.sendStartIfNeeded() }
     }
 
     // MARK: - Missing-sidecar overlay
@@ -1241,7 +1204,6 @@ struct ContentView: View {
         catalog suppliedCatalog: [ModelEntry]? = nil,
         emptyCatalogIsAuthoritative: Bool = false
     ) async {
-        guard !telemetryConsentPending else { return }
         let resolutionWasPending: Bool = {
             if case .pendingCatalog = restoredChatAlias { return true }
             return false
@@ -1306,14 +1268,6 @@ struct ContentView: View {
         catalogEntries: [ModelEntry],
         launchPlan: SessionModelRestore.LaunchPlan
     ) async {
-        // Consent is the first user-controlled surface. Do not even inspect
-        // model caches behind it: the final AutoStartDecision also knows about
-        // this gate, but reaching that decision requires loading the catalog
-        // first (`rapid-mlx models` + `ls`). Besides doing work the user has not
-        // allowed the app to begin yet, that made first-launch UI depend on the
-        // operator's existing HF cache. The task is keyed on this value and
-        // runs again immediately after the user answers.
-        guard !telemetryConsentPending else { return }
         guard launchPlan.shouldAutoStart else {
             autoStartPendingDownload = nil
             return
@@ -1367,12 +1321,6 @@ struct ContentView: View {
             catalogAliases: catalogAliases,
             rejectsAlias: rejectsAlias,
             userOptedIn: autoStartOnLaunch,
-            // #1589: the two first-run surfaces get the launch before
-            // auto-start does. Nothing loads behind the modal consent
-            // sheet, and nothing loads for a user Quickstart still owes
-            // onboarding to — auto-start restores a last-used model, it
-            // does not invent a first one.
-            firstRunDecisionPending: telemetryConsentPending,
             // The SAME predicate the Quickstart sheet presents on (via
             // ``QuickstartCoordinator.isEligible``), minus the server-state
             // gate that this path is about to move. Asking it here rather

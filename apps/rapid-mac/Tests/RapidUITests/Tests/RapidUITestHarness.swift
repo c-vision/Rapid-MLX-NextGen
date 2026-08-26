@@ -84,6 +84,9 @@ final class RapidUITestHarness {
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: fakeSidecar))
         XCTAssertTrue(FileManager.default.fileExists(atPath: appURL.path))
         app = XCUIApplication(url: appURL)
+        app.launchArguments += [
+            "-com.rapidmlx.rapid.telemetry.enabled", "false",
+        ]
         app.launchEnvironment = [
             "HOME": testHome.path,
             "CFFIXED_USER_HOME": testHome.path,
@@ -321,8 +324,6 @@ final class RapidUITestHarness {
     }
 
     private func dismissFirstRunIfNeeded() {
-        let decline = element("TelemetryConsent.DontShare")
-        if decline.waitForExistence(timeout: 5) { decline.click() }
         let skip = element("Quickstart.Skip")
         if skip.waitForExistence(timeout: 10) { skip.click() }
     }

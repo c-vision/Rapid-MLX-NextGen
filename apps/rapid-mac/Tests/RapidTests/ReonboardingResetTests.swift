@@ -133,7 +133,7 @@ struct ReonboardingResetTests {
         )
         #expect(!FileManager.default.fileExists(atPath: consent.path))
         #expect(defaults.object(forKey: TelemetryConfig.enabledKey) == nil,
-                "the consent sheet is gated on this key being absent")
+                "the post-value invitation is gated on this key being absent")
     }
 
     /// The whole-domain wipe also removes Quickstart's own keys, so the

@@ -198,9 +198,6 @@ struct ChatView: View {
     /// unavailable. Kept alongside the Boolean so mouse, keyboard, paste,
     /// drag/drop, and VoiceOver all present the same contract.
     var imageInputUnavailableMessage: String? = nil
-    /// First launch must not inspect model caches behind the consent sheet.
-    /// The parent flips this after the user makes that one-time decision.
-    var catalogRefreshEnabled: Bool = true
     /// Explicit picker gesture signal used by launch auto-start arbitration.
     /// Catalog-driven default selection intentionally does not call this.
     var onUserModelSelection: (String) -> Void = { _ in }
@@ -778,7 +775,6 @@ struct ChatView: View {
                 alias: $alias,
                 quickstart: quickstart,
                 composerStyle: true,
-                catalogRefreshEnabled: catalogRefreshEnabled,
                 onUserSelection: onUserModelSelection
             )
             sendOrStopButton

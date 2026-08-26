@@ -42,6 +42,7 @@ struct SettingsView: View {
     /// onboarding alerts" affordance that brings the prompt back.
     @Environment(DockVisibilityPromptStore.self) private var dockPromptStore
     @Environment(QuickstartCoordinator.self) private var quickstart
+    @Environment(DeferredTelemetryConsentCoordinator.self) private var deferredTelemetryConsent
     @State private var confirmingSetupRestart = false
     @State private var restartingSetup = false
 
@@ -573,12 +574,12 @@ struct SettingsView: View {
             }
             .toggleStyle(TrailingSettingsToggleStyle())
             .accessibilityIdentifier("Settings.Privacy.TelemetryToggle")
-            // The first-run consent sheet (ContentView) writes the same
+            // The post-value consent invitation writes the same
             // preference, so the seeded value can be stale by the time this
             // panel is first shown...
             .onAppear { telemetryEnabled = TelemetryConfig.isEnabled }
             // ...and it can go stale *while* the panel is open: Settings can be
-            // opened over the still-attached first-run sheet, and answering
+            // opened while the invitation is visible, and answering
             // "Share" there would otherwise leave this switch reading off while
             // telemetry is running. Re-reading on any defaults change keeps the
             // two surfaces honest without either one knowing about the other.
@@ -656,7 +657,7 @@ struct SettingsView: View {
     /// rebuilds the view for unrelated reasons.
     ///
     /// Seeded once and re-read in ``onAppear`` so a change made elsewhere —
-    /// the first-run consent sheet writes the same key — is still reflected.
+    /// the post-value consent invitation writes the same key — is still reflected.
     @State private var telemetryEnabled = TelemetryConfig.isEnabled
 
     private var telemetryEnabledBinding: Binding<Bool> {
@@ -668,10 +669,7 @@ struct SettingsView: View {
                 // reintroduce the same problem the moment a write is deferred
                 // or rejected.
                 telemetryEnabled = enabled
-                TelemetryConsent.record(enabled: enabled)
-                if enabled {
-                    Task { await TelemetrySession.sendStartIfNeeded() }
-                }
+                deferredTelemetryConsent.settingsChanged(enabled: enabled)
             }
         )
     }

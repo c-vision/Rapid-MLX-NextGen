@@ -224,6 +224,11 @@ _enable_audio_lane: bool = False
 _model_path: str | None = (
     None  # Actual model path (for cache dir, not affected by --served-model-name)
 )
+# True when ``load_model`` was given an explicit ``--served-model-name``, so
+# downstream surfaces (the readiness banner) can prefer the served API name
+# over the catalog alias. Set regardless of what the name resolves to (issue
+# #2353).
+_served_model_name_set: bool = False
 _default_max_tokens: int = 4096
 _default_max_tokens_is_explicit: bool = False
 _thinking_token_budget: int = 2048  # Extra tokens added for thinking models
@@ -859,10 +864,21 @@ async def lifespan(app: FastAPI):
     # embedded usage where uvicorn is owned elsewhere), fall back silently.
     from vllm_mlx.connect import endpoints_from_bind, render_banner
 
+    # The banner's "Model:" line is the copyable API identity the user
+    # pastes into an SDK request. Prefer the explicit ``--served-model-name``
+    # when one was supplied; otherwise keep the catalog alias. Tracking the
+    # option explicitly (not inferring from ``model_name``/``model_path``
+    # differences) keeps the banner correct even when a served name happens
+    # to equal the resolved path (issue #2353).
+    _banner_model = (
+        _cfg.model_name
+        if _served_model_name_set
+        else (_cfg.model_alias or _cfg.model_name)
+    )
     _ep = endpoints_from_bind(
         _cfg.bind_host,
         _cfg.bind_port,
-        model=_cfg.model_alias or _cfg.model_name,
+        model=_banner_model,
         listen_fd=_cfg.bind_listen_fd,
     )
     if _ep.listen_fd is not None or (_cfg.bind_host and _cfg.bind_port):
@@ -1913,6 +1929,7 @@ def load_model(
         _model_alias, \
         _model_name, \
         _model_path, \
+        _served_model_name_set, \
         _default_max_tokens, \
         _default_max_tokens_is_explicit, \
         _tool_parser_instance, \
@@ -1950,6 +1967,7 @@ def load_model(
     _model_alias = effective_model_alias
     _model_path = model_name
     _model_name = served_model_name or model_name
+    _served_model_name_set = bool(served_model_name)
     _tool_parser_instance = None
 
     # Populate the sampling overlays now that we know which model we're
@@ -2525,7 +2543,7 @@ def _handoff_resident_primary_audio_worker(
 def _set_resident_primary(entry: ModelEntry | None) -> None:
     """Publish a replacement assistant as the legacy/default engine."""
 
-    global _engine, _model_name, _model_alias, _model_path
+    global _engine, _model_name, _model_alias, _model_path, _served_model_name_set
     global _enable_auto_tool_choice, _tool_call_parser, _tool_parser_instance
     global _reasoning_parser, _reasoning_parser_name
 
@@ -2557,6 +2575,9 @@ def _set_resident_primary(entry: ModelEntry | None) -> None:
     _model_name = entry.model_name
     _model_alias = entry.model_name
     _model_path = entry.model_path
+    # A replacement assistant has no --served-model-name override; the banner
+    # must fall back to the alias, so clear the explicit-override marker.
+    _served_model_name_set = False
     _tool_call_parser = entry.tool_call_parser
     _tool_parser_instance = None
     _enable_auto_tool_choice = entry.tool_call_parser is not None
