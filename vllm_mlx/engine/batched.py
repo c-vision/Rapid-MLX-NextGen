@@ -19,6 +19,7 @@ import logging
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from typing import Any
@@ -902,7 +903,7 @@ class BatchedEngine(BaseEngine):
         self._admission_reservations = 0
         self._admission_tokens: set[str] = set()
         self._admission_tasks: dict[str, asyncio.Task] = {}
-        self._lifecycle_aborted_tasks: set[asyncio.Task] = set()
+        self._lifecycle_aborted_tasks: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
         self._generation_paused = False
         self._generation_pause_mode: str | None = None
 
@@ -1009,6 +1010,11 @@ class BatchedEngine(BaseEngine):
             except RuntimeError:
                 owner = None
             if owner is not None:
+                # A task may survive a handled cancellation and later make a
+                # new request. Do not let an old replacement marker bleed into
+                # the new admission; the active cancellation path consumes it
+                # at the route boundary before it can re-enter here.
+                getattr(self, "_lifecycle_aborted_tasks", set()).discard(owner)
                 tasks: dict[str, asyncio.Task] | None = getattr(
                     self, "_admission_tasks", None
                 )
@@ -1059,9 +1065,7 @@ class BatchedEngine(BaseEngine):
             # exercise the public counter-based release contract.
             self._admission_reservations -= 1
         if consumed_token is not None:
-            owner = getattr(self, "_admission_tasks", {}).pop(consumed_token, None)
-            if owner is not None:
-                getattr(self, "_lifecycle_aborted_tasks", set()).discard(owner)
+            getattr(self, "_admission_tasks", {}).pop(consumed_token, None)
         if clear_context and token is not None and token in context_stack:
             remaining = tuple(value for value in context_stack if value != token)
             _admission_token_context.set((id(self), remaining) if remaining else None)
@@ -1190,11 +1194,9 @@ class BatchedEngine(BaseEngine):
                         if token in task_by_token
                     }
                 )
-                aborted_tasks: set[asyncio.Task] | None = getattr(
-                    self, "_lifecycle_aborted_tasks", None
-                )
+                aborted_tasks = getattr(self, "_lifecycle_aborted_tasks", None)
                 if aborted_tasks is None:
-                    aborted_tasks = set()
+                    aborted_tasks = weakref.WeakSet()
                     self._lifecycle_aborted_tasks = aborted_tasks
                 aborted_tasks.update(admitted_tasks)
             pause_admission = getattr(scheduler, "pause_generation_admission", None)

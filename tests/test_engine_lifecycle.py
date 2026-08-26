@@ -400,6 +400,44 @@ async def test_direct_stream_precommit_failure_releases_admission():
 
 
 @pytest.mark.asyncio
+async def test_engine_precommit_cleanup_preserves_lifecycle_route_translation():
+    from fastapi import HTTPException
+
+    from vllm_mlx.service.helpers import _raise_lifecycle_cancel_or_reraise
+
+    engine, scheduler = _engine()
+    entered_precommit = asyncio.Event()
+
+    class StalledCoreStub:
+        def __init__(self):
+            self.engine = SimpleNamespace(scheduler=scheduler)
+
+        async def generate(self, **_kwargs):
+            entered_precommit.set()
+            await asyncio.Event().wait()
+
+    engine._engine = StalledCoreStub()
+    engine._loaded = True
+
+    async def route_boundary():
+        try:
+            await engine.generate("prompt", max_tokens=1)
+        except asyncio.CancelledError as exc:
+            _raise_lifecycle_cancel_or_reraise(engine, exc)
+
+    response = asyncio.create_task(route_boundary())
+    await entered_precommit.wait()
+    status = await asyncio.wait_for(engine.pause_generation("abort"), timeout=1)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await response
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "Request cancelled by model replacement"
+    assert status["admitted_requests"] == 0
+    assert not engine._lifecycle_aborted_tasks
+
+
+@pytest.mark.asyncio
 async def test_direct_mllm_stream_transfers_admission_at_queue_commit():
     engine, _ = _engine()
     committed = asyncio.Event()
