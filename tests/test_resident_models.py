@@ -508,6 +508,19 @@ def residency_activity_contract(monkeypatch):
         with pytest.raises(KeyError):
             await reload_manager.unload("missing")
 
+        async def image_loader(name: str, path: str | None, performance=None):
+            return entry(name, FakeImageEngine())
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(reload_manager, "loader", image_loader)
+            with pytest.raises(ResidentModelError, match="image-gen.*assistant"):
+                await reload_manager.load("wrong-new-group", replace_group="assistant")
+            assert "wrong-new-group" not in reload_registry
+
+            image = await reload_manager.load("resident-image")
+            with pytest.raises(ResidentModelError, match="image-gen.*assistant"):
+                await reload_manager.load(image.model_id, replace_group="assistant")
+
         with pytest.raises(ResidentModelError, match="does not belong"):
             await reload_manager._quiesce_group_locked(replacement, "image", "reject")
 

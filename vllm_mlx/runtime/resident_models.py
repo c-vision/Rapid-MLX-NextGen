@@ -218,14 +218,19 @@ def _effective_replace_group(
 ) -> str | None:
     """Resolve the replacement group to enforce for a just-touched model.
 
-    An explicit ``replace_group`` always wins. Otherwise a generative-media
-    entry derives its own single-slot group; everything else stays unmanaged
-    (``None``) so a bare text load never evicts a sibling.
+    An explicit group must match the entry's actual modality group. Otherwise
+    a generative-media entry derives its own single-slot group; everything else
+    stays unmanaged (``None``) so a bare text load never evicts a sibling.
     """
 
-    if replace_group is not None:
-        return replace_group
     derived = _replacement_group(entry)
+    if replace_group is not None:
+        if replace_group != derived:
+            raise ResidentModelError(
+                f"model {entry.model_name!r} belongs to replacement group "
+                f"{derived!r}, not {replace_group!r}"
+            )
+        return replace_group
     return derived if derived in _SINGLE_SLOT_MEDIA_GROUPS else None
 
 
@@ -605,16 +610,6 @@ class ResidentModelManager:
                     performance=performance,
                 )
                 group = _effective_replace_group(record.entry, replace_group)
-                # ``_effective_replace_group`` returns an explicit group
-                # verbatim, so this is unreachable through every loader caller;
-                # retain the defensive invariant for future resolver changes.
-                if (
-                    replace_group is not None and group != replace_group
-                ):  # pragma: no cover
-                    raise ResidentModelError(
-                        f"model {record.model_id!r} does not belong to replacement "
-                        f"group {replace_group!r}"
-                    )
                 if replace_group is not None and replace_mode != "reject":
                     (
                         candidates,
