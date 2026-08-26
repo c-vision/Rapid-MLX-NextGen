@@ -4921,14 +4921,14 @@ flow_dictation() {
         if jq -e '.data.ui_elements[]?
                   | select(.identifier == "Dictation.Status"
                            and (((.description // .value // .label // "") | tostring)
-                                | startswith("Ready — press")))' \
+                                | startswith("Listening — press")))' \
                  "$OUT/dictation-ready.json" >/dev/null; then
             ready_seen=1; break
         fi
         sleep 0.1
     done
     [[ "$ready_seen" == 1 ]] \
-        || die "Dictation did not become Ready after model warmup"
+        || die "Dictation did not become Listening after model warmup"
 
     # The warmup request must have stayed on the conversation server. A
     # transcription-only start here is the exact silent-eviction regression.

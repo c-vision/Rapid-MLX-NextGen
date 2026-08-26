@@ -29,6 +29,15 @@ class ResidentModelError(RuntimeError):
 class ResidentModelCapacityError(ResidentModelError):
     """The configured ceiling cannot admit a model after eligible eviction."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        replacement_projection: ReplacementProjection | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.replacement_projection = replacement_projection
+
 
 class ResidentModelBusyError(ResidentModelError):
     """A model cannot be removed while it owns active work."""
@@ -74,6 +83,33 @@ class ResidentPerformanceConfig:
                 "cache_memory_mb": self.cache_memory_mb,
             }.items()
             if value is not None
+        }
+
+
+@dataclass(frozen=True)
+class ReplacementProjection:
+    """Admission truth for one assistant replacement request."""
+
+    strategy: str
+    reason: str
+    models_to_free: tuple[tuple[str, int], ...]
+    current_bytes: int
+    requested_bytes: int
+    projected_bytes: int
+    limit_bytes: int
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "strategy": self.strategy,
+            "reason": self.reason,
+            "models_to_free": [
+                {"id": model_id, "estimated_bytes": estimated_bytes}
+                for model_id, estimated_bytes in self.models_to_free
+            ],
+            "current_bytes": self.current_bytes,
+            "requested_bytes": self.requested_bytes,
+            "projected_bytes": self.projected_bytes,
+            "limit_bytes": self.limit_bytes,
         }
 
 
@@ -164,6 +200,7 @@ class ResidencyRecord:
     state: str = "resident"
     measured_bytes: int = 0
     performance: ResidentPerformanceConfig | None = None
+    replacement_projection: ReplacementProjection | None = None
     lease_idle: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def __post_init__(self) -> None:
@@ -372,6 +409,10 @@ class ResidentModelManager:
         self.idle_ttl_seconds = max(0.0, float(idle_ttl_seconds))
         self._clock = clock
         self._memory_reader = memory_reader
+        # Residency is configured before startup loading. Preserve the process
+        # baseline so the protected startup model receives an attributable
+        # footprint instead of treating Python/server memory as releasable.
+        self._baseline_memory_bytes = self._read_memory()
         self._on_primary_handoff = on_primary_handoff
         self._on_primary_changed = on_primary_changed
         self._records: dict[str, ResidencyRecord] = {}
@@ -414,10 +455,10 @@ class ResidentModelManager:
             estimated_bytes=max(
                 1, estimated_bytes or estimate_model_bytes(entry.model_name)
             ),
-            # Process footprint is exposed separately as the authoritative
-            # total. Charging it to the primary row would make that one model
-            # appear to own Python, uvicorn, Metal caches, and every secondary.
-            measured_bytes=0,
+            measured_bytes=max(
+                0,
+                self._read_memory() - self._baseline_memory_bytes,
+            ),
             loaded_at=now,
             last_used_at=now,
             pinned=True,
@@ -509,19 +550,7 @@ class ResidentModelManager:
         if self.memory_limit_bytes <= 0:
             return
         while self._accounted_usage() + incoming_bytes > self.memory_limit_bytes:
-            candidates = sorted(
-                (
-                    record
-                    for record in self._records.values()
-                    if record.model_id not in exclude
-                    and not record.pinned
-                    and not record.primary
-                    and record.active_requests == 0
-                    and record.state == "resident"
-                    and _engine_is_idle(record.entry.engine)
-                ),
-                key=lambda record: record.last_used_at,
-            )
+            candidates = self._eviction_candidates_locked(exclude)
             if not candidates:
                 usage = self._accounted_usage()
                 raise ResidentModelCapacityError(
@@ -532,6 +561,23 @@ class ResidentModelManager:
                     "no idle unpinned model is eligible for eviction"
                 )
             await self._evict_locked(candidates[0], reason="memory_pressure")
+
+    def _eviction_candidates_locked(self, exclude: set[str]) -> list[ResidencyRecord]:
+        """Return the exact idle-LRU order used by admission and eviction."""
+
+        return sorted(
+            (
+                record
+                for record in self._records.values()
+                if record.model_id not in exclude
+                and not record.pinned
+                and not record.primary
+                and record.active_requests == 0
+                and record.state == "resident"
+                and _engine_is_idle(record.entry.engine)
+            ),
+            key=lambda record: record.last_used_at,
+        )
 
     async def load(
         self,
@@ -545,11 +591,15 @@ class ResidentModelManager:
         performance: ResidentPerformanceConfig | None = None,
         reload_if_changed: bool = False,
         replace_mode: str = "reject",
+        memory_policy: str = "keep_then_commit",
+        resolved_group: str | None = None,
     ) -> ResidencyRecord:
         model_name = model_name.strip()
         if not model_name:
             raise ResidentModelError("model must not be empty")
         estimate = max(1, estimated_bytes or estimate_model_bytes(model_name))
+        if memory_policy not in {"keep_then_commit", "evict_first_if_needed"}:
+            raise ResidentModelError(f"unsupported memory policy {memory_policy!r}")
 
         async with self._lock:
             canonical = self._canonical(model_name)
@@ -600,12 +650,22 @@ class ResidentModelManager:
             record: ResidencyRecord | None = None
             candidates: list[ResidencyRecord] = []
             paused_engines: list[object] = []
+            destructive_handoff: PrimaryHandoffLease | None = None
+            destructive_primary = False
+            destructive_primary_publish_attempted = False
+            destructive_replacement = False
+            projection: ReplacementProjection | None = None
             try:
                 if replace_group is not None:
+                    if resolved_group is not None and resolved_group != replace_group:
+                        raise ResidentModelError(
+                            f"model {model_name!r} belongs to replacement group "
+                            f"{resolved_group!r}, not {replace_group!r}"
+                        )
                     if replace_mode == "reject":
-                        # Reject is a non-destructive preflight: close admission
-                        # only after proving the old assistant is already idle,
-                        # so a busy rejection cannot evict unrelated residents.
+                        # Preserve the established busy-before-capacity
+                        # contract without evicting anything: the zero-timeout
+                        # pause closes admission while the projection is read.
                         (
                             candidates,
                             paused_engines,
@@ -613,11 +673,43 @@ class ResidentModelManager:
                             replace_group, replace_mode
                         )
                     else:
-                        # Wait/abort may drain or terminate live traffic. Merely
-                        # identify the protected group here; do not mutate the
-                        # healthy assistant until the replacement has actually
-                        # materialized and passed its modality contract.
-                        candidates = self._replacement_candidates_locked(replace_group)
+                        candidates = self._replacement_candidates_locked(
+                            replace_group,
+                            replace_mode=replace_mode,
+                        )
+                    projection = self._replacement_projection_locked(
+                        estimate,
+                        candidates,
+                        (
+                            memory_policy
+                            if resolved_group == replace_group
+                            else "keep_then_commit"
+                        ),
+                    )
+                    if projection.reason == "role_capacity_insufficient_after_eviction":
+                        raise ResidentModelCapacityError(
+                            "resident model memory ceiling exceeded after projected "
+                            "assistant replacement",
+                            replacement_projection=projection,
+                        )
+                    evict_first = projection.strategy == "evict_first"
+                    if evict_first:
+                        if replace_mode != "reject":
+                            (
+                                candidates,
+                                paused_engines,
+                            ) = await self._quiesce_replacement_group_locked(
+                                replace_group, replace_mode
+                            )
+                        (
+                            destructive_handoff,
+                            destructive_primary,
+                        ) = await self._evict_replacement_before_load_locked(
+                            candidates,
+                            replace_group,
+                        )
+                        destructive_replacement = True
+                        paused_engines = []
                 await self._evict_for_locked(
                     estimate,
                     exclude={model_name, *(item.model_id for item in candidates)},
@@ -640,9 +732,14 @@ class ResidentModelManager:
                     last_used_at=now,
                     pinned=pin,
                     performance=performance,
+                    replacement_projection=projection,
                 )
                 group = _effective_replace_group(record.entry, replace_group)
-                if replace_group is not None and replace_mode != "reject":
+                if destructive_replacement:
+                    record.primary = destructive_primary
+                    if destructive_primary:
+                        record.pinned = True
+                elif replace_group is not None and replace_mode != "reject":
                     (
                         candidates,
                         paused_engines,
@@ -657,9 +754,12 @@ class ResidentModelManager:
                 # Keep the replacement private until the old inference engines
                 # have reached the policy boundary. Publication only makes the
                 # already-quiesced replacement visible to residency readers.
-                self.registry.add(entry)
+                self.registry.add(entry, is_default=record.primary)
                 self._index_record(record)
                 self.loads_total += 1
+                if destructive_primary and self._on_primary_changed is not None:
+                    destructive_primary_publish_attempted = True
+                    self._on_primary_changed(entry)
                 await self._evict_for_locked(
                     0,
                     exclude={
@@ -667,7 +767,10 @@ class ResidentModelManager:
                         *(item.model_id for item in candidates),
                     },
                 )
-                if group is not None:
+                if destructive_handoff is not None:
+                    destructive_handoff.commit(entry)
+                    destructive_handoff = None
+                if group is not None and not destructive_replacement:
                     await self._commit_group_replacement_locked(
                         record, group, candidates
                     )
@@ -694,9 +797,164 @@ class ResidentModelManager:
                                 await result
                         _release_allocator_cache()
                 finally:
-                    await self._resume_engines(paused_engines)
+                    if (
+                        destructive_primary_publish_attempted
+                        and self._on_primary_changed is not None
+                    ):
+                        # Removing the rejected target may auto-promote an
+                        # unrelated secondary. A failed primary publication
+                        # has no valid default until a later load succeeds.
+                        self.registry.clear_default()
+                        try:
+                            self._on_primary_changed(None)
+                        except BaseException:
+                            logger.exception(
+                                "Failed to clear rejected replacement primary"
+                            )
+                    if destructive_handoff is not None:
+                        destructive_handoff.commit(None)
+                    if not destructive_replacement:
+                        await self._resume_engines(paused_engines)
                 raise
             return record
+
+    def _replacement_projection_locked(
+        self,
+        incoming_bytes: int,
+        candidates: list[ResidencyRecord],
+        memory_policy: str,
+    ) -> ReplacementProjection:
+        """Choose rollback-safe or destructive admission before mutation."""
+
+        measured = self._read_memory()
+        reserved = sum(
+            max(record.estimated_bytes, record.measured_bytes)
+            for record in self._records.values()
+            if record.state == "resident"
+        )
+        current = max(measured, reserved)
+        limit = self.memory_limit_bytes
+        replacement_ids = {record.model_id for record in candidates}
+        idle_candidates = self._eviction_candidates_locked(replacement_ids)
+
+        def payload(records: list[ResidencyRecord]) -> tuple[tuple[str, int], ...]:
+            return tuple(
+                (
+                    record.model_id,
+                    max(record.estimated_bytes, record.measured_bytes),
+                )
+                for record in records
+            )
+
+        def projected(records: list[ResidencyRecord]) -> int:
+            released_measured = sum(record.measured_bytes for record in records)
+            released_reserved = sum(
+                max(record.estimated_bytes, record.measured_bytes) for record in records
+            )
+            remaining = max(
+                max(0, measured - released_measured),
+                max(0, reserved - released_reserved),
+            )
+            return remaining + incoming_bytes
+
+        keep_projected = current + incoming_bytes
+        evict_projected = projected(candidates)
+        if limit <= 0 or keep_projected <= limit:
+            return ReplacementProjection(
+                strategy="keep_then_commit",
+                reason="keep_both_fits",
+                models_to_free=payload(candidates),
+                current_bytes=current,
+                requested_bytes=incoming_bytes,
+                projected_bytes=evict_projected,
+                limit_bytes=limit,
+            )
+        if memory_policy == "evict_first_if_needed":
+            selected = list(candidates)
+            for record in idle_candidates:
+                if evict_projected <= limit:
+                    break
+                selected.append(record)
+                evict_projected = projected(selected)
+            if evict_projected <= limit:
+                return ReplacementProjection(
+                    strategy="evict_first",
+                    reason="role_capacity_evict_first_required",
+                    models_to_free=payload(selected),
+                    current_bytes=current,
+                    requested_bytes=incoming_bytes,
+                    projected_bytes=evict_projected,
+                    limit_bytes=limit,
+                )
+        else:
+            selected_idle: list[ResidencyRecord] = []
+            keep_after_lru = keep_projected
+            for record in idle_candidates:
+                if keep_after_lru <= limit:
+                    break
+                selected_idle.append(record)
+                keep_after_lru = projected(selected_idle)
+            if keep_after_lru <= limit:
+                return ReplacementProjection(
+                    strategy="keep_then_commit",
+                    reason="keep_both_fits",
+                    models_to_free=payload(selected_idle + candidates),
+                    current_bytes=current,
+                    requested_bytes=incoming_bytes,
+                    projected_bytes=projected(selected_idle + candidates),
+                    limit_bytes=limit,
+                )
+        all_releasable = candidates + idle_candidates
+        return ReplacementProjection(
+            strategy="reject",
+            reason="role_capacity_insufficient_after_eviction",
+            models_to_free=payload(all_releasable),
+            current_bytes=current,
+            requested_bytes=incoming_bytes,
+            projected_bytes=projected(all_releasable),
+            limit_bytes=limit,
+        )
+
+    async def _evict_replacement_before_load_locked(
+        self,
+        candidates: list[ResidencyRecord],
+        group: str,
+    ) -> tuple[PrimaryHandoffLease | None, bool]:
+        """Destructively retire a quiesced group while holding audio ownership."""
+
+        old_primary = next((record for record in candidates if record.primary), None)
+        handoff = None
+        if old_primary is not None and self._on_primary_handoff is not None:
+            handoff = self._on_primary_handoff(old_primary.entry)
+        destructive_started = False
+        try:
+            # Retire sibling assistants while the healthy primary remains
+            # published. A sibling stop failure can therefore roll back the
+            # handoff without stranding the server's default route.
+            for record in candidates:
+                if record is old_primary:
+                    continue
+                record.pinned = False
+                await self._evict_locked(record, reason=f"replace_{group}_evict_first")
+            if old_primary is not None:
+                if self._on_primary_changed is not None:
+                    self._on_primary_changed(None)
+                self.registry.clear_default()
+                destructive_started = True
+                old_primary.primary = False
+                old_primary.pinned = False
+                await self._evict_locked(
+                    old_primary,
+                    reason=f"replace_{group}_evict_first",
+                )
+        except BaseException:
+            if handoff is not None:
+                if destructive_started:
+                    handoff.commit(None)
+                else:
+                    handoff.rollback()
+            raise
+        return handoff, old_primary is not None
 
     async def _reload_locked(
         self,
@@ -1218,6 +1476,11 @@ class ResidentModelManager:
                     "idle_seconds": max(0.0, now - record.last_used_at),
                     "performance": (
                         record.performance.payload() if record.performance else None
+                    ),
+                    "replacement_projection": (
+                        record.replacement_projection.payload()
+                        if record.replacement_projection
+                        else None
                     ),
                 }
             )

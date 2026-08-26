@@ -85,7 +85,6 @@ final class DictationController {
             refreshReadiness()
             if isEnabled {
                 cancelActiveSessionForModelChange()
-                hotkey.stop()
                 phase = .preparingModel
             }
             Task {
@@ -153,6 +152,7 @@ final class DictationController {
     private let testingPrewarm: (@MainActor () async -> Bool)?
     private let testingWarmup: (@MainActor () async -> Bool)?
     private let testingHotkeyStart: (@MainActor () -> Bool)?
+    private let testingHotkeyStop: (@MainActor () -> Void)?
     private let testingRecorderStart: (@MainActor () throws -> Void)?
     private let testingRecorderCancel: (@MainActor () -> Void)?
     private let testingTranscribeCancel: (@MainActor () -> Void)?
@@ -161,6 +161,10 @@ final class DictationController {
         get { captureLifecycle.ticker }
         set { captureLifecycle.ticker = newValue }
     }
+    /// The event tap belongs to the user's Enabled intent, not to whichever
+    /// model process happens to be serving. Model transitions temporarily gate
+    /// capture through ``phase`` while keeping this registration alive.
+    private(set) var isHotkeyArmed = false
     private var recordingStart: Date?
     private var capturingApp: String?
     private var level: Float = 0
@@ -209,6 +213,7 @@ final class DictationController {
         testingPrewarm: (@MainActor () async -> Bool)? = nil,
         testingWarmup: (@MainActor () async -> Bool)? = nil,
         testingHotkeyStart: (@MainActor () -> Bool)? = nil,
+        testingHotkeyStop: (@MainActor () -> Void)? = nil,
         testingRecorderStart: (@MainActor () throws -> Void)? = nil,
         testingRecorderCancel: (@MainActor () -> Void)? = nil,
         testingTranscribeCancel: (@MainActor () -> Void)? = nil,
@@ -227,6 +232,7 @@ final class DictationController {
         self.testingPrewarm = testingPrewarm
         self.testingWarmup = testingWarmup
         self.testingHotkeyStart = testingHotkeyStart
+        self.testingHotkeyStop = testingHotkeyStop
         self.testingRecorderStart = testingRecorderStart
         self.testingRecorderCancel = testingRecorderCancel
         self.testingTranscribeCancel = testingTranscribeCancel
@@ -337,12 +343,10 @@ final class DictationController {
             guard alias != modelAlias || prewarmTask == nil else { break }
             cancelActiveSessionForModelChange()
             cancelModelPreparation()
-            hotkey.stop()
             phase = .preparingModel
         case .ready(let alias):
             guard alias != modelAlias || prewarmTask == nil else { break }
             cancelActiveSessionForModelChange()
-            hotkey.stop()
             phase = .preparingModel
             Task { [weak self] in
                 await self?.enable(replacingCurrentPrewarm: true)
@@ -350,10 +354,10 @@ final class DictationController {
         case .crashed, .stopped, .idle, .missing:
             cancelActiveSessionForModelChange()
             cancelModelPreparation()
-            hotkey.stop()
             // Preserve the user's Enabled intent, but publish a terminal
-            // non-ready phase. Foreground revalidation or a later server
-            // transition can retry through the existing enable path.
+            // non-ready phase. Keep the feature-owned event tap registered:
+            // foreground revalidation or a later server transition can retry
+            // the model without asking the user to arm dictation by hand.
             phase = .off
         }
     }
@@ -390,6 +394,7 @@ final class DictationController {
         if case .reject(let message, let disableIntent) = decision {
             lastError = message
             phase = .off
+            stopHotkey()
             // Missing local model/recording prerequisites make the persisted
             // intent invalid. Accessibility is different: the user already
             // expressed intent, and granting TCC later should allow re-arm.
@@ -408,7 +413,6 @@ final class DictationController {
             return
         }
         modelPreparationDeferred = false
-        hotkey.stop()
         phase = .preparingModel
         let preparingAlias = modelAlias
         let prewarmSucceeded = await prewarmModel(
@@ -444,6 +448,11 @@ final class DictationController {
 
     @discardableResult
     private func registerHotkey() -> Bool {
+        guard !isHotkeyArmed else {
+            lastError = nil
+            phase = .idle
+            return true
+        }
         guard testingHotkeyStart?() ?? hotkey.start() else {
             // macOS does not apply an Accessibility grant to an already-running
             // process, so this is the common shape right after the user flips
@@ -457,9 +466,20 @@ final class DictationController {
             return false
         }
         accessibilityNeedsRelaunch = false
+        isHotkeyArmed = true
         lastError = nil
         phase = .idle
         return true
+    }
+
+    private func stopHotkey() {
+        guard isHotkeyArmed else { return }
+        if let testingHotkeyStop {
+            testingHotkeyStop()
+        } else {
+            hotkey.stop()
+        }
+        isHotkeyArmed = false
     }
 
     func disable() {
@@ -468,7 +488,7 @@ final class DictationController {
         // seconds in its graceful-shutdown window; leaving the event tap live
         // for that window makes the hotkey appear to work even though no new
         // transcription can possibly complete.
-        hotkey.stop()
+        stopHotkey()
         transcribeTask?.cancel()
         transcribeTask = nil
         transcribeRequestID = nil
@@ -801,7 +821,6 @@ final class DictationController {
             return
         }
         guard server.isVoiceLaneReady(for: requestedAlias) else {
-            hotkey.stop()
             phase = .preparingModel
             beginRecordingTask = nil
             beginRecordingRequestID = nil

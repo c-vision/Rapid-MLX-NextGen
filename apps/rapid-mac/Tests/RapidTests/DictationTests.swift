@@ -426,6 +426,56 @@ struct DictationTests {
     }
 
     @MainActor
+    @Test("chat-model switches keep the enabled feature's event tap armed")
+    func chatModelSwitchKeepsHotkeyRegistration() async {
+        var prewarmCount = 0
+        var hotkeyStartCount = 0
+        var hotkeyStopCount = 0
+        let controller = readinessController(
+            prewarm: {
+                prewarmCount += 1
+                return true
+            },
+            hotkeyStart: {
+                hotkeyStartCount += 1
+                return true
+            },
+            hotkeyStop: { hotkeyStopCount += 1 }
+        )
+
+        await controller.enable()
+        #expect(controller.phase == .idle)
+        #expect(controller.isHotkeyArmed)
+        #expect(hotkeyStartCount == 1)
+
+        // Whole-process replacement publishes the old child stopping before
+        // the new alias starts. That terminal-looking intermediate state was
+        // the exact RC1 vector that destroyed the tap and exposed Arm now.
+        controller.serverStateDidChange(.stopped)
+        #expect(controller.phase == .off)
+        #expect(controller.isHotkeyArmed)
+        #expect(hotkeyStopCount == 0)
+
+        controller.serverStateDidChange(.starting(alias: "qwen3.5-4b-4bit"))
+        #expect(controller.phase == .preparingModel)
+        #expect(controller.isHotkeyArmed)
+        #expect(hotkeyStopCount == 0)
+
+        controller.serverStateDidChange(.ready(alias: "qwen3.5-4b-4bit"))
+        for _ in 0..<40 where controller.phase != .idle { await Task.yield() }
+
+        #expect(controller.phase == .idle)
+        #expect(controller.isHotkeyArmed)
+        #expect(prewarmCount == 2)
+        #expect(hotkeyStartCount == 1)
+        #expect(hotkeyStopCount == 0)
+
+        controller.disable()
+        #expect(!controller.isHotkeyArmed)
+        #expect(hotkeyStopCount == 1)
+    }
+
+    @MainActor
     @Test("failed chat-model switch leaves enabled dictation retryable")
     func failedChatModelSwitchIsRetryable() async {
         var warmupContinuation: CheckedContinuation<Bool, Never>?
@@ -550,7 +600,7 @@ struct DictationTests {
 
         #expect(controller.phase == .idle)
         #expect(prewarmCount == 1)
-        #expect(hotkeyStartCount == 2)
+        #expect(hotkeyStartCount == 1, "finishing launch restore reuses the feature-owned event tap")
     }
 
     @MainActor
@@ -620,9 +670,10 @@ struct DictationTests {
 
         await controller.bootstrap(deferModelPreparation: true)
         controller.modelAlias = "another-speech-input"
-        while hotkeyStartCount < 2 { await Task.yield() }
+        for _ in 0..<40 where controller.phase != .idle { await Task.yield() }
 
         #expect(controller.phase == .idle)
+        #expect(hotkeyStartCount == 1, "the enabled feature keeps one event-tap registration")
         #expect(prewarmCount == 0, "a model change must not steal the starting chat process")
     }
 
@@ -931,7 +982,8 @@ struct DictationTests {
         phase: DictationController.Phase = .off,
         initiallyDeferred: Bool = false,
         prewarm: @escaping @MainActor () async -> Bool,
-        hotkeyStart: @escaping @MainActor () -> Bool
+        hotkeyStart: @escaping @MainActor () -> Bool,
+        hotkeyStop: @escaping @MainActor () -> Void = {}
     ) -> DictationController {
         let entry = ModelEntry(
             alias: "whisper-small",
@@ -958,6 +1010,7 @@ struct DictationTests {
             ),
             testingPrewarm: prewarm,
             testingHotkeyStart: hotkeyStart,
+            testingHotkeyStop: hotkeyStop,
             testingInitialModelPreparationDeferred: initiallyDeferred,
             audioCatalogLoader: { _ in [entry] }
         )

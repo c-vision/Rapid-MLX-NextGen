@@ -59,6 +59,9 @@ class ModelLoadRequest(BaseModel):
     performance: ModelPerformanceRequest | None = None
     reload_if_changed: StrictBool = False
     replace_mode: Literal["reject", "wait", "abort"] = "reject"
+    memory_policy: Literal["keep_then_commit", "evict_first_if_needed"] = (
+        "evict_first_if_needed"
+    )
 
 
 class ModelPinRequest(BaseModel):
@@ -121,9 +124,22 @@ async def load_resident_model(request: ModelLoadRequest):
         performance = (
             request.performance.runtime_value() if request.performance else None
         )
-        profile = resolve_profile(request.model) or (
+        model_profile = resolve_profile(request.model)
+        path_profile = (
             resolve_profile(request.model_path) if request.model_path else None
         )
+        # The loader consumes model_path when supplied, so only that
+        # checkpoint's metadata may authorize destructive admission. An
+        # unknown override falls back to keep-then-commit rather than trusting
+        # the request-facing alias for different weights.
+        profile = path_profile if request.model_path else model_profile
+        resolved_group = None
+        if profile is not None:
+            resolved_group = (
+                "assistant"
+                if profile.modality in {"text", "vision"}
+                else profile.modality
+            )
         if (
             performance is not None
             and profile is not None
@@ -154,11 +170,27 @@ async def load_resident_model(request: ModelLoadRequest):
             performance=performance,
             reload_if_changed=request.reload_if_changed,
             replace_mode=request.replace_mode,
+            memory_policy=request.memory_policy,
+            resolved_group=resolved_group,
         )
     except HTTPException:
         raise
     except ResidentModelCapacityError as exc:
-        raise HTTPException(status_code=507, detail=str(exc)) from exc
+        projection = exc.replacement_projection
+        if projection is None:
+            raise HTTPException(status_code=507, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=507,
+            detail={
+                "error": {
+                    "message": str(exc),
+                    "type": "insufficient_capacity_error",
+                    "code": "insufficient_capacity_error",
+                    "param": "estimated_size_gb",
+                },
+                "replacement_projection": projection.payload(),
+            },
+        ) from exc
     except ResidentModelError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
