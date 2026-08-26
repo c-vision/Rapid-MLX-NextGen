@@ -534,6 +534,8 @@ def residency_activity_contract(monkeypatch):
             reload_manager._replacement_candidates_locked(
                 "assistant", replace_mode="invalid"
             )
+        with pytest.raises(ResidentModelError, match="unsupported replacement mode"):
+            await reload_manager._quiesce_records_locked([], "invalid")
 
         busy = await reload_manager.load("busy")
         busy.entry.engine.running = 1
@@ -1384,6 +1386,26 @@ async def test_reload_waits_for_admitted_precommit_request_before_stop():
     assert old_engine.stopped is True
     assert replacement.entry.engine is loaded[0]
     assert registry.default_name == "chat"
+
+
+@pytest.mark.asyncio
+async def test_reload_quiesces_and_retires_the_rest_of_explicit_group():
+    manager, registry, loaded, _ = manager_fixture(limit_gib=20)
+    sibling = await manager.load("chat-sibling")
+
+    replacement = await manager.load(
+        "chat",
+        performance=ResidentPerformanceConfig(kv_cache_dtype="int8"),
+        reload_if_changed=True,
+        replace_group="assistant",
+        replace_mode="wait",
+    )
+
+    assert replacement.primary is True
+    assert registry.default_name == "chat"
+    assert [item.model_name for item in registry.list_entries()] == ["chat"]
+    assert sibling.entry.engine.stopped is True
+    assert loaded["chat"].stopped is False
 
 
 @pytest.mark.asyncio
