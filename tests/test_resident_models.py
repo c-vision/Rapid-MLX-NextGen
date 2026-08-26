@@ -11,6 +11,7 @@ from vllm_mlx.runtime.resident_models import (
     ResidencyRecord,
     ResidentModelBusyError,
     ResidentModelCapacityError,
+    ResidentModelError,
     ResidentModelManager,
     ResidentPerformanceConfig,
     resident_scheduler_kwargs,
@@ -438,7 +439,7 @@ def manager_fixture(*, limit_gib=10, ttl=0):
 
 
 @pytest.fixture
-def residency_activity_contract():
+def residency_activity_contract(monkeypatch):
     """Exercise the activity SSOT from the MLX-free Linux fixed selector."""
     from vllm_mlx.runtime.resident_models import _engine_active_requests
 
@@ -490,6 +491,7 @@ def residency_activity_contract():
             reload_if_changed=True,
         )
         assert replacement.entry.aliases == {"reload-alias"}
+        assert (await reload_manager.load("reload-alias", pin=True)).pinned is True
 
         try:
             await reload_manager.load(
@@ -502,6 +504,62 @@ def residency_activity_contract():
         else:
             raise AssertionError("failed reload must surface its loader error")
         assert reload_registry.get_entry("reload-alias").aliases == {"reload-alias"}
+
+        with pytest.raises(KeyError):
+            await reload_manager.unload("missing")
+
+        with pytest.raises(ResidentModelError, match="does not belong"):
+            await reload_manager._quiesce_group_locked(replacement, "image", "reject")
+
+        busy = await reload_manager.load("busy")
+        busy.entry.engine.running = 1
+        busy.active_requests = 1
+        with pytest.raises(ResidentModelBusyError, match="active request"):
+            await reload_manager._quiesce_replacement_group_locked(
+                "assistant", "wait", exclude_model_id=replacement.model_id
+            )
+        with pytest.raises(ResidentModelBusyError, match="active request"):
+            await reload_manager.unload("busy")
+        busy.active_requests = 0
+        busy.entry.engine.running = 0
+        busy.state = "evicting"
+        with pytest.raises(ResidentModelBusyError, match="being evicted"):
+            async with reload_manager.lease("busy"):
+                pass
+        busy.state = "resident"
+
+        pinned = await reload_manager.load("pinned-secondary", pin=True)
+        pinned.primary = False
+        with pytest.raises(ResidentModelError, match="pinned model"):
+            reload_manager._replacement_candidates_locked("assistant")
+
+        rollback_engine = FakeLifecycleEngine()
+        resumed = []
+
+        async def quiesce(*_args, **_kwargs):
+            rollback_engine.paused = True
+            return [], [rollback_engine]
+
+        async def fail_commit(*_args, **_kwargs):
+            raise RuntimeError("commit failed")
+
+        original_resume = rollback_engine.resume_generation
+
+        async def resume():
+            resumed.append(True)
+            return await original_resume()
+
+        rollback_engine.resume_generation = resume
+        with monkeypatch.context() as scoped:
+            scoped.setattr(reload_manager, "_quiesce_group_locked", quiesce)
+            scoped.setattr(
+                reload_manager, "_commit_group_replacement_locked", fail_commit
+            )
+            with pytest.raises(RuntimeError, match="commit failed"):
+                await reload_manager._replace_group_locked(
+                    replacement, "assistant", "wait"
+                )
+        assert resumed == [True]
 
     return exercise_reload_identity
 

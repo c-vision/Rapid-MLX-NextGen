@@ -8,7 +8,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from vllm_mlx.mllm_scheduler import MLLMRequest, MLLMScheduler
+from tests._headless_mlx import install_headless_mlx_import_stubs
+
+install_headless_mlx_import_stubs()
+
+from vllm_mlx.mllm_scheduler import MLLMRequest, MLLMScheduler  # noqa: E402
 
 
 @pytest.mark.asyncio

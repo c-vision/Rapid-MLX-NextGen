@@ -319,9 +319,7 @@ jobs:
             tests/test_pflash_server_module_wiring.py::test_server_module_strict_metadata_failure_propagates \
             tests/test_pflash_server_module_wiring.py::test_server_module_cache_metadata_failure_is_nonfatal \
             tests/test_pflash_server_module_wiring.py::test_server_module_missing_auto_config_module_degrades_to_no_default \
-            tests/test_resident_models.py::test_dynamic_resident_auto_detected_hybrid_gets_bounded_prefix_reuse \
-            tests/test_resident_models.py::test_dynamic_resident_prefix_disable_keeps_hybrid_entries_zero \
-            tests/test_resident_models.py::test_dynamic_resident_full_attention_stays_unbounded \
+            tests/test_resident_models.py \
             tests/test_serve_listen_fd.py::test_serve_command_threads_auto_detected_hybrid_into_cache_admission \
             tests/test_serve_listen_fd.py::test_serve_command_cache_is_first_metadata_consumer \
             tests/test_serve_listen_fd.py::test_serve_command_missing_auto_config_module_degrades_to_no_default \
@@ -364,6 +362,20 @@ jobs:
             -v --tb=short \
             -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache" \
             --cov=vllm_mlx \
+            --cov-report=term-missing \
+            --cov-report=xml
+
+          # Engine lifecycle contracts execute real engine methods but no tensor
+          # operations. Keep their inert MLX import seam in a separate process
+          # so optional-runtime discovery in the broader Linux suite stays real.
+          pytest \
+            tests/test_engine_lifecycle.py \
+            tests/test_mllm_process_loop_errors.py \
+            tests/test_disconnect_guard_aborts_scheduler.py \
+            tests/test_rst_mid_sse_zombie_kv.py \
+            -v --tb=short \
+            --cov=vllm_mlx \
+            --cov-append \
             --cov-report=term-missing \
             --cov-report=xml
 

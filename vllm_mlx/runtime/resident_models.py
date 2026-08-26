@@ -545,16 +545,20 @@ class ResidentModelManager:
         async with self._lock:
             canonical = self._canonical(model_name)
             if canonical is not None:
-                record = self._records[canonical]
-                if reload_if_changed and record.performance != performance:
-                    record = await self._reload_locked(record, performance)
-                record.last_used_at = self._clock()
+                existing_record = self._records[canonical]
+                if reload_if_changed and existing_record.performance != performance:
+                    existing_record = await self._reload_locked(
+                        existing_record, performance
+                    )
+                existing_record.last_used_at = self._clock()
                 if pin:
-                    record.pinned = True
-                group = _effective_replace_group(record.entry, replace_group)
+                    existing_record.pinned = True
+                group = _effective_replace_group(existing_record.entry, replace_group)
                 if group is not None:
-                    await self._replace_group_locked(record, group, replace_mode)
-                return record
+                    await self._replace_group_locked(
+                        existing_record, group, replace_mode
+                    )
+                return existing_record
 
             record: ResidencyRecord | None = None
             candidates: list[ResidencyRecord] = []
@@ -601,7 +605,12 @@ class ResidentModelManager:
                     performance=performance,
                 )
                 group = _effective_replace_group(record.entry, replace_group)
-                if replace_group is not None and group != replace_group:
+                # ``_effective_replace_group`` returns an explicit group
+                # verbatim, so this is unreachable through every loader caller;
+                # retain the defensive invariant for future resolver changes.
+                if (
+                    replace_group is not None and group != replace_group
+                ):  # pragma: no cover
                     raise ResidentModelError(
                         f"model {record.model_id!r} does not belong to replacement "
                         f"group {replace_group!r}"

@@ -6,11 +6,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_mlx.engine.batched import BatchedEngine, _admission_token_context
-from vllm_mlx.engine_core import EngineCore
-from vllm_mlx.mllm_scheduler import MLLMScheduler
-from vllm_mlx.output_collector import RequestOutputCollector
-from vllm_mlx.scheduler import BackpressureError, Scheduler
+from tests._headless_mlx import install_headless_mlx_import_stubs
+
+install_headless_mlx_import_stubs()
+
+from vllm_mlx.engine.batched import (  # noqa: E402
+    BatchedEngine,
+    _admission_token_context,
+)
+from vllm_mlx.engine_core import EngineCore  # noqa: E402
+from vllm_mlx.mllm_scheduler import MLLMScheduler  # noqa: E402
+from vllm_mlx.output_collector import RequestOutputCollector  # noqa: E402
+from vllm_mlx.scheduler import BackpressureError, Scheduler  # noqa: E402
 
 
 def _engine(*, reservations: int = 0, running: dict | None = None):
@@ -961,3 +968,473 @@ async def test_post_commit_lifecycle_abort_emits_model_replacement_sse():
         "code": "model_replacement",
     }
     assert chunks[-1] == "data: [DONE]\n\n"
+
+
+def test_headless_scheduler_initializers_publish_lifecycle_state(monkeypatch):
+    """The Linux contract lane must execute both real scheduler constructors."""
+
+    tokenizer = SimpleNamespace(eos_token_id=2, encode=lambda _text: [])
+    monkeypatch.setattr(
+        "vllm_mlx.mllm_scheduler.MultimodalProcessor",
+        lambda **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.mllm_scheduler.MLLMCacheManager", lambda **_kwargs: object()
+    )
+    text = Scheduler(SimpleNamespace(), tokenizer)
+    vision = MLLMScheduler(
+        SimpleNamespace(config=None), SimpleNamespace(tokenizer=tokenizer)
+    )
+
+    for scheduler in (text, vision):
+        assert scheduler._generation_paused is False
+        assert scheduler._paused_add_allowance == 0
+        assert scheduler._paused_admission_tokens == set()
+    assert vision._abort_error_kinds == {}
+    assert (
+        vision.add_request("hello", request_id="vision-admitted") == "vision-admitted"
+    )
+    assert "vision-admitted" in vision.requests
+
+
+@pytest.mark.asyncio
+async def test_admission_defensive_state_and_scheduler_variants():
+    engine, scheduler = _engine()
+    del engine._admission_tokens
+    del engine._admission_tasks
+    engine.check_admission()
+    token = engine._current_admission_token()
+    assert token in engine._admission_tokens
+    assert token in engine._admission_tasks
+    assert engine._ensure_generation_admission() == (token, False)
+    engine.release_admission_reservation()
+
+    engine._admission_reservations = 1
+    engine._admission_tokens = set()
+    engine.release_admission_reservation()
+    assert engine._admission_reservations == 0
+    engine._transfer_admission_to_scheduler(None)
+
+    engine._engine = None
+    assert engine._lifecycle_request_ids() == set()
+    engine._engine = SimpleNamespace(
+        engine=SimpleNamespace(
+            scheduler=SimpleNamespace(request_ids_snapshot=lambda: (1, "two"))
+        )
+    )
+    assert engine._lifecycle_request_ids() == {"1", "two"}
+
+
+@pytest.mark.asyncio
+async def test_pause_validation_fallback_and_timeout_paths():
+    engine, scheduler = _engine(reservations=1)
+    with pytest.raises(ValueError, match="pause mode"):
+        await engine.pause_generation("invalid")
+
+    del scheduler.pause_generation_admission
+    engine._lifecycle_aborted_tasks = None
+    pause = asyncio.create_task(engine.pause_generation("abort", timeout=1))
+    await asyncio.sleep(0)
+    engine.release_admission_reservation()
+    status = await pause
+    assert status["admitted_requests"] == 0
+    assert scheduler.generation_paused is True
+
+
+@pytest.mark.asyncio
+async def test_batched_abort_routes_error_kind_to_each_backend():
+    engine, _ = _engine()
+    calls = []
+    engine._mllm_scheduler = SimpleNamespace(
+        abort_request=lambda request_id, **kwargs: (
+            calls.append((request_id, kwargs)) or True
+        )
+    )
+    assert await engine.abort_request("m0") is True
+    assert await engine.abort_request("m1", error_kind="lifecycle") is True
+
+    engine._mllm_scheduler = None
+
+    async def abort_request(request_id, **kwargs):
+        calls.append((request_id, kwargs))
+        return True
+
+    engine._engine = SimpleNamespace(abort_request=abort_request)
+    assert await engine.abort_request("t0") is True
+    assert await engine.abort_request("t1", error_kind="lifecycle") is True
+    assert calls == [
+        ("m0", {}),
+        ("m1", {"error_kind": "lifecycle"}),
+        ("t0", {}),
+        ("t1", {"error_kind": "lifecycle"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mllm_generation_precommit_failures_release_admission():
+    engine, _ = _engine()
+
+    class FailingMLLM:
+        config = SimpleNamespace(max_concurrent_requests=8)
+
+        async def generate(self, **_kwargs):
+            raise RuntimeError("non-stream precommit")
+
+        async def add_request_async(self, **_kwargs):
+            raise RuntimeError("stream precommit")
+
+    engine._loaded = True
+    engine._is_mllm = True
+    engine._mllm_scheduler = FailingMLLM()
+    engine._engine = None
+
+    with pytest.raises(RuntimeError, match="non-stream precommit"):
+        await engine.generate("prompt", max_tokens=1)
+    assert engine._admission_reservations == 0
+
+    with pytest.raises(RuntimeError, match="stream precommit"):
+        await anext(engine.stream_generate("prompt", max_tokens=1))
+    assert engine._admission_reservations == 0
+
+
+@pytest.mark.asyncio
+async def test_engine_core_error_and_async_abort_contracts():
+    from vllm_mlx.engine_core import AsyncEngineCore
+    from vllm_mlx.request import InferenceAbortedError, RequestOutput
+
+    core = EngineCore.__new__(EngineCore)
+
+    async def add_request(*_args, **_kwargs):
+        return "failed"
+
+    core.add_request = add_request
+    terminal = RequestOutput(
+        request_id="failed",
+        finished=True,
+        finish_reason="length",
+        error="cancelled",
+        error_kind="lifecycle",
+    )
+    collector = RequestOutputCollector(aggregate=True)
+    collector.put(terminal)
+    event = asyncio.Event()
+    event.set()
+    core._finished_events = {"failed": event}
+    core._output_collectors = {"failed": collector}
+    core._cleanup_request = lambda _request_id: None
+    with pytest.raises(InferenceAbortedError) as exc_info:
+        await core.generate("prompt", SimpleNamespace())
+    assert exc_info.value.error_kind == "lifecycle"
+
+    async_core = AsyncEngineCore.__new__(AsyncEngineCore)
+
+    async def abort(request_id, *, error_kind=None):
+        return request_id == "active" and error_kind == "lifecycle"
+
+    async_core.engine = SimpleNamespace(abort_request=abort)
+    assert await async_core.abort_request("active", error_kind="lifecycle") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("module_name", "entrypoint", "request_factory", "cancel_target"),
+    [
+        (
+            "vllm_mlx.routes.chat",
+            "create_chat_completion",
+            lambda: (SimpleNamespace(model="gpt-5"), SimpleNamespace()),
+            "_create_chat_completion_impl",
+        ),
+        (
+            "vllm_mlx.routes.completions",
+            "create_completion",
+            lambda: ("completion-request", SimpleNamespace()),
+            "logger.info",
+        ),
+    ],
+)
+async def test_route_wrappers_translate_owned_cancellation(
+    monkeypatch, module_name, entrypoint, request_factory, cancel_target
+):
+    module = __import__(module_name, fromlist=[entrypoint])
+    engine = SimpleNamespace()
+    monkeypatch.setattr(module, "get_engine", lambda _model: engine)
+    monkeypatch.setattr(module, "_validate_model_name", lambda _model: None)
+    monkeypatch.setattr(module, "_check_admission_or_503", lambda _engine: None)
+    monkeypatch.setattr(
+        module, "_release_admission_unless_committed", lambda *_args: None
+    )
+
+    def translate(_engine, _exc):
+        raise RuntimeError("translated")
+
+    monkeypatch.setattr(module, "_raise_lifecycle_cancel_or_reraise", translate)
+    if cancel_target == "logger.info":
+        monkeypatch.setattr(
+            module.logger,
+            "info",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(asyncio.CancelledError()),
+        )
+    else:
+
+        async def cancel(*_args, **_kwargs):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(module, cancel_target, cancel)
+
+    args = request_factory()
+    if args[0] == "completion-request":
+        args = (module.CompletionRequest(model="gpt-5", prompt="hello"), args[1])
+    with pytest.raises(RuntimeError, match="translated"):
+        await getattr(module, entrypoint)(*args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("module_name", "entrypoint", "body", "cancel_target"),
+    [
+        (
+            "vllm_mlx.routes.anthropic",
+            "create_anthropic_message",
+            {
+                "model": "claude-local",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            "logger.info",
+        ),
+        (
+            "vllm_mlx.routes.responses",
+            "create_response",
+            {"model": "gpt-5", "input": "hello"},
+            "_log_request",
+        ),
+    ],
+)
+async def test_json_route_wrappers_translate_owned_cancellation(
+    monkeypatch, module_name, entrypoint, body, cancel_target
+):
+    module = __import__(module_name, fromlist=[entrypoint])
+    engine = SimpleNamespace()
+    monkeypatch.setattr(module, "get_engine", lambda _model: engine)
+    monkeypatch.setattr(module, "_check_admission_or_503", lambda _engine: None)
+    monkeypatch.setattr(
+        module, "_release_admission_unless_committed", lambda *_args: None
+    )
+
+    def translate(_engine, _exc):
+        raise RuntimeError("translated")
+
+    monkeypatch.setattr(module, "_raise_lifecycle_cancel_or_reraise", translate)
+    target_owner, target_name = (
+        (module.logger, "info")
+        if cancel_target == "logger.info"
+        else (module, cancel_target)
+    )
+    monkeypatch.setattr(
+        target_owner,
+        target_name,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(asyncio.CancelledError()),
+    )
+
+    raw_request = SimpleNamespace(json=lambda: None)
+
+    async def json_body():
+        return body
+
+    raw_request.json = json_body
+    with pytest.raises(RuntimeError, match="translated"):
+        await getattr(module, entrypoint)(raw_request)
+
+
+def test_scheduler_commit_and_reset_lifecycle_edges():
+    from vllm_mlx.request import Request, SamplingParams
+
+    tokenizer = SimpleNamespace(eos_token_id=2, encode=lambda _text: [1, 2])
+    scheduler = Scheduler(SimpleNamespace(), tokenizer)
+    request = Request(
+        request_id="fresh", prompt="hello", sampling_params=SamplingParams(max_tokens=1)
+    )
+    scheduler.add_request(request)
+    assert scheduler.requests["fresh"] is request
+
+    scheduler.set_generation_paused(True)
+    rejected = Request(
+        request_id="rejected",
+        prompt="rejected",
+        prompt_token_ids=[1],
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+    with pytest.raises(BackpressureError, match="paused"):
+        scheduler._commit_request(rejected)
+
+    scheduler._paused_admission_tokens = {"admitted"}
+    admitted = Request(
+        request_id="admitted",
+        prompt="admitted",
+        prompt_token_ids=[1],
+        sampling_params=SamplingParams(max_tokens=1),
+        lifecycle_admission_token="admitted",
+    )
+    scheduler._commit_request(admitted)
+    assert scheduler._paused_admission_tokens == set()
+    scheduler.reset()
+    assert scheduler.requests == {}
+
+
+def test_mllm_commit_abort_distribution_cleanup_and_reset(monkeypatch):
+    from collections import deque
+
+    from vllm_mlx.mllm_scheduler import MLLMRequest, MLLMSchedulerOutput
+
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler._cancel_counter_lock = threading.Lock()
+    scheduler._generation_paused = True
+    scheduler._paused_admission_tokens = set()
+    scheduler._paused_add_allowance = 0
+    scheduler.requests = {}
+    scheduler.waiting = deque()
+    scheduler.running = {}
+    scheduler.request_id_to_uid = {}
+    scheduler.uid_to_request_id = {}
+    scheduler._detokenizer_pool = {}
+    scheduler._cancelled_request_ids = set()
+    scheduler._disconnect_abort_ids = set()
+    scheduler._pending_abort_ids = set()
+    scheduler._aborted_queue_ids = set()
+    scheduler._abort_error_kinds = None
+    scheduler.finished_req_ids = set()
+    scheduler.output_queues = {}
+    scheduler.num_requests_cancelled = 0
+    scheduler.num_requests_cancelled_via_disconnect = 0
+    scheduler.num_requests_processed = 0
+    scheduler.total_prompt_tokens = 0
+    scheduler.total_completion_tokens = 0
+    scheduler.batch_generator = None
+    scheduler.vision_cache = None
+
+    rejected = MLLMRequest(request_id="rejected", prompt="hello")
+    with pytest.raises(BackpressureError, match="paused"):
+        scheduler._commit_request(rejected)
+    scheduler._paused_admission_tokens = {"admitted"}
+    admitted = MLLMRequest(
+        request_id="admitted", prompt="hello", lifecycle_admission_token="admitted"
+    )
+    scheduler._commit_request(admitted)
+    assert scheduler._paused_admission_tokens == set()
+
+    assert scheduler.abort_request("admitted", error_kind="lifecycle") is True
+    assert scheduler._abort_error_kinds == {"admitted": "lifecycle"}
+
+    scheduler.running["admitted"] = admitted
+    scheduler._detokenizer_pool["admitted"] = object()
+    scheduler._do_abort_request("admitted")
+    assert "admitted" not in scheduler.requests
+
+    scheduler.running["finished"] = MLLMRequest(request_id="finished", prompt="x")
+    scheduler.requests["finished"] = scheduler.running["finished"]
+    scheduler.request_id_to_uid["finished"] = 7
+    scheduler.uid_to_request_id[7] = "finished"
+    scheduler._cleanup_finished({"finished"})
+    assert "finished" not in scheduler.requests
+
+    ordinary = asyncio.Queue(maxsize=1)
+    ordinary.put_nowait(object())
+    lifecycle = asyncio.Queue(maxsize=1)
+    lifecycle.put_nowait(object())
+    scheduler.output_queues = {"ordinary": ordinary, "lifecycle": lifecycle}
+    scheduler._aborted_queue_ids = {"ordinary", "lifecycle"}
+    scheduler._abort_error_kinds = {"lifecycle": "lifecycle"}
+    scheduler._distribute_outputs(MLLMSchedulerOutput(outputs=[]))
+    terminal = lifecycle.get_nowait()
+    assert terminal.error_kind == "lifecycle"
+
+    scheduler.requests = {"remove": object()}
+    assert scheduler.remove_finished_request("remove") is not None
+
+    scheduler.requests = {"generated": object()}
+
+    async def add_request_async(*_args, **_kwargs):
+        return "generated"
+
+    async def stream_outputs(_request_id):
+        from vllm_mlx.request import RequestOutput
+
+        yield RequestOutput(request_id="generated", finished=True)
+
+    scheduler.add_request_async = add_request_async
+    scheduler.stream_outputs = stream_outputs
+
+    async def exercise_generate():
+        await scheduler.generate("hello")
+
+    asyncio.run(exercise_generate())
+    assert "generated" not in scheduler.requests
+
+    scheduler.requests = {"reset": object()}
+    scheduler.running = {}
+    scheduler.waiting = deque()
+    scheduler._pending_abort_ids = set()
+    scheduler._aborted_queue_ids = set()
+    scheduler._abort_error_kinds = {}
+    scheduler._cancelled_request_ids = set()
+    scheduler._disconnect_abort_ids = set()
+    monkeypatch.setattr(scheduler, "abort_request", lambda _request_id: True)
+    scheduler.reset()
+    assert scheduler.requests == {}
+
+
+@pytest.mark.asyncio
+async def test_disconnect_helpers_preserve_non_lifecycle_failures():
+    from vllm_mlx.request import ClientRequestError
+    from vllm_mlx.service.helpers import _disconnect_guard, _wait_with_disconnect
+
+    engine, _ = _engine()
+
+    class RawRequest:
+        async def is_disconnected(self):
+            return False
+
+    async def cancelled_stream():
+        raise asyncio.CancelledError
+        yield  # pragma: no cover
+
+    with pytest.raises(asyncio.CancelledError):
+        await anext(
+            _disconnect_guard(
+                cancelled_stream(),
+                RawRequest(),
+                poll_interval=0.01,
+                engine=engine,
+                keepalive_seconds=0,
+            )
+        )
+
+    async def collect_error(exc):
+        async def failed():
+            raise exc
+            yield  # pragma: no cover
+
+        return [
+            chunk
+            async for chunk in _disconnect_guard(
+                failed(),
+                RawRequest(),
+                poll_interval=0.01,
+                engine=engine,
+                keepalive_seconds=0,
+            )
+        ]
+
+    client_chunks = await collect_error(ClientRequestError("bad image"))
+    internal_chunks = await collect_error(RuntimeError("secret"))
+    assert "invalid_request_error" in client_chunks[0]
+    assert "internal_error" in internal_chunks[0]
+
+    async def cancelled_value():
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await _wait_with_disconnect(
+            cancelled_value(), RawRequest(), timeout=1, poll_interval=0.01
+        )
