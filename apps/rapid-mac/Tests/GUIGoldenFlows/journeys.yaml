@@ -221,6 +221,14 @@ journeys:
     fixtures: [fake-sidecar, delayed-transcription, isolated-home]
     source_paths: [apps/rapid-mac/Sources/Rapid/Dictation/, apps/rapid-mac/Sources/Rapid/Audio/, apps/rapid-mac/Sources/Rapid/UI/DictationView.swift]
     owns_baseline: false
+  - name: dictation-rc2-upgrade
+    group: audio
+    risk: high
+    driver: ax
+    ci_tier: local
+    fixtures: [fake-sidecar, audio-models, isolated-home]
+    source_paths: [apps/rapid-mac/Sources/Rapid/Dictation/, apps/rapid-mac/Sources/Rapid/Audio/, apps/rapid-mac/Sources/Rapid/Server/SessionModelRestore.swift, apps/rapid-mac/Sources/Rapid/UI/ContentView.swift]
+    owns_baseline: false
   - name: audio-readiness
     group: audio
     risk: high

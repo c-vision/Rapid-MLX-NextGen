@@ -884,3 +884,34 @@ def test_local_snapshot_falls_back_when_the_local_resolve_fails(monkeypatch):
     monkeypatch.setattr("vllm_mlx._download_gate.is_repo_cached", lambda _name: True)
 
     assert tok._local_snapshot_if_cached("org/warm-repo") == "org/warm-repo"
+
+
+def test_local_snapshot_uses_one_complete_immutable_revision_without_main_ref(
+    monkeypatch, tmp_path
+):
+    """Issue #2329: the text loader consumes the same unambiguous checkpoint
+    source that automatic lane resolution inspected, without a network lookup.
+    """
+    import json
+
+    import huggingface_hub
+
+    from vllm_mlx.utils import tokenizer as tok
+
+    repo_root = tmp_path / "models--mlx-community--Qwen3.5-2B-MLX-4bit"
+    revision = "93760be4f1f69842a46bc13dbdc0f19e291392a3"
+    snapshot = repo_root / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+            }
+        )
+    )
+    (snapshot / "model.safetensors").write_bytes(b"complete")
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+
+    resolved = tok._local_snapshot_if_cached("mlx-community/Qwen3.5-2B-MLX-4bit")
+    assert resolved == str(snapshot)

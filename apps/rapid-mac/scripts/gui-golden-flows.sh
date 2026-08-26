@@ -57,7 +57,7 @@ Flows: fresh-install, cached-quickstart, cached-curated-tradeup, cached-variant-
        slow-stream-stop,
        model-crash-recovery, low-memory-choice,
        update-state, update-busy, campaign-banner, window-close-prompt, no-dead-controls, catalog-integrity,
-       browse-all-destination, chat-document-attachment, chat-multimodal-attachments, image-generation, dictation, audio-readiness, all
+       browse-all-destination, chat-document-attachment, chat-multimodal-attachments, image-generation, dictation, dictation-rc2-upgrade, audio-readiness, all
 
 Most named regression flows drive the app through the accessibility API alone.
 The preflight contract tests keep the exact allowlist in sync with
@@ -146,7 +146,7 @@ flow_requires_screen_recording() {
 flow_requires_peekaboo() {
     case "$FLOW" in
         fresh-install|cached-quickstart|cached-curated-tradeup|cached-variant-collapse|download-progress|settings-persistence|settings-mtp|chat-restore|message-actions|restored-tools|tool-loop-budget|chat-depth|math-rendering|browse-all-destination|no-dead-controls|catalog-integrity|update-state|update-busy|campaign-banner|launch-integrations) return 1 ;;
-        slow-stream-stop|model-crash-recovery|low-memory-choice|chat-document-attachment|chat-multimodal-attachments|image-generation|dictation|audio-readiness|window-close-prompt|resident-load-rejected) return 1 ;;
+        slow-stream-stop|model-crash-recovery|low-memory-choice|chat-document-attachment|chat-multimodal-attachments|image-generation|dictation|dictation-rc2-upgrade|audio-readiness|window-close-prompt|resident-load-rejected) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -4754,6 +4754,55 @@ flow_audio_readiness() {
 # is reachable, raw recordings remain opt-in, local vocabulary edits work,
 # mode round-trips preserve the pane, opening it alone never starts a model,
 # and enabling visibly transitions from Loading to Ready.
+flow_dictation_rc2_upgrade() {
+    log "flow: dictation-rc2-upgrade"
+    start_persona dictation-rc2-upgrade \
+        RAPID_GUI_GOLDEN_MODE=1 \
+        RAPID_GUI_DICTATION_READINESS_FIXTURE=1 \
+        FAKE_CACHED_DICTATION=1
+    dismiss_first_run
+    stop_app
+
+    # Recreate the keys written by rc2 before lane ownership existed: one
+    # shared last-served chat key plus independently persisted Dictation intent
+    # and its audio model. The bundle id is unique to this throwaway persona.
+    defaults write "$BUNDLE_ID" rapid.serve.lastAlias "fake-alias"
+    defaults write "$BUNDLE_ID" dictation.enabled -bool true
+    defaults write "$BUNDLE_ID" dictation.model "fake-whisper-small"
+    relaunch_persona
+    dismiss_first_run
+
+    local i restored_chat=0
+    for ((i=0; i<120; i++)); do
+        see_main "$OUT/rc2-upgrade-chat.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(.identifier == "ModelPickerBar.ModelMenu"
+                           and .value == "fake-alias")' \
+                 "$OUT/rc2-upgrade-chat.json" >/dev/null; then
+            restored_chat=1; break
+        fi
+        sleep 0.1
+    done
+    [[ "$restored_chat" == 1 ]] \
+        || die "rc2 upgrade did not restore the persisted chat model"
+    wait_send_idle "$OUT/rc2-upgrade-send-ready.json"
+    jq -e -s 'any(.[]; .event == "server_started" and .alias == "fake-alias")
+              and (any(.[]; .event == "server_started" and .alias == "fake-whisper-small") | not)' \
+        "$OUT/fake-events.jsonl" >/dev/null \
+        || die "rc2 upgrade restored the transcription alias as process owner"
+    press "$OUT/rc2-upgrade-send-ready.json" Sidebar.Audio \
+        "$OUT/rc2-upgrade-audio-open.json" \
+        || die "Audio is not reachable after rc2 upgrade"
+    wait_identifier Dictation.Enable "$OUT/rc2-upgrade-audio.json"
+    [[ "$(element_field "$OUT/rc2-upgrade-audio.json" Dictation.Enable value)" == "1" ]] \
+        || die "rc2 upgrade lost persisted Dictation intent"
+
+    log "  rc2 chat + Dictation state restored with Send enabled"
+    log "  dictation-rc2-upgrade OK"
+    cleanup_persona
+}
+
+
 flow_dictation() {
     log "flow: dictation"
     start_persona dictation \
@@ -4905,7 +4954,38 @@ flow_dictation() {
         "Conversation state before dictation"
     send_prompt "Conversation survives dictation" "dictation-chat"
 
-    log "  setup controls, privacy toggle, vocabulary, co-loaded warmup, and preserved chat produced effects"
+    # Relaunch is the state-ownership contract: Dictation remains enabled, but
+    # its audio selection must never become the restored chat model. Session
+    # restore starts the catalog-proven chat alias first, then re-arms the
+    # audio lane on that process; no transcription-only child may appear.
+    relaunch_persona
+    dismiss_first_run
+    local restored_chat=0
+    for ((i=0; i<120; i++)); do
+        see_main "$OUT/dictation-relaunch-chat.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(.identifier == "ModelPickerBar.ModelMenu"
+                           and .value == "fake-alias")' \
+                 "$OUT/dictation-relaunch-chat.json" >/dev/null; then
+            restored_chat=1; break
+        fi
+        sleep 0.1
+    done
+    [[ "$restored_chat" == 1 ]] \
+        || die "Relaunch did not restore the conversation model after enabling Dictation"
+    wait_send_idle "$OUT/dictation-relaunch-send-ready.json"
+    jq -e -s '(map(select(.event == "server_started" and .alias == "fake-alias")) | length) == 2
+              and (any(.[]; .event == "server_started" and .alias == "fake-whisper-small") | not)' \
+        "$OUT/fake-events.jsonl" >/dev/null \
+        || die "Relaunch restored the transcription alias as the process-owning chat model"
+    press "$OUT/dictation-relaunch-send-ready.json" Sidebar.Audio \
+        "$OUT/dictation-relaunch-audio-open.json" \
+        || die "Audio is not reachable after Dictation relaunch"
+    wait_identifier Dictation.Enable "$OUT/dictation-relaunch-audio.json"
+    [[ "$(element_field "$OUT/dictation-relaunch-audio.json" Dictation.Enable value)" == "1" ]] \
+        || die "Relaunch disabled the user's persisted Dictation intent"
+
+    log "  setup controls, privacy toggle, vocabulary, co-loaded warmup, relaunch, and preserved chat produced effects"
     log "  dictation OK"
     cleanup_persona
 }
@@ -4945,6 +5025,7 @@ case "$FLOW" in
     chat-multimodal-attachments) flow_chat_multimodal_attachments ;;
     image-generation) flow_image_generation ;;
     dictation) flow_dictation ;;
+    dictation-rc2-upgrade) flow_dictation_rc2_upgrade ;;
     audio-readiness) flow_audio_readiness ;;
     resident-load-rejected) flow_resident_load_rejected ;;
     launch-integrations) flow_launch_integrations ;;

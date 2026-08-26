@@ -947,9 +947,11 @@ def _local_snapshot_if_cached(model_name: str) -> str:
     """
     try:
         from .._download_gate import is_repo_cached
+        from ..model_metadata import resolve_unreferenced_cached_snapshot
 
         if not is_repo_cached(model_name):
-            return model_name
+            snapshot = resolve_unreferenced_cached_snapshot(model_name)
+            return str(snapshot) if snapshot is not None else model_name
     except Exception:
         return model_name
     try:

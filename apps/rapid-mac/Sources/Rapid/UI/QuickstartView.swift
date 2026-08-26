@@ -4386,7 +4386,15 @@ struct QuickstartView: View {
             }
         case .restart:
             coordinator.enterStarting()
-            Task { await server.start(alias: coordinator.selection.alias) }
+            let catalogEntry = cachedModels.first {
+                $0.alias == coordinator.selection.alias
+            }
+            Task {
+                await server.start(
+                    alias: coordinator.selection.alias,
+                    catalogEntryHint: catalogEntry
+                )
+            }
         case .openModelManagement, .openWebSearchSettings:
             // One path for every Settings deep-link. ``route`` stages the
             // target tab and only then runs the open — ``SettingsView`` reads
@@ -4464,7 +4472,8 @@ struct QuickstartView: View {
             await coordinator.afterSkippingDownloadBeat(duration: Self.skippingDownloadBeat) {
                 await server.start(
                     alias: cached.alias,
-                    hfPath: cached.hfRepo
+                    hfPath: cached.hfRepo,
+                    catalogEntryHint: cached
                 )
             }
         }
@@ -4557,10 +4566,14 @@ struct QuickstartView: View {
             // and re-enters main actor; we kick it via a Task because
             // the .task(id:) closure is already main-actor bound.
             coordinator.enterStarting()
+            let catalogEntry = cachedModels.first {
+                $0.alias == coordinator.selection.alias
+            }
             Task { @MainActor in
                 await server.start(
                     alias: coordinator.selection.alias,
-                    hfPath: coordinator.selection.hfRepo
+                    hfPath: coordinator.selection.hfRepo,
+                    catalogEntryHint: catalogEntry
                 )
             }
         case .cancelled:

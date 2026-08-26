@@ -106,6 +106,45 @@ struct LaunchOnboardingOrderingTests {
         ))
     }
 
+    @Test("legacy audio ownership cannot suppress first-run onboarding")
+    func legacyAudioAliasStillOwesOnboarding() {
+        let audio = ModelEntry(
+            alias: "speech-input",
+            hfRepo: "example/speech-input",
+            sizeOnDisk: "500 MB",
+            cached: true,
+            kind: .audio,
+            audioCapability: .transcription
+        )
+        let launchPlan = SessionModelRestore.launchPlan(
+            legacyLastAlias: audio.alias,
+            dictationAlias: audio.alias,
+            speechAlias: nil,
+            catalog: [audio],
+            autoStartEnabled: false
+        )
+        let restored = launchPlan.models
+
+        #expect(restored.chatAlias == nil)
+        #expect(launchPlan.chatAliasResolved)
+        #expect(!launchPlan.shouldAutoStart)
+        #expect(QuickstartCoordinator.onboardingOwed(
+            done: false,
+            legacyDone: false,
+            lastServedAlias: restored.chatAlias
+        ))
+        #expect(launchDecision(
+            lastServedAlias: restored.chatAlias,
+            cachedAliases: [audio.alias]
+        ) == .skip(reason: .onboardingPending))
+        #expect(QuickstartCoordinator.isEligible(
+            done: false,
+            legacyDone: false,
+            lastServedAlias: restored.chatAlias,
+            serverState: .idle
+        ))
+    }
+
     /// The pre-fix state, asserted from the wizard's side, so the test
     /// file documents *why* the gate has to sit where it does. Had
     /// auto-start been allowed to run, this is what the sheet would have
@@ -264,13 +303,20 @@ struct LaunchOnboardingOrderingTests {
     /// single re-run of the launch hook, not a permanent suppression.
     @Test("Answering consent releases the deferred auto-start")
     func consentAnsweredReleasesAutoStart() {
-        let decision = launchDecision(
+        let deferred = launchDecision(
+            lastServedAlias: "qwen3.5-4b-4bit",
+            cachedAliases: ["qwen3.5-4b-4bit"],
+            done: true,
+            consentPending: true
+        )
+        let released = launchDecision(
             lastServedAlias: "qwen3.5-4b-4bit",
             cachedAliases: ["qwen3.5-4b-4bit"],
             done: true,
             consentPending: false
         )
-        #expect(decision == .start(alias: "qwen3.5-4b-4bit"))
+        #expect(deferred == .skip(reason: .firstRunDecisionPending))
+        #expect(released == .start(alias: "qwen3.5-4b-4bit"))
     }
 
     // MARK: - Precedence ladder

@@ -114,7 +114,36 @@ final class DictationController {
     private let server: ServerManager
     private let client: AudioClient
     private let hotkey = DictationHotkey()
-    private let recorder = DictationRecorder()
+    /// Constructing `DictationRecorder` initializes AVAudioEngine/CoreAudio.
+    /// Keep that work behind the first real capture so state-only controllers
+    /// (including launch restore and tests) never claim audio resources.
+    private final class CaptureLifecycle: @unchecked Sendable {
+        var recorder: DictationRecorder?
+        var ticker: Timer?
+
+        deinit {
+            ticker?.invalidate()
+            recorder?.shutdown()
+        }
+    }
+
+    private let captureLifecycle = CaptureLifecycle()
+    private var recorderStorage: DictationRecorder? {
+        get { captureLifecycle.recorder }
+        set { captureLifecycle.recorder = newValue }
+    }
+    private var recorder: DictationRecorder {
+        if let recorderStorage { return recorderStorage }
+        let recorder = DictationRecorder()
+        recorder.onLevel = { [weak self] value in
+            Task { @MainActor in self?.level = value }
+        }
+        recorder.onFirstSample = { [weak self] in
+            Task { @MainActor in self?.markRecordingStarted() }
+        }
+        recorderStorage = recorder
+        return recorder
+    }
     private let hud = DictationHUD()
     /// `nil` means the catalog probe itself failed; an array is authoritative.
     /// Keeping those states distinct prevents a transient CLI failure from
@@ -128,7 +157,10 @@ final class DictationController {
     private let testingRecorderCancel: (@MainActor () -> Void)?
     private let testingTranscribeCancel: (@MainActor () -> Void)?
 
-    private var tickTimer: Timer?
+    private var tickTimer: Timer? {
+        get { captureLifecycle.ticker }
+        set { captureLifecycle.ticker = newValue }
+    }
     private var recordingStart: Date?
     private var capturingApp: String?
     private var level: Float = 0
@@ -147,6 +179,11 @@ final class DictationController {
     /// Invalidates stale `enable()` continuations when the model changes, the
     /// feature is disabled, or another enable attempt supersedes them.
     private var enableRequestID: UUID?
+    /// Launch restore arms the global shortcut before the primary model has
+    /// finished its potentially long health-check window, but must not let an
+    /// audio-only fallback race that primary launch. Cleared as soon as the
+    /// chat restore settles and normal voice-lane preparation begins.
+    private var modelPreparationDeferred = false
     /// alias → catalog facts. ``ensureServing`` needs the repo; readiness
     /// needs ``cached``. One `audioEntries` fetch fills both. The repo is
     /// only ever passed to the server for models already on disk — passing
@@ -174,6 +211,7 @@ final class DictationController {
         testingRecorderStart: (@MainActor () throws -> Void)? = nil,
         testingRecorderCancel: (@MainActor () -> Void)? = nil,
         testingTranscribeCancel: (@MainActor () -> Void)? = nil,
+        testingInitialModelPreparationDeferred: Bool? = nil,
         audioCatalogLoader: @escaping @MainActor (URL) async -> [ModelEntry]? = {
             await ModelCatalog.audioEntriesIfAvailable(binary: $0)
         }
@@ -192,7 +230,13 @@ final class DictationController {
         self.testingTranscribeCancel = testingTranscribeCancel
 
         let defaults = UserDefaults.standard
-        self.isEnabled = testingEnabled ?? defaults.bool(forKey: Keys.enabled)
+        let restoredIsEnabled = testingEnabled ?? defaults.bool(forKey: Keys.enabled)
+        self.isEnabled = restoredIsEnabled
+        // Persisted enabled intent is a launch-time fact. Establish the same
+        // barrier synchronously with the controller so a mounted Audio view's
+        // revalidation cannot outrun ContentView's async session restore.
+        self.modelPreparationDeferred = testingInitialModelPreparationDeferred
+            ?? (testingEnabled == nil && restoredIsEnabled)
         self.trigger = DictationHotkey.Trigger(
             rawValue: defaults.string(forKey: Keys.trigger) ?? ""
         ) ?? .rightCommand
@@ -206,12 +250,6 @@ final class DictationController {
         hotkey.trigger = trigger
         hotkey.onTap = { [weak self] in self?.handleHotkey() }
 
-        recorder.onLevel = { [weak self] value in
-            Task { @MainActor in self?.level = value }
-        }
-        recorder.onFirstSample = { [weak self] in
-            Task { @MainActor in self?.markRecordingStarted() }
-        }
     }
 
     // MARK: - Readiness
@@ -260,13 +298,36 @@ final class DictationController {
     /// that normally follows flipping the switch: the event tap was never
     /// installed, the banner still read "Ready", and the hotkey did nothing
     /// until the user toggled it off and on again.
-    func bootstrap() async {
+    func bootstrap(deferModelPreparation: Bool = false) async {
         guard isEnabled, phase == .off else { return }
+        await enable(deferModelPreparation: deferModelPreparation)
+    }
+
+    /// Finish the audio half of launch restore after the chat launch has
+    /// settled. The shortcut was already armed by ``bootstrap`` so a slow
+    /// primary launch never leaves the user's persisted global shortcut
+    /// silently unregistered.
+    func finishDeferredBootstrap() async {
+        guard isEnabled, modelPreparationDeferred else { return }
+        modelPreparationDeferred = false
+        // Cancellation still owns cleanup: leave the already-registered
+        // shortcut able to prepare on its next use, but do not start an audio
+        // model from a superseded launch task.
+        guard !Task.isCancelled else { return }
         await enable()
     }
 
-    func enable(replacingCurrentPrewarm: Bool = false) async {
+    func enable(
+        replacingCurrentPrewarm: Bool = false,
+        deferModelPreparation: Bool = false
+    ) async {
         guard isEnabled else { return }
+        // Establish the launch barrier before the first suspension. Catalog
+        // refresh is re-entrant: a model change or download completion can
+        // start another enable while this call awaits the subprocess.
+        if deferModelPreparation {
+            modelPreparationDeferred = true
+        }
         let requestID = UUID()
         enableRequestID = requestID
         // The on-disk bit comes from a catalog subprocess; fetch it before
@@ -294,6 +355,18 @@ final class DictationController {
             if disableIntent { isEnabled = false }
             return
         }
+        // Once launch restore establishes this barrier, every re-entrant
+        // enable path (model selection, download completion, activation) must
+        // inherit it. Only `finishDeferredBootstrap` clears it after chat has
+        // settled; otherwise a model change can start an audio-only fallback
+        // and tear down the still-starting primary child.
+        if deferModelPreparation || modelPreparationDeferred {
+            modelPreparationDeferred = true
+            guard registerHotkey() else { return }
+            enableRequestID = nil
+            return
+        }
+        modelPreparationDeferred = false
         hotkey.stop()
         phase = .preparingModel
         let preparingAlias = modelAlias
@@ -315,6 +388,12 @@ final class DictationController {
             }
             return
         }
+        guard registerHotkey() else { return }
+        enableRequestID = nil
+    }
+
+    @discardableResult
+    private func registerHotkey() -> Bool {
         guard testingHotkeyStart?() ?? hotkey.start() else {
             // macOS does not apply an Accessibility grant to an already-running
             // process, so this is the common shape right after the user flips
@@ -325,12 +404,12 @@ final class DictationController {
                 ? "Accessibility is granted, but this running copy hasn't picked it up. Relaunch Rapid to finish."
                 : "The dictation hotkey couldn't be registered."
             phase = .off
-            return
+            return false
         }
         accessibilityNeedsRelaunch = false
         lastError = nil
         phase = .idle
-        enableRequestID = nil
+        return true
     }
 
     func disable() {
@@ -350,8 +429,9 @@ final class DictationController {
         prewarmTask = nil
         prewarmRequestID = nil
         enableRequestID = nil
+        modelPreparationDeferred = false
         stopTicking()
-        recorder.shutdown()
+        recorderStorage?.shutdown()
         hud.hide()
         phase = .off
     }
@@ -368,7 +448,7 @@ final class DictationController {
             if let testingRecorderCancel {
                 testingRecorderCancel()
             } else {
-                recorder.cancelCapture()
+                recorderStorage?.cancelCapture()
             }
         } else if phase == .transcribing {
             testingTranscribeCancel?()
@@ -651,6 +731,10 @@ final class DictationController {
             return
         }
         let requestedAlias = modelAlias
+        guard !modelPreparationDeferred else {
+            lastError = "Dictation will be ready after your chat model finishes starting."
+            return
+        }
         guard server.isVoiceLaneReady(for: requestedAlias) else {
             hotkey.stop()
             phase = .preparingModel
@@ -721,7 +805,7 @@ final class DictationController {
 
     private func finishRecording() {
         stopTicking()
-        let audio = recorder.stopCapture()
+        let audio = recorderStorage?.stopCapture()
         let duration = recordingStart.map { Date().timeIntervalSince($0) } ?? 0
         recordingStart = nil
 
@@ -899,6 +983,12 @@ final class DictationController {
         tickTimer?.invalidate()
         tickTimer = nil
     }
+
+    /// Lifecycle assertions for state-only tests. These intentionally expose
+    /// no way to drive capture; they only prove tests leave no run-loop or
+    /// CoreAudio work behind for the next MainActor test.
+    internal var testingHasActiveTicker: Bool { tickTimer?.isValid == true }
+    internal var testingHasRecorder: Bool { recorderStorage != nil }
 
     // MARK: - Text
 

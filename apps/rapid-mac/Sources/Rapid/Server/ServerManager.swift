@@ -682,6 +682,14 @@ final class ServerManager {
 
     /// Interval between `/healthz` probes once the child is up.
     private let healthPollInterval: TimeInterval = 0.5
+    /// Persistence destination for lane-owned launch state. Production uses
+    /// standard defaults; lifecycle tests inject an isolated suite while still
+    /// driving the real spawn/health transition.
+    private let sessionDefaults: UserDefaults?
+    /// Catalog provenance supplied by UI start paths. Retained by alias so a
+    /// memory-confirmation re-entry does not lose the proof carried by the
+    /// original Start action when a later catalog subprocess fails.
+    private var catalogProvenStartEntries: [String: ModelEntry] = [:]
 
     /// v0.6 audit P1 (ServerManager — silent-crash detection):
     /// once the child has reported ready, continue polling /healthz
@@ -937,6 +945,7 @@ final class ServerManager {
         self.binaryResolution = resolution
         self.binaryPath = resolution?.binary
         self.state = (resolution == nil) ? .missing : .idle
+        self.sessionDefaults = .standard
     }
 
     /// Wire the app's ``DownloadManager`` so ``start(alias:)`` can
@@ -953,17 +962,21 @@ final class ServerManager {
     /// child or relying on whatever ``rapid-mlx`` happens to be on
     /// disk. Not part of any production code path; the underscore
     /// prefix mirrors the Swift Standard Library convention for
-    /// "API kept around for testing only."
+    /// "API kept around for testing only." Session persistence is opt-in:
+    /// parallel fake-sidecar tests must not race through ``.standard`` or
+    /// mutate the app's real last-chat selection.
     internal init(
         testingState: ServerState,
         binaryPath: URL? = nil,
         residency: ModelResidencySnapshot = .empty,
-        activeBearer: String? = nil
+        activeBearer: String? = nil,
+        sessionDefaults: UserDefaults? = nil
     ) {
         self.state = testingState
         self.activeBearer = activeBearer
         self.binaryPath = binaryPath
         self.residency = residency
+        self.sessionDefaults = sessionDefaults
         self.binaryResolution = binaryPath.map {
             ServerLocator.Resolution(binary: $0, source: .unknown, version: nil)
         }
@@ -991,6 +1004,37 @@ final class ServerManager {
     /// stop landing mid-loop to pin the state-drift guard.
     internal func _testSetState(_ newState: ServerState) {
         self.state = newState
+    }
+
+    /// Publish the selection consequence of a successful health transition.
+    /// Kept as one lifecycle boundary so tests exercise the same call that the
+    /// real `/healthz` success path uses instead of calling persistence policy
+    /// in isolation.
+    internal func recordReadySelection(
+        alias: String,
+        catalogEntry: ModelEntry?
+    ) {
+        guard let sessionDefaults else { return }
+        SessionModelRestore.persistReadyAlias(
+            alias,
+            catalogEntry: catalogEntry,
+            defaults: sessionDefaults
+        )
+    }
+
+    /// Prefer the start-time probe, but preserve catalog provenance already
+    /// held by the initiating UI when that probe transiently fails. The hint
+    /// is accepted only for the exact alias being launched.
+    internal static func readyCatalogEntry(
+        alias: String,
+        probed: ModelEntry?,
+        hint: ModelEntry?
+    ) -> ModelEntry? {
+        if let probed { return probed }
+        guard let hint,
+              hint.alias.caseInsensitiveCompare(alias) == .orderedSame
+        else { return nil }
+        return hint
     }
 
     /// Issue #1838 test seam — swap in a ``ServerResidencyClient`` whose
@@ -1084,13 +1128,15 @@ final class ServerManager {
 
     // MARK: - Persisted "last served" alias (v0.5.3 auto-restart)
 
-    /// UserDefaults key holding the alias of the model the user most
-    /// recently asked us to serve. Written on every transition into
-    /// ``.ready(alias:)`` and cleared on user-initiated ``stop()``.
+    /// UserDefaults key holding the alias of the chat model the user most
+    /// recently asked us to serve. Written only when authoritative catalog
+    /// metadata identifies the ready child as chat-capable; audio/image lane
+    /// process ownership must never replace the user's chat selection.
+    /// Cleared on user-initiated ``stop()``.
     /// ``RapidApp`` reads this on launch to decide whether to
     /// auto-resume the previous session's model (LM Studio shape:
     /// the loaded model survives an app restart).
-    nonisolated fileprivate static let lastServedAliasKey = "rapid.serve.lastAlias"
+    nonisolated fileprivate static let lastServedAliasKey = SessionModelRestore.chatAliasStorageKey
 
     /// Currently persisted last-served alias, if any. ``nil`` after a
     /// user-initiated Stop or a fresh install. Exposed as a static
@@ -1163,12 +1209,14 @@ final class ServerManager {
         estimatedMemoryGB: Double?,
         replacementGroup: ResidentModelReplacementGroup? = nil,
         imageMode: ResidentImageMode? = nil,
-        residencyEligible: Bool = true
+        residencyEligible: Bool = true,
+        catalogEntryHint: ModelEntry? = nil
     ) async -> Bool {
         let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         let requestedPerformanceFlags = perfLaunchFlagsProvider?(trimmed) ?? []
         var requestedCatalogSupportsImageInput = false
+        var probedCatalogEntry: ModelEntry?
         // Cold start delegates to `start`, which resolves the same metadata
         // authoritatively. This probe is needed only to decide whether an
         // already-running text-lane sidecar can accept a resident load.
@@ -1180,12 +1228,18 @@ final class ServerManager {
                 $0.alias.caseInsensitiveCompare(trimmed) == .orderedSame
             }
             if Task.isCancelled || didSignalShutdown { return false }
+            probedCatalogEntry = entry
             requestedCatalogSupportsImageInput = ModelBrandStyle.supportsImageInput(
                 forAlias: trimmed,
                 isBuiltinProfile: entry?.isBuiltinProfile,
                 isTextOnly: entry?.isTextOnly
             )
         }
+        let provenCatalogEntry = Self.readyCatalogEntry(
+            alias: trimmed,
+            probed: probedCatalogEntry,
+            hint: catalogEntryHint
+        )
         let requiresImageLaneRestart = Self.requiresProcessRestartForImageCapability(
             catalogSupportsImageInput: requestedCatalogSupportsImageInput,
             userOverrides: requestedPerformanceFlags,
@@ -1306,6 +1360,12 @@ final class ServerManager {
                 if replacementGroup != nil {
                     state = .ready(alias: trimmed)
                 }
+                if replacementGroup == .assistant {
+                    recordReadySelection(
+                        alias: trimmed,
+                        catalogEntry: provenCatalogEntry
+                    )
+                }
                 // A successful in-process load confirms the model is fine, so
                 // drop any (possibly concurrent) rejection recorded for it —
                 // but only if THIS attempt is still the newest for the alias.
@@ -1379,7 +1439,12 @@ final class ServerManager {
             await stop(preservingLastServedAlias: true)
         }
         let memoryRequestID = UUID()
-        await start(alias: trimmed, hfPath: hfPath, memoryRequestID: memoryRequestID)
+        await start(
+            alias: trimmed,
+            hfPath: hfPath,
+            memoryRequestID: memoryRequestID,
+            catalogEntryHint: provenCatalogEntry
+        )
         // ``start`` also returns without spawning when the pre-load
         // memory guard parks the load on a confirmation prompt. Reading
         // ``isServing`` now would report "couldn't start the model"
@@ -1713,7 +1778,8 @@ final class ServerManager {
         isAutoRespawn: Bool = false,
         bypassMemoryGuard: Bool = false,
         memoryRequestID: UUID? = nil,
-        isLaunchAutoStart: Bool = false
+        isLaunchAutoStart: Bool = false,
+        catalogEntryHint: ModelEntry? = nil
     ) async {
         // Issue #278: a manual restart is the user taking over the
         // lifecycle — reset the budget at entry so a previously
@@ -1748,6 +1814,13 @@ final class ServerManager {
                 message: "That model name isn't valid. Pick a model from the bar at the top."
             )
             return
+        }
+        if let hintedEntry = Self.readyCatalogEntry(
+            alias: trimmedAlias,
+            probed: nil,
+            hint: catalogEntryHint
+        ) {
+            catalogProvenStartEntries[trimmedAlias.lowercased()] = hintedEntry
         }
 
         // Pre-load memory guard (#324). Loading a model whose footprint,
@@ -1882,12 +1955,18 @@ final class ServerManager {
         // launch a visual checkpoint in its text lane. Keeping this await
         // before `isOperating = true` preserves the cancellable startup
         // contract; re-check every entry guard after actor reentrancy.
-        let catalogEntry = await ModelCatalogCache.shared.entries(
+        let probedCatalogEntry = await ModelCatalogCache.shared.entries(
             binary: binary,
             generation: downloads?.cacheGeneration ?? 0
         ).first {
             $0.alias.caseInsensitiveCompare(trimmedAlias) == .orderedSame
         }
+        let catalogEntry = Self.readyCatalogEntry(
+            alias: trimmedAlias,
+            probed: probedCatalogEntry,
+            hint: catalogEntryHint
+                ?? catalogProvenStartEntries[trimmedAlias.lowercased()]
+        )
         if Task.isCancelled || didSignalShutdown { return }
         guard !isOperating, child == nil else { return }
         let catalogSupportsImageInput = ModelBrandStyle.supportsImageInput(
@@ -2344,7 +2423,7 @@ final class ServerManager {
                 // overwrite the previous good-known value, so a
                 // crashed launch attempt doesn't strand the resume
                 // logic on a model the user can't actually load.
-                UserDefaults.standard.set(trimmedAlias, forKey: Self.lastServedAliasKey)
+                recordReadySelection(alias: trimmedAlias, catalogEntry: catalogEntry)
                 await refreshResidency()
                 // v0.6 audit P1 (silent-crash detection): now that
                 // the child is ready, start the runtime health

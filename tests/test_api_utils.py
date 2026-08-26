@@ -7,6 +7,7 @@ from vllm_mlx/api/utils.py. No MLX dependency.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -908,8 +909,6 @@ class TestMllmBackboneIsHybrid:
         repo_root = tmp_path / "hub" / "models--mlx-community--Qwen3.5-2B-MLX-4bit"
         snapshot = repo_root / "snapshots" / revision
         snapshot.mkdir(parents=True)
-        (repo_root / "refs").mkdir()
-        (repo_root / "refs" / "main").write_text(revision)
         (snapshot / "config.json").write_text(
             json.dumps(
                 {
@@ -947,6 +946,16 @@ class TestMllmBackboneIsHybrid:
         monkeypatch.setattr(
             huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path / "hub")
         )
+        from vllm_mlx import cli
+
+        def fail_on_network(_name):
+            raise AssertionError("complete singleton snapshot must stay offline")
+
+        monkeypatch.setattr(
+            cli,
+            "_ensure_model_downloaded",
+            fail_on_network,
+        )
 
         class StubEngine:
             is_mllm = False
@@ -971,19 +980,30 @@ class TestMllmBackboneIsHybrid:
         # old process-global alias must not lend its image profile to Qwen.
         monkeypatch.setattr(server, "_model_alias", "z-image-turbo", raising=False)
 
+        from vllm_mlx.model_metadata import read_model_metadata
+        from vllm_mlx.utils.tokenizer import _local_snapshot_if_cached
+
+        metadata = read_model_metadata(repo)
+        assert metadata is not None
+        assert metadata.snapshot_dir == snapshot
+        assert _local_snapshot_if_cached(repo) == str(snapshot)
+
         server.load_model(alias)
 
         assert server._model_path == repo
-        assert server._model_name == alias
+        # Only an explicit ``served_model_name`` replaces the primary served
+        # id. The canonical checkpoint remains primary by default, while the
+        # requested short name is exposed separately as its alias.
+        assert server._model_name == repo
         assert server._model_alias == alias
-        assert server._engine.kwargs["model_name"] == repo
+        assert server._engine.kwargs["model_name"] == str(snapshot)
         assert server._engine.kwargs["force_text"] is True
 
         # CLI startup arrives with the canonical repo plus a matching saved
         # alias. That same-source identity remains valid and keeps its profile.
         server.load_model(repo)
         assert server._model_alias == alias
-        assert server._engine.kwargs["model_name"] == repo
+        assert server._engine.kwargs["model_name"] == str(snapshot)
         assert server._engine.kwargs["force_text"] is True
 
         # A removed/corrupt prior identity is stale process state, not a reason
@@ -1002,8 +1022,52 @@ class TestMllmBackboneIsHybrid:
         server._model_alias = "removed-prior-alias"
         server.load_model(repo)
         assert server._model_alias is None
-        assert server._engine.kwargs["model_name"] == repo
+        assert server._engine.kwargs["model_name"] == str(snapshot)
         assert server._engine.kwargs["force_text"] is True
+
+    def test_unreferenced_snapshot_resolution_fails_closed(self, monkeypatch, tmp_path):
+        """Ambiguous, partial, and malformed cache shapes must stay offline-safe."""
+        import huggingface_hub
+
+        from vllm_mlx import model_metadata
+
+        repo = "publisher/model"
+        repo_root = tmp_path / "models--publisher--model"
+        snapshots = repo_root / "snapshots"
+        snapshot = snapshots / "immutable-revision"
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text(
+            json.dumps({"model_type": "qwen3_5"}), encoding="utf-8"
+        )
+        (snapshot / "model.safetensors").write_bytes(b"complete")
+        monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+
+        refs = repo_root / "refs"
+        refs.mkdir()
+        (refs / "main").write_text("missing-revision", encoding="utf-8")
+        assert model_metadata.resolve_unreferenced_cached_snapshot(repo) is None
+        (refs / "main").unlink()
+
+        second = snapshots / "second-revision"
+        second.mkdir()
+        assert model_metadata.resolve_unreferenced_cached_snapshot(repo) is None
+        second.rmdir()
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                "vllm_mlx.model_aliases.checkpoint_prefix", lambda _name: "nested/"
+            )
+            assert model_metadata.resolve_unreferenced_cached_snapshot(repo) is None
+
+        (snapshot / "model.safetensors").unlink()
+        assert model_metadata.resolve_unreferenced_cached_snapshot(repo) is None
+
+        def fail_to_list(_path):
+            raise OSError("stale cache mount")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(Path, "iterdir", fail_to_list)
+            assert model_metadata.resolve_unreferenced_cached_snapshot(repo) is None
 
     def test_sliding_and_full_attention_is_not_hybrid(self, monkeypatch):
         from vllm_mlx.api.utils import mllm_backbone_is_hybrid

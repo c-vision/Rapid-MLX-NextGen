@@ -1567,10 +1567,17 @@ struct ModelPickerBar: View {
             pendingTooBigStart = trimmed
             return
         }
-        let hfPath = catalog.first(where: { $0.alias == trimmed })?.hfRepo
+        let catalogEntry = catalog.first(where: { $0.alias == trimmed })
+        let hfPath = catalogEntry?.hfRepo
         // Launch flags are applied inside ServerManager.start (one choke
         // point for every start path), RAM-gated to the recommended pick.
-        Task { await server.start(alias: trimmed, hfPath: hfPath) }
+        Task {
+            await server.start(
+                alias: trimmed,
+                hfPath: hfPath,
+                catalogEntryHint: catalogEntry
+            )
+        }
     }
 
     /// Alert title shown when the user tries to Start a ``.tooBig``

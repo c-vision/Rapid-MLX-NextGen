@@ -6,6 +6,29 @@ import SwiftUI
 /// server is ready the picker's Start button owns the flow, and a
 /// brand-new user with no model on disk sees the Quickstart card.
 struct ContentView: View {
+    enum RestoredChatAlias: Equatable {
+        case pendingCatalog
+        /// The bounded catalog retry also failed. The persisted key remains
+        /// untouched for a future launch, but this session must not stay
+        /// blocked behind an alias it could not classify.
+        case unresolved
+        case resolved(String?)
+    }
+
+    /// Outer nil means catalog classification is still pending. Outer some
+    /// carries the value onboarding should evaluate; `.unresolved` therefore
+    /// deliberately behaves like no persisted chat model for this session.
+    static func quickstartChatAlias(for state: RestoredChatAlias) -> String?? {
+        switch state {
+        case .pendingCatalog:
+            nil
+        case .unresolved:
+            .some(nil)
+        case .resolved(let alias):
+            .some(alias)
+        }
+    }
+
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// #459: hard window-width floor. The original 640pt target preserved
     /// half-screen tiling on built-in MacBook displays; 720pt is the smallest
@@ -23,6 +46,7 @@ struct ContentView: View {
     @Environment(ChatViewModel.self) private var chat
     @Environment(ImageGenViewModel.self) private var imageGen
     @Environment(AudioViewModel.self) private var audio
+    @Environment(DictationController.self) private var dictation
     @Environment(SamplingConfig.self) private var sampling
     @Environment(UpdateChecker.self) private var updater
     @Environment(QuickstartCoordinator.self) private var quickstart
@@ -69,6 +93,16 @@ struct ContentView: View {
     /// FU-1: persisted opt-out for the launch-time auto-start path.
     @AppStorage(AutoStartPreference.storageKey) private var autoStartOnLaunch: Bool = AutoStartPreference.defaultValue
     @State private var campaign: Campaign? = Campaign.previewFromEnvironment(ProcessInfo.processInfo.environment)
+    /// The rc2 key predates lane ownership. A non-empty value cannot decide
+    /// onboarding until catalog metadata proves it is a chat model; keeping an
+    /// explicit pending state prevents the launch gate and Quickstart surface
+    /// from interpreting the same legacy audio alias differently.
+    @State private var restoredChatAlias: RestoredChatAlias =
+        ServerManager.lastServedAlias() == nil ? .resolved(nil) : .pendingCatalog
+    /// A legacy chat key needs catalog metadata before it can be trusted. If
+    /// the shared launch probe fails empty, permit one immediate authoritative
+    /// retry without turning session restoration into a polling loop.
+    @State private var catalogRestoreRetryAttempted = false
 
     var body: some View {
         // Capture the identity owned by this alert render. A delayed dismiss
@@ -246,7 +280,7 @@ struct ContentView: View {
         // re-run, and the first pass returns at the gate without an
         // in-flight `server.start` for SwiftUI's task cancellation to
         // interrupt. Users with no pending decision see one run, as before.
-        .task(id: telemetryConsentPending) { await runLaunchAutoStart() }
+        .task(id: telemetryConsentPending) { await restorePersistedSession() }
         // Keyed exactly as the picker's own catalog task: re-fetch when
         // the engine binary appears and whenever the set of models on
         // disk changes anywhere in the app. Routed through the shared
@@ -586,14 +620,32 @@ struct ContentView: View {
     private func refreshCatalogSnapshot() async {
         guard let binary = server.binaryPath else { return }
         let generation = downloads.cacheGeneration
-        let loaded = await ModelCatalogCache.shared.entries(
+        var loaded = await ModelCatalogCache.shared.entries(
             binary: binary,
             generation: generation
         )
         guard !Task.isCancelled, generation == downloads.cacheGeneration else { return }
+        if loaded.isEmpty,
+           case .pendingCatalog = restoredChatAlias,
+           !catalogRestoreRetryAttempted {
+            catalogRestoreRetryAttempted = true
+            await ModelCatalogCache.shared.invalidate()
+            loaded = await ModelCatalogCache.shared.entries(
+                binary: binary,
+                generation: generation
+            )
+            guard !Task.isCancelled, generation == downloads.cacheGeneration else { return }
+        }
         catalogEntries = loaded
         catalogGeneration = generation
         catalogLoaded = true
+        if case .pendingCatalog = restoredChatAlias,
+           !loaded.isEmpty || catalogRestoreRetryAttempted {
+            await restorePersistedSession(
+                catalog: loaded,
+                emptyCatalogIsAuthoritative: loaded.isEmpty
+            )
+        }
     }
 
     /// Perform the readiness banner's next-step action.
@@ -632,7 +684,8 @@ struct ContentView: View {
     }
 
     private func startModel(_ target: String) {
-        let hfPath = catalogEntries.first(where: { $0.alias == target })?.hfRepo
+        let catalogEntry = catalogEntries.first(where: { $0.alias == target })
+        let hfPath = catalogEntry?.hfRepo
         // ``ensureServing`` via the shared helper, NOT ``server.start``: start is
         // cold-start only and no-ops while a different model (e.g. an Images
         // checkpoint) is resident, silently dropping the switch (#1739).
@@ -641,7 +694,8 @@ struct ContentView: View {
                 alias: target,
                 hfPath: hfPath,
                 estimatedMemoryGB: nil,
-                replacementGroup: .assistant
+                replacementGroup: .assistant,
+                catalogEntryHint: catalogEntry
             )
         }
     }
@@ -672,7 +726,8 @@ struct ContentView: View {
                 alias: target,
                 hfPath: hfPath,
                 estimatedMemoryGB: nil,
-                replacementGroup: .assistant
+                replacementGroup: .assistant,
+                catalogEntryHint: entry
             )
         }
     }
@@ -685,10 +740,17 @@ struct ContentView: View {
     }
 
     private func restartModel(_ target: String) {
-        let hfPath = catalogEntries.first(where: { $0.alias == target })?.hfRepo
+        let catalogEntry = catalogEntries.first(where: { $0.alias == target })
+        let hfPath = catalogEntry?.hfRepo
         Task {
             await server.stop()
-            _ = await server.ensureServing(alias: target, hfPath: hfPath)
+            _ = await server.ensureServing(
+                alias: target,
+                hfPath: hfPath,
+                estimatedMemoryGB: nil,
+                replacementGroup: .assistant,
+                catalogEntryHint: catalogEntry
+            )
         }
     }
 
@@ -842,10 +904,13 @@ struct ContentView: View {
         ) {
             return false
         }
+        guard let chatAlias = Self.quickstartChatAlias(for: restoredChatAlias) else {
+            return false
+        }
         if QuickstartCoordinator.isEligible(
             done: quickstart.done,
             legacyDone: quickstart.legacyDone,
-            lastServedAlias: ServerManager.lastServedAlias(),
+            lastServedAlias: chatAlias,
             serverState: server.state
         ) {
             return true
@@ -1121,7 +1186,80 @@ struct ContentView: View {
 
     // MARK: - Launch auto-start (Flow A/B)
 
-    private func runLaunchAutoStart() async {
+    /// Restore lane-owned state in dependency order. Start resolving chat
+    /// first, while arming Dictation's persisted global shortcut immediately;
+    /// audio model preparation remains deferred until the chat launch settles.
+    /// This keeps a slow primary health check from disabling the shortcut
+    /// without letting an audio fallback win ownership of the shared process.
+    private func restorePersistedSession(
+        catalog suppliedCatalog: [ModelEntry]? = nil,
+        emptyCatalogIsAuthoritative: Bool = false
+    ) async {
+        guard !telemetryConsentPending else { return }
+        let resolutionWasPending: Bool = {
+            if case .pendingCatalog = restoredChatAlias { return true }
+            return false
+        }()
+        _ = BundledModel.installBundledSnapshotSymlink()
+        _ = QuickstartModel.installAllSnapshotSymlinks()
+        let sessionCatalog: [ModelEntry]
+        if let suppliedCatalog {
+            sessionCatalog = suppliedCatalog
+        } else if let binary = server.binaryPath {
+            sessionCatalog = await ModelCatalogCache.shared.entries(
+                binary: binary,
+                generation: downloads.cacheGeneration
+            )
+        } else {
+            sessionCatalog = []
+        }
+        let launchPlan = SessionModelRestore.launchPlan(
+            legacyLastAlias: ServerManager.lastServedAlias(),
+            dictationAlias: nil,
+            speechAlias: nil,
+            catalog: sessionCatalog,
+            autoStartEnabled: autoStartOnLaunch,
+            emptyCatalogIsAuthoritative: emptyCatalogIsAuthoritative
+        )
+        // Another reader may have resolved the same shared load while this
+        // task was suspended. A stale empty result cannot re-establish the
+        // audio barrier after the winning restore has already paired it.
+        if resolutionWasPending {
+            guard case .pendingCatalog = restoredChatAlias else { return }
+        }
+        if launchPlan.chatAliasResolved {
+            restoredChatAlias = emptyCatalogIsAuthoritative
+                ? .unresolved
+                : .resolved(launchPlan.models.chatAlias)
+        }
+
+        async let chatRestore: Void = runLaunchAutoStart(
+            catalogEntries: sessionCatalog,
+            launchPlan: launchPlan
+        )
+        await dictation.bootstrap(deferModelPreparation: true)
+        await chatRestore
+        // A failed catalog probe cannot classify the legacy key. Keep the
+        // audio barrier established; `refreshCatalogSnapshot` re-enters this
+        // same function when its independent probe produces real rows.
+        guard launchPlan.chatAliasResolved else { return }
+        if Task.isCancelled {
+            // The catalog task is keyed on cache generation. Hand ownership
+            // back to its replacement and pair the already-established audio
+            // barrier without starting audio from this cancelled task.
+            if resolutionWasPending {
+                restoredChatAlias = .pendingCatalog
+            }
+            await dictation.finishDeferredBootstrap()
+            return
+        }
+        await dictation.finishDeferredBootstrap()
+    }
+
+    private func runLaunchAutoStart(
+        catalogEntries: [ModelEntry],
+        launchPlan: SessionModelRestore.LaunchPlan
+    ) async {
         // Consent is the first user-controlled surface. Do not even inspect
         // model caches behind it: the final AutoStartDecision also knows about
         // this gate, but reaching that decision requires loading the catalog
@@ -1130,18 +1268,15 @@ struct ContentView: View {
         // operator's existing HF cache. The task is keyed on this value and
         // runs again immediately after the user answers.
         guard !telemetryConsentPending else { return }
-        guard autoStartOnLaunch else {
+        guard launchPlan.shouldAutoStart else {
             autoStartPendingDownload = nil
             return
         }
         guard case .idle = server.state else { return }
 
-        _ = BundledModel.installBundledSnapshotSymlink()
-        _ = QuickstartModel.installAllSnapshotSymlinks()
-
         let aliasAtEntry = alias
         let userSelectionRevisionAtEntry = userSelectionRevision
-        var cachedAliases: Set<String> = []
+        let cachedAliases = Set(catalogEntries.filter { $0.cached }.map(\.alias))
         // #1706: the full catalog membership snapshot (cached AND
         // uncached entries the sidecar can serve), used to validate the
         // stored last-served alias before we resume it. `nil` would ask
@@ -1149,15 +1284,9 @@ struct ContentView: View {
         // concrete set when the binary is reachable so a stored alias
         // the engine can't serve (renamed/dropped/wrong-modality) falls
         // through to the picker instead of a failed serve.
-        var catalogAliases: Set<String>? = nil
-        if let binary = server.binaryPath {
-            let entries = await ModelCatalogCache.shared.entries(
-                binary: binary,
-                generation: downloads.cacheGeneration
-            )
-            cachedAliases = Set(entries.filter { $0.cached }.map(\.alias))
-            catalogAliases = Set(entries.map(\.alias))
-        }
+        let catalogAliases: Set<String>? = server.binaryPath == nil
+            ? nil
+            : Set(catalogEntries.map(\.alias))
         guard case .idle = server.state else {
             autoStartPendingDownload = nil
             return
@@ -1184,7 +1313,7 @@ struct ContentView: View {
                     alias: candidate, physicalRAMGB: hardware.physicalRAMGB)
         }
         let decision = AutoStartDecision.decide(
-            lastServedAlias: ServerManager.lastServedAlias(),
+            lastServedAlias: launchPlan.models.chatAlias,
             bundledFallbackAlias: BundledModel.firstLaunchAlias(lastServedAlias: nil),
             binaryReachable: server.binaryPath != nil,
             cachedAliases: cachedAliases,
@@ -1206,7 +1335,7 @@ struct ContentView: View {
             onboardingPending: QuickstartCoordinator.onboardingOwed(
                 done: quickstart.done,
                 legacyDone: quickstart.legacyDone,
-                lastServedAlias: ServerManager.lastServedAlias()
+                lastServedAlias: launchPlan.models.chatAlias
             ),
             // Skip a retired starter only while the rescue is still on
             // offer. Once the user has completed or dismissed Quickstart,
@@ -1229,7 +1358,14 @@ struct ContentView: View {
             // modal the user never asked for (issue: annoying warning on every
             // app open). The user's own Start/first-message routes through
             // ``start`` without this flag and still gets the warning.
-            await server.start(alias: resume, isLaunchAutoStart: true)
+            let catalogEntry = catalogEntries.first {
+                $0.alias.caseInsensitiveCompare(resume) == .orderedSame
+            }
+            await server.start(
+                alias: resume,
+                isLaunchAutoStart: true,
+                catalogEntryHint: catalogEntry
+            )
         case .promptDownload(let pending):
             let footprint = ModelSizing.estimate(alias: pending)
             let sizeText: String? = footprint.paramsBillions == nil

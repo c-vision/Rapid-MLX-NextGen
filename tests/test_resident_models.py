@@ -47,7 +47,11 @@ def test_resident_performance_maps_to_the_scheduler_contract():
     ],
 )
 async def test_dynamic_resident_auto_detected_hybrid_gets_bounded_prefix_reuse(
-    monkeypatch, scheduler_config_stub, model_name, model_path
+    monkeypatch,
+    scheduler_config_stub,
+    residency_activity_contract,
+    model_name,
+    model_path,
 ):
     """Runtime residency must consume the same architecture truth as serve."""
     from vllm_mlx import server
@@ -68,6 +72,10 @@ async def test_dynamic_resident_auto_detected_hybrid_gets_bounded_prefix_reuse(
             pass
 
     monkeypatch.setattr(server, "BatchedEngine", FakeEngine)
+    monkeypatch.setattr(server, "_ensure_routing_config", lambda _name: None)
+    monkeypatch.setattr(
+        server, "resolve_serving_lane", lambda _name, **_kwargs: (False, True)
+    )
     monkeypatch.setattr("vllm_mlx.model_aliases.resolve_profile", lambda _name: None)
     monkeypatch.setattr(
         "vllm_mlx.model_auto_config.detect_model_config",
@@ -84,6 +92,7 @@ async def test_dynamic_resident_auto_detected_hybrid_gets_bounded_prefix_reuse(
     assert scheduler.enable_prefix_cache is True
     assert scheduler.hybrid_cache_entries == 8
     assert scheduler.non_trimmable_exact_prefix_reuse is True
+    await residency_activity_contract()
 
 
 @pytest.mark.asyncio
@@ -108,6 +117,10 @@ async def test_dynamic_resident_prefix_disable_keeps_hybrid_entries_zero(
             pass
 
     monkeypatch.setattr(server, "BatchedEngine", FakeEngine)
+    monkeypatch.setattr(server, "_ensure_routing_config", lambda _name: None)
+    monkeypatch.setattr(
+        server, "resolve_serving_lane", lambda _name, **_kwargs: (False, True)
+    )
     monkeypatch.setattr("vllm_mlx.model_aliases.resolve_profile", lambda _name: None)
     monkeypatch.setattr(
         "vllm_mlx.model_auto_config.detect_model_config",
@@ -152,6 +165,10 @@ async def test_dynamic_resident_full_attention_stays_unbounded(
             pass
 
     monkeypatch.setattr(server, "BatchedEngine", FakeEngine)
+    monkeypatch.setattr(server, "_ensure_routing_config", lambda _name: None)
+    monkeypatch.setattr(
+        server, "resolve_serving_lane", lambda _name, **_kwargs: (False, False)
+    )
     monkeypatch.setattr("vllm_mlx.model_aliases.resolve_profile", lambda _name: None)
     monkeypatch.setattr(
         "vllm_mlx.model_auto_config.detect_model_config",
@@ -165,15 +182,167 @@ async def test_dynamic_resident_full_attention_stays_unbounded(
     assert scheduler.non_trimmable_exact_prefix_reuse is False
 
 
+@pytest.mark.asyncio
+async def test_dynamic_resident_loads_singleton_no_refs_snapshot_offline(
+    monkeypatch, tmp_path, scheduler_config_stub
+):
+    """A commit-pinned catalog snapshot is the runtime load path without main."""
+    import json
+
+    import huggingface_hub
+
+    from vllm_mlx import server
+
+    repo = "mlx-community/Qwen3.5-2B-MLX-4bit"
+    revision = "93760be4f1f69842a46bc13dbdc0f19e291392a3"
+    snapshot = (
+        tmp_path
+        / "hub"
+        / "models--mlx-community--Qwen3.5-2B-MLX-4bit"
+        / "snapshots"
+        / revision
+    )
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "vision_config": {"model_type": "qwen3_5_vision"},
+                "text_config": {
+                    "model_type": "qwen3_5_text",
+                    "layer_types": ["linear_attention", "full_attention"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "model.safetensors").write_bytes(b"complete")
+    (snapshot / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "language_model.layers.0.weight": "model.safetensors",
+                    "vision_tower.blocks.0.weight": "model.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path / "hub")
+    )
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+
+    def fail_on_network(_name):
+        raise AssertionError("singleton snapshot must never need the network")
+
+    monkeypatch.setattr("vllm_mlx.cli._ensure_model_downloaded", fail_on_network)
+    captured = {}
+
+    class FakeEngine:
+        is_mllm = False
+
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def start(self):
+            pass
+
+        def generate_warmup(self):
+            pass
+
+    monkeypatch.setattr(server, "BatchedEngine", FakeEngine)
+
+    entry = await server._load_dynamic_resident_model("qwen3.5-2b-4bit", repo)
+
+    assert entry.model_path == repo
+    assert captured["model_name"] == str(snapshot)
+    assert captured["force_text"] is True
+
+
+@pytest.mark.asyncio
+async def test_dynamic_switch_restores_hybrid_text_lane(
+    monkeypatch, tmp_path, scheduler_config_stub
+):
+    """A large hybrid checkpoint keeps its lane after a small-model switch."""
+    import json
+
+    from vllm_mlx import server
+
+    large = tmp_path / "qwen35-9b"
+    small = tmp_path / "qwen3-06b"
+    for path in (large, small):
+        path.mkdir()
+        (path / "model.safetensors").write_bytes(b"complete")
+    (large / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "vision_config": {"model_type": "qwen3_5_vision"},
+                "text_config": {
+                    "model_type": "qwen3_5_text",
+                    "layer_types": ["linear_attention", "full_attention"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (large / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "language_model.layers.0.weight": "model.safetensors",
+                    "vision_tower.blocks.0.weight": "model.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (small / "config.json").write_text(
+        json.dumps({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+        encoding="utf-8",
+    )
+    constructed = []
+
+    class FakeEngine:
+        is_mllm = False
+
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+        async def start(self):
+            pass
+
+        def generate_warmup(self):
+            pass
+
+    monkeypatch.setattr(server, "BatchedEngine", FakeEngine)
+    monkeypatch.setattr("vllm_mlx.model_aliases.resolve_profile", lambda _name: None)
+
+    await server._load_dynamic_resident_model("large", str(large))
+    await server._load_dynamic_resident_model("small", str(small))
+    await server._load_dynamic_resident_model("large", str(large))
+
+    assert [item["model_name"] for item in constructed] == [
+        str(large),
+        str(small),
+        str(large),
+    ]
+    assert [item["force_text"] for item in constructed] == [True, False, True]
+
+
 class FakeEngine:
     is_mllm = False
 
     def __init__(self) -> None:
         self.stopped = False
         self.running = 0
+        self.waiting = 0
 
     def get_stats(self):
-        return {"num_running": self.running, "num_waiting": 0}
+        return {"num_running": self.running, "num_waiting": self.waiting}
 
     async def stop(self) -> None:
         self.stopped = True
@@ -225,6 +394,75 @@ def manager_fixture(*, limit_gib=10, ttl=0):
     )
     manager.register_primary(primary, estimated_bytes=4 * GIB)
     return manager, registry, loaded, clock
+
+
+@pytest.fixture
+def residency_activity_contract():
+    """Exercise the activity SSOT from the MLX-free Linux fixed selector."""
+    from vllm_mlx.runtime.resident_models import _engine_active_requests
+
+    class ProgressEngine:
+        def progress_snapshot(self):
+            return {"running": True}
+
+    assert _engine_active_requests(ProgressEngine()) == 1
+
+    class BrokenProgressEngine:
+        def progress_snapshot(self):
+            raise RuntimeError("progress unavailable")
+
+    assert _engine_active_requests(BrokenProgressEngine()) is None
+
+    class BrokenStatsEngine:
+        def get_stats(self):
+            raise RuntimeError("stats unavailable")
+
+    assert _engine_active_requests(BrokenStatsEngine()) is None
+
+    manager, registry, _, _ = manager_fixture(limit_gib=12)
+    primary = registry.get_engine("chat")
+    primary.running = 1
+    primary.waiting = 1
+    chat = next(item for item in manager.snapshot()["models"] if item["id"] == "chat")
+    assert chat["active_requests"] == 2
+
+    async def exercise_reload_identity() -> None:
+        reload_registry = ModelRegistry()
+        reload_primary = entry("reload-chat")
+        reload_primary.aliases.add("reload-alias")
+        reload_registry.add(reload_primary, is_default=True)
+
+        async def loader(name: str, path: str | None, performance=None):
+            if performance == ResidentPerformanceConfig(kv_cache_dtype="int4"):
+                raise RuntimeError("new config failed")
+            return entry(name)
+
+        reload_manager = ResidentModelManager(
+            reload_registry,
+            loader,
+            memory_reader=lambda: 0,
+        )
+        reload_manager.register_primary(reload_primary, estimated_bytes=1 * GIB)
+        replacement = await reload_manager.load(
+            "reload-alias",
+            performance=ResidentPerformanceConfig(kv_cache_dtype="int8"),
+            reload_if_changed=True,
+        )
+        assert replacement.entry.aliases == {"reload-alias"}
+
+        try:
+            await reload_manager.load(
+                "reload-alias",
+                performance=ResidentPerformanceConfig(kv_cache_dtype="int4"),
+                reload_if_changed=True,
+            )
+        except RuntimeError as exc:
+            assert str(exc) == "new config failed"
+        else:
+            raise AssertionError("failed reload must surface its loader error")
+        assert reload_registry.get_entry("reload-alias").aliases == {"reload-alias"}
+
+    return exercise_reload_identity
 
 
 @pytest.mark.asyncio
@@ -428,6 +666,8 @@ async def test_second_image_model_evicts_the_first_without_an_explicit_group():
 async def test_failed_assistant_replacement_rolls_back_newly_loaded_model():
     manager, registry, loaded, _ = manager_fixture(limit_gib=20)
     registry.get_engine("chat").running = 1
+    chat = next(item for item in manager.snapshot()["models"] if item["id"] == "chat")
+    assert chat["active_requests"] == 1
 
     with pytest.raises(ResidentModelBusyError, match="active request"):
         await manager.load(
@@ -477,10 +717,77 @@ async def test_per_model_performance_reload_replaces_only_the_target_engine():
     }
 
 
+def test_performance_reload_preserves_alias_in_routing_and_models_list(monkeypatch):
+    from vllm_mlx.config import get_config, reset_config
+    from vllm_mlx.routes import models as models_route
+    from vllm_mlx.routes import residency as residency_route
+
+    repo = "mlx-community/Qwen3-0.6B-4bit"
+    alias = "qwen3-0.6b-4bit"
+    registry = ModelRegistry()
+    primary = ModelEntry(
+        engine=FakeEngine(),
+        model_name=repo,
+        model_path=repo,
+        aliases={alias},
+    )
+    registry.add(primary, is_default=True)
+
+    async def loader(name: str, path: str | None, performance=None):
+        return ModelEntry(
+            engine=FakeEngine(),
+            model_name=name,
+            model_path=path or name,
+        )
+
+    manager = ResidentModelManager(registry, loader, memory_reader=lambda: 0)
+    manager.register_primary(primary, estimated_bytes=1 * GIB)
+
+    reset_config()
+    cfg = get_config()
+    cfg.model_registry = registry
+    cfg.residency_manager = manager
+    cfg.api_key = None
+    cfg.embedding_model_locked = None
+    app = FastAPI()
+    app.include_router(residency_route.router)
+    app.include_router(models_route.router)
+    monkeypatch.setattr(
+        residency_route,
+        "resolve_resident_performance",
+        lambda performance, **_kwargs: performance,
+    )
+    try:
+        with TestClient(app) as client:
+            reload_response = client.post(
+                "/v1/models/load",
+                json={
+                    "model": alias,
+                    "model_path": repo,
+                    "reload_if_changed": True,
+                    "performance": {"kv_cache_dtype": "int8"},
+                },
+            )
+            assert reload_response.status_code == 200
+            replacement = registry.get_entry(alias)
+            assert replacement.model_name == repo
+            assert replacement.model_path == repo
+            assert replacement.aliases == {alias}
+            registry.validate_model_name(alias)
+            assert registry.get_engine(alias) is replacement.engine
+            response = client.get("/v1/models")
+        assert response.status_code == 200
+        ids = {item["id"] for item in response.json()["data"]}
+        assert {repo, alias}.issubset(ids)
+    finally:
+        reset_config()
+
+
 @pytest.mark.asyncio
 async def test_failed_performance_reload_restores_the_last_known_good_engine():
     registry = ModelRegistry()
     primary = entry("chat")
+    primary.aliases.add("chat-alias")
     registry.add(primary, is_default=True)
     calls: list[ResidentPerformanceConfig | None] = []
 
@@ -502,6 +809,8 @@ async def test_failed_performance_reload_restores_the_last_known_good_engine():
 
     assert calls == [ResidentPerformanceConfig(kv_cache_dtype="int4"), None]
     assert "chat" in registry
+    assert registry.get_engine("chat-alias") is registry.get_engine("chat")
+    assert registry.get_entry("chat").aliases == {"chat-alias"}
     assert registry.get_engine("chat") is not primary.engine
     assert manager.snapshot()["models"][0]["performance"] is None
 
@@ -581,6 +890,31 @@ def test_residency_control_plane_load_pin_status_and_unload(monkeypatch):
         )
         assert client.delete("/v1/models/image").status_code == 204
         assert "image" not in registry
+
+
+def test_residency_snapshot_reports_primary_running_and_queued_requests(monkeypatch):
+    """Primary requests bypass manager leases but still belong in residency."""
+    from types import SimpleNamespace
+
+    from vllm_mlx.routes.residency import router
+
+    manager, registry, _, _ = manager_fixture(limit_gib=12)
+    primary = registry.get_engine("chat")
+    primary.running = 1
+    primary.waiting = 1
+    monkeypatch.setattr(
+        "vllm_mlx.routes.residency.get_config",
+        lambda: SimpleNamespace(residency_manager=manager),
+    )
+    app = FastAPI()
+    app.include_router(router)
+
+    with TestClient(app) as client:
+        response = client.get("/v1/models/residency")
+
+    assert response.status_code == 200
+    chat = next(item for item in response.json()["models"] if item["id"] == "chat")
+    assert chat["active_requests"] == 2
 
 
 def test_residency_control_plane_validates_and_forwards_performance(monkeypatch):

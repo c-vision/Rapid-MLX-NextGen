@@ -646,11 +646,19 @@ def test_launch_auto_start_defers_to_first_run_surfaces():
     # once the answer lands. A bare `.task` fires once, which would strand a
     # returning user on an idle server for the whole session.
     assert (
-        ".task(id: telemetryConsentPending) { await runLaunchAutoStart() }" in caller
+        ".task(id: telemetryConsentPending) { await restorePersistedSession() }"
+        in caller
     ), (
         "the launch task is no longer keyed on the consent decision. With a "
         "bare `.task` the auto-start that stood down for the consent sheet "
         "never gets its turn, and a returning user's model never loads"
+    )
+    restore = caller.split("private func restorePersistedSession(", 1)[1].split(
+        "private func runLaunchAutoStart(", 1
+    )[0]
+    assert "runLaunchAutoStart(" in restore, (
+        "the consent-keyed session restore no longer reaches launch auto-start; "
+        "answering consent would re-run restore without loading the user's model"
     )
 
     # And the gates must sit above the serverState switch: below it they can

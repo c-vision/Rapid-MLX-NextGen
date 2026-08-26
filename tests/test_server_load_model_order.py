@@ -42,6 +42,12 @@ class _StubEngine:
         self.args = args
         self.kwargs = kwargs
 
+    async def start(self):
+        pass
+
+    def generate_warmup(self):
+        pass
+
 
 @pytest.fixture(autouse=True)
 def _reset_cfg_around_each_test():
@@ -169,6 +175,52 @@ def test_load_model_genuine_vlm_stays_on_mllm_lane(monkeypatch):
     # No downgrade → force_text stays False; BatchedEngine does its own MLLM
     # auto-detection from there.
     assert server._engine.kwargs.get("force_text") is False
+
+
+@pytest.mark.asyncio
+async def test_startup_and_runtime_use_identical_checkpoint_lane_contract(monkeypatch):
+    """Startup and residency must hand the same resolved path/lane to engine."""
+    from vllm_mlx import server
+    from vllm_mlx.model_profile import ModelProfile
+
+    _stub_routing_globals(monkeypatch, server)
+    calls = []
+    resolved = server._ServingCheckpoint(
+        model_path="publisher/model",
+        load_path="/cache/snapshots/revision",
+        auto_text_fallback=True,
+    )
+
+    def resolve_once(model_name, **kwargs):
+        calls.append((model_name, kwargs))
+        return resolved
+
+    monkeypatch.setattr(server, "_resolve_serving_checkpoint", resolve_once)
+    monkeypatch.setattr("vllm_mlx.model_aliases.resolve_profile", lambda _name: None)
+    monkeypatch.setattr(
+        "vllm_mlx.model_auto_config.detect_model_config",
+        lambda _name: ModelProfile(is_hybrid=False),
+    )
+
+    server.load_model("publisher/model")
+    startup_kwargs = dict(server._engine.kwargs)
+    runtime = await server._load_dynamic_resident_model("publisher/model", None)
+
+    assert calls == [
+        (
+            "publisher/model",
+            {
+                "force_mllm": False,
+                "force_text": False,
+            },
+        ),
+        (
+            "publisher/model",
+            {"force_text": False},
+        ),
+    ]
+    assert startup_kwargs["model_name"] == runtime.engine.kwargs["model_name"]
+    assert startup_kwargs["force_text"] == runtime.engine.kwargs["force_text"] is True
 
 
 def test_ensure_routing_config_raises_when_prefetch_does_not_materialize(monkeypatch):
