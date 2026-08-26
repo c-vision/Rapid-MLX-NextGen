@@ -26,8 +26,8 @@ responsiveness and cache correctness.
 ### Added
 
 - **More capable local models.** Supported Qwen3-Next checkpoints can stream
-  experts from disk, Nemotron Labs Diffusion 3B can generate images, and
-  verified Ornith 1.5 models are available from the Desktop catalog.
+  experts from disk, Nemotron Labs Diffusion 3B runs as a standard text model,
+  and verified Ornith 1.5 models are available from the Desktop catalog.
 - **Chat understands the current local date and time.** Questions about today
   no longer depend on the model's training cutoff or require a web search.
 - **Desktop workflows cover more of the local stack.** Attachments, dedicated
@@ -105,9 +105,9 @@ does not replace the stable updater feed.
 - **Ornith 1.5 is available end to end.** The 9B dense and 35B-A3B
   mixture-of-experts checkpoints are recognized by the engine and exposed in
   the Mac model picker with the correct runtime routes.
-- **More local generation choices.** Nemotron Labs Diffusion 3B can generate
-  images through its autoregressive path, and Qwen3-Next can stream routed
-  experts from disk on memory-constrained machines.
+- **More local generation choices.** Nemotron Labs Diffusion 3B runs as a
+  standard text model, and Qwen3-Next can stream routed experts from disk on
+  memory-constrained machines.
 - **Agent health is visible and actionable.** The CLI reports integration
   health and can re-run setup, while the Mac menu bar can copy the active API
   endpoint for connecting another client.
