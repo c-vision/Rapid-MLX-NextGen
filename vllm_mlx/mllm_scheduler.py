@@ -1951,7 +1951,10 @@ class MLLMScheduler:
                     if output.error_kind == "lifecycle":
                         from .request import InferenceAbortedError
 
-                        raise InferenceAbortedError(output.error)
+                        raise InferenceAbortedError(
+                            output.error,
+                            error_kind=output.error_kind,
+                        )
                     if output.error_kind == "invalid_request":
                         raise ClientRequestError(output.error)
                     raise ValueError(output.error)

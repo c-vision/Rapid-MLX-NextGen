@@ -897,6 +897,67 @@ async def test_mllm_abort_unblocks_consumer_as_inference_error():
         )
     )
 
-    with pytest.raises(InferenceAbortedError, match="cancellation"):
+    with pytest.raises(InferenceAbortedError, match="cancellation") as exc_info:
         await anext(scheduler.stream_outputs("active"))
+    assert exc_info.value.error_kind == "lifecycle"
     assert "active" not in scheduler.output_queues
+
+
+@pytest.mark.asyncio
+async def test_text_abort_preserves_lifecycle_reason_through_stream_consumer():
+    from vllm_mlx.request import InferenceAbortedError
+
+    engine = EngineCore.__new__(EngineCore)
+    engine.scheduler = SimpleNamespace(abort_request=lambda _request_id: True)
+    engine._output_collectors = {
+        "active": RequestOutputCollector(aggregate=True),
+    }
+    engine._finished_events = {"active": asyncio.Event()}
+    engine._idle_event = asyncio.Event()
+    engine._cleanup_request = lambda _request_id: None
+
+    assert await engine.abort_request("active", error_kind="lifecycle") is True
+
+    with pytest.raises(InferenceAbortedError, match="cancellation") as exc_info:
+        await anext(engine.stream_outputs("active"))
+    assert exc_info.value.error_kind == "lifecycle"
+
+
+@pytest.mark.asyncio
+async def test_post_commit_lifecycle_abort_emits_model_replacement_sse():
+    import json
+
+    from vllm_mlx.request import InferenceAbortedError
+    from vllm_mlx.service.helpers import _disconnect_guard
+
+    engine, _ = _engine()
+
+    class RawRequest:
+        async def is_disconnected(self):
+            return False
+
+    async def aborted_stream():
+        raise InferenceAbortedError(
+            "Inference aborted by a cancellation request",
+            error_kind="lifecycle",
+        )
+        yield "unreachable"  # pragma: no cover
+
+    chunks = [
+        chunk
+        async for chunk in _disconnect_guard(
+            aborted_stream(),
+            RawRequest(),
+            poll_interval=0.01,
+            engine=engine,
+            keepalive_seconds=0,
+        )
+    ]
+
+    payload = json.loads(chunks[0].removeprefix("data: "))
+    assert payload["error"] == {
+        "message": "Request cancelled by model replacement",
+        "type": "server_error",
+        "code": "model_replacement",
+    }
+    assert chunks[-1] == "data: [DONE]\n\n"

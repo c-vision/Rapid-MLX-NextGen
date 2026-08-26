@@ -1496,7 +1496,10 @@ class EngineCore:
                             logger.warning(
                                 f"[stream_outputs] {request_id[:12]} engine aborted: {output.error}"
                             )
-                            raise InferenceAbortedError(output.error)
+                            raise InferenceAbortedError(
+                                output.error,
+                                error_kind=output.error_kind,
+                            )
 
                     yield output
 
@@ -1610,7 +1613,10 @@ class EngineCore:
 
                 from .request import InferenceAbortedError
 
-                raise InferenceAbortedError(final_output.error)
+                raise InferenceAbortedError(
+                    final_output.error,
+                    error_kind=final_output.error_kind,
+                )
 
             return final_output
 

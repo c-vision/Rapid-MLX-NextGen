@@ -279,6 +279,10 @@ class InferenceAbortedError(RuntimeError):
     handle a retry against a smaller request.
     """
 
+    def __init__(self, message: str, *, error_kind: str | None = None) -> None:
+        super().__init__(message)
+        self.error_kind = error_kind
+
 
 class ClientRequestError(ValueError):
     """A request rejection whose message is explicitly safe for clients.

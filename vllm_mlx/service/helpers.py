@@ -4066,24 +4066,38 @@ async def _disconnect_guard(
                 # message substring: arbitrary internal exceptions may contain
                 # caller text or local paths. Every other fault remains under
                 # F-131's generic sanitisation.
-                from ..request import ClientRequestError
+                from ..request import ClientRequestError, InferenceAbortedError
 
-                if isinstance(exc, ClientRequestError):
+                if (
+                    isinstance(exc, InferenceAbortedError)
+                    and exc.error_kind == "lifecycle"
+                ):
+                    _sse_type = "server_error"
+                    _sse_message = "Request cancelled by model replacement"
+                    _sse_code = "model_replacement"
+                elif isinstance(exc, ClientRequestError):
                     _sse_type = "invalid_request_error"
                     _sse_message = str(exc)
+                    _sse_code = None
                 else:
                     _sse_type = "internal_error"
                     _sse_message = "Internal error during streaming"
+                    _sse_code = None
+                error = {
+                    "message": _sse_message,
+                    "type": _sse_type,
+                }
+                if _sse_code is not None:
+                    error["code"] = _sse_code
                 error_data = _json.dumps(
                     {
-                        "error": {
-                            "message": _sse_message,
-                            "type": _sse_type,
-                        }
+                        "error": error,
                     }
                 )
                 yield f"data: {error_data}\n\n"
                 yield "data: [DONE]\n\n"
+                if _sse_code == "model_replacement":
+                    finished_normally = True
                 break
             chunk_count += 1
             if chunk_count == 1:
