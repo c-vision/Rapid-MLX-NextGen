@@ -66,8 +66,8 @@ struct SettingsView: View {
         /// the older stand-alone "Models" tab was folded in here so
         /// users don't face two competing model surfaces.
         case modelManagement
-        /// Instructions applied to every chat before any conversation-specific
-        /// override. Stored locally in UserDefaults.
+        /// Global system-prompt default applied before any conversation-specific
+        /// override. Stored locally in UserDefaults under the legacy key.
         case instructions
         /// Built-in tools the model can call: on/off per tool, the
         /// web-search backend + key, and the browse approval mode.
@@ -102,7 +102,7 @@ struct SettingsView: View {
         var title: String {
             switch self {
             case .modelManagement: return "Model Management"
-            case .instructions: return "Instructions"
+            case .instructions: return "System Prompt"
             case .tools: return "Tools"
             case .connectors: return "Connectors"
             case .performance: return "Performance"
@@ -502,23 +502,28 @@ struct SettingsView: View {
         @Bindable var config = customInstructions
         return VStack(alignment: .leading, spacing: RapidTheme.Space.xl) {
             SectionHeader(
-                "Custom Instructions",
-                subtitle: "Set preferences for how the assistant responds in every conversation.",
+                "System Prompt",
+                subtitle: "Sent as a system message with every conversation. Conversation prompts can override it.",
                 emphasis: .page
             )
             InstructionEditorSection(
-                "Global",
-                subtitle: "Used in every conversation. A conversation can add more specific direction.",
+                "Global default",
+                subtitle: "Used when a conversation has no conflicting prompt. Stored only on this Mac.",
                 clearEnabled: CustomInstructionsConfig.normalized(config.global) != nil,
                 onClear: { config.global = "" }
             ) {
                 InstructionTextEditor(
                     text: $config.global,
-                    placeholder: "For example: Be concise, use plain language, and include code examples when useful.",
+                    placeholder: "For example: Answer concisely, use plain language, and include code examples when useful.",
                     height: 172,
                     accessibilityIdentifier: "Settings.Instructions.GlobalEditor"
                 )
             }
+            EffectiveSystemPromptDisclosure(
+                global: config.global,
+                conversation: "",
+                accessibilityIdentifier: "Settings.SystemPrompt.EffectivePreview"
+            )
         }
     }
 

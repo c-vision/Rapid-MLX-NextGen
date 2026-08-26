@@ -8194,7 +8194,7 @@ def chat_command(args):
             if not _auto_yes and _interactive:
                 from vllm_mlx._download_gate import (
                     confirm_or_abort,
-                    estimate_repo_size_bytes,
+                    estimate_download_size_bytes,
                     is_repo_cached,
                 )
 
@@ -8202,7 +8202,7 @@ def chat_command(args):
                     try:
                         confirm_or_abort(
                             resolved,
-                            estimate_repo_size_bytes(resolved),
+                            estimate_download_size_bytes(resolved),
                         )
                     except SystemExit:
                         # User said no — keep the current server up.
@@ -9012,9 +9012,35 @@ def connect_command(args):
     lifespan banner uses — so ``ready``/``openai``/``anthropic`` and the
     machine form can never drift from what a running server prints.
     """
-    from vllm_mlx.connect import probe_server_alive, render_banner, resolve_endpoints
+    from vllm_mlx.connect import (
+        _parse_base_url,
+        probe_server_alive,
+        render_banner,
+        resolve_endpoints,
+    )
 
-    eps = resolve_endpoints(host=args.host, port=args.port, model=args.model)
+    # ``--base-url`` is the explicit way to pass the *live* server instance
+    # context across process boundaries (#2348): the serve banner advertises
+    # ``connect openai-python --base-url <url>`` pointing at the real server,
+    # and a standalone ``connect`` derives host/port from it instead of falling
+    # back to the localhost:8000 default. Parse the base URL first, then let an
+    # explicit ``--host``/``--port`` override its respective coordinate only
+    # when that flag is actually supplied (independent overrides, codex #2348).
+    host = args.host
+    port = args.port
+    base_url = getattr(args, "base_url", None)
+    if base_url is not None:
+        try:
+            base_host, base_port = _parse_base_url(base_url)
+        except ValueError:
+            print(f"  connect: invalid --base-url: {base_url}")
+            sys.exit(1)
+        if args.host is None:
+            host = base_host
+        if args.port is None:
+            port = base_port
+
+    eps = resolve_endpoints(host=host, port=port, model=args.model)
 
     # Per-target "how to connect" cheat sheet.
     if args.target:
@@ -11171,6 +11197,17 @@ Examples:
         default=None,
         help="Model name to advertise (default: auto-detect from server)",
     ).completer = alias_completer
+    connect_parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help=(
+            "Explicit OpenAI-style base URL of the running server "
+            "(e.g. http://localhost:8123/v1) — the banner's pasted commands "
+            "carry this so the snippet targets the live host/port, not the "
+            "default. Overrides --host/--port only when those are unset."
+        ),
+    )
 
     # Doctor command — pure env-health probe (≤5 s, no model load, no server).
     # Model-validation tiers (smoke/check/full/benchmark) moved to
@@ -11677,7 +11714,7 @@ def main():
         if not _auto_yes and _interactive:
             from vllm_mlx._download_gate import (
                 confirm_or_abort,
-                estimate_repo_size_bytes,
+                estimate_download_size_bytes,
                 is_repo_cached,
             )
 
@@ -11692,9 +11729,14 @@ def main():
                 # including the auto-selected starter: it is an unpinned HF repo
                 # whose declared size we must actually verify, never assume,
                 # before waiving consent.
+                #
+                # ``estimate_download_size_bytes`` (not the raw
+                # ``estimate_repo_size_bytes``) so a catalog model's checked-in
+                # footprint still gates when the Hub can't be reached offline
+                # (issue #2350).
                 _short = args.model.split("/")[-1]
                 with _StatusSpinner(f"Resolving {_short} …"):
-                    _size = estimate_repo_size_bytes(args.model)
+                    _size = estimate_download_size_bytes(args.model)
                 confirm_or_abort(args.model, _size)
     # --- END B2 --------------------------------------------------------
 

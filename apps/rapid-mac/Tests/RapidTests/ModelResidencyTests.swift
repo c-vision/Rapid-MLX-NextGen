@@ -56,6 +56,59 @@ struct ModelResidencyTests {
                 cacheMemoryMB: 4096
             )
         ))
+        #expect(snapshot.audioLanes.isEmpty, "older snapshots remain compatible")
+    }
+
+    @Test("Audio-lane residency decodes and matches only the exact catalog model path")
+    func decodesAudioLaneTruth() throws {
+        let data = Data(
+            #"""
+            {
+              "memory_limit_bytes": 34359738368,
+              "memory_used_bytes": 10737418240,
+              "memory_available_bytes": 23622320128,
+              "idle_ttl_seconds": 1800,
+              "loads_total": 0,
+              "evictions_total": 0,
+              "models": [],
+              "audio_lanes": [
+                {
+                  "lane": "stt",
+                  "model": "mlx-community/whisper-small-mlx",
+                  "state": "resident",
+                  "active_requests": 0,
+                  "loaded_at": 123.0,
+                  "idle_seconds": 4.0,
+                  "last_error": null
+                },
+                {
+                  "lane": "tts",
+                  "model": null,
+                  "state": "registered",
+                  "active_requests": 0,
+                  "loaded_at": null,
+                  "idle_seconds": 0.0,
+                  "last_error": null
+                }
+              ]
+            }
+            """#.utf8
+        )
+
+        let snapshot = try JSONDecoder().decode(ModelResidencySnapshot.self, from: data)
+
+        #expect(snapshot.audioLanes == [
+            ResidentAudioLaneStatus(
+                lane: "stt",
+                model: "mlx-community/whisper-small-mlx",
+                state: "resident"
+            ),
+            ResidentAudioLaneStatus(lane: "tts", model: nil, state: "registered")
+        ])
+        #expect(snapshot.containsResidentAudioLane(
+            modelPath: "mlx-community/whisper-small-mlx"
+        ))
+        #expect(!snapshot.containsResidentAudioLane(modelPath: "whisper-small"))
     }
 
     @Test("Resident rows prefer the catalog alias over the HF path")
@@ -224,6 +277,84 @@ struct ModelResidencyTests {
             return
         }
         #expect(alias == "flux-klein")
+    }
+
+    @Test("Server accepts only the exact live alias profile for photo capability")
+    func liveProfileCannotLagAcrossModelSwitch() {
+        let server = ServerManager(testingState: .ready(alias: "current-model"))
+        server.applyActiveModelProfile(
+            ServerModelProfile(
+                id: "old-model",
+                capabilities: ["text", "vision"],
+                servingLane: "vision",
+                servingLaneReason: "vision_supported"
+            ),
+            forAlias: "old-model"
+        )
+        #expect(server.activeModelProfile == nil)
+
+        server.applyActiveModelProfile(
+            ServerModelProfile(
+                id: "current-model",
+                capabilities: ["text"],
+                servingLane: "text",
+                servingLaneReason: "operator_forced_text"
+            ),
+            forAlias: "current-model"
+        )
+        #expect(server.activeModelProfile?.id == "current-model")
+        #expect(!server.imageInputAvailability(
+            forAlias: "current-model",
+            catalogSupportsImageInput: true
+        ).isAvailable)
+
+        server.clearActiveModelProfile()
+        #expect(server.activeModelProfile == nil)
+    }
+
+    @Test("Secondary resident chat aliases accept their own live photo profile")
+    func secondaryResidentProfileIsAuthoritative() {
+        let secondary = ResidentModelStatus(
+            id: "secondary-model",
+            modelPath: "repo/secondary-model",
+            aliases: [],
+            modality: "text",
+            state: "resident",
+            pinned: false,
+            primary: false,
+            activeRequests: 0,
+            estimatedBytes: 1,
+            measuredBytes: nil,
+            idleSeconds: 0
+        )
+        let residency = ModelResidencySnapshot(
+            memoryLimitBytes: 10,
+            memoryUsedBytes: 1,
+            memoryAvailableBytes: 9,
+            idleTTLSeconds: 60,
+            loadsTotal: 1,
+            evictionsTotal: 0,
+            models: [secondary]
+        )
+        let server = ServerManager(
+            testingState: .ready(alias: "primary-model"),
+            residency: residency
+        )
+        server.applyActiveModelProfile(
+            ServerModelProfile(
+                id: "secondary-model",
+                capabilities: ["text"],
+                servingLane: "text",
+                servingLaneReason: "operator_forced_text"
+            ),
+            forAlias: "secondary-model"
+        )
+
+        #expect(server.activeModelProfile?.id == "secondary-model")
+        #expect(!server.imageInputAvailability(
+            forAlias: "secondary-model",
+            catalogSupportsImageInput: true
+        ).isAvailable)
     }
 
     @Test("Resident ceiling reuses the Mac usable-RAM bucket")

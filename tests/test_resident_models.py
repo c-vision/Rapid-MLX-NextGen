@@ -450,6 +450,51 @@ def manager_fixture(*, limit_gib=10, ttl=0):
     return manager, registry, loaded, clock
 
 
+def test_residency_snapshot_exposes_live_serving_lane_truth():
+    manager, registry, _, _ = manager_fixture()
+    engine = registry.get_entry("chat").engine
+    engine.serving_lane = "text"
+    engine.serving_lane_reason = "vision_hybrid_runtime_unsupported"
+
+    payload = manager.snapshot()["models"][0]
+
+    assert payload["serving_lane"] == "text"
+    assert payload["serving_lane_reason"] == "vision_hybrid_runtime_unsupported"
+
+
+def test_live_engine_exposes_serving_lane_decision():
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    engine = BatchedEngine.__new__(BatchedEngine)
+    engine._is_mllm = True
+    engine._serving_lane_reason = "vision_hybrid_runtime_supported"
+
+    assert engine.serving_lane == "vision"
+    assert engine.serving_lane_reason == "vision_hybrid_runtime_supported"
+
+
+def test_models_lane_fields_use_matching_live_engine(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_mlx.routes import models as models_route
+
+    engine = SimpleNamespace(
+        serving_lane="text",
+        serving_lane_reason="vision_hybrid_runtime_unsupported",
+    )
+    monkeypatch.setattr(
+        models_route,
+        "_engine_for",
+        lambda model_id: engine if model_id == "served-alias" else None,
+    )
+
+    assert models_route._served_lane_fields("served-alias") == (
+        "text",
+        "vision_hybrid_runtime_unsupported",
+    )
+    assert models_route._served_lane_fields("unknown") == (None, None)
+
+
 @pytest.fixture
 def residency_activity_contract(monkeypatch):
     """Exercise the activity SSOT from the MLX-free Linux fixed selector."""
@@ -1385,6 +1430,264 @@ async def test_failed_performance_reload_restores_the_last_known_good_engine():
     assert registry.get_entry("chat").aliases == {"chat-alias"}
     assert registry.get_engine("chat") is not primary.engine
     assert manager.snapshot()["models"][0]["performance"] is None
+
+
+@pytest.mark.asyncio
+async def test_double_failed_primary_reload_clears_every_serving_owner():
+    registry = ModelRegistry()
+    primary = entry("chat")
+    registry.add(primary, is_default=True)
+    primary_changes: list[ModelEntry | None] = []
+
+    async def loader(name: str, path: str | None, performance=None):
+        del path, performance
+        if name == "secondary":
+            return entry(name)
+        raise RuntimeError("loader unavailable")
+
+    manager = ResidentModelManager(
+        registry,
+        loader,
+        memory_reader=lambda: 0,
+        on_primary_changed=primary_changes.append,
+    )
+    manager.register_primary(primary, estimated_bytes=4 * GIB)
+    await manager.load("secondary", estimated_bytes=1 * GIB)
+
+    with pytest.raises(RuntimeError, match="loader unavailable"):
+        await manager.load(
+            "chat",
+            performance=ResidentPerformanceConfig(kv_cache_dtype="int4"),
+            reload_if_changed=True,
+        )
+
+    assert [item.model_name for item in registry.list_entries()] == ["secondary"]
+    assert registry.default_name is None
+    assert [item["id"] for item in manager.snapshot()["models"]] == ["secondary"]
+    assert registry.get_engine("secondary") is not None
+    with pytest.raises(KeyError, match="No default model set"):
+        registry.get_engine(None)
+    assert primary_changes == [None]
+
+
+@pytest.mark.asyncio
+async def test_primary_reload_clears_default_before_awaiting_replacement():
+    registry = ModelRegistry()
+    primary = entry("chat")
+    registry.add(primary, is_default=True)
+    replacement_started = asyncio.Event()
+    finish_replacement = asyncio.Event()
+    primary_changes: list[ModelEntry | None] = []
+
+    async def loader(name: str, path: str | None, performance=None):
+        del path, performance
+        if name == "secondary":
+            return entry(name)
+        replacement_started.set()
+        await finish_replacement.wait()
+        return entry(name)
+
+    manager = ResidentModelManager(
+        registry,
+        loader,
+        memory_reader=lambda: 0,
+        on_primary_changed=primary_changes.append,
+    )
+    manager.register_primary(primary, estimated_bytes=4 * GIB)
+    await manager.load("secondary", estimated_bytes=1 * GIB)
+
+    reload_task = asyncio.create_task(
+        manager.load(
+            "chat",
+            performance=ResidentPerformanceConfig(kv_cache_dtype="int4"),
+            reload_if_changed=True,
+        )
+    )
+    await replacement_started.wait()
+
+    assert registry.default_name is None
+    assert registry.get_engine("secondary") is not None
+    with pytest.raises(KeyError, match="No default model set"):
+        registry.get_engine(None)
+    assert primary_changes == [None]
+
+    finish_replacement.set()
+    replacement = await reload_task
+    assert registry.default_name == "chat"
+    assert primary_changes == [None, replacement.entry]
+
+
+@pytest.mark.asyncio
+async def test_primary_reload_clear_callback_failure_restores_old_owner():
+    registry = ModelRegistry()
+    old_engine = FakeLifecycleEngine()
+    primary = entry("chat", old_engine)
+    registry.add(primary, is_default=True)
+    changes: list[ModelEntry | None] = []
+    handoff_events: list[str] = []
+
+    async def loader(name: str, path: str | None, performance=None):
+        del path, performance
+        return entry(name)
+
+    def publish(value: ModelEntry | None) -> None:
+        changes.append(value)
+        if value is None:
+            raise RuntimeError("clear failed")
+
+    class Handoff:
+        def commit(self, committed):
+            handoff_events.append(f"commit:{committed}")
+
+        def rollback(self):
+            handoff_events.append("rollback")
+
+    manager = ResidentModelManager(
+        registry,
+        loader,
+        memory_reader=lambda: 0,
+        on_primary_handoff=lambda _entry: Handoff(),
+        on_primary_changed=publish,
+    )
+    manager.register_primary(primary, estimated_bytes=4 * GIB)
+
+    with pytest.raises(RuntimeError, match="clear failed"):
+        await manager.load(
+            "chat",
+            performance=ResidentPerformanceConfig(kv_cache_dtype="int4"),
+            reload_if_changed=True,
+        )
+
+    assert changes == [None, primary]
+    assert handoff_events == ["rollback"]
+    assert registry.default_name == "chat"
+    assert registry.get_engine(None) is old_engine
+    assert old_engine.stopped is False
+    assert manager.snapshot()["models"][0]["primary"] is True
+
+
+@pytest.mark.asyncio
+async def test_restore_publication_failure_clears_partially_published_primary():
+    registry = ModelRegistry()
+    primary = entry("chat")
+    registry.add(primary, is_default=True)
+    published: list[ModelEntry | None] = [primary]
+    restored_engines: list[FakeEngine] = []
+
+    async def loader(name: str, path: str | None, performance=None):
+        del path
+        if performance is not None:
+            raise RuntimeError("replacement failed")
+        restored = FakeEngine()
+        restored_engines.append(restored)
+        return entry(name, restored)
+
+    def publish(value: ModelEntry | None) -> None:
+        published[0] = value
+        if value is not None and value is not primary:
+            raise RuntimeError("restore publication failed")
+
+    manager = ResidentModelManager(
+        registry,
+        loader,
+        memory_reader=lambda: 0,
+        on_primary_changed=publish,
+    )
+    manager.register_primary(primary, estimated_bytes=4 * GIB)
+
+    with pytest.raises(RuntimeError, match="replacement failed"):
+        await manager.load(
+            "chat",
+            performance=ResidentPerformanceConfig(kv_cache_dtype="int4"),
+            reload_if_changed=True,
+        )
+
+    assert published == [None]
+    assert restored_engines[0].stopped is True
+    assert registry.list_entries() == []
+    assert registry.default_name is None
+    assert manager.snapshot()["models"] == []
+
+
+@pytest.mark.asyncio
+async def test_restore_publication_failure_tolerates_cleanup_failures(caplog):
+    """Cleanup failures cannot mask the original replacement error."""
+    registry = ModelRegistry()
+    primary = entry("chat")
+    registry.add(primary, is_default=True)
+
+    class FailingStopEngine(FakeEngine):
+        async def stop(self):
+            raise RuntimeError("cleanup stop failed")
+
+    async def loader(name: str, path: str | None, performance=None):
+        del path
+        if performance is not None:
+            raise RuntimeError("replacement failed")
+        return entry(name, FailingStopEngine())
+
+    publications: list[ModelEntry | None] = []
+
+    def publish(value: ModelEntry | None) -> None:
+        publications.append(value)
+        if len(publications) == 1 and value is None:
+            return
+        if value is not None:
+            raise RuntimeError("restore publication failed")
+        raise RuntimeError("clear publication failed")
+
+    manager = ResidentModelManager(
+        registry,
+        loader,
+        memory_reader=lambda: 0,
+        on_primary_changed=publish,
+    )
+    manager.register_primary(primary, estimated_bytes=4 * GIB)
+
+    with pytest.raises(RuntimeError, match="replacement failed"):
+        await manager.load(
+            "chat",
+            performance=ResidentPerformanceConfig(kv_cache_dtype="int4"),
+            reload_if_changed=True,
+        )
+
+    assert registry.list_entries() == []
+    assert registry.default_name is None
+    assert "Failed to stop partially restored resident model" in caplog.text
+    assert "Failed to clear serving-layer primary" in caplog.text
+
+
+def test_clearing_resident_primary_disables_legacy_routing_and_readiness(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_mlx import server
+
+    cfg = SimpleNamespace()
+    monkeypatch.setattr(server, "get_config", lambda: cfg)
+    monkeypatch.setattr(server, "_engine", object())
+    monkeypatch.setattr(server, "_model_name", "chat")
+
+    server._set_resident_primary(None)
+
+    assert server._engine is None
+    assert server._model_name is None
+    assert server._model_alias is None
+    assert server._model_path is None
+    assert server._enable_auto_tool_choice is False
+    assert server._tool_call_parser is None
+    assert server._tool_parser_instance is None
+    assert server._reasoning_parser is None
+    assert server._reasoning_parser_name is None
+    assert cfg.engine is None
+    assert cfg.model_name is None
+    assert cfg.model_alias is None
+    assert cfg.model_path is None
+    assert cfg.ready is False
+
+    replacement = entry("replacement")
+    server._set_resident_primary(replacement)
+    assert cfg.engine is replacement.engine
+    assert cfg.ready is True
 
 
 @pytest.mark.asyncio

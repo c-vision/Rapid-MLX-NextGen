@@ -176,7 +176,7 @@ class ResidencyRecord:
 
 
 Loader = Callable[..., Awaitable[ModelEntry]]
-PrimaryChanged = Callable[[ModelEntry], None]
+PrimaryChanged = Callable[[ModelEntry | None], None]
 
 
 class PrimaryHandoffLease(Protocol):
@@ -719,8 +719,27 @@ class ResidentModelManager:
             else None
         )
 
+        if primary and self._on_primary_changed is not None:
+            try:
+                self._on_primary_changed(None)
+            except BaseException:
+                # The old engine is still intact and registered at this point.
+                # Restore its serving-layer publication before releasing the
+                # handoff so a callback failure cannot strand the transaction.
+                try:
+                    self._on_primary_changed(record.entry)
+                finally:
+                    if handoff is not None:
+                        handoff.rollback()
+                raise
         self.registry.remove(model_name)
         self._drop_record(model_name)
+        if primary:
+            # Removing the registry default otherwise promotes an unrelated
+            # secondary while the replacement loader is still in flight.  Make
+            # primary unavailability visible through both routing surfaces
+            # before the first await; publication below restores them together.
+            self.registry.clear_default()
         try:
             stop = getattr(record.entry.engine, "stop", None)
             if callable(stop):
@@ -825,6 +844,35 @@ class ResidentModelManager:
                 "Failed to restore resident model %r after reload failure",
                 record.model_id,
             )
+            # A failed rebuild cannot remain partially published.  Remove any
+            # entry that made it through the registry before a later publisher
+            # failed, then clear every default/legacy owner for a lost primary.
+            if restored_entry is not None:
+                self.registry.remove(restored_entry.model_name)
+                self._drop_record(restored_entry.model_name)
+                try:
+                    stop = getattr(restored_entry.engine, "stop", None)
+                    if callable(stop):
+                        result = stop()
+                        if asyncio.iscoroutine(result):
+                            await result
+                except BaseException:
+                    logger.exception(
+                        "Failed to stop partially restored resident model %r",
+                        record.model_id,
+                    )
+                _release_allocator_cache()
+                if record.primary and self._on_primary_changed is not None:
+                    try:
+                        self._on_primary_changed(None)
+                    except BaseException:
+                        logger.exception(
+                            "Failed to clear serving-layer primary after "
+                            "restore publication failure"
+                        )
+                restored_entry = None
+            if record.primary:
+                self.registry.clear_default()
         finally:
             if handoff is not None:
                 handoff.commit(restored_entry)
@@ -1154,6 +1202,8 @@ class ResidentModelManager:
                     "model_path": record.entry.model_path,
                     "aliases": sorted(record.entry.aliases),
                     "modality": (_modality(record.entry)),
+                    "serving_lane": getattr(engine, "serving_lane", None),
+                    "serving_lane_reason": getattr(engine, "serving_lane_reason", None),
                     "state": record.state if resident else "registered",
                     "pinned": record.pinned,
                     "primary": record.primary,

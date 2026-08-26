@@ -2519,6 +2519,12 @@ class ModelInfo(BaseModel):
     # dispatches on this — populating from the server lets us drop
     # the desktop-side hard-coded modality map in a future release.
     modality: str | None = None
+    # Live serving lane and its machine-readable resolution reason. These are
+    # populated for a resident text/vision engine so clients can distinguish
+    # a genuinely text-only checkpoint from a multimodal checkpoint currently
+    # served through a text fallback. Discovery-only entries keep ``None``.
+    serving_lane: str | None = None
+    serving_lane_reason: str | None = None
     # Max prompt-token context window the loaded engine advertises
     # for this id. Populated only when the entry maps to an actively
     # loaded engine (single-model serve, or the matching ModelEntry

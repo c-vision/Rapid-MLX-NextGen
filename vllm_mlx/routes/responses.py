@@ -69,6 +69,7 @@ from ..api.utils import (
     StreamingReasoningSanitizer,
     StreamingThinkRouter,
     StreamingToolCallFilter,
+    UnsupportedContentBlockError,
     clean_output_text,
     decode_inline_tool_call_arguments,
     extract_json_from_response,
@@ -1311,6 +1312,13 @@ async def create_response(request: Request):
                 allow_video=getattr(engine, "is_mllm", False),
                 allow_audio=False,
             )
+        except UnsupportedContentBlockError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=e.openai_detail(
+                    serving_lane_reason=getattr(engine, "serving_lane_reason", None)
+                ),
+            ) from e
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 

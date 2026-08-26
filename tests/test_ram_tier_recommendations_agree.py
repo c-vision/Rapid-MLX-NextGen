@@ -365,21 +365,25 @@ QUICKSTART = REPO / "apps/rapid-mac/Sources/Rapid/UI/QuickstartView.swift"
 BUNDLED = REPO / "apps/rapid-mac/Sources/Rapid/Server/BundledModel.swift"
 
 
-def _parse_quickstart_default() -> tuple[str, str]:
-    """``(alias, hfRepo)`` from ``QuickstartCoordinator.defaultChoice``."""
+def _parse_quickstart_choice(name: str) -> tuple[str, str]:
+    """``(alias, hfRepo)`` from one authored Quickstart choice."""
     text = QUICKSTART.read_text()
     block = re.search(
-        r"static let defaultChoice = QuickstartModelChoice\((.*?)\n    \)",
+        rf"static let {name} = QuickstartModelChoice\((.*?)\n    \)",
         text,
         re.DOTALL,
     )
-    assert block, "defaultChoice literal not found in QuickstartView.swift"
+    assert block, f"{name} literal not found in QuickstartView.swift"
     body = block.group(1)
     alias = re.search(r'alias:\s*"([^"]+)"', body)
     repo = re.search(r'hfRepo:\s*"([^"]+)"', body)
-    assert alias, "defaultChoice has no alias literal"
-    assert repo, "defaultChoice must pin hfRepo — it drives the byte-progress monitor"
+    assert alias, f"{name} has no alias literal"
+    assert repo, f"{name} must pin hfRepo — it drives the byte-progress monitor"
     return alias.group(1), repo.group(1)
+
+
+def _parse_quickstart_default() -> tuple[str, str]:
+    return _parse_quickstart_choice("defaultChoice")
 
 
 def _parse_bundled() -> tuple[str, str]:
@@ -414,16 +418,23 @@ def test_quickstart_pinned_repo_matches_the_registry():
     )
 
 
-def test_bundled_starter_tracks_the_quickstart_starter():
-    """``BundledModel`` is the airgapped twin of the Quickstart pick. The
-    two are one product decision reached by two paths; letting them drift
-    ships an offline build whose first launch uses the rejected model."""
+def test_bundled_model_tracks_the_explicit_low_memory_choice():
+    """Bundled weights remain a runnable offline/low-memory escape hatch.
+
+    They are deliberately no longer the automatic starter: first run chooses
+    the hardware-fit 2.6B/4B baseline, while the existing 1.2B bundle remains
+    available without stranding airgapped or memory-constrained users.
+    """
     q_alias, q_repo = _parse_quickstart_default()
+    low_alias, low_repo = _parse_quickstart_choice("lowMemoryChoice")
     b_alias, b_repo = _parse_bundled()
-    assert b_alias == q_alias, (
-        f"bundledAlias {b_alias!r} != Quickstart starter {q_alias!r}"
+    assert (b_alias, b_repo) == (low_alias, low_repo), (
+        f"bundled model {(b_alias, b_repo)!r} != low-memory choice "
+        f"{(low_alias, low_repo)!r}"
     )
-    assert b_repo == q_repo, f"bundledRepoID {b_repo!r} != Quickstart hfRepo {q_repo!r}"
+    assert (b_alias, b_repo) != (q_alias, q_repo), (
+        "the 1.2B bundle must not silently become the automatic starter again"
+    )
 
 
 def test_build_script_stages_the_bundled_repo():

@@ -183,8 +183,8 @@ struct QuickstartRecommendedCard: View {
                         .foregroundStyle(RapidTheme.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 7) {
-                        OnboardingAttributePill(text: "Instant")
-                        OnboardingAttributePill(text: "Runs on any Mac")
+                        OnboardingAttributePill(text: "On-device")
+                        OnboardingAttributePill(text: "Fits this Mac")
                     }
                     .padding(.top, 2)
                 }
@@ -207,7 +207,7 @@ struct QuickstartRecommendedCard: View {
         if choice.isStarter { parts.append("recommended starter") }
         parts.append(choice.blurb)
         if !sizeText.isEmpty { parts.append("download \(sizeText)") }
-        parts.append("instant, runs on any Mac")
+        parts.append("on-device, fits this Mac")
         return parts.joined(separator: ". ")
     }
 }

@@ -89,6 +89,20 @@ struct ResidentPerformanceStatus: Codable, Sendable, Equatable {
     }
 }
 
+/// One lazily loaded speech engine mounted beside the primary chat model.
+/// The server reports the authoritative model path and lifecycle state; the
+/// Desktop uses those fields instead of assuming that an audio-capable route
+/// means the selected speech weights are still resident.
+struct ResidentAudioLaneStatus: Codable, Sendable, Equatable {
+    let lane: String
+    let model: String?
+    let state: String
+
+    func matches(modelPath: String) -> Bool {
+        model == modelPath && state == "resident"
+    }
+}
+
 struct ModelResidencySnapshot: Codable, Sendable, Equatable {
     let memoryLimitBytes: UInt64
     let memoryUsedBytes: UInt64
@@ -97,6 +111,7 @@ struct ModelResidencySnapshot: Codable, Sendable, Equatable {
     let loadsTotal: Int
     let evictionsTotal: Int
     let models: [ResidentModelStatus]
+    let audioLanes: [ResidentAudioLaneStatus]
 
     enum CodingKeys: String, CodingKey {
         case memoryLimitBytes = "memory_limit_bytes"
@@ -106,6 +121,42 @@ struct ModelResidencySnapshot: Codable, Sendable, Equatable {
         case loadsTotal = "loads_total"
         case evictionsTotal = "evictions_total"
         case models
+        case audioLanes = "audio_lanes"
+    }
+
+    init(
+        memoryLimitBytes: UInt64,
+        memoryUsedBytes: UInt64,
+        memoryAvailableBytes: UInt64?,
+        idleTTLSeconds: Double,
+        loadsTotal: Int,
+        evictionsTotal: Int,
+        models: [ResidentModelStatus],
+        audioLanes: [ResidentAudioLaneStatus] = []
+    ) {
+        self.memoryLimitBytes = memoryLimitBytes
+        self.memoryUsedBytes = memoryUsedBytes
+        self.memoryAvailableBytes = memoryAvailableBytes
+        self.idleTTLSeconds = idleTTLSeconds
+        self.loadsTotal = loadsTotal
+        self.evictionsTotal = evictionsTotal
+        self.models = models
+        self.audioLanes = audioLanes
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        memoryLimitBytes = try values.decode(UInt64.self, forKey: .memoryLimitBytes)
+        memoryUsedBytes = try values.decode(UInt64.self, forKey: .memoryUsedBytes)
+        memoryAvailableBytes = try values.decodeIfPresent(UInt64.self, forKey: .memoryAvailableBytes)
+        idleTTLSeconds = try values.decode(Double.self, forKey: .idleTTLSeconds)
+        loadsTotal = try values.decode(Int.self, forKey: .loadsTotal)
+        evictionsTotal = try values.decode(Int.self, forKey: .evictionsTotal)
+        models = try values.decode([ResidentModelStatus].self, forKey: .models)
+        audioLanes = try values.decodeIfPresent(
+            [ResidentAudioLaneStatus].self,
+            forKey: .audioLanes
+        ) ?? []
     }
 
     static let empty = ModelResidencySnapshot(
@@ -115,11 +166,16 @@ struct ModelResidencySnapshot: Codable, Sendable, Equatable {
         idleTTLSeconds: 0,
         loadsTotal: 0,
         evictionsTotal: 0,
-        models: []
+        models: [],
+        audioLanes: []
     )
 
     func contains(_ alias: String) -> Bool {
         models.contains { $0.matches(alias) && $0.state != "evicting" }
+    }
+
+    func containsResidentAudioLane(modelPath: String) -> Bool {
+        audioLanes.contains { $0.matches(modelPath: modelPath) }
     }
 
     /// Pick the resident text model that can host chat-only subsystems such

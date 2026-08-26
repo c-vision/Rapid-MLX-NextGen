@@ -569,17 +569,17 @@ struct Step2ModelSelectionBehaviorTests {
     @Test("A 32 GB Mac recommends only the 27B, not the 48 GB+ 35B")
     func midRAMRecommendsOnly27B() {
         let list = QuickstartView.shortlist(catalog: [], selection: "", physicalRAMGB: 32)
-        #expect(list.recommended.map(\.alias) == ["qwen3.8-27b-4bit", "qwen3.5-4b-4bit"],
-                "32 GB tier is smart 27B then fast 4B; the 35B is a 48 GB+ pick")
+        #expect(list.recommended.map(\.alias) == ["qwen3.8-27b-4bit"],
+                "32 GB shows the smart 27B; the fast 4B is already the starter")
     }
 
     @Test("The starter is never duplicated inside the recommended row")
     func starterEqualFastPickIsDroppedFromRecommended() {
-        // 8 GB's fast pick is the starter itself; it must stay in the ✓ card
-        // and not reappear in the recommended row.
+        // At 8 GB the smart pick is the starter and the fast pick is the
+        // explicit low-memory card, so neither belongs in a duplicate row.
         let list = QuickstartView.shortlist(catalog: [], selection: "", physicalRAMGB: 8)
-        #expect(list.recommended.map(\.alias) == ["lfm2.5-2.6b-4bit"],
-                "the starter-equal fast pick is deduplicated against the ✓ card")
+        #expect(list.recommended.isEmpty,
+                "starter and low-memory picks are deduplicated against their authored cards")
     }
 
     @Test("No RAM argument means no recommended row")

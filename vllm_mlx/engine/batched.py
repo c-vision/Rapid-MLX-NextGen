@@ -797,6 +797,7 @@ class BatchedEngine(BaseEngine):
         enable_disk_stream: bool = False,
         disk_stream_cache_gb: float = 1.0,
         chat_template_id: str | None = None,
+        serving_lane_reason: str | None = None,
     ):
         """
         Initialize the batched engine.
@@ -833,6 +834,9 @@ class BatchedEngine(BaseEngine):
             chat_template_id: Keyword-only model-profile prompt contract.
                 Control-plane callers pass this when ``model_name`` is a local
                 snapshot path whose originating profile is already known.
+            serving_lane_reason: Machine-readable reason from the shared
+                serving-lane decision. Kept on the live engine so model and
+                residency APIs report the decision that was actually loaded.
         """
         self._model_name = model_name
         if chat_template_id is None:
@@ -866,6 +870,7 @@ class BatchedEngine(BaseEngine):
         # demand for the vision lane, so a missing vision tower must hard-fail
         # for that operator rather than silently degrade behind their back.
         self._force_mllm = force_mllm
+        self._serving_lane_reason = serving_lane_reason
         if force_text:
             # User explicitly opted out of MLLM routing. Skip the probe
             # entirely so a False from auto-detection can't be overridden
@@ -911,6 +916,16 @@ class BatchedEngine(BaseEngine):
     def model_name(self) -> str:
         """Get the model name."""
         return self._model_name
+
+    @property
+    def serving_lane(self) -> str:
+        """The live request lane exposed to capability consumers."""
+        return "vision" if self._is_mllm else "text"
+
+    @property
+    def serving_lane_reason(self) -> str | None:
+        """Stable reason supplied by the shared serving-lane contract."""
+        return self._serving_lane_reason
 
     @property
     def is_mllm(self) -> bool:
@@ -1414,6 +1429,7 @@ class BatchedEngine(BaseEngine):
             )
             gc.collect()
             self._is_mllm = False
+            self._serving_lane_reason = "vision_weights_unavailable"
             await self._start_llm()
             return
 
@@ -2286,6 +2302,8 @@ class BatchedEngine(BaseEngine):
         stop: list[str] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        request_id: str | None = None,
+        request_admitted_event: asyncio.Event | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -2299,6 +2317,11 @@ class BatchedEngine(BaseEngine):
             stop: Stop sequences
             images: Optional image URLs/paths (for MLLM)
             videos: Optional video URLs/paths (for MLLM)
+            request_id: Optional caller-provided request identity. Streaming
+                API routes use the public response id so cancellation and
+                scheduler admission address the same request.
+            request_admitted_event: Optional route notification set after
+                scheduler admission, before waiting for the first output.
             **kwargs: Additional model-specific parameters. C-01:
                 ``request_id_holder`` (``list[str | None]``) — when
                 provided, the engine writes the admitted scheduler
@@ -2351,6 +2374,7 @@ class BatchedEngine(BaseEngine):
             }
             try:
                 request_id = await self._mllm_scheduler.add_request_async(
+                    request_id=request_id,
                     prompt=prompt,
                     images=images,
                     videos=videos,
@@ -2377,6 +2401,8 @@ class BatchedEngine(BaseEngine):
                         "[stream_generate] request_id_holder publish failed",
                         exc_info=True,
                     )
+            if request_admitted_event is not None:
+                request_admitted_event.set()
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
                 # ``logprobs`` is now wired through from
@@ -2451,6 +2477,7 @@ class BatchedEngine(BaseEngine):
                 "suppressed_tokens_logits_processor", None
             )
             request_id = await self._engine.add_request(
+                request_id=request_id,
                 prompt=prompt,
                 sampling_params=sampling_params,
                 prefix_boundary=prefix_boundary,
@@ -2476,6 +2503,8 @@ class BatchedEngine(BaseEngine):
                     "[stream_generate] request_id_holder publish failed",
                     exc_info=True,
                 )
+        if request_admitted_event is not None:
+            request_admitted_event.set()
 
         # F-012 belt-and-suspenders: ``stream_outputs.finally`` already
         # aborts on any abnormal exit AFTER it enters its ``try`` block.
@@ -3424,6 +3453,15 @@ class BatchedEngine(BaseEngine):
             videos=all_videos if all_videos else None,
             **kwargs,
         )
+        # Prime scheduler admission before exposing any synthetic prefix. The
+        # route publishes the public request id with its first SSE frame; if a
+        # forced prefix were yielded first, an immediate cancel could race the
+        # scheduler registration and return 404 for a live request.
+        routed_stream = self._stream_with_output_router(stream, router)
+        try:
+            first_output = await anext(routed_stream)
+        except StopAsyncIteration:
+            first_output = None
         # On the streaming path inject the forced prefix as a synthetic
         # first chunk so the route layer's streaming tool-call parser
         # sees the wire envelope opener from the very first delta.
@@ -3436,7 +3474,9 @@ class BatchedEngine(BaseEngine):
                 finished=False,
                 finish_reason=None,
             )
-        async for output in self._stream_with_output_router(stream, router):
+        if first_output is not None:
+            yield first_output
+        async for output in routed_stream:
             yield output
 
     def get_stats(self) -> dict[str, Any]:

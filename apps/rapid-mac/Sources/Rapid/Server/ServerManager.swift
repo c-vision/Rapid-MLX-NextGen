@@ -350,6 +350,26 @@ final class ServerManager {
         servingAlias == alias || voiceCoLoadsOnPrimary
     }
 
+    /// Whether the selected voice engine is actually resident, rather than
+    /// merely routable through a chat process that mounted ``/v1/audio/*``.
+    /// Exact catalog provenance keeps this capability check independent of
+    /// alias naming conventions.
+    func isVoiceLaneResident(for alias: String, modelPath: String?) -> Bool {
+        if servingAlias == alias { return true }
+        guard voiceCoLoadsOnPrimary, let modelPath else { return false }
+        return residency.containsResidentAudioLane(modelPath: modelPath)
+    }
+
+    /// Refresh and verify as one contract so a failed request can never make
+    /// a caller treat the previous process's audio snapshot as current.
+    func refreshVoiceLaneResidency(for alias: String, modelPath: String?) async -> Bool {
+        // An audio-only process owns this model at startup; no lazy lane or
+        // prior-process snapshot is involved.
+        if servingAlias == alias { return true }
+        guard await refreshResidency() else { return false }
+        return isVoiceLaneResident(for: alias, modelPath: modelPath)
+    }
+
     /// Bring up a server for a voice (STT/TTS) request, reusing the primary
     /// chat LLM/VLM process when one is already up so voice and text/vision
     /// run side-by-side instead of voice replacing the chat model.
@@ -385,16 +405,18 @@ final class ServerManager {
         isModelResident(alias) ? .ready(alias: alias) : state
     }
 
-    func refreshResidency() async {
+    @discardableResult
+    func refreshResidency() async -> Bool {
         guard case .ready = state else {
             residency = .empty
-            return
+            return false
         }
         guard let snapshot = await residencyClient.fetch(
             port: activePort,
             bearer: activeBearer
-        ) else { return }
+        ) else { return false }
         residency = snapshot
+        return true
     }
 
     func confirmPendingModelSwitch(_ request: PendingModelSwitch) {
@@ -646,6 +668,28 @@ final class ServerManager {
     /// Process-wide lane captured at spawn. Nil means there is no live child;
     /// UI capability must observe this value rather than the process handle.
     private(set) var launchedImageInputLane: Bool?
+    /// Exact live `/v1/models/{alias}` profile. Consumers require its id to
+    /// match the current alias, so a profile can never lag one model behind.
+    private(set) var activeModelProfile: ServerModelProfile?
+
+    func clearActiveModelProfile() {
+        activeModelProfile = nil
+    }
+
+    /// Publish or retire one sidecar session as a unit. Model profiles belong
+    /// to the bearer-authenticated process that returned them and must never
+    /// survive a process replacement on the same alias and port.
+    private func setActiveServerSession(bearer: String?) {
+        activeBearer = bearer
+        activeModelProfile = nil
+    }
+
+    func applyActiveModelProfile(_ profile: ServerModelProfile, forAlias alias: String) {
+        guard isModelResident(alias),
+              profile.id.caseInsensitiveCompare(alias) == .orderedSame
+        else { return }
+        activeModelProfile = profile
+    }
 
     func hasAppliedSpeculativeDecoding(forAlias alias: String) -> Bool {
         guard child != nil,
@@ -2307,7 +2351,7 @@ final class ServerManager {
         self.launchedPerformanceFlags = performanceFlags
         // Codex r1 P3 (#17): only publish the bearer after the spawn
         // has succeeded — see comment at the bearer guard above.
-        self.activeBearer = bearer
+        setActiveServerSession(bearer: bearer)
         self.stdoutPipe = stdoutPipe
         self.stderrPipe = stderrPipe
         // #20: persist ownership before startMonitor() so a crash
@@ -2574,7 +2618,7 @@ final class ServerManager {
         // post-stop chat request can't slip through with a stale
         // secret targeting whatever happens to bind the port next.
         // (#1035: the nil transition evicts cached MCP tools via didSet.)
-        activeBearer = nil
+        setActiveServerSession(bearer: nil)
         // Issue #278: honour the "readyAt cleared on every child
         // exit" invariant in shutdownSync too (parallel to the
         // terminateChild defensive teardown). App-termination only,
@@ -2661,7 +2705,7 @@ final class ServerManager {
             launchedImageInputLane = nil
             // #17: see shutdownSync — bearer is dead the moment the
             // child is.
-            activeBearer = nil
+            setActiveServerSession(bearer: nil)
             startedAt = nil
             // Issue #278: defensive teardown also has to honour the
             // "readyAt cleared on every child exit" invariant in
@@ -2732,7 +2776,7 @@ final class ServerManager {
         launchedImageInputLane = nil
         // #17: the child owns the secret; the secret is meaningless
         // (and a leak vector) once the child is gone.
-        activeBearer = nil
+        setActiveServerSession(bearer: nil)
         startedAt = nil
         // Issue #278: snapshot + window-gate the auto-respawn budget
         // reset, then clear ``readyAt``. The wasExpected-stop branch
@@ -3428,16 +3472,33 @@ final class ServerManager {
         forAlias alias: String,
         catalogSupportsImageInput: Bool? = nil
     ) -> Bool {
+        imageInputAvailability(
+            forAlias: alias,
+            catalogSupportsImageInput: catalogSupportsImageInput
+        ).isAvailable
+    }
+
+    internal func imageInputAvailability(
+        forAlias alias: String,
+        catalogSupportsImageInput: Bool? = nil
+    ) -> ImageInputAvailability {
         let catalogCapability = catalogSupportsImageInput
             ?? ModelCatalogCache.supportsImageInput(forAlias: alias, binary: binaryPath)
         let safeOverrides = Self.imageSafePerformanceOverrides(
             catalogSupportsImageInput: catalogCapability,
             userOverrides: perfLaunchFlagsProvider?(alias) ?? []
         )
-        return Self.effectiveRunningImageCapability(
+        let fallback = Self.effectiveRunningImageCapability(
             catalogSupportsImageInput: catalogCapability,
             userOverrides: safeOverrides,
             processLaunchFlags: launchedImageInputLane.map { $0 ? ["--mllm"] : [] }
+        )
+        let profile = activeModelProfile.flatMap {
+            $0.id.caseInsensitiveCompare(alias) == .orderedSame ? $0 : nil
+        }
+        return ImageInputAvailability.resolve(
+            fallbackSupportsImageInput: fallback,
+            profile: profile
         )
     }
 

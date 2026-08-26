@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import signal
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1170,6 +1171,33 @@ def test_share_command_skips_download_gate_for_chat_spawn_child():
         ),
     ):
         share_cli._maybe_confirm_download("mlx-community/Qwen3.5-4B-MLX-4bit")
+
+
+def test_maybe_confirm_download_gates_catalog_alias_offline_via_manifest():
+    """Issue #2350: a catalog alias (resolved to its HF repo by ``main()``)
+    must still confirm when the live metadata lookup is unavailable offline.
+    ``_maybe_confirm_download`` is handed ``args.model`` — the resolved repo
+    id — so the checked-in manifest supplies the ~438 GiB footprint and
+    ``confirm_or_abort`` is reached instead of silently proceeding."""
+    from vllm_mlx.model_aliases import resolve_model
+
+    resolved = resolve_model("kimi-k2.6")
+    assert "/" in resolved
+    fake_sys = SimpleNamespace(stdin=SimpleNamespace(isatty=lambda: True))
+    with (
+        patch.object(share_cli, "sys", fake_sys),
+        patch("vllm_mlx._download_gate.is_repo_cached", return_value=False),
+        patch(
+            "vllm_mlx._download_gate.estimate_download_size_bytes",
+            side_effect=lambda repo: None if repo != resolved else 470_632_354_731,
+        ),
+        patch("vllm_mlx._download_gate.confirm_or_abort") as confirm,
+    ):
+        # ``_maybe_confirm_download`` passes the resolved repo id down to the
+        # size lookup; offline that falls back to the manifest footprint.
+        share_cli._maybe_confirm_download(resolved)
+        confirm.assert_called_once()
+        assert confirm.call_args.args[1] == 470_632_354_731
 
 
 # ─────────────────────────── banner content ─────────────────────────────────

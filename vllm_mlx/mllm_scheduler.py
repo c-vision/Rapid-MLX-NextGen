@@ -624,6 +624,8 @@ class MLLMScheduler:
         """Atomically publish a request to lifecycle truth and the run queue."""
 
         with self._request_state_lock():
+            if request.request_id in self.requests:
+                raise ValueError(f"Request {request.request_id} already exists")
             if getattr(self, "_generation_paused", False):
                 from .scheduler import BackpressureError
 

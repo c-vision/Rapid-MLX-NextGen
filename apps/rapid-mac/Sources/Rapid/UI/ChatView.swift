@@ -194,6 +194,10 @@ struct ChatView: View {
     var readiness: ModelReadiness
     /// Catalog-backed capability shared with launch and request encoding.
     var supportsImageInput: Bool = false
+    /// Runtime-backed explanation shown for every attach path when photos are
+    /// unavailable. Kept alongside the Boolean so mouse, keyboard, paste,
+    /// drag/drop, and VoiceOver all present the same contract.
+    var imageInputUnavailableMessage: String? = nil
     /// First launch must not inspect model caches behind the consent sheet.
     /// The parent flips this after the user makes that one-time decision.
     var catalogRefreshEnabled: Bool = true
@@ -722,7 +726,11 @@ struct ChatView: View {
                     .help(
                         supportsImageInput
                             ? "Upload photo"
-                            : "Current model doesn't support photos"
+                            : imageInputUnavailableMessage
+                                ?? "Current model doesn't support photos"
+                    )
+                    .accessibilityHint(
+                        supportsImageInput ? "" : imageInputUnavailableMessage ?? ""
                     )
                     .accessibilityIdentifier("ChatView.Attachments.UploadPhoto")
                 }
@@ -747,12 +755,13 @@ struct ChatView: View {
             }
             .buttonStyle(.plain)
             .disabled(viewModel.isStreaming)
-            .help("Conversation instructions")
-            .accessibilityLabel("Conversation instructions")
+            .help("Conversation system prompt")
+            .accessibilityLabel("Conversation system prompt")
             .accessibilityIdentifier("ChatView.ConversationInstructions")
             .popover(isPresented: $showsConversationInstructions, arrowEdge: .bottom) {
                 ConversationInstructionsPopover(
                     draft: $conversationInstructionsDraft,
+                    global: viewModel.customInstructions.global,
                     onSave: { value in
                         viewModel.setConversationInstructions(value)
                         showsConversationInstructions = false
@@ -1121,7 +1130,8 @@ struct ChatView: View {
     }
 
     private func rejectImageInputForCurrentModel() {
-        attachmentDraft.notice = "\(alias) doesn't support image input. Choose a vision model to add photos."
+        attachmentDraft.notice = imageInputUnavailableMessage
+            ?? "This model doesn't support photos. Choose a vision-capable model to add one."
         VoiceOverAnnouncer.announce(attachmentDraft.notice ?? "This model doesn't support images.")
     }
 

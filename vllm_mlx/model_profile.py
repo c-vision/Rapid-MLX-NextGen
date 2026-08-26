@@ -244,6 +244,12 @@ class ModelProfile:
     # GB peak RSS — needs 192 GB+ M3 Ultra). Enforced as a boot-time
     # WARNING (not a hard block) in ``vllm_mlx/cli.py``.
     min_memory_gb: float | None = None
+    # Measured unified-memory floor for automatic vision-lane admission.
+    # This is separate from ``min_memory_gb`` because the same checkpoint can
+    # remain safe through its text lane on a smaller Mac.  ``None`` preserves
+    # automatic vision admission when no catalog measurement is available;
+    # explicit ``--mllm`` always remains the operator override.
+    vision_min_memory_gb: float | None = None
     # ``is_text_only`` = this checkpoint is served through the
     # auto-regressive text (mlx-lm) lane even though its ``config.json``
     # declares a ``vision_config`` (and may ship ``vision_tower`` weights)

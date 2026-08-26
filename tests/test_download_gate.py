@@ -96,6 +96,76 @@ def test_estimate_repo_size_returns_none_on_empty_repo():
 
 
 # ---------------------------------------------------------------------------
+# estimate_download_size_bytes (declared-footprint fallback, issue #2350)
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_download_size_prefers_live_estimate():
+    """The live HF estimate is authoritative when available — the manifest must
+    not shadow a fresher online footprint."""
+    with (
+        patch.object(gate, "estimate_repo_size_bytes", return_value=123456),
+        patch("vllm_mlx.model_sizes.size_bytes", return_value=999999),
+    ):
+        assert gate.estimate_download_size_bytes("org/Big") == 123456
+
+
+def test_estimate_download_size_falls_back_to_manifest_when_live_none():
+    """When the live lookup is unavailable (offline / gated / timeout) the gate
+    must fall back to the checked-in manifest so a known-large catalog model is
+    still confirmed instead of silently proceeding (issue #2350)."""
+    with (
+        patch.object(gate, "estimate_repo_size_bytes", return_value=None),
+        patch("vllm_mlx.model_sizes.size_bytes", return_value=470_632_354_731),
+    ):
+        assert gate.estimate_download_size_bytes("org/Big") == 470_632_354_731
+
+
+def test_estimate_download_size_none_when_both_unavailable():
+    """No live metadata AND no manifest entry → ``None`` (the gate degrades to
+    today's "proceed with an unknown size" behavior for an unknown repo)."""
+    with (
+        patch.object(gate, "estimate_repo_size_bytes", return_value=None),
+        patch("vllm_mlx.model_sizes.size_bytes", return_value=None),
+    ):
+        assert gate.estimate_download_size_bytes("org/Unlisted") is None
+
+
+def test_estimate_download_size_survives_manifest_error():
+    """A raised manifest access must not break the gate — fall back to ``None``
+    rather than propagating."""
+    with (
+        patch.object(gate, "estimate_repo_size_bytes", return_value=None),
+        patch(
+            "vllm_mlx.model_sizes.size_bytes",
+            side_effect=RuntimeError("manifest corrupt"),
+        ),
+    ):
+        assert gate.estimate_download_size_bytes("org/Big") is None
+
+
+def test_offline_catalog_alias_still_gates_via_manifest():
+    """Issue #2350 end-to-end shape: a slash-free catalog alias resolves to a
+    repo whose ~438 GiB footprint is declared in the manifest. When the live
+    HF lookup is unavailable (offline reproduce), the gate must still see the
+    manifest size — well above the 10 GiB confirm threshold — instead of
+    ``None`` ("size unknown, proceeding without confirmation")."""
+    from vllm_mlx.model_aliases import resolve_model
+
+    alias = "kimi-k2.6"
+    resolved = resolve_model(alias)
+    assert "/" in resolved, "alias must resolve to an HF repo id"
+    # Live metadata unavailable → manifest carries the declared footprint.
+    with patch.object(gate, "estimate_repo_size_bytes", return_value=None):
+        size = gate.estimate_download_size_bytes(resolved)
+    assert size is not None and size > 10 * 1024**3
+    # Sanity: the manifest actually records this alias's repo as large.
+    from vllm_mlx import model_sizes
+
+    assert model_sizes.size_bytes(resolved) == size
+
+
+# ---------------------------------------------------------------------------
 # confirm_or_abort
 # ---------------------------------------------------------------------------
 

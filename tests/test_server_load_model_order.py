@@ -138,8 +138,11 @@ def test_load_model_materializes_config_before_hybrid_routing_probe(
     # its config has been materialized (i.e. after the download).
     monkeypatch.setattr(api_utils, "is_mllm_model", lambda name: True)
     monkeypatch.setattr(
-        api_utils, "mllm_backbone_is_hybrid", lambda name: state["materialized"]
+        api_utils,
+        "mllm_backbone_cache_mode",
+        lambda name: "arrays" if state["materialized"] else None,
     )
+    monkeypatch.setattr(api_utils, "mllm_hybrid_runtime_supported", lambda: False)
 
     with caplog.at_level(logging.INFO, logger="vllm_mlx.server"):
         server.load_model("some/uncached-hybrid-vlm-4bit")
@@ -167,7 +170,7 @@ def test_load_model_genuine_vlm_stays_on_mllm_lane(monkeypatch):
     _stub_routing_globals(monkeypatch, server)
     monkeypatch.setattr(server, "_ensure_routing_config", lambda name: None)
     monkeypatch.setattr(api_utils, "is_mllm_model", lambda name: True)
-    monkeypatch.setattr(api_utils, "mllm_backbone_is_hybrid", lambda name: False)
+    monkeypatch.setattr(api_utils, "mllm_backbone_cache_mode", lambda name: None)
 
     server.load_model("some/genuine-vlm-4bit")
 
@@ -177,8 +180,55 @@ def test_load_model_genuine_vlm_stays_on_mllm_lane(monkeypatch):
     assert server._engine.kwargs.get("force_text") is False
 
 
+def test_materialized_checkpoint_keeps_catalog_vision_memory_floor(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_mlx import model_aliases, model_metadata, server
+    from vllm_mlx.api import utils as api_utils
+    from vllm_mlx.model_profile import ModelProfile
+
+    monkeypatch.setattr(model_aliases, "resolve_model", lambda _name: "publisher/model")
+    monkeypatch.setattr(
+        model_aliases,
+        "resolve_profile",
+        lambda _name: ModelProfile(vision_min_memory_gb=32.0),
+    )
+    monkeypatch.setattr(server, "_ensure_routing_config", lambda _name: None)
+    monkeypatch.setattr(
+        model_metadata,
+        "read_model_metadata",
+        lambda _name: SimpleNamespace(snapshot_dir="/cache/snapshots/revision"),
+    )
+    monkeypatch.setattr(api_utils, "is_mllm_model", lambda _name: True)
+    monkeypatch.setattr(
+        api_utils, "mllm_arch_unsupported_but_text_vendored", lambda _name: False
+    )
+    monkeypatch.setattr(api_utils, "mllm_backbone_cache_mode", lambda _name: "arrays")
+    monkeypatch.setattr(api_utils, "mllm_hybrid_runtime_supported", lambda: True)
+    monkeypatch.setattr(api_utils, "physical_ram_gb", lambda: 16.0)
+
+    resolved = server._resolve_serving_checkpoint("qwen3.5-4b-4bit")
+
+    assert resolved.load_path == "/cache/snapshots/revision"
+    assert resolved.auto_text_fallback is True
+    assert resolved.lane_reason == "vision_memory_insufficient"
+
+
 @pytest.mark.asyncio
-async def test_startup_and_runtime_use_identical_checkpoint_lane_contract(monkeypatch):
+@pytest.mark.parametrize(
+    ("auto_text_fallback", "lane_reason", "expected_force_text"),
+    [
+        (True, "vision_hybrid_runtime_unsupported", True),
+        (False, "vision_hybrid_runtime_supported", False),
+    ],
+)
+async def test_startup_and_runtime_use_identical_checkpoint_lane_contract(
+    monkeypatch,
+    scheduler_config_stub,
+    auto_text_fallback,
+    lane_reason,
+    expected_force_text,
+):
     """Startup and residency must hand the same resolved path/lane to engine."""
     from vllm_mlx import server
     from vllm_mlx.model_profile import ModelProfile
@@ -188,7 +238,8 @@ async def test_startup_and_runtime_use_identical_checkpoint_lane_contract(monkey
     resolved = server._ServingCheckpoint(
         model_path="publisher/model",
         load_path="/cache/snapshots/revision",
-        auto_text_fallback=True,
+        auto_text_fallback=auto_text_fallback,
+        lane_reason=lane_reason,
     )
 
     def resolve_once(model_name, **kwargs):
@@ -220,7 +271,16 @@ async def test_startup_and_runtime_use_identical_checkpoint_lane_contract(monkey
         ),
     ]
     assert startup_kwargs["model_name"] == runtime.engine.kwargs["model_name"]
-    assert startup_kwargs["force_text"] == runtime.engine.kwargs["force_text"] is True
+    assert (
+        startup_kwargs["force_text"]
+        == runtime.engine.kwargs["force_text"]
+        is expected_force_text
+    )
+    assert (
+        startup_kwargs["serving_lane_reason"]
+        == runtime.engine.kwargs["serving_lane_reason"]
+        == lane_reason
+    )
 
 
 def test_ensure_routing_config_raises_when_prefetch_does_not_materialize(monkeypatch):
@@ -400,7 +460,9 @@ def test_load_model_infers_programmatic_max_tokens_explicit(monkeypatch):
     assert cfg.default_max_tokens_is_explicit is False
 
 
-def test_load_model_mtp_kwarg_translates_to_scheduler_config(monkeypatch):
+def test_load_model_mtp_kwarg_translates_to_scheduler_config(
+    monkeypatch, scheduler_config_stub
+):
     from vllm_mlx import server
 
     monkeypatch.setattr(server, "BatchedEngine", _StubEngine)
@@ -423,11 +485,10 @@ def test_load_model_mtp_kwarg_translates_to_scheduler_config(monkeypatch):
     assert cfg.enable_mtp is True
 
 
-def test_load_model_mtp_kwarg_rejects_conflicting_spec_decode():
+def test_load_model_mtp_kwarg_rejects_conflicting_spec_decode(scheduler_config_stub):
     from vllm_mlx import server
-    from vllm_mlx.scheduler import SchedulerConfig
 
-    cfg = SchedulerConfig()
+    cfg = scheduler_config_stub()
     cfg.spec_decode = "suffix"
 
     with pytest.raises(ValueError, match="mtp=True.*spec_decode='suffix'"):
@@ -438,26 +499,28 @@ def test_load_model_mtp_kwarg_rejects_conflicting_spec_decode():
         )
 
 
-def test_load_model_mtp_kwarg_rejects_conflicting_suffix_config():
+def test_load_model_mtp_kwarg_rejects_conflicting_suffix_config(
+    scheduler_config_stub,
+):
     from vllm_mlx import server
-    from vllm_mlx.scheduler import SchedulerConfig
 
     with pytest.raises(ValueError, match="enable_suffix_decoding=True"):
         server.load_model(
             "mlx-community/Qwen3.5-9B-4bit",
-            scheduler_config=SchedulerConfig(enable_suffix_decoding=True),
+            scheduler_config=scheduler_config_stub(enable_suffix_decoding=True),
             mtp=True,
         )
 
 
-def test_load_model_mtp_kwarg_rejects_conflicting_dflash_config():
+def test_load_model_mtp_kwarg_rejects_conflicting_dflash_config(
+    scheduler_config_stub,
+):
     from vllm_mlx import server
-    from vllm_mlx.scheduler import SchedulerConfig
 
     with pytest.raises(ValueError, match="dflash_drafter_path"):
         server.load_model(
             "mlx-community/Qwen3.5-9B-4bit",
-            scheduler_config=SchedulerConfig(dflash_drafter_path="local/draft"),
+            scheduler_config=scheduler_config_stub(dflash_drafter_path="local/draft"),
             mtp=True,
         )
 
@@ -527,18 +590,19 @@ def test_load_model_response_cache_reconfigure_failure_forces_disabled(monkeypat
     rc.reset_response_cache_for_tests()
 
 
-def test_load_model_mtp_kwarg_rejects_legacy_optimistic_config():
+def test_load_model_mtp_kwarg_rejects_legacy_optimistic_config(
+    scheduler_config_stub,
+):
     """PR #1050 hard-reject: server.load_model(mtp=True) with a
     scheduler_config carrying ``mtp_optimistic=True`` must fail because
     the direct mutation of ``spec_decode='mtp'`` below would bypass
     ``__post_init__`` and silently drop the flag under the vendored path."""
     from vllm_mlx import server
-    from vllm_mlx.scheduler import SchedulerConfig
 
     # SchedulerConfig(mtp_optimistic=True) alone (spec_decode="none") is
     # legal — the reject is triggered only once mtp=True elevates the
     # config into the unified spec-decode interface path.
-    cfg = SchedulerConfig(mtp_optimistic=True)
+    cfg = scheduler_config_stub(mtp_optimistic=True)
 
     with pytest.raises(
         ValueError, match="mtp_optimistic.*not supported under the unified"

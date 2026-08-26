@@ -15,7 +15,7 @@
   },
   "qwen3.5-4b-4bit": {
     "hf_path": "mlx-community/Qwen3.5-4B-MLX-4bit",
-    "is_text_only": true,
+    "vision_min_memory_gb": 32,
     "tool_call_parser": "hermes",
     "reasoning_parser": "qwen3",
     "is_hybrid": false,
@@ -53,6 +53,7 @@
   },
   "qwen3.5-9b-4bit": {
     "hf_path": "mlx-community/Qwen3.5-9B-4bit",
+    "vision_min_memory_gb": 32,
     "tool_call_parser": "hermes",
     "reasoning_parser": "qwen3",
     "is_hybrid": false,

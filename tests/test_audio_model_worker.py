@@ -967,9 +967,9 @@ async def test_primary_reload_restores_old_config_after_publication_failure(
             model_path=path or f"repo/{name}",
         )
 
-    def publish(entry: ModelEntry) -> None:
+    def publish(entry: ModelEntry | None) -> None:
         server._set_resident_primary(entry)
-        if entry.engine is loaded[0]:
+        if entry is not None and entry.engine is loaded[0]:
             raise RuntimeError("primary publication failed")
 
     manager = ResidentModelManager(
@@ -1133,9 +1133,10 @@ async def test_primary_reload_releases_handoff_when_cleanup_and_restore_fail(
             model_path=path or f"repo/{name}",
         )
 
-    def reject_publication(entry: ModelEntry) -> None:
+    def reject_publication(entry: ModelEntry | None) -> None:
         server._set_resident_primary(entry)
-        raise RuntimeError("primary publication failed")
+        if entry is not None:
+            raise RuntimeError("primary publication failed")
 
     manager = ResidentModelManager(
         registry,

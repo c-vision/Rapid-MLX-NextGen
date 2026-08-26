@@ -1285,15 +1285,15 @@ flow_fresh_install() {
     see_main "$OUT/compact.json"
     baseline onboarding-direction-d.compact "$OUT/compact.json"
     press "$OUT/compact.json" Quickstart.GetStarted "$OUT/get-started.json"
-    wait_tree_text "~633 MB" "$OUT/chooser-settled.json"
+    wait_selected Quickstart.Choice.lfm2.5-2.6b-4bit "$OUT/chooser-settled.json"
     baseline onboarding-direction-d.compact-chooser "$OUT/chooser-settled.json"
     press "$OUT/chooser-settled.json" Quickstart.Footer.Back "$OUT/chooser-back.json"
     wait_identifier Quickstart.Skip "$OUT/welcome-returned.json"
     press "$OUT/welcome-returned.json" Quickstart.Skip "$OUT/quickstart-skip.json"
     wait_identifier rapid.chat.compose "$OUT/steady.json"
     selected_model="$(element_field "$OUT/steady.json" ModelPickerBar.ModelMenu value)"
-    [[ "$selected_model" == *"lfm2.5-1b-4bit"* ]] \
-        || die "#1564: skipping Quickstart selected '$selected_model' instead of the small starter"
+    [[ "$selected_model" == *"lfm2.5-2.6b-4bit"* ]] \
+        || die "#2219: 8 GB onboarding selected '$selected_model' instead of the compact starter"
     for id in Sidebar.NewChat Sidebar.Launch rapid.chat.compose ChatView.SendOrStopButton ModelPickerBar.ModelMenu; do
         jq -e --arg id "$id" '.data.ui_elements[]? | select(.identifier == $id)' "$OUT/steady.json" >/dev/null \
             || die "post-onboarding shell missing $id"
@@ -1463,9 +1463,9 @@ flow_cached_quickstart() {
 }
 
 flow_cached_curated_tradeup() {
-    log "cached curated trade-up keeps its on-disk state past the six-row cap"
+    log "cached hardware-fit starter stays visible past the six-row cap"
     start_persona cached-curated-tradeup FAKE_CACHED_CURATED_TRADEUP=1 \
-        RAPID_GUI_HARDWARE_FIXTURE=1 RAPID_HARDWARE_RAM_GB=$GOLDEN_RAM_GB \
+        RAPID_GUI_HARDWARE_FIXTURE=1 RAPID_HARDWARE_RAM_GB=16 \
         RAPID_HARDWARE_BRAND="$GOLDEN_BRAND"
     see_main "$OUT/consent.json"
     if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.DontShare")' \
@@ -1474,23 +1474,18 @@ flow_cached_curated_tradeup() {
     fi
 
     # Six alphabetically earlier cached rows consume the bounded "Already on
-    # this Mac" presentation. Qwen remains a native curated trade-up, so this
-    # pins the exact seam where cached provenance used to be discarded.
+    # this Mac" presentation. The hardware-fit cached starter still has to own
+    # the one visible selected row; cached preference cannot produce a hidden
+    # choice with a disabled footer.
     wait_identifier Quickstart.GetStarted "$OUT/welcome.json"
     press "$OUT/welcome.json" Quickstart.GetStarted "$OUT/get-started.json"
-    wait_identifier Quickstart.Choice.qwen3.5-4b-4bit "$OUT/chooser.json"
+    wait_selected Quickstart.CachedModel.qwen3.5-4b-4bit "$OUT/chooser.json"
     jq -e '.data.ui_elements[]?
-            | select(.identifier == "Quickstart.Choice.qwen3.5-4b-4bit")
+            | select(.identifier == "Quickstart.CachedModel.qwen3.5-4b-4bit")
             | select((.description // "") | contains("on disk 2.9 GB"))
-            | select(((.description // "") | contains("download")) | not)' \
+            | select(((.description // "") | contains("Download 2.9 GB")) | not)' \
         "$OUT/chooser.json" >/dev/null \
-        || die "cached curated trade-up still advertises a download"
-    press "$OUT/chooser.json" Quickstart.Choice.qwen3.5-4b-4bit "$OUT/select.json"
-    # Verify the action's semantic result, not footer copy. The cached model's
-    # provenance is pinned above; after the press the durable contract is that
-    # this exact card becomes selected. Footer wording is presentation copy and
-    # is not required for the cached trade-up behavior under test.
-    wait_selected Quickstart.Choice.qwen3.5-4b-4bit "$OUT/selected.json"
+        || die "cached hardware-fit starter is hidden or advertises a download"
     cleanup_persona
 }
 
@@ -1534,11 +1529,13 @@ flow_download_progress() {
     fi
     wait_identifier Quickstart.GetStarted "$OUT/welcome.json"
     press "$OUT/welcome.json" Quickstart.GetStarted "$OUT/get-started.json"
-    # The footer exists while Step 2 is still asynchronously reading the
-    # catalogue. Waiting for that shared identifier can capture the transient
-    # "Matching models" state before the recommendation and its size land.
-    wait_tree_text "~633 MB" "$OUT/chooser.json"
-    press "$OUT/chooser.json" Quickstart.Footer.Primary "$OUT/review-open.json"
+    # Cached preference is the normal first-run policy now. Select the explicit
+    # low-memory download so this journey still exercises the 633 MB overrun
+    # fixture rather than accidentally starting the cached fake model.
+    wait_identifier Quickstart.Choice.lfm2.5-1b-4bit "$OUT/chooser.json"
+    press "$OUT/chooser.json" Quickstart.Choice.lfm2.5-1b-4bit "$OUT/select-download.json"
+    wait_selected Quickstart.Choice.lfm2.5-1b-4bit "$OUT/selected-download.json"
+    press "$OUT/selected-download.json" Quickstart.Footer.Primary "$OUT/review-open.json"
     wait_identifier Quickstart.Review.Alias "$OUT/review.json"
     assert_tree_text "$OUT/review.json" "Download & start"
     # AXPress is normally immediate, but AppKit can synchronously hold the
@@ -2491,19 +2488,19 @@ flow_low_memory_choice() {
     fi
     wait_identifier Quickstart.GetStarted "$OUT/welcome.json"
     press "$OUT/welcome.json" Quickstart.GetStarted "$OUT/get-started.json"
-    wait_identifier Quickstart.Choice.qwen3-0.6b-4bit "$OUT/model-choices.json"
+    wait_identifier Quickstart.Choice.lfm2.5-1b-4bit "$OUT/model-choices.json"
 
     local fallback_label
-    fallback_label="$(element_field "$OUT/model-choices.json" Quickstart.Choice.qwen3-0.6b-4bit description)"
+    fallback_label="$(element_field "$OUT/model-choices.json" Quickstart.Choice.lfm2.5-1b-4bit description)"
     [[ "$fallback_label" == *"Lowest memory"* ]] \
         || die "low-memory choice is missing its spoken category label"
     [[ "$fallback_label" == *"less accurate"* ]] \
         || die "low-memory choice hides its quality trade-off"
     [[ "$fallback_label" == *"not recommended for tools"* ]] \
         || die "low-memory choice hides its tool-use limitation"
-    press "$OUT/model-choices.json" Quickstart.Choice.qwen3-0.6b-4bit "$OUT/select-low-memory.json"
+    press "$OUT/model-choices.json" Quickstart.Choice.lfm2.5-1b-4bit "$OUT/select-low-memory.json"
     see_main "$OUT/low-memory-selected.json"
-    jq -e '.data.ui_elements[]? | select(.identifier == "Quickstart.Choice.qwen3-0.6b-4bit")' \
+    jq -e '.data.ui_elements[]? | select(.identifier == "Quickstart.Choice.lfm2.5-1b-4bit")' \
         "$OUT/low-memory-selected.json" >/dev/null \
         || die "selecting the low-memory choice dismissed or replaced the chooser"
     jq -e '.data.ui_elements[]? | select(.identifier == "Quickstart.Footer.Primary")' \
@@ -3030,10 +3027,14 @@ flow_browse_all_destination() {
     for ((i=0; i<40; i++)); do
         see_main "$OUT/ba-chooser.json"
         chosen="$(jq -r '[.data.ui_elements[]?
-                          | select((.identifier // "") | startswith("Quickstart.Choice."))]
+                          | select((.identifier // "") as $id
+                            | ($id | startswith("Quickstart.Choice."))
+                              or ($id | startswith("Quickstart.CachedModel."))
+                              or ($id | startswith("Quickstart.YourPick.")))]
                          | (map(select(.selected == true))) as $default
                          | if ($default | length) != 1 then empty
-                           else (map(select(.identifier != $default[0].identifier))[0].identifier // empty)
+                           else (map(select(.identifier != $default[0].identifier
+                                    and ((.identifier // "") | startswith("Quickstart.Choice."))))[0].identifier // empty)
                            end' \
                   "$OUT/ba-chooser.json")"
         if [[ -n "$chosen" ]]; then break; fi

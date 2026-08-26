@@ -145,6 +145,10 @@ struct ContentView: View {
             }
         }
         .onChange(of: server.state) { _, newState in
+            // A chat-model replacement can keep the process or respawn it.
+            // Dictation owns the same reconciliation entry point for both so
+            // an enabled STT lane is resident before its hotkey reads Ready.
+            dictation.serverStateDidChange(newState)
             // #223: clear the download-prompt CTA the moment the server
             // moves out of ``.idle``.
             if case .idle = newState {} else { autoStartPendingDownload = nil }
@@ -294,12 +298,52 @@ struct ContentView: View {
             guard !telemetryConsentPending else { return }
             await refreshCatalogSnapshot()
         }
+        // The selected chat alias may be a secondary resident model rather
+        // than the process-owning `servingAlias`. Fetch its exact live profile
+        // whenever that selection becomes resident so photo admission follows
+        // the lane that will actually receive the request.
+        .task(id: SelectedModelProfileKey(
+            alias: alias,
+            isResident: server.isModelResident(alias),
+            port: server.activePort,
+            bearer: server.activeBearer
+        )) {
+            let requestedAlias = alias
+            server.clearActiveModelProfile()
+            await refreshSelectedModelProfile(for: requestedAlias)
+        }
         .task {
             while !Task.isCancelled {
                 await server.refreshResidency()
                 try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled else { return }
+                // Reuse the existing local residency cadence as recovery for
+                // a transient profile timeout/non-2xx. A successful profile
+                // remains authoritative for this bearer session; only a
+                // missing/mismatched profile needs another request.
+                if server.activeModelProfile?.id.caseInsensitiveCompare(alias) != .orderedSame {
+                    await refreshSelectedModelProfile(for: alias)
+                }
             }
         }
+    }
+
+    private func refreshSelectedModelProfile(for requestedAlias: String) async {
+        guard server.isModelResident(requestedAlias) else { return }
+        let requestedPort = server.activePort
+        let requestedBearer = server.activeBearer
+        let profile = await ServerProfileFetcher.fetch(
+            baseURL: ChatStreamClient.loopbackURL(port: requestedPort),
+            alias: requestedAlias,
+            bearer: requestedBearer
+        )
+        guard !Task.isCancelled,
+              alias == requestedAlias,
+              server.activePort == requestedPort,
+              server.activeBearer == requestedBearer,
+              server.isModelResident(requestedAlias),
+              let profile else { return }
+        server.applyActiveModelProfile(profile, forAlias: requestedAlias)
     }
 
     /// First-run setup, filling the window (Paper 05.1.A).
@@ -784,12 +828,14 @@ struct ContentView: View {
     private var mainArea: some View {
         switch ContentView.mainAreaBranch(for: server.state) {
         case .chat:
+            let imageAvailability = imageInputAvailability(for: alias)
             ChatView(
                 viewModel: chat,
                 server: server,
                 alias: $alias,
                 readiness: readiness,
-                supportsImageInput: supportsImageInput(for: alias),
+                supportsImageInput: imageAvailability.isAvailable,
+                imageInputUnavailableMessage: imageAvailability.unavailableMessage,
                 catalogRefreshEnabled: !telemetryConsentPending,
                 onUserModelSelection: selectChatModel,
                 onReadinessAction: performReadinessAction,
@@ -800,7 +846,7 @@ struct ContentView: View {
         }
     }
 
-    private func supportsImageInput(for alias: String) -> Bool {
+    private func imageInputAvailability(for alias: String) -> ImageInputAvailability {
         let entry = catalogEntries.first {
             $0.alias.caseInsensitiveCompare(alias) == .orderedSame
         }
@@ -809,7 +855,7 @@ struct ContentView: View {
             isBuiltinProfile: entry?.isBuiltinProfile,
             isTextOnly: entry?.isTextOnly
         )
-        return server.supportsImageInput(
+        return server.imageInputAvailability(
             forAlias: alias,
             catalogSupportsImageInput: catalogSupportsImageInput
         )
@@ -1441,6 +1487,16 @@ struct ContentView: View {
             return .chat
         }
     }
+}
+
+/// Identity of the exact live server session whose selected-model profile is
+/// shown by the composer. A fresh sidecar rotates its bearer even when it
+/// reuses the same alias and port, so capability state must be fetched again.
+struct SelectedModelProfileKey: Equatable {
+    let alias: String
+    let isResident: Bool
+    let port: Int
+    let bearer: String?
 }
 
 /// Approval dialog for the ``browse`` tool: present while a request is

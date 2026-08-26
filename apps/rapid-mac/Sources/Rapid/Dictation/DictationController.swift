@@ -317,6 +317,44 @@ final class DictationController {
         await enable()
     }
 
+    /// Keep the enabled speech lane attached to whichever chat process owns
+    /// the current session. A process-replacing model switch discards every
+    /// lazy audio engine, while an in-process assistant replacement preserves
+    /// it; both transitions arrive through the same ``ServerState`` boundary.
+    /// Re-running the existing preparation flight is therefore idempotent for
+    /// the latter and restores the former without inventing another lifecycle.
+    func serverStateDidChange(_ newState: ServerState) {
+        guard isEnabled, !modelPreparationDeferred else { return }
+        switch newState {
+        case .starting(let alias):
+            // `prewarmModel` owns an audio-only fallback while its flight is
+            // present. A same-alias transition with no such flight is an
+            // external restart (for example ServerManager auto-respawn) and
+            // must reconcile just like a chat-process replacement.
+            guard alias != modelAlias || prewarmTask == nil else { break }
+            cancelActiveSessionForModelChange()
+            cancelModelPreparation()
+            hotkey.stop()
+            phase = .preparingModel
+        case .ready(let alias):
+            guard alias != modelAlias || prewarmTask == nil else { break }
+            cancelActiveSessionForModelChange()
+            hotkey.stop()
+            phase = .preparingModel
+            Task { [weak self] in
+                await self?.enable(replacingCurrentPrewarm: true)
+            }
+        case .crashed, .stopped, .idle, .missing:
+            cancelActiveSessionForModelChange()
+            cancelModelPreparation()
+            hotkey.stop()
+            // Preserve the user's Enabled intent, but publish a terminal
+            // non-ready phase. Foreground revalidation or a later server
+            // transition can retry through the existing enable path.
+            phase = .off
+        }
+    }
+
     func enable(
         replacingCurrentPrewarm: Bool = false,
         deferModelPreparation: Bool = false
@@ -373,6 +411,15 @@ final class DictationController {
         let prewarmSucceeded = await prewarmModel(
             replacingCurrent: replacingCurrentPrewarm
         )
+        // A test prewarm seam represents the whole preparation contract. In
+        // production, readiness comes only from the server's exact catalog
+        // model path in the latest audio-lane residency snapshot.
+        let voiceLaneReady = testingPrewarm != nil
+            ? prewarmSucceeded
+            : server.isVoiceLaneResident(
+                for: preparingAlias,
+                modelPath: catalogByAlias[preparingAlias]?.repo
+            )
         guard DictationEnablePolicy.mayRegisterHotkey(after: .init(
             prewarmSucceeded: prewarmSucceeded,
             isEnabled: isEnabled,
@@ -380,7 +427,7 @@ final class DictationController {
             selectedAlias: modelAlias,
             preparingAlias: preparingAlias,
             isPreparing: phase == .preparingModel,
-            voiceLaneReady: server.isVoiceLaneReady(for: preparingAlias)
+            voiceLaneReady: voiceLaneReady
         )) else {
             if isEnabled, enableRequestID == requestID, modelAlias == preparingAlias {
                 lastError = "\(preparingAlias) couldn't load. There may not be enough memory to start dictation."
@@ -460,6 +507,13 @@ final class DictationController {
         recordingStart = nil
         capturingApp = nil
         hud.hide()
+    }
+
+    private func cancelModelPreparation() {
+        prewarmTask?.cancel()
+        prewarmTask = nil
+        prewarmRequestID = nil
+        enableRequestID = nil
     }
 
     /// Tear down the process-wide dictation service without changing the
@@ -599,7 +653,7 @@ final class DictationController {
         guard isEnabled, !modelAlias.isEmpty else { return false }
         if let testingPrewarm { return await testingPrewarm() }
         let alias = modelAlias
-        _ = await catalogFacts(for: alias)
+        let facts = await catalogFacts(for: alias)
         // Actor reentrancy: every await above and below is a window for
         // disable() or a model change to land. Re-check before each step
         // that mutates the sidecar or touches the wire.
@@ -609,10 +663,18 @@ final class DictationController {
             guard !Task.isCancelled, isEnabled, modelAlias == alias else { return false }
         }
         let warmed = await warmUpEngine()
+        // The silence request materializes the lazy STT engine. Refresh the
+        // authoritative snapshot before arming the global hotkey: a mounted
+        // audio route alone is not proof that a process-replacing model switch
+        // restored the selected speech weights.
+        let voiceLaneResident = await server.refreshVoiceLaneResidency(
+            for: alias,
+            modelPath: facts?.repo
+        )
         guard !Task.isCancelled,
               isEnabled,
               modelAlias == alias,
-              server.isVoiceLaneReady(for: alias) else { return false }
+              voiceLaneResident else { return false }
         if warmed {
             lastWarmupWarning = nil
         } else {

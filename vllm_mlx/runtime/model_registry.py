@@ -206,6 +206,12 @@ class ModelRegistry:
         logger.info("Promoted model %r to registry default", canonical)
         return self._entries[canonical]
 
+    def clear_default(self) -> None:
+        """Remove request-default ownership without unloading named entries."""
+
+        self._default = None
+        logger.info("Cleared registry default model")
+
     def __len__(self) -> int:
         return len(self._entries)
 

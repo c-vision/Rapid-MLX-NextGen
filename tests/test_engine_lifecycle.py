@@ -20,6 +20,37 @@ from vllm_mlx.output_collector import RequestOutputCollector  # noqa: E402
 from vllm_mlx.scheduler import BackpressureError, Scheduler  # noqa: E402
 
 
+@pytest.mark.asyncio
+async def test_missing_vision_weights_update_live_lane_reason(monkeypatch):
+    from vllm_mlx.models import mllm as mllm_mod
+
+    class FakeTextOnlyMLLM:
+        def __init__(self, model_name, trust_remote_code=True):
+            self.model_name = model_name
+
+        def load(self):
+            raise mllm_mod.TextOnlyCheckpointError(
+                "checkpoint has no vision tower", missing_count=1
+            )
+
+    monkeypatch.setattr(mllm_mod, "MLXMultimodalLM", FakeTextOnlyMLLM)
+    engine = BatchedEngine(
+        "fake/text-only-vision-checkpoint",
+        serving_lane_reason="vision_supported",
+    )
+    engine._is_mllm = True
+
+    async def start_llm():
+        return None
+
+    monkeypatch.setattr(engine, "_start_llm", start_llm)
+
+    await engine._start_mllm()
+
+    assert engine.serving_lane == "text"
+    assert engine.serving_lane_reason == "vision_weights_unavailable"
+
+
 def _engine(*, reservations: int = 0, running: dict | None = None):
     engine = BatchedEngine.__new__(BatchedEngine)
     engine._is_mllm = False

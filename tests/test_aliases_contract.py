@@ -81,6 +81,7 @@ ALLOWED_PROFILE_KEYS: frozenset[str] = frozenset(
         "ddtree_speculative_tokens",
         "ddtree_tree_budget",
         "min_memory_gb",
+        "vision_min_memory_gb",
         "recommended_sampling",
         "pflash_tier",
         "pflash_keep_ratio",
@@ -591,6 +592,20 @@ def test_negative_control_dflash_missing_drafter_is_caught() -> None:
         _coerce(
             "fake-alias",
             {"hf_path": "fake/Model", "supports_dflash": True},
+        )
+
+
+@pytest.mark.parametrize("bad_floor", [0, -1, True, "32"])
+def test_vision_memory_floor_requires_a_positive_number(bad_floor) -> None:
+    from vllm_mlx.model_aliases import _coerce
+
+    with pytest.raises(ValueError, match="vision_min_memory_gb"):
+        _coerce(
+            "fake-vision-alias",
+            {
+                "hf_path": "fake/Vision-Model",
+                "vision_min_memory_gb": bad_floor,
+            },
         )
 
 

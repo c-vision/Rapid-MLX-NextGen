@@ -684,6 +684,43 @@ final class ChatViewModel {
         return messages[index]
     }
 
+    /// Persist attachment acceptance on the user turn itself. Failed empty
+    /// assistant placeholders are intentionally removed from later wire
+    /// history, so they cannot safely own this focus state.
+    private func setImageDeliveryStatus(
+        messageID: UUID?,
+        status: ChatMessage.ImageDeliveryStatus?,
+        epoch: Int
+    ) {
+        guard epoch == conversationEpoch else { return }
+        Self.updateImageDeliveryStatus(
+            in: &messages,
+            messageID: messageID,
+            status: status
+        )
+    }
+
+    /// Pure state-layer seam for the request lifecycle. Matching by persisted
+    /// message identity prevents a late response from changing a newer image
+    /// turn after conversation branching or editing.
+    static func updateImageDeliveryStatus(
+        in messages: inout [ChatMessage],
+        messageID: UUID?,
+        status: ChatMessage.ImageDeliveryStatus?
+    ) {
+        guard let messageID,
+              let index = messages.firstIndex(where: { $0.id == messageID })
+        else { return }
+        // Acceptance is monotonic for one request: once the server emits a
+        // token, a later transport failure means the response was interrupted,
+        // not that the image was rejected. An explicit retry may still move a
+        // previously rejected image to accepted when its own first token lands.
+        if messages[index].imageDeliveryStatus == .accepted, status != .accepted {
+            return
+        }
+        messages[index].imageDeliveryStatus = status
+    }
+
     /// Start a fresh conversation — drops the transcript and any stale
     /// error banner. The in-flight stream (if any) is cancelled first.
     func newConversation() {
@@ -767,6 +804,7 @@ final class ChatViewModel {
             role: .user,
             content: trimmed,
             imageAttachments: imageAttachments,
+            imageDeliveryStatus: imageAttachments.isEmpty ? nil : .pending,
             fileAttachments: ChatFileAttachment.fittedForMessage(fileAttachments),
             status: .complete
         )
@@ -780,7 +818,8 @@ final class ChatViewModel {
             ?? ModelBrandStyle.supportsImageInput(forAlias: alias)
         beginAssistantTurn(
             alias: alias,
-            supportsImageInput: resolvedImageCapability
+            supportsImageInput: resolvedImageCapability,
+            imageMessageID: imageAttachments.isEmpty ? nil : user.id
         )
     }
 
@@ -795,7 +834,8 @@ final class ChatViewModel {
     /// see the two answers as alternatives at all.
     private func beginAssistantTurn(
         alias: String,
-        supportsImageInput: Bool
+        supportsImageInput: Bool,
+        imageMessageID: UUID? = nil
     ) {
         let placeholder = ChatMessage(role: .assistant, status: .streaming)
         let placeholderIndex = appendMessage(placeholder)
@@ -835,20 +875,29 @@ final class ChatViewModel {
                 // returns `ready == true`, yet must still not stream and
                 // must still reset `isStreaming`.
                 guard !Task.isCancelled else {
-                    finishStartupCancellation(placeholderIndex: placeholderIndex, epoch: epoch)
+                    finishStartupCancellation(
+                        placeholderIndex: placeholderIndex,
+                        imageMessageID: imageMessageID,
+                        epoch: epoch
+                    )
                     return
                 }
                 guard ready else {
                     finishWithStartupFailure(
                         placeholderIndex: placeholderIndex,
                         alias: alias,
+                        imageMessageID: imageMessageID,
                         epoch: epoch
                     )
                     return
                 }
             }
             guard !Task.isCancelled else {
-                finishStartupCancellation(placeholderIndex: placeholderIndex, epoch: epoch)
+                finishStartupCancellation(
+                    placeholderIndex: placeholderIndex,
+                    imageMessageID: imageMessageID,
+                    epoch: epoch
+                )
                 return
             }
 
@@ -937,9 +986,15 @@ final class ChatViewModel {
     func finishWithStartupFailure(
         placeholderIndex: Int,
         alias: String,
+        imageMessageID: UUID? = nil,
         epoch: Int? = nil
     ) {
         if let epoch, epoch != conversationEpoch { return }
+        setImageDeliveryStatus(
+            messageID: imageMessageID,
+            status: nil,
+            epoch: conversationEpoch
+        )
         let message = "Couldn't start \(alias). Try again, or pick a different model in the box below."
         if var placeholder = currentMessage(index: placeholderIndex) {
             placeholder.status = .failed
@@ -981,9 +1036,15 @@ final class ChatViewModel {
     /// ``finaliseCancellation``.
     func finishStartupCancellation(
         placeholderIndex: Int,
+        imageMessageID: UUID? = nil,
         epoch: Int? = nil
     ) {
         if let epoch, epoch != conversationEpoch { return }
+        setImageDeliveryStatus(
+            messageID: imageMessageID,
+            status: nil,
+            epoch: conversationEpoch
+        )
         if var placeholder = currentMessage(index: placeholderIndex) {
             Self.finaliseCancellation(message: &placeholder)
             updateMessage(at: placeholderIndex, with: placeholder)
@@ -2293,6 +2354,24 @@ final class ChatViewModel {
         return result
     }
 
+    /// Read-only preview of the Desktop-authored system prompt shared by
+    /// Settings and the per-conversation editor. It deliberately uses the
+    /// same assembly function as the wire path so displayed precedence and
+    /// automatic context cannot drift from what Rapid sends.
+    nonisolated static func effectiveSystemPrompt(
+        dateContext: String? = nil,
+        global: String,
+        conversation: String
+    ) -> String {
+        addingInstructionLayers(
+            to: [],
+            ambientPreamble: nil,
+            dateContext: dateContext ?? currentDateTimeContext(),
+            global: global,
+            conversation: conversation
+        ).first?.content ?? ""
+    }
+
     /// Request-time current-date context for the leading system row, so a small
     /// model does not guess "today" from training memory (issue #2330, where
     /// `qwen3.5-4b-4bit` answered "Friday, May 24, 2024" and then insisted it
@@ -2551,6 +2630,11 @@ Your previous draft refused the question by claiming you lack real-time access o
                 guard let self else { return }
                 switch event {
                 case .firstToken(let at):
+                    self.setImageDeliveryStatus(
+                        messageID: request.imageMessageID,
+                        status: .accepted,
+                        epoch: epoch
+                    )
                     // The stream says the first generated token landed, on
                     // whichever lane carried it. Stamping per-lane here
                     // instead would miss a turn that opens with a tool-call
@@ -2584,6 +2668,11 @@ Your previous draft refused the question by claiming you lack real-time access o
                     capturedPromptTokens = prompt
                     capturedCompletionTokens = completion
                 case .finished(let reason):
+                    self.setImageDeliveryStatus(
+                        messageID: request.imageMessageID,
+                        status: .accepted,
+                        epoch: epoch
+                    )
                     capturedFinish = reason
                     current.status = .complete
                     // v0.4.35 + cycle-2 (2026-06-19): classify the
@@ -2763,12 +2852,23 @@ Your previous draft refused the question by claiming you lack real-time access o
             }
             return .terminal
         } catch {
+            let imageRejection = request.imageMessageID == nil
+                ? nil
+                : (error as? ChatStreamError)?.attachmentFailureMessage
+            setImageDeliveryStatus(
+                messageID: request.imageMessageID,
+                // A transient transport/busy/runtime failure does not prove
+                // the attachment was unsupported. Return it to the legacy
+                // unknown state so a later plain follow-up can retry it.
+                status: imageRejection == nil ? nil : .rejected,
+                epoch: epoch
+            )
             current.status = .failed
             // Raw error → log for support; the user only ever sees
             // humanize()'s clean, jargon-free copy.
             print("[chat] stream failed: \(error.localizedDescription)")
             let failureKind = FailureDiagnoser.chatFailureKind(error: error)
-            let actionable = FailureDiagnoser.diagnosis(
+            let actionable = imageRejection ?? FailureDiagnoser.diagnosis(
                 for: failureKind,
                 modelAlias: request.alias
             ).message
