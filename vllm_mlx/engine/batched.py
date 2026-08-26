@@ -38,6 +38,9 @@ _PREFIX_BOUNDARY_REPLAY_TOKENS = 8
 _admission_token_context: contextvars.ContextVar[tuple[int, tuple[str, ...]] | None] = (
     contextvars.ContextVar("rapid_mlx_admission_token", default=None)
 )
+_admission_engine_context: contextvars.ContextVar["BatchedEngine | None"] = (
+    contextvars.ContextVar("rapid_mlx_admission_engine", default=None)
+)
 
 
 def _load_lazy_and_install_disk_stream(
@@ -899,6 +902,7 @@ class BatchedEngine(BaseEngine):
         self._admission_reservations = 0
         self._admission_tokens: set[str] = set()
         self._admission_tasks: dict[str, asyncio.Task] = {}
+        self._lifecycle_aborted_tasks: set[asyncio.Task] = set()
         self._generation_paused = False
         self._generation_pause_mode: str | None = None
 
@@ -1015,6 +1019,7 @@ class BatchedEngine(BaseEngine):
             context = _admission_token_context.get()
             stack = context[1] if context is not None and context[0] == id(self) else ()
             _admission_token_context.set((id(self), (*stack, token)))
+            _admission_engine_context.set(self)
 
     def release_admission_reservation(self) -> None:
         """Release a slot reserved by ``check_admission``.
@@ -1054,16 +1059,42 @@ class BatchedEngine(BaseEngine):
             # exercise the public counter-based release contract.
             self._admission_reservations -= 1
         if consumed_token is not None:
-            getattr(self, "_admission_tasks", {}).pop(consumed_token, None)
+            owner = getattr(self, "_admission_tasks", {}).pop(consumed_token, None)
+            if owner is not None:
+                getattr(self, "_lifecycle_aborted_tasks", set()).discard(owner)
         if clear_context and token is not None and token in context_stack:
             remaining = tuple(value for value in context_stack if value != token)
             _admission_token_context.set((id(self), remaining) if remaining else None)
+            if not remaining:
+                _admission_engine_context.set(None)
 
     def _current_admission_token(self) -> str | None:
         context = _admission_token_context.get()
         if context is None or context[0] != id(self) or not context[1]:
             return None
         return context[1][-1]
+
+    def bind_admission_task(self, task: asyncio.Task) -> None:
+        """Transfer a route reservation to its actual generation task."""
+
+        token = self._current_admission_token()
+        if token is None:
+            return
+        with self._admission_lock:
+            if token in getattr(self, "_admission_tokens", set()):
+                self._admission_tasks[token] = task
+
+    def consume_lifecycle_task_abort(self, task: asyncio.Task) -> bool:
+        """Return whether ``task`` was cancelled by lifecycle replacement."""
+
+        with self._admission_lock:
+            aborted: set[asyncio.Task] = getattr(
+                self, "_lifecycle_aborted_tasks", set()
+            )
+            if task not in aborted:
+                return False
+            aborted.remove(task)
+            return True
 
     def _transfer_admission_to_scheduler(self, token: str | None) -> None:
         """End route ownership once the scheduler has committed the request."""
@@ -1136,10 +1167,19 @@ class BatchedEngine(BaseEngine):
                     self, "_admission_tasks", {}
                 )
                 admitted_tasks = tuple(
-                    task_by_token[token]
-                    for token in admitted_tokens
-                    if token in task_by_token
+                    {
+                        task_by_token[token]
+                        for token in admitted_tokens
+                        if token in task_by_token
+                    }
                 )
+                aborted_tasks: set[asyncio.Task] | None = getattr(
+                    self, "_lifecycle_aborted_tasks", None
+                )
+                if aborted_tasks is None:
+                    aborted_tasks = set()
+                    self._lifecycle_aborted_tasks = aborted_tasks
+                aborted_tasks.update(admitted_tasks)
             pause_admission = getattr(scheduler, "pause_generation_admission", None)
             if callable(pause_admission):
                 pause_admission(admitted_tokens, mode)

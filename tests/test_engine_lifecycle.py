@@ -21,6 +21,7 @@ def _engine(*, reservations: int = 0, running: dict | None = None):
     engine._admission_reservations = reservations
     engine._admission_tokens = {f"reserved-{index}" for index in range(reservations)}
     engine._admission_tasks = {}
+    engine._lifecycle_aborted_tasks = set()
     _admission_token_context.set(
         (id(engine), ("reserved-0",)) if reservations else None
     )
@@ -127,6 +128,91 @@ async def test_abort_pause_cancels_request_stalled_before_scheduler_commit():
     with pytest.raises(asyncio.CancelledError):
         await request
     assert scheduler._paused_admission_tokens == set()
+    assert status["admitted_requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pre_scheduler_abort_returns_terminal_non_streaming_503():
+    from fastapi import HTTPException
+
+    from vllm_mlx.service.helpers import _wait_with_disconnect
+
+    engine, _ = _engine()
+    preprocessing = asyncio.Event()
+
+    class RawRequest:
+        async def is_disconnected(self):
+            return False
+
+    async def stalled_generation():
+        preprocessing.set()
+        await asyncio.Event().wait()
+
+    async def request():
+        engine.check_admission()
+        try:
+            return await _wait_with_disconnect(
+                stalled_generation(),
+                RawRequest(),
+                timeout=5,
+                poll_interval=0.01,
+            )
+        finally:
+            engine.release_admission_reservation()
+
+    response = asyncio.create_task(request())
+    await preprocessing.wait()
+    status = await asyncio.wait_for(engine.pause_generation("abort"), timeout=1)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await response
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "Request cancelled by model replacement"
+    assert status["admitted_requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pre_scheduler_abort_emits_terminal_streaming_error():
+    import json
+
+    from vllm_mlx.service.helpers import _disconnect_guard
+
+    engine, _ = _engine()
+    preprocessing = asyncio.Event()
+
+    class RawRequest:
+        async def is_disconnected(self):
+            return False
+
+    async def stalled_stream():
+        preprocessing.set()
+        await asyncio.Event().wait()
+        yield "unreachable"
+
+    async def request():
+        engine.check_admission()
+        try:
+            return [
+                chunk
+                async for chunk in _disconnect_guard(
+                    stalled_stream(),
+                    RawRequest(),
+                    poll_interval=0.01,
+                    engine=engine,
+                    keepalive_seconds=0,
+                )
+            ]
+        finally:
+            engine.release_admission_reservation()
+
+    response = asyncio.create_task(request())
+    await preprocessing.wait()
+    status = await asyncio.wait_for(engine.pause_generation("abort"), timeout=1)
+    chunks = await response
+
+    payload = json.loads(chunks[0].removeprefix("data: "))
+    assert payload["error"]["code"] == "model_replacement"
+    assert chunks[-1] == "data: [DONE]\n\n"
     assert status["admitted_requests"] == 0
 
 

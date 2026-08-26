@@ -3923,6 +3923,9 @@ async def _disconnect_guard(
             #     existing future. The wait below ignores it.
             if anext_task is None or anext_task.done():
                 anext_task = asyncio.ensure_future(aiter.__anext__())
+                bind_task = getattr(engine, "bind_admission_task", None)
+                if callable(bind_task):
+                    bind_task(anext_task)
             wait_kwargs: dict = {"return_when": asyncio.FIRST_COMPLETED}
             if keepalive_enabled:
                 wait_kwargs["timeout"] = keepalive_seconds
@@ -3990,6 +3993,25 @@ async def _disconnect_guard(
                 # generator already drained, the scheduler already
                 # marked the request as finished — a defensive abort
                 # here would only pollute logs.
+                finished_normally = True
+                break
+            except asyncio.CancelledError:
+                consume_abort = getattr(engine, "consume_lifecycle_task_abort", None)
+                if not callable(consume_abort) or not consume_abort(anext_task):
+                    raise
+                import json as _json
+
+                error_data = _json.dumps(
+                    {
+                        "error": {
+                            "message": "Request cancelled by model replacement",
+                            "type": "server_error",
+                            "code": "model_replacement",
+                        }
+                    }
+                )
+                yield f"data: {error_data}\n\n"
+                yield "data: [DONE]\n\n"
                 finished_normally = True
                 break
             except Exception as exc:
@@ -4225,7 +4247,13 @@ async def _wait_with_disconnect(
 
     _t0 = _time.monotonic()
 
+    from ..engine.batched import _admission_engine_context
+
+    engine = _admission_engine_context.get()
     task = asyncio.ensure_future(coro)
+    bind_task = getattr(engine, "bind_admission_task", None)
+    if callable(bind_task):
+        bind_task(task)
 
     async def _wait_disconnect():
         poll_count = 0
@@ -4275,6 +4303,14 @@ async def _wait_with_disconnect(
 
         try:
             return task.result()
+        except asyncio.CancelledError:
+            consume_abort = getattr(engine, "consume_lifecycle_task_abort", None)
+            if callable(consume_abort) and consume_abort(task):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Request cancelled by model replacement",
+                )
+            raise
         except BackpressureError as exc:
             _raise_backpressure_503(exc)
 
