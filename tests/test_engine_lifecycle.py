@@ -189,6 +189,45 @@ def test_scheduler_transfer_releases_route_owned_reservation():
     assert engine._admission_tokens == set()
 
 
+@pytest.mark.asyncio
+async def test_stream_terminal_release_cannot_consume_concurrent_admission():
+    engine, scheduler = _engine()
+    scheduler.config.max_concurrent_requests = None
+    stream_transferred = asyncio.Event()
+    concurrent_reserved = asyncio.Event()
+    release_concurrent = asyncio.Event()
+    concurrent_token = None
+
+    async def streaming_request():
+        engine.check_admission()
+        token = engine._current_admission_token()
+        engine._transfer_admission_to_scheduler(token)
+        stream_transferred.set()
+        await concurrent_reserved.wait()
+        engine.release_admission_reservation()
+
+    async def concurrent_request():
+        nonlocal concurrent_token
+        await stream_transferred.wait()
+        engine.check_admission()
+        concurrent_token = engine._current_admission_token()
+        concurrent_reserved.set()
+        await release_concurrent.wait()
+        engine.release_admission_reservation()
+
+    stream = asyncio.create_task(streaming_request())
+    concurrent = asyncio.create_task(concurrent_request())
+    await stream
+
+    assert concurrent_token is not None
+    assert engine._admission_reservations == 1
+    assert engine._admission_tokens == {concurrent_token}
+
+    release_concurrent.set()
+    await concurrent
+    assert engine._admission_reservations == 0
+
+
 @pytest.mark.parametrize("scheduler_type", [Scheduler, MLLMScheduler])
 @pytest.mark.parametrize("mode", ["wait", "abort"])
 def test_scheduler_pause_accepts_only_uncommitted_pre_pause_token(scheduler_type, mode):

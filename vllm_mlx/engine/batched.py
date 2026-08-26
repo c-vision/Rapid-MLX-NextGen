@@ -1017,7 +1017,11 @@ class BatchedEngine(BaseEngine):
             self._consume_admission_token_locked(token, stack)
 
     def _consume_admission_token_locked(
-        self, token: str | None, context_stack: tuple[str, ...]
+        self,
+        token: str | None,
+        context_stack: tuple[str, ...],
+        *,
+        clear_context: bool = True,
     ) -> None:
         """Release one route reservation while holding ``_admission_lock``."""
 
@@ -1034,7 +1038,7 @@ class BatchedEngine(BaseEngine):
             # Minimal engine doubles created before lifecycle tokens still
             # exercise the public counter-based release contract.
             self._admission_reservations -= 1
-        if token is not None and token in context_stack:
+        if clear_context and token is not None and token in context_stack:
             remaining = tuple(value for value in context_stack if value != token)
             _admission_token_context.set((id(self), remaining) if remaining else None)
 
@@ -1052,7 +1056,11 @@ class BatchedEngine(BaseEngine):
         with self._admission_lock:
             context = _admission_token_context.get()
             stack = context[1] if context is not None and context[0] == id(self) else ()
-            self._consume_admission_token_locked(token, stack)
+            # The streaming route still calls release in its terminal guard.
+            # Keep this task's consumed token in context as a tombstone so that
+            # terminal release is an exact no-op instead of popping a token
+            # owned by a concurrent request with a different context.
+            self._consume_admission_token_locked(token, stack, clear_context=False)
 
     def lifecycle_status(self) -> dict[str, object]:
         """Return engine-owned admission and scheduler activity."""
