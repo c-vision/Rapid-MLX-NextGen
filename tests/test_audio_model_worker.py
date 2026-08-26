@@ -1166,7 +1166,7 @@ async def test_primary_reload_releases_handoff_when_cleanup_and_restore_fail(
 
 
 @pytest.mark.asyncio
-async def test_primary_replacement_rolls_back_after_old_worker_stop_failure(
+async def test_primary_replacement_keeps_new_worker_after_old_stop_failure(
     monkeypatch,
 ):
     import vllm_mlx.server as server
@@ -1177,23 +1177,23 @@ async def test_primary_replacement_rolls_back_after_old_worker_stop_failure(
     manager, registry, loaded = _replacement_manager(server, old_worker)
     bind_audio_worker(old_worker)
     try:
-        with pytest.raises(RuntimeError, match="old stop failed"):
-            await manager.load(
-                "chat-new",
-                estimated_bytes=1,
-                replace_group="assistant",
-            )
+        replacement = await manager.load(
+            "chat-new",
+            estimated_bytes=1,
+            replace_group="assistant",
+        )
 
-        assert registry.default_name == "chat-old"
-        assert [entry.model_name for entry in registry.list_entries()] == ["chat-old"]
-        assert server._engine is old_worker
+        assert replacement.primary is True
+        assert registry.default_name == "chat-new"
+        assert [entry.model_name for entry in registry.list_entries()] == ["chat-new"]
+        assert server._engine is loaded["chat-new"]
         assert old_worker.stopped is False
-        assert loaded["chat-new"].stopped is True
+        assert loaded["chat-new"].stopped is False
         assert await run_audio_mlx("stt", "whisper", "infer", lambda: "after") == (
             "after"
         )
-        assert old_worker.async_calls == 1
-        assert loaded["chat-new"].async_calls == 0
+        assert old_worker.async_calls == 0
+        assert loaded["chat-new"].async_calls == 1
     finally:
         bind_audio_worker(None)
 
