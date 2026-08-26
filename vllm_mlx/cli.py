@@ -5655,6 +5655,13 @@ def _cache_entry_is_runnable(repo: str) -> bool:
     downloads (config/tokenizer only, no weights) look ready in ``ls`` and in
     the desktop model picker. Reuse the serve download gate's authoritative
     completeness checks for both text and component-split video layouts.
+
+    ``resolve_unreferenced_cached_snapshot`` closes the #2351 gap: a complete,
+    unambiguous SINGLE snapshot with no ``refs/main`` (a commit-pinned
+    ``snapshot_download`` / manual pull) is loadable by the routing & loader
+    contract — the inventory must report it available, not ``(incomplete)``,
+    so ``models --cached`` and the serve gate agree with the loader. Multiple
+    snapshots are ambiguous and stay unresolved there.
     """
     try:
         from vllm_mlx._download_gate import (
@@ -5664,6 +5671,7 @@ def _cache_entry_is_runnable(repo: str) -> bool:
             is_repo_cached,
         )
         from vllm_mlx.audio.registry import resolve_audio_alias
+        from vllm_mlx.model_metadata import resolve_unreferenced_cached_snapshot
 
         audio_entry = resolve_audio_alias(repo)
         if audio_entry is not None and audio_entry.family == "whisper":
@@ -5672,6 +5680,7 @@ def _cache_entry_is_runnable(repo: str) -> bool:
             is_repo_cached(repo)
             or _snapshot_is_complete_split_model(repo)
             or _snapshot_is_complete_mflux_model(repo)
+            or resolve_unreferenced_cached_snapshot(repo) is not None
         )
     except Exception:
         return False

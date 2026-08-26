@@ -430,6 +430,66 @@ def test_cached_view_marks_known_partial_repo_incomplete(tmp_path, monkeypatch, 
     assert alias not in out
 
 
+def test_cached_view_marks_singleton_snapshot_without_refs_main_runnable(
+    tmp_path, monkeypatch, capsys
+):
+    """#2351: an unambiguous COMPLETE immutable snapshot with NO ``refs/main``
+    (a pinned ``snapshot_download``/manual pull of an exact commit) is loadable
+    by the routing & loader contract, so ``models --cached`` must report it
+    available, not ``(incomplete)`` — the inventory must agree with the serve
+    path. Ambiguous (multiple) snapshots stay unresolved."""
+    repo = "mlx-community/qwen-cached-singleton"
+    cache_root = tmp_path / "hf-cache"
+    repo_root = cache_root / "models--mlx-community--qwen-cached-singleton"
+    sha = "93760be4f1f69842a46bc13dbdc0f19e291392a3"
+    snapshot = repo_root / "snapshots" / sha
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "tokenizer.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    # NO refs/ directory at all — the #2351 repro.
+
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache_root))
+    monkeypatch.setattr(
+        cli,
+        "_scan_hf_cache_models",
+        lambda: [(repo, 1_600_000_000, 0.0)],
+    )
+
+    cli._print_cached_models()
+    out = capsys.readouterr().out
+
+    assert repo in out
+    assert "(incomplete)" not in out, out
+
+
+def test_cached_view_marks_ambiguous_multiple_snapshots_incomplete(
+    tmp_path, monkeypatch, capsys
+):
+    """Two snapshots with no ``refs/main`` stay unresolved (can't know which a
+    fresh resolve would pick) — preserves the round-10 guarantee that an old
+    complete snapshot cannot mask a newer incomplete one."""
+    repo = "mlx-community/qwen-ambiguous"
+    cache_root = tmp_path / "hf-cache"
+    repo_root = cache_root / "models--mlx-community--qwen-ambiguous"
+    for sha in ("aaa", "bbb"):
+        snap = repo_root / "snapshots" / sha
+        snap.mkdir(parents=True)
+        (snap / "config.json").write_text("{}")
+        (snap / "model.safetensors").write_bytes(b"weights")
+
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache_root))
+    monkeypatch.setattr(
+        cli,
+        "_scan_hf_cache_models",
+        lambda: [(repo, 1_600_000_000, 0.0)],
+    )
+
+    cli._print_cached_models()
+    out = capsys.readouterr().out
+    assert "(incomplete)" in out
+
+
 def test_cached_view_renders_complete_mflux_alias(monkeypatch, capsys):
     """A complete mflux cache must map back to its image alias in ``ls``."""
     repo = "Runpod/FLUX.2-klein-4B-mflux-4bit"

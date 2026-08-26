@@ -366,6 +366,7 @@ jobs:
             tests/test_version_sync.py \
             tests/test_pull_variant_selection.py \
             tests/test_share_cli.py \
+            tests/test_cli_models.py \
             -v --tb=short \
             -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache" \
             --cov=vllm_mlx \
