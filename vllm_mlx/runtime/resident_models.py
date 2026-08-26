@@ -551,31 +551,47 @@ class ResidentModelManager:
                     await self._replace_group_locked(record, group, replace_mode)
                 return record
 
-            await self._evict_for_locked(estimate, exclude={model_name})
-            before = self._read_memory()
-            if image_mode is None:
-                entry = await self.loader(model_name, model_path, performance)
-            else:
-                entry = await self.loader(
-                    model_name, model_path, performance, image_mode
-                )
-            now = self._clock()
-            after = self._read_memory()
-            delta = max(0, after - before) if before and after else 0
-            record = ResidencyRecord(
-                entry=entry,
-                estimated_bytes=estimate,
-                measured_bytes=delta,
-                loaded_at=now,
-                last_used_at=now,
-                pinned=pin,
-                performance=performance,
-            )
-            group = _effective_replace_group(record.entry, replace_group)
+            record: ResidencyRecord | None = None
             candidates: list[ResidencyRecord] = []
             paused_engines: list[object] = []
             try:
-                if group is not None:
+                if replace_group is not None:
+                    (
+                        candidates,
+                        paused_engines,
+                    ) = await self._quiesce_replacement_group_locked(
+                        replace_group, replace_mode
+                    )
+                await self._evict_for_locked(
+                    estimate,
+                    exclude={model_name, *(item.model_id for item in candidates)},
+                )
+                before = self._read_memory()
+                if image_mode is None:
+                    entry = await self.loader(model_name, model_path, performance)
+                else:
+                    entry = await self.loader(
+                        model_name, model_path, performance, image_mode
+                    )
+                now = self._clock()
+                after = self._read_memory()
+                delta = max(0, after - before) if before and after else 0
+                record = ResidencyRecord(
+                    entry=entry,
+                    estimated_bytes=estimate,
+                    measured_bytes=delta,
+                    loaded_at=now,
+                    last_used_at=now,
+                    pinned=pin,
+                    performance=performance,
+                )
+                group = _effective_replace_group(record.entry, replace_group)
+                if replace_group is not None and group != replace_group:
+                    raise ResidentModelError(
+                        f"model {record.model_id!r} does not belong to replacement "
+                        f"group {replace_group!r}"
+                    )
+                if group is not None and replace_group is None:
                     candidates, paused_engines = await self._quiesce_group_locked(
                         record, group, replace_mode
                     )
@@ -595,11 +611,11 @@ class ResidentModelManager:
                 # later admission/replacement failure must not leave a model
                 # resident even though the control-plane request was rejected.
                 try:
-                    if record.model_id in self._records:
+                    if record is not None and record.model_id in self._records:
                         await self._evict_locked(
                             record, reason="load_rollback", count=False
                         )
-                    else:
+                    elif record is not None:
                         stop = getattr(record.entry.engine, "stop", None)
                         if callable(stop):
                             result = stop()
@@ -780,13 +796,26 @@ class ResidentModelManager:
             raise ResidentModelError(
                 f"model {target.model_id!r} does not belong to replacement group {group!r}"
             )
+        return await self._quiesce_replacement_group_locked(
+            group, replace_mode, exclude_model_id=target.model_id
+        )
+
+    async def _quiesce_replacement_group_locked(
+        self,
+        group: str,
+        replace_mode: str,
+        *,
+        exclude_model_id: str | None = None,
+    ) -> tuple[list[ResidencyRecord], list[object]]:
+        """Close one group before any externally visible lifecycle mutation."""
+
         if replace_mode not in {"reject", "wait", "abort"}:
             raise ResidentModelError(f"unsupported replacement mode {replace_mode!r}")
 
         candidates = [
             record
             for record in self._records.values()
-            if record.model_id != target.model_id
+            if record.model_id != exclude_model_id
             and _replacement_group(record.entry) == group
         ]
         for record in candidates:

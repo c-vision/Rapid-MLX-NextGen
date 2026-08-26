@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from vllm_mlx.runtime.model_registry import ModelEntry, ModelRegistry
 from vllm_mlx.runtime.resident_models import (
+    ResidencyRecord,
     ResidentModelBusyError,
     ResidentModelCapacityError,
     ResidentModelManager,
@@ -713,8 +714,58 @@ async def test_failed_assistant_replacement_rolls_back_newly_loaded_model():
 
     assert "chat" in registry
     assert "chat-new" not in registry
-    assert loaded["chat-new"].stopped is True
+    assert "chat-new" not in loaded
     assert {item["id"] for item in manager.snapshot()["models"]} == {"chat"}
+
+
+@pytest.mark.asyncio
+async def test_busy_reject_precedes_unrelated_capacity_eviction():
+    registry = ModelRegistry()
+    chat_engine = FakeLifecycleEngine()
+    chat_engine.running = 1
+    primary = entry("chat", chat_engine)
+    image_engine = FakeImageEngine()
+    image = entry("image", image_engine)
+    registry.add(primary, is_default=True)
+    registry.add(image)
+    loaded = []
+
+    async def loader(name: str, path: str | None, performance=None):
+        loaded.append(name)
+        return entry(name)
+
+    manager = ResidentModelManager(
+        registry,
+        loader,
+        memory_limit_bytes=8 * GIB,
+        memory_reader=lambda: 0,
+    )
+    manager.register_primary(primary, estimated_bytes=4 * GIB)
+    manager._index_record(
+        ResidencyRecord(
+            entry=image,
+            estimated_bytes=3 * GIB,
+            loaded_at=0,
+            last_used_at=0,
+        )
+    )
+
+    with pytest.raises(ResidentModelBusyError, match="active request"):
+        await manager.load(
+            "chat-new",
+            estimated_bytes=4 * GIB,
+            replace_group="assistant",
+            replace_mode="reject",
+        )
+
+    assert loaded == []
+    assert registry.default_name == "chat"
+    assert {item["id"] for item in manager.snapshot()["models"]} == {
+        "chat",
+        "image",
+    }
+    assert chat_engine.stopped is False
+    assert image_engine.stopped is False
 
 
 @pytest.mark.asyncio
@@ -855,7 +906,7 @@ async def test_cancelled_replacement_resumes_old_engine_and_discards_target():
     assert old_engine.paused is False
     assert old_engine.stopped is False
     assert "chat-new" not in registry
-    assert loaded is not None and loaded.engine.stopped is True
+    assert loaded is None
 
 
 @pytest.mark.asyncio
