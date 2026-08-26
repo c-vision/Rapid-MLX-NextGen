@@ -744,7 +744,11 @@ async def test_residency_snapshot_includes_audio_lane_truth(monkeypatch):
 @pytest.mark.asyncio
 async def test_primary_replacement_rebinds_after_audio_work_finishes(monkeypatch):
     import vllm_mlx.server as server
-    from vllm_mlx.runtime.audio_worker import bind_audio_worker, run_audio_mlx
+    from vllm_mlx.runtime.audio_worker import (
+        audio_worker,
+        bind_audio_worker,
+        run_audio_mlx,
+    )
 
     old_worker = _ReplacementWorker("chat-old")
     _configure_server_primary(monkeypatch, server, old_worker)
@@ -754,6 +758,11 @@ async def test_primary_replacement_rebinds_after_audio_work_finishes(monkeypatch
         assert (
             await run_audio_mlx("stt", "whisper", "infer", lambda: "before") == "before"
         )
+        stt_before = next(
+            lane for lane in audio_worker.snapshot() if lane["lane"] == "stt"
+        )
+        assert stt_before["model"] == "whisper"
+        assert stt_before["state"] == "resident"
 
         replacement = await manager.load(
             "chat-new",
@@ -770,13 +779,20 @@ async def test_primary_replacement_rebinds_after_audio_work_finishes(monkeypatch
         )
         assert old_worker.async_calls == 1
         assert loaded["chat-new"].async_calls == 1
+        stt_after = next(
+            lane for lane in audio_worker.snapshot() if lane["lane"] == "stt"
+        )
+        assert stt_after["model"] == "whisper"
+        assert stt_after["state"] == "resident"
     finally:
         bind_audio_worker(None)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("replace_mode", ["reject", "wait", "abort"])
 async def test_primary_replacement_rejects_active_audio_without_stopping_old_worker(
     monkeypatch,
+    replace_mode,
 ):
     import vllm_mlx.server as server
     from vllm_mlx.runtime.audio_worker import bind_audio_worker, run_audio_mlx
@@ -802,6 +818,7 @@ async def test_primary_replacement_rejects_active_audio_without_stopping_old_wor
                 "chat-new",
                 estimated_bytes=1,
                 replace_group="assistant",
+                replace_mode=replace_mode,
             )
 
         assert registry.default_name == "chat-old"
