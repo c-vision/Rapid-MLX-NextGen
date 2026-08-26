@@ -6080,7 +6080,16 @@ class Scheduler:
         # exception path between admission and tracking leaves
         # the ledger intact and the prior lifetime's dedupe
         # stays effective.
-        with self._cancel_counter_lock:
+        self._commit_request(request)
+
+        logger.debug(
+            f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
+        )
+
+    def _commit_request(self, request: Request) -> None:
+        """Atomically publish a request to lifecycle truth and the run queue."""
+
+        with self._request_state_lock():
             if getattr(self, "_generation_paused", False):
                 commit_tokens: set[str] = getattr(
                     self, "_paused_admission_tokens", set()
@@ -6095,11 +6104,7 @@ class Scheduler:
             self._disconnect_abort_ids.discard(request.request_id)
             self._orphaned_running_candidates.pop(request.request_id, None)
             self.requests[request.request_id] = request
-        self.waiting.append(request)
-
-        logger.debug(
-            f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
-        )
+            self.waiting.append(request)
 
     def set_generation_paused(self, paused: bool, *, add_allowance: int = 0) -> None:
         """Close or reopen scheduler admission for model replacement."""

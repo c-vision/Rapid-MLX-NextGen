@@ -604,7 +604,25 @@ class MLLMScheduler:
         # abort+cleanup window; see
         # ``Scheduler.remove_finished_request`` docstring for the
         # multi-branch race repro the persistence plugs.
-        with self._cancel_counter_lock:
+        self._commit_request(request)
+        # Wake the idle scheduler loop immediately (see ``_new_request_event``)
+        # instead of letting it sleep out its poll tick. Safe from here: both
+        # request collections were published atomically above.
+        new_request_event = getattr(self, "_new_request_event", None)
+        if new_request_event is not None:
+            new_request_event.set()
+
+        logger.debug(
+            f"Added MLLM request {request_id}: "
+            f"{len(images or [])} images, {len(videos or [])} videos"
+        )
+
+        return request_id
+
+    def _commit_request(self, request: MLLMRequest) -> None:
+        """Atomically publish a request to lifecycle truth and the run queue."""
+
+        with self._request_state_lock():
             if getattr(self, "_generation_paused", False):
                 from .scheduler import BackpressureError
 
@@ -617,26 +635,10 @@ class MLLMScheduler:
                         "generation is paused for a model lifecycle operation"
                     )
                 commit_tokens.remove(token)
-            self._cancelled_request_ids.discard(request_id)
-            self._disconnect_abort_ids.discard(request_id)
-            self.requests[request_id] = request
-        self.waiting.append(request)
-        # Wake the idle scheduler loop immediately (see ``_new_request_event``)
-        # instead of letting it sleep out its poll tick. Safe from here: both
-        # this append and the loop's wait run on the event-loop thread.
-        # ``getattr`` keeps ``add_request`` callable on the minimally
-        # constructed schedulers unit tests build via ``__new__`` (which set
-        # only ``config`` and skip ``__init__``); the live loop always has it.
-        new_request_event = getattr(self, "_new_request_event", None)
-        if new_request_event is not None:
-            new_request_event.set()
-
-        logger.debug(
-            f"Added MLLM request {request_id}: "
-            f"{len(images or [])} images, {len(videos or [])} videos"
-        )
-
-        return request_id
+            self._cancelled_request_ids.discard(request.request_id)
+            self._disconnect_abort_ids.discard(request.request_id)
+            self.requests[request.request_id] = request
+            self.waiting.append(request)
 
     def set_generation_paused(self, paused: bool, *, add_allowance: int = 0) -> None:
         """Close or reopen scheduler admission for model replacement."""

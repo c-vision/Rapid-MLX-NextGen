@@ -419,6 +419,75 @@ def test_request_id_snapshot_is_safe_during_concurrent_mutation(scheduler_type):
     writer.join()
 
 
+@pytest.mark.parametrize("scheduler_type", [Scheduler, MLLMScheduler])
+def test_request_publication_is_atomic_with_wait_queue(scheduler_type):
+    class TracedLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.contended = threading.Event()
+
+        def __enter__(self):
+            if self._lock.locked():
+                self.contended.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self._lock.release()
+
+    entered_append = threading.Event()
+    release_append = threading.Event()
+
+    class BlockingWaiting(list):
+        def append(self, request):
+            entered_append.set()
+            assert release_append.wait(timeout=1)
+            super().append(request)
+
+    scheduler = scheduler_type.__new__(scheduler_type)
+    scheduler._cancel_counter_lock = TracedLock()
+    scheduler._generation_paused = False
+    scheduler._paused_admission_tokens = set()
+    scheduler._paused_add_allowance = 0
+    scheduler.requests = {}
+    scheduler.waiting = BlockingWaiting()
+    scheduler._cancelled_request_ids = set()
+    scheduler._disconnect_abort_ids = set()
+    scheduler._orphaned_running_candidates = {}
+    request = SimpleNamespace(request_id="publishing", lifecycle_admission_token=None)
+    errors = []
+
+    def publish():
+        try:
+            scheduler._commit_request(request)
+        except BaseException as exc:
+            errors.append(exc)
+
+    publisher = threading.Thread(target=publish)
+
+    def pause():
+        try:
+            scheduler.pause_generation_admission(set(), "wait")
+        except BaseException as exc:
+            errors.append(exc)
+
+    publisher.start()
+    assert entered_append.wait(timeout=1)
+    pauser = threading.Thread(target=pause)
+    pauser.start()
+
+    assert scheduler._cancel_counter_lock.contended.wait(timeout=1)
+    assert pauser.is_alive()
+    release_append.set()
+    publisher.join(timeout=1)
+    pauser.join(timeout=1)
+
+    assert errors == []
+    assert scheduler.requests == {"publishing": request}
+    assert scheduler.waiting == [request]
+    assert scheduler._generation_paused is True
+
+
 @pytest.mark.asyncio
 async def test_text_abort_wakes_non_streaming_consumer_with_terminal_error():
     engine = EngineCore.__new__(EngineCore)
