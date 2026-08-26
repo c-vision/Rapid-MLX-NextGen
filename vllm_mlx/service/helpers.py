@@ -155,6 +155,19 @@ def _release_admission_unless_committed(engine, committed: bool) -> None:
         )
 
 
+def _raise_lifecycle_cancel_or_reraise(engine, exc: asyncio.CancelledError) -> None:
+    """Translate only engine-owned route cancellation into terminal HTTP."""
+
+    task = asyncio.current_task()
+    consume_abort = getattr(engine, "consume_lifecycle_task_abort", None)
+    if task is not None and callable(consume_abort) and consume_abort(task):
+        raise HTTPException(
+            status_code=503,
+            detail="Request cancelled by model replacement",
+        ) from exc
+    raise exc
+
+
 def _raise_backpressure_503(exc: Exception) -> None:
     """Convert ``BackpressureError`` from the scheduler into HTTP 503
     with a Retry-After header (RFC 9110 §10.2.4).

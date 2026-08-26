@@ -90,6 +90,7 @@ from ..service.helpers import (
     _is_structured_output_requested,
     _maybe_pin_system_prompt,
     _parse_tool_calls_with_parser,
+    _raise_lifecycle_cancel_or_reraise,
     _release_admission_unless_committed,
     _rescue_silent_drop_from_reasoning,
     _resolve_enable_thinking,
@@ -3253,6 +3254,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         return await _create_chat_completion_impl(
             request, raw_request, engine, _commit_state, _admission_acquired
         )
+    except asyncio.CancelledError as exc:
+        _raise_lifecycle_cancel_or_reraise(engine, exc)
     finally:
         if _admission_acquired[0]:
             _release_admission_unless_committed(engine, _commit_state[0])

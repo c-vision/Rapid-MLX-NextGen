@@ -172,6 +172,48 @@ async def test_pre_scheduler_abort_returns_terminal_non_streaming_503():
 
 
 @pytest.mark.asyncio
+async def test_route_boundary_translates_lifecycle_abort_before_helper_binding():
+    from fastapi import HTTPException
+
+    from vllm_mlx.service.helpers import _raise_lifecycle_cancel_or_reraise
+
+    engine, _ = _engine()
+    adapting = asyncio.Event()
+
+    async def route_boundary():
+        engine.check_admission()
+        try:
+            adapting.set()
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as exc:
+            _raise_lifecycle_cancel_or_reraise(engine, exc)
+        finally:
+            engine.release_admission_reservation()
+
+    response = asyncio.create_task(route_boundary())
+    await adapting.wait()
+    status = await asyncio.wait_for(engine.pause_generation("abort"), timeout=1)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await response
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "Request cancelled by model replacement"
+    assert status["admitted_requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_route_boundary_preserves_unowned_cancellation():
+    from vllm_mlx.service.helpers import _raise_lifecycle_cancel_or_reraise
+
+    engine, _ = _engine()
+    error = asyncio.CancelledError("client disconnected")
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        _raise_lifecycle_cancel_or_reraise(engine, error)
+    assert exc_info.value is error
+
+
+@pytest.mark.asyncio
 async def test_pre_scheduler_abort_emits_terminal_streaming_error():
     import json
 
