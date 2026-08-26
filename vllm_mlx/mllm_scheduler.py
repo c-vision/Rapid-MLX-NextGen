@@ -346,6 +346,7 @@ class MLLMScheduler:
         self._cancel_counter_lock = threading.Lock()
         # Aborted request IDs that need queue signaling (executor → event loop).
         self._aborted_queue_ids: set[str] = set()
+        self._abort_error_kinds: dict[str, str] = {}
 
         # Async processing control
         self._running = False
@@ -677,7 +678,7 @@ class MLLMScheduler:
             self._cancel_counter_lock = lock
         return lock
 
-    def abort_request(self, request_id: str) -> bool:
+    def abort_request(self, request_id: str, *, error_kind: str | None = None) -> bool:
         """
         Queue request for abort.  Thread-safe (called from event loop).
 
@@ -718,6 +719,12 @@ class MLLMScheduler:
             already_counted = request_id in self._cancelled_request_ids
             self._cancelled_request_ids.add(request_id)
             self._pending_abort_ids.add(request_id)
+            if error_kind is not None:
+                abort_error_kinds = getattr(self, "_abort_error_kinds", None)
+                if abort_error_kinds is None:
+                    abort_error_kinds = {}
+                    self._abort_error_kinds = abort_error_kinds
+                abort_error_kinds[request_id] = error_kind
             if not already_counted:
                 self.num_requests_cancelled += 1
         logger.debug(f"Enqueued abort for request {request_id}")
@@ -1354,8 +1361,15 @@ class MLLMScheduler:
         # Signal queues for requests aborted during this step
         while self._aborted_queue_ids:
             request_id = self._aborted_queue_ids.pop()
+            error_kind = getattr(self, "_abort_error_kinds", {}).pop(request_id, None)
             queue = self.output_queues.get(request_id)
             if queue is not None:
+                if error_kind != "lifecycle":
+                    try:
+                        queue.put_nowait(None)
+                    except asyncio.QueueFull:
+                        pass
+                    continue
                 try:
                     queue.put_nowait(
                         RequestOutput(

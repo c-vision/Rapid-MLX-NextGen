@@ -891,14 +891,6 @@ class ResidentModelManager:
             target_primary = target.primary
             target_pinned = target.pinned
 
-        # Stop the old primary last. Until it returns successfully, rollback
-        # can restore a live worker and coherent routing if any eviction fails.
-        ordered_candidates = [
-            record for record in candidates if record is not old_primary
-        ]
-        if old_primary is not None:
-            ordered_candidates.append(old_primary)
-
         try:
             if old_primary is not None:
                 old_primary.primary = False
@@ -908,9 +900,11 @@ class ResidentModelManager:
                 self.registry.set_default(target.model_id)
                 if self._on_primary_changed is not None:
                     self._on_primary_changed(target.entry)
-            for record in ordered_candidates:
+                # This is the transaction's only fallible retirement. Stop it
+                # before touching sibling candidates so rollback always points
+                # at a live primary/audio worker.
                 await self._evict_locked(
-                    record,
+                    old_primary,
                     reason=f"replace_{group}",
                 )
         except BaseException:
@@ -930,8 +924,27 @@ class ResidentModelManager:
                         handoff.rollback()
             raise
         else:
+            # Once the old primary is stopped (or the group had none), routing
+            # publication is committed and cannot truthfully roll back. Finish
+            # retiring secondary candidates as non-failing cleanup: each is
+            # already quiesced and removed from routing before stop(), so a
+            # cleanup failure may leak resources but cannot resurrect a dead
+            # route or undo the committed primary handoff.
             if handoff is not None:
                 handoff.commit(target.entry)
+            for record in candidates:
+                if record is old_primary:
+                    continue
+                try:
+                    await self._evict_locked(
+                        record,
+                        reason=f"replace_{group}",
+                    )
+                except (Exception, asyncio.CancelledError):
+                    logger.exception(
+                        "Failed to stop replaced model %r after routing retirement",
+                        record.model_id,
+                    )
 
     async def set_pinned(self, model_name: str, pinned: bool) -> ResidencyRecord:
         async with self._lock:

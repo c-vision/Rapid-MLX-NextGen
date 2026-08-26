@@ -421,9 +421,10 @@ class TestRequestManagement:
                     await engine.abort_request(rid)
                     break
 
-            from vllm_mlx.request import InferenceAbortedError
-
-            with pytest.raises(InferenceAbortedError, match="cancellation"):
+            terminal = await anext(stream)
+            assert terminal.finished is True
+            assert terminal.error is None
+            with pytest.raises(StopAsyncIteration):
                 await anext(stream)
             await stream.aclose()
 

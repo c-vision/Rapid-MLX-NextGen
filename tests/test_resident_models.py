@@ -388,6 +388,11 @@ class FailingResumeLifecycleEngine(FakeLifecycleEngine):
         raise RuntimeError("resume failed")
 
 
+class FailingStopLifecycleEngine(FakeLifecycleEngine):
+    async def stop(self) -> None:
+        raise RuntimeError("stop failed")
+
+
 class Clock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -846,6 +851,42 @@ async def test_replacement_does_not_publish_target_until_old_engine_drains():
     allow_drain.set()
     await replacement
     assert registry.default_name == "chat-new"
+
+
+@pytest.mark.asyncio
+async def test_committed_replacement_does_not_rollback_to_stopped_sibling(caplog):
+    registry = ModelRegistry()
+    primary_engine = FakeLifecycleEngine()
+    primary = entry("chat-primary", primary_engine)
+    sibling_engine = FailingStopLifecycleEngine()
+    sibling = entry("chat-sibling", sibling_engine)
+    registry.add(primary, is_default=True)
+    registry.add(sibling)
+
+    async def loader(name: str, path: str | None, performance=None):
+        return entry(name)
+
+    manager = ResidentModelManager(registry, loader, memory_reader=lambda: 0)
+    manager.register_primary(primary, estimated_bytes=4 * GIB)
+    manager._index_record(
+        ResidencyRecord(
+            entry=sibling,
+            estimated_bytes=4 * GIB,
+            loaded_at=0,
+            last_used_at=0,
+        )
+    )
+
+    replacement = await manager.load(
+        "chat-new", replace_group="assistant", replace_mode="wait"
+    )
+
+    assert primary_engine.stopped is True
+    assert replacement.primary is True
+    assert registry.default_name == "chat-new"
+    assert [item.model_name for item in registry.list_entries()] == ["chat-new"]
+    assert {item["id"] for item in manager.snapshot()["models"]} == {"chat-new"}
+    assert "Failed to stop replaced model 'chat-sibling'" in caplog.text
 
 
 @pytest.mark.asyncio

@@ -1223,7 +1223,7 @@ class BatchedEngine(BaseEngine):
             while True:
                 if mode == "abort":
                     for request_id in self._lifecycle_request_ids():
-                        await self.abort_request(request_id)
+                        await self.abort_request(request_id, error_kind="lifecycle")
                 status = self.lifecycle_status()
                 if (
                     status["admitted_requests"] == 0
@@ -2324,7 +2324,19 @@ class BatchedEngine(BaseEngine):
         # disconnect. Popped from kwargs so it never reaches the
         # scheduler's add_request (which would reject unknown kwargs).
         request_id_holder = kwargs.pop("request_id_holder", None)
-        admission_token = self._current_admission_token()
+        admission_token, owns_admission = self._ensure_generation_admission()
+        request_committed = False
+
+        def commit_admission() -> None:
+            nonlocal request_committed
+            self._transfer_admission_to_scheduler(
+                admission_token, clear_context=owns_admission
+            )
+            request_committed = True
+
+        def release_uncommitted_admission() -> None:
+            if owns_admission and not request_committed:
+                self.release_admission_reservation()
 
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal
@@ -2335,20 +2347,24 @@ class BatchedEngine(BaseEngine):
                 for k in ("repetition_penalty", "presence_penalty", "frequency_penalty")
                 if k in kwargs
             }
-            request_id = await self._mllm_scheduler.add_request_async(
-                prompt=prompt,
-                images=images,
-                videos=videos,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stop=stop,
-                video_fps=kwargs.pop("video_fps", None),
-                video_max_frames=kwargs.pop("video_max_frames", None),
-                lifecycle_admission_token=admission_token,
-                **_mllm_penalty_kwargs,
-            )
-            self._transfer_admission_to_scheduler(admission_token)
+            try:
+                request_id = await self._mllm_scheduler.add_request_async(
+                    prompt=prompt,
+                    images=images,
+                    videos=videos,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop,
+                    video_fps=kwargs.pop("video_fps", None),
+                    video_max_frames=kwargs.pop("video_max_frames", None),
+                    lifecycle_admission_token=admission_token,
+                    on_request_committed=commit_admission,
+                    **_mllm_penalty_kwargs,
+                )
+            except BaseException:
+                release_uncommitted_admission()
+                raise
             # C-01 force-abort: publish the scheduler request id so the
             # route's disconnect_guard can call abort_request directly.
             if request_id_holder is not None:
@@ -2409,38 +2425,44 @@ class BatchedEngine(BaseEngine):
             )
             if k in kwargs
         }
-        sampling_params = SamplingParams(
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stop=stop or [],
-            **_sp_kwargs,
-        )
+        try:
+            sampling_params = SamplingParams(
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop or [],
+                **_sp_kwargs,
+            )
 
-        prefix_boundary = kwargs.pop("prefix_boundary", 0)
-        # PFlash routing hints (#287) — parity with generate().
-        has_tools = bool(kwargs.pop("has_tools", False))
-        requires_prompt_integrity = bool(kwargs.pop("requires_prompt_integrity", False))
-        # Grammar-constrained tool calling (#558) — streaming parity.
-        grammar_logits_processor = kwargs.pop("grammar_logits_processor", None)
-        reasoning_budget_logits_processor = kwargs.pop(
-            "reasoning_budget_logits_processor", None
-        )
-        suppressed_tokens_logits_processor = kwargs.pop(
-            "suppressed_tokens_logits_processor", None
-        )
-        request_id = await self._engine.add_request(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            prefix_boundary=prefix_boundary,
-            has_tools=has_tools,
-            requires_prompt_integrity=requires_prompt_integrity,
-            grammar_logits_processor=grammar_logits_processor,
-            reasoning_budget_logits_processor=reasoning_budget_logits_processor,
-            suppressed_tokens_logits_processor=suppressed_tokens_logits_processor,
-            lifecycle_admission_token=admission_token,
-        )
-        self._transfer_admission_to_scheduler(admission_token)
+            prefix_boundary = kwargs.pop("prefix_boundary", 0)
+            # PFlash routing hints (#287) — parity with generate().
+            has_tools = bool(kwargs.pop("has_tools", False))
+            requires_prompt_integrity = bool(
+                kwargs.pop("requires_prompt_integrity", False)
+            )
+            # Grammar-constrained tool calling (#558) — streaming parity.
+            grammar_logits_processor = kwargs.pop("grammar_logits_processor", None)
+            reasoning_budget_logits_processor = kwargs.pop(
+                "reasoning_budget_logits_processor", None
+            )
+            suppressed_tokens_logits_processor = kwargs.pop(
+                "suppressed_tokens_logits_processor", None
+            )
+            request_id = await self._engine.add_request(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                prefix_boundary=prefix_boundary,
+                has_tools=has_tools,
+                requires_prompt_integrity=requires_prompt_integrity,
+                grammar_logits_processor=grammar_logits_processor,
+                reasoning_budget_logits_processor=reasoning_budget_logits_processor,
+                suppressed_tokens_logits_processor=suppressed_tokens_logits_processor,
+                lifecycle_admission_token=admission_token,
+                on_request_committed=commit_admission,
+            )
+        except BaseException:
+            release_uncommitted_admission()
+            raise
         # C-01 force-abort: publish the scheduler request id (text path)
         # so the route's disconnect_guard can call abort_request directly
         # on client disconnect.
@@ -3478,7 +3500,9 @@ class BatchedEngine(BaseEngine):
             return self._engine.clear_prefix_cache(reset_stats=reset_stats)
         return False
 
-    async def abort_request(self, request_id: str) -> bool:
+    async def abort_request(
+        self, request_id: str, *, error_kind: str | None = None
+    ) -> bool:
         """Abort an active or queued batched request by request ID.
 
         Routes to whichever backend is loaded:
@@ -3491,9 +3515,14 @@ class BatchedEngine(BaseEngine):
         import inspect
 
         if self._mllm_scheduler is not None:
-            return self._mllm_scheduler.abort_request(request_id)
+            if error_kind is None:
+                return self._mllm_scheduler.abort_request(request_id)
+            return self._mllm_scheduler.abort_request(request_id, error_kind=error_kind)
         if self._engine is not None and hasattr(self._engine, "abort_request"):
-            result = self._engine.abort_request(request_id)
+            if error_kind is None:
+                result = self._engine.abort_request(request_id)
+            else:
+                result = self._engine.abort_request(request_id, error_kind=error_kind)
             if inspect.isawaitable(result):
                 return await result
             return result

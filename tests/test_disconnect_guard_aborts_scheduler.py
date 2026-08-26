@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import threading
 import time
 
 import pytest
@@ -713,13 +714,24 @@ async def test_batched_engine_publishes_request_id_into_holder():
     eng._stream_interval = 1
     eng._is_hybrid_model = lambda: False
     eng._create_output_router = lambda: None
+    eng._admission_lock = threading.Lock()
+    eng._admission_reservations = 0
+    eng._admission_tokens = set()
+    eng._admission_tasks = {}
+    eng._lifecycle_aborted_tasks = set()
+    eng._generation_paused = False
+    eng._generation_pause_mode = None
+    eng._scheduler_config = None
 
     # Fake AsyncEngineCore so add_request returns a concrete id and
     # stream_outputs yields one finished chunk.
     fake_engine = MagicMock()
-    fut: asyncio.Future = asyncio.Future()
-    fut.set_result("req-engine-issued-7777")
-    fake_engine.add_request = MagicMock(return_value=fut)
+
+    async def add_request(**kwargs):
+        kwargs["on_request_committed"]()
+        return "req-engine-issued-7777"
+
+    fake_engine.add_request = MagicMock(side_effect=add_request)
 
     async def stream_outputs(request_id):
         yield RequestOutput(
@@ -735,6 +747,7 @@ async def test_batched_engine_publishes_request_id_into_holder():
         )
 
     fake_engine.stream_outputs = stream_outputs
+    fake_engine.engine = None
     fake_engine.scheduler = MagicMock()
     fake_engine.scheduler.abort_request = MagicMock(return_value=True)
     fake_engine._cleanup_request = MagicMock()

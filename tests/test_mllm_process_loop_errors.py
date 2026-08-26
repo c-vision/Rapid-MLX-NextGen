@@ -42,6 +42,7 @@ async def test_process_loop_failure_unblocks_every_inflight_request() -> None:
     scheduler._detokenizer_pool = {running.request_id: object()}
     scheduler._pending_abort_ids = {running.request_id, pending_only}
     scheduler._aborted_queue_ids = {aborted}
+    scheduler._abort_error_kinds = {aborted: "lifecycle"}
     scheduler.finished_req_ids = set()
     scheduler._running = True
     scheduler._injected_step_executor = None

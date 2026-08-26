@@ -43,10 +43,14 @@ This keeps replacement policy scoped to the selected lifecycle group.
 2. Close admission on every old assistant engine and reach the selected
    reject/drain/abort boundary.
 3. Acquire the existing primary/audio-worker handoff lease.
-4. Publish the replacement as primary, retire old assistant engines, and
-   commit the worker handoff.
-5. On cancellation or failure, discard the unpublished replacement, reopen
-   old assistant admission, and roll back the audio-worker lease.
+4. Publish the replacement as primary and retire the old primary first. Until
+   that stop succeeds, failure restores the old primary and audio-worker lease.
+5. Successful primary retirement is the commit point. Commit the worker
+   handoff, remove every quiesced sibling from routing, and treat any later
+   sibling stop failure as cleanup rather than rolling routes back to an engine
+   that may already be stopped.
+6. Before the commit point, cancellation or failure discards the replacement,
+   reopens old assistant admission, and rolls back the audio-worker lease.
 
 No capacity, idle-TTL, audio-lane, scheduler, or Desktop policy is introduced
 by this decision.

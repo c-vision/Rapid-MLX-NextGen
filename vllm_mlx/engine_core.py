@@ -1308,8 +1308,10 @@ class EngineCore:
 
         return request_id
 
-    async def abort_request(self, request_id: str) -> bool:
-        """Abort scheduler work and wake its streaming or aggregate consumer."""
+    async def abort_request(
+        self, request_id: str, *, error_kind: str | None = None
+    ) -> bool:
+        """Abort work, preserving the caller-selected terminal semantics."""
 
         result = self.scheduler.abort_request(request_id)
         if result:
@@ -1322,8 +1324,14 @@ class EngineCore:
                             request_id=request_id,
                             finished=True,
                             finish_reason="length",
-                            error="Inference aborted by a cancellation request",
-                            error_kind="lifecycle",
+                            error=(
+                                "Inference aborted by a cancellation request"
+                                if error_kind == "lifecycle"
+                                else None
+                            ),
+                            error_kind=(
+                                "lifecycle" if error_kind == "lifecycle" else None
+                            ),
                         )
                     )
                 event.set()
@@ -1919,9 +1927,11 @@ class AsyncEngineCore:
             **kwargs,
         )
 
-    async def abort_request(self, request_id: str) -> bool:
+    async def abort_request(
+        self, request_id: str, *, error_kind: str | None = None
+    ) -> bool:
         """Abort a request."""
-        return await self.engine.abort_request(request_id)
+        return await self.engine.abort_request(request_id, error_kind=error_kind)
 
     async def stream_outputs(
         self,

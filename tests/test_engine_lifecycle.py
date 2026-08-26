@@ -84,7 +84,8 @@ async def test_abort_pause_rechecks_requests_that_arrive_after_pause_edge():
     engine, scheduler = _engine(reservations=1)
     aborted = []
 
-    async def abort_request(request_id):
+    async def abort_request(request_id, *, error_kind=None):
+        assert error_kind == "lifecycle"
         aborted.append(request_id)
         scheduler.requests.pop(request_id, None)
         scheduler.running.pop(request_id, None)
@@ -339,6 +340,100 @@ async def test_direct_non_stream_generation_transfers_admission_at_commit():
     generation.cancel()
     with pytest.raises(asyncio.CancelledError):
         await generation
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_generation_reserves_until_scheduler_commit():
+    engine, scheduler = _engine()
+    committed = asyncio.Event()
+
+    class AsyncCoreStub:
+        def __init__(self):
+            self.engine = SimpleNamespace(scheduler=scheduler)
+
+        async def add_request(self, **kwargs):
+            assert engine._admission_reservations == 1
+            kwargs["on_request_committed"]()
+            committed.set()
+            return "streaming"
+
+        async def stream_outputs(self, _request_id):
+            await asyncio.Event().wait()
+            yield  # pragma: no cover - keeps this an async generator
+
+    engine._engine = AsyncCoreStub()
+    engine._loaded = True
+
+    stream = engine.stream_generate("prompt", max_tokens=1)
+    consumer = asyncio.create_task(anext(stream))
+    await committed.wait()
+
+    assert engine._admission_reservations == 0
+    assert engine._admission_tokens == set()
+    assert engine._current_admission_token() is None
+
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_precommit_failure_releases_admission():
+    engine, scheduler = _engine()
+
+    class FailingCoreStub:
+        def __init__(self):
+            self.engine = SimpleNamespace(scheduler=scheduler)
+
+        async def add_request(self, **_kwargs):
+            raise RuntimeError("precommit failed")
+
+    engine._engine = FailingCoreStub()
+    engine._loaded = True
+
+    with pytest.raises(RuntimeError, match="precommit failed"):
+        await anext(engine.stream_generate("prompt", max_tokens=1))
+
+    assert engine._admission_reservations == 0
+    assert engine._admission_tokens == set()
+
+
+@pytest.mark.asyncio
+async def test_direct_mllm_stream_transfers_admission_at_queue_commit():
+    engine, _ = _engine()
+    committed = asyncio.Event()
+
+    class MLLMSchedulerStub:
+        config = SimpleNamespace(max_concurrent_requests=8)
+
+        async def add_request_async(self, **kwargs):
+            assert engine._admission_reservations == 1
+            kwargs["on_request_committed"]()
+            committed.set()
+            return "mllm-streaming"
+
+        async def stream_outputs(self, _request_id):
+            await asyncio.Event().wait()
+            yield  # pragma: no cover - keeps this an async generator
+
+    engine._is_mllm = True
+    engine._mllm_scheduler = MLLMSchedulerStub()
+    engine._engine = None
+    engine._loaded = True
+
+    stream = engine.stream_generate("prompt", max_tokens=1)
+    consumer = asyncio.create_task(anext(stream))
+    await committed.wait()
+
+    assert engine._admission_reservations == 0
+    assert engine._admission_tokens == set()
+    assert engine._current_admission_token() is None
+
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    await stream.aclose()
 
 
 @pytest.mark.asyncio
@@ -623,7 +718,7 @@ async def test_text_abort_wakes_non_streaming_consumer_with_terminal_error():
     engine._finished_events = {"active": asyncio.Event()}
     engine._idle_event = asyncio.Event()
 
-    assert await engine.abort_request("active") is True
+    assert await engine.abort_request("active", error_kind="lifecycle") is True
     await asyncio.wait_for(engine._finished_events["active"].wait(), timeout=0.1)
 
     terminal = engine._output_collectors["active"].get_nowait()
@@ -637,10 +732,39 @@ async def test_text_abort_wakes_non_streaming_consumer_with_terminal_error():
     assert "active" in engine._finished_events
 
 
+@pytest.mark.asyncio
+async def test_text_ordinary_abort_preserves_non_lifecycle_cleanup():
+    engine = EngineCore.__new__(EngineCore)
+    engine.scheduler = SimpleNamespace(
+        abort_request=lambda _request_id: True,
+        remove_finished_request=lambda _request_id: None,
+    )
+    engine._output_collectors = {
+        "active": RequestOutputCollector(aggregate=True),
+    }
+    engine._stream_states = {"active": object()}
+    engine._stream_buffers = {"active": object()}
+    engine._finished_events = {"active": asyncio.Event()}
+    engine._idle_event = asyncio.Event()
+
+    assert await engine.abort_request("active") is True
+
+    await asyncio.wait_for(engine._finished_events["active"].wait(), timeout=0.1)
+    terminal = engine._output_collectors["active"].get_nowait()
+    assert terminal is not None
+    assert terminal.finished is True
+    assert terminal.error is None
+    assert terminal.error_kind is None
+    # The consumer still owns cleanup after receiving the ordinary terminal.
+    assert "active" in engine._output_collectors
+    assert "active" in engine._finished_events
+
+
 def test_mllm_abort_delivers_terminal_error_instead_of_empty_success():
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
     scheduler.output_queues = {"active": asyncio.Queue()}
     scheduler._aborted_queue_ids = {"active"}
+    scheduler._abort_error_kinds = {"active": "lifecycle"}
 
     scheduler._distribute_outputs(SimpleNamespace(outputs=[]))
 
@@ -648,6 +772,33 @@ def test_mllm_abort_delivers_terminal_error_instead_of_empty_success():
     assert terminal.finished is True
     assert terminal.error_kind == "lifecycle"
     assert "cancellation" in terminal.error
+
+
+def test_mllm_ordinary_abort_preserves_non_lifecycle_queue_close():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.output_queues = {"active": asyncio.Queue()}
+    scheduler._aborted_queue_ids = {"active"}
+    scheduler._abort_error_kinds = {}
+
+    scheduler._distribute_outputs(SimpleNamespace(outputs=[]))
+
+    assert scheduler.output_queues["active"].get_nowait() is None
+
+
+def test_mllm_lifecycle_abort_records_reason_until_terminal_delivery():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler._cancel_counter_lock = threading.Lock()
+    scheduler.requests = {"active": object()}
+    scheduler.request_id_to_uid = {}
+    scheduler.running = {}
+    scheduler._pending_abort_ids = set()
+    scheduler._cancelled_request_ids = set()
+    scheduler._abort_error_kinds = {}
+    scheduler.num_requests_cancelled = 0
+
+    assert scheduler.abort_request("active", error_kind="lifecycle") is True
+
+    assert scheduler._abort_error_kinds == {"active": "lifecycle"}
 
 
 def test_mllm_abort_remains_queued_until_terminal_delivery():
