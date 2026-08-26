@@ -1310,8 +1310,8 @@ async def test_failed_performance_reload_restores_the_last_known_good_engine():
 
 
 @pytest.mark.asyncio
-async def test_failed_stop_keeps_the_existing_engine_registered():
-    manager, registry, _, _ = manager_fixture(limit_gib=20)
+async def test_failed_stop_rebuilds_the_existing_engine_before_rerouting():
+    manager, registry, loaded, _ = manager_fixture(limit_gib=20)
     old_engine = registry.get_engine("chat")
 
     async def failed_stop():
@@ -1325,8 +1325,65 @@ async def test_failed_stop_keeps_the_existing_engine_registered():
             reload_if_changed=True,
         )
 
-    assert registry.get_engine("chat") is old_engine
+    assert registry.get_engine("chat") is loaded["chat"]
+    assert registry.get_engine("chat") is not old_engine
     assert manager.snapshot()["models"][0]["id"] == "chat"
+
+
+@pytest.mark.asyncio
+async def test_reload_waits_for_admitted_precommit_request_before_stop():
+    admitted = asyncio.Event()
+    drained = asyncio.Event()
+
+    class PrecommitEngine(FakeLifecycleEngine):
+        def lifecycle_status(self):
+            status = super().lifecycle_status()
+            status["active_requests"] = 1 if admitted.is_set() else 0
+            status["admitted_requests"] = 1 if admitted.is_set() else 0
+            return status
+
+        async def pause_generation(self, mode="wait", *, timeout=None):
+            self.pauses.append((mode, timeout))
+            self.paused = True
+            if admitted.is_set():
+                await drained.wait()
+                admitted.clear()
+            return self.lifecycle_status()
+
+    registry = ModelRegistry()
+    old_engine = PrecommitEngine()
+    primary = entry("chat", old_engine)
+    registry.add(primary, is_default=True)
+    loaded: list[FakeEngine] = []
+
+    async def loader(name: str, path: str | None, performance=None):
+        replacement = FakeEngine()
+        loaded.append(replacement)
+        return entry(name, replacement)
+
+    manager = ResidentModelManager(registry, loader, memory_reader=lambda: 0)
+    manager.register_primary(primary, estimated_bytes=4 * GIB)
+    admitted.set()
+
+    reload_task = asyncio.create_task(
+        manager.load(
+            "chat",
+            performance=ResidentPerformanceConfig(kv_cache_dtype="int8"),
+            reload_if_changed=True,
+            replace_mode="wait",
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert reload_task.done() is False
+    assert old_engine.stopped is False
+    assert loaded == []
+
+    drained.set()
+    replacement = await asyncio.wait_for(reload_task, timeout=1)
+    assert old_engine.stopped is True
+    assert replacement.entry.engine is loaded[0]
+    assert registry.default_name == "chat"
 
 
 @pytest.mark.asyncio

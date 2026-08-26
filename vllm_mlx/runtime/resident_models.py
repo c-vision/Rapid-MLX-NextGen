@@ -551,15 +551,43 @@ class ResidentModelManager:
             canonical = self._canonical(model_name)
             if canonical is not None:
                 existing_record = self._records[canonical]
+                group = _effective_replace_group(existing_record.entry, replace_group)
+                did_reload = False
                 if reload_if_changed and existing_record.performance != performance:
-                    existing_record = await self._reload_locked(
-                        existing_record, performance
-                    )
+                    reload_candidates: list[ResidencyRecord] = []
+                    reload_paused_engines: list[object] = []
+                    try:
+                        if group is not None:
+                            (
+                                group_records,
+                                reload_paused_engines,
+                            ) = await self._quiesce_replacement_group_locked(
+                                group, replace_mode
+                            )
+                            reload_candidates = [
+                                candidate
+                                for candidate in group_records
+                                if candidate is not existing_record
+                            ]
+                        else:
+                            reload_paused_engines = await self._quiesce_records_locked(
+                                [existing_record], replace_mode
+                            )
+                        existing_record = await self._reload_locked(
+                            existing_record, performance
+                        )
+                        did_reload = True
+                        if group is not None:
+                            await self._commit_group_replacement_locked(
+                                existing_record, group, reload_candidates
+                            )
+                    except BaseException:
+                        await self._resume_engines(reload_paused_engines)
+                        raise
                 existing_record.last_used_at = self._clock()
                 if pin:
                     existing_record.pinned = True
-                group = _effective_replace_group(existing_record.entry, replace_group)
-                if group is not None:
+                if group is not None and not did_reload:
                     await self._replace_group_locked(
                         existing_record, group, replace_mode
                     )
@@ -689,14 +717,12 @@ class ResidentModelManager:
                 result = stop()
                 if asyncio.iscoroutine(result):
                     await result
-        except BaseException:
-            # A failed stop must not also make the still-existing engine
-            # disappear from routing and residency accounting.
-            self.registry.add(record.entry, is_default=primary)
-            self._index_record(record)
-            if handoff is not None:
-                handoff.rollback()
-            raise
+        except BaseException as stop_error:
+            # A stop attempt may already have disabled part of the engine.
+            # Rebuild the last known-good configuration instead of routing a
+            # possibly half-stopped worker after rollback.
+            await self._restore_reload_locked(record, handoff)
+            raise stop_error
         _release_allocator_cache()
 
         before = self._read_memory()
@@ -848,9 +874,21 @@ class ResidentModelManager:
             replace_mode=replace_mode,
         )
 
+        paused_engines = await self._quiesce_records_locked(candidates, replace_mode)
+        return candidates, paused_engines
+
+    async def _quiesce_records_locked(
+        self,
+        records: list[ResidencyRecord],
+        replace_mode: str,
+    ) -> list[object]:
+        """Close admission and drain/abort exact records before mutation."""
+
+        if replace_mode not in {"reject", "wait", "abort"}:
+            raise ResidentModelError(f"unsupported replacement mode {replace_mode!r}")
         paused_engines: list[object] = []
         try:
-            for record in candidates:
+            for record in records:
                 engine = record.entry.engine
                 pause = getattr(engine, "pause_generation", None)
                 if record.active_requests and (
@@ -875,7 +913,7 @@ class ResidentModelManager:
         except BaseException:
             await self._resume_engines(paused_engines)
             raise
-        return candidates, paused_engines
+        return paused_engines
 
     def _replacement_candidates_locked(
         self,

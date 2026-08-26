@@ -1006,7 +1006,7 @@ async def test_primary_reload_restores_old_config_after_publication_failure(
 
 
 @pytest.mark.asyncio
-async def test_primary_reload_rolls_back_handoff_when_old_stop_fails(monkeypatch):
+async def test_primary_reload_rebuilds_handoff_when_old_stop_fails(monkeypatch):
     import vllm_mlx.server as server
     from vllm_mlx.runtime.audio_worker import bind_audio_worker, run_audio_mlx
     from vllm_mlx.runtime.resident_models import ResidentPerformanceConfig
@@ -1025,13 +1025,15 @@ async def test_primary_reload_rolls_back_handoff_when_old_stop_fails(monkeypatch
 
         assert old_worker.stop_calls == 1
         assert old_worker.stopped is False
-        assert loaded == {}
+        restored = loaded["chat-old"]
         assert registry.default_name == "chat-old"
-        assert registry.get_entry("chat-old").engine is old_worker
-        assert server._engine is old_worker
+        assert registry.get_entry("chat-old").engine is restored
+        assert server._engine is restored
         assert await run_audio_mlx("stt", "whisper", "infer", lambda: "after") == (
             "after"
         )
+        assert old_worker.async_calls == 0
+        assert restored.async_calls == 1
     finally:
         bind_audio_worker(None)
 
