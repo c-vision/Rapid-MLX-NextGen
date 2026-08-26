@@ -107,6 +107,7 @@ def test_manifest_fields_are_valid_and_fail_closed():
         "crash-once",
         "delayed-transcription",
         "document",
+        "native-file-drag",
         "fake-sidecar",
         "generated-images",
         "isolated-home",

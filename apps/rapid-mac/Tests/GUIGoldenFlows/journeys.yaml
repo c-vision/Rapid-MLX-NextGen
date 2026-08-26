@@ -194,7 +194,7 @@ journeys:
     risk: high
     driver: hybrid
     ci_tier: pr
-    fixtures: [fake-sidecar, document, isolated-home]
+    fixtures: [fake-sidecar, document, native-file-drag, isolated-home]
     source_paths: [apps/rapid-mac/Sources/Rapid/Chat/]
     owns_baseline: false
   - name: chat-multimodal-attachments
@@ -202,7 +202,7 @@ journeys:
     risk: high
     driver: hybrid
     ci_tier: pr
-    fixtures: [fake-sidecar, two-images, document, isolated-home]
+    fixtures: [fake-sidecar, two-images, document, native-file-drag, isolated-home]
     source_paths: [apps/rapid-mac/Sources/Rapid/Chat/]
     owns_baseline: false
   - name: image-generation

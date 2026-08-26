@@ -638,6 +638,7 @@ struct ChatView: View {
                     onSubmit: send,
                     onCancel: { viewModel.stop() },
                     onPasteAttachments: pasteAttachmentsFromClipboard,
+                    onDropAttachments: addAttachmentURLs,
                     onRecallLastUser: {
                         messages.last(where: { $0.role == .user })?.content
                     }
@@ -2039,6 +2040,7 @@ struct ComposeField: View {
     /// when nothing is streaming.
     var onCancel: () -> Void
     var onPasteAttachments: () -> Bool = { false }
+    var onDropAttachments: (([URL]) -> Bool)?
     /// Resolves the text of the last user message in the active
     /// session, or ``nil`` when there's nothing to recall. Bound to
     /// the Up-arrow-in-empty-compose recall affordance (Claude /
@@ -2088,6 +2090,7 @@ struct ComposeField: View {
                 onSubmit: onSubmit,
                 onCancel: onCancel,
                 onPasteAttachments: onPasteAttachments,
+                onDropAttachments: onDropAttachments,
                 onRecallLastUser: onRecallLastUser,
                 axIdentifier: axIdentifier,
                 axLabel: axLabel,
@@ -2124,6 +2127,12 @@ struct ComposeField: View {
 /// width changes both re-measure, so wrapping caused by resizing the
 /// window grows the field just like typing does.
 final class AutosizingTextView: NSTextView {
+    static func makeForComposer() -> AutosizingTextView {
+        let view = AutosizingTextView()
+        view.registerForDraggedTypes([.fileURL])
+        return view
+    }
+
     /// Called with the measured content height whenever the text or the
     /// view's width changes. The receiver owns the clamping; this only
     /// reports what the layout manager actually used.
@@ -2143,6 +2152,9 @@ final class AutosizingTextView: NSTextView {
     /// AppKit routes Command-V through ``paste(_:)`` directly; it does not
     /// reliably consult the text-view delegate's ``doCommandBy`` hook.
     var onPasteAttachments: (() -> Bool)?
+    /// File URLs dropped directly over NSTextView otherwise fall through to
+    /// AppKit's text insertion and become literal paths in the draft.
+    var onDropAttachments: (([URL]) -> Bool)?
     private var lastReportedCompositionState = false
 
     private func reportCompositionState() {
@@ -2177,6 +2189,48 @@ final class AutosizingTextView: NSTextView {
     override func paste(_ sender: Any?) {
         if onPasteAttachments?() == true { return }
         super.paste(sender)
+    }
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        if Self.containsFileURLs(sender.draggingPasteboard) { return .copy }
+        return super.draggingEntered(sender)
+    }
+
+    override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        if Self.containsFileURLs(sender.draggingPasteboard) { return .copy }
+        return super.draggingUpdated(sender)
+    }
+
+    override func prepareForDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        if Self.containsFileURLs(sender.draggingPasteboard) { return true }
+        return super.prepareForDragOperation(sender)
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        if consumeFileDrop(from: sender.draggingPasteboard) { return true }
+        return super.performDragOperation(sender)
+    }
+
+    /// Returns true when a file drop was consumed, regardless of whether the
+    /// attachment importer accepted its type. Unsupported files must still be
+    /// swallowed here so AppKit cannot insert their paths as fallback text.
+    @discardableResult
+    func consumeFileDrop(from pasteboard: NSPasteboard) -> Bool {
+        let urls = Self.fileURLs(from: pasteboard)
+        guard !urls.isEmpty, let onDropAttachments else { return false }
+        _ = onDropAttachments(urls)
+        return true
+    }
+
+    private static func containsFileURLs(_ pasteboard: NSPasteboard) -> Bool {
+        !fileURLs(from: pasteboard).isEmpty
+    }
+
+    private static func fileURLs(from pasteboard: NSPasteboard) -> [URL] {
+        pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] ?? []
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -2290,6 +2344,7 @@ struct ComposeTextEditor: NSViewRepresentable {
     var onSubmit: () -> Void
     var onCancel: () -> Void
     var onPasteAttachments: () -> Bool
+    var onDropAttachments: (([URL]) -> Bool)?
     var onRecallLastUser: () -> String?
     /// Accessibility identity of the underlying ``NSTextView``. Defaults to
     /// the chat compose field so every existing call site — and the external
@@ -2322,7 +2377,7 @@ struct ComposeTextEditor: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let tv = AutosizingTextView()
+        let tv = AutosizingTextView.makeForComposer()
         tv.delegate = context.coordinator
         tv.isRichText = false
         tv.allowsUndo = true
@@ -2354,6 +2409,7 @@ struct ComposeTextEditor: NSViewRepresentable {
         tv.onMeasuredHeight = onMeasuredHeight
         tv.onComposingChange = onComposingChange
         tv.onPasteAttachments = onPasteAttachments
+        tv.onDropAttachments = onDropAttachments
         // Bug 3-A residual P2: NSTextView already advertises role
         // ``.textArea`` by default, but with no label / identifier
         // AppleScript and cliclick can't tell which text area is the
@@ -2402,6 +2458,7 @@ struct ComposeTextEditor: NSViewRepresentable {
         view.onMeasuredHeight = onMeasuredHeight
         view.onComposingChange = onComposingChange
         view.onPasteAttachments = onPasteAttachments
+        view.onDropAttachments = onDropAttachments
         context.coordinator.onSubmit = onSubmit
         context.coordinator.onCancel = onCancel
         context.coordinator.onPasteAttachments = onPasteAttachments

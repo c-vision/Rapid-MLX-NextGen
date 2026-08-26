@@ -223,11 +223,10 @@ final class RapidUITestHarness {
         let source = dragSource.descendants(matching: .any)
             .matching(identifier: "RapidUITests.FileDragSource").firstMatch
         XCTAssertTrue(source.waitForExistence(timeout: 15))
-        // Dropping directly on NSTextView makes AppKit insert the file path as
-        // text before SwiftUI's enclosing URL drop destination can handle it.
-        // The attachment button is inside that same drop destination and does
-        // not consume file URLs, so the native event reaches the product path.
-        let dropTarget = element("ChatView.AddAttachments")
+        // Exercise the native text editor itself. The editor must explicitly
+        // register for file URLs; otherwise AppKit inserts the path as text
+        // before SwiftUI's enclosing drop destination can handle the event.
+        let dropTarget = element("rapid.chat.compose")
         XCTAssertTrue(dropTarget.waitForExistence(timeout: 10))
         source.click(forDuration: 1, thenDragTo: dropTarget)
     }
