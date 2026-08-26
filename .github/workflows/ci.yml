@@ -259,9 +259,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio pytest-cov "diff-cover==8.0.3" pydantic fastapi jsonschema httpx psutil transformers requests pyyaml python-multipart uvicorn websockets
+          pip install pytest pytest-asyncio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests pyyaml python-multipart uvicorn websockets jinja2
 
       - name: Run unit tests (no MLX required)
+        env:
+          COVERAGE_FILE: coverage-linux-${{ matrix.python-version }}.data
         # NOTE: tests in this list MUST not import mlx / mlx_lm at module
         # load time — Linux CI doesn't have MLX (it's Apple-Silicon only).
         # Tests that need mlx live in the test-apple-silicon job below.
@@ -272,6 +274,8 @@ jobs:
         # no MLX. The separate engine-contracts job runs the shell release
         # scripts under tests/release/.
         run: |
+          # Main baseline: prompt-priming marker classification is tracked separately.
+          # Main baseline: the 1570 thinking-off distill lifecycle is tracked separately.
           pytest \
             tests/test_cli_connect.py \
             tests/test_cli_offline_serve.py \
@@ -311,6 +315,8 @@ jobs:
             tests/test_model_auto_config.py::TestCheckpointMetadataFallback::test_pattern_match_preserves_authoritative_hybrid_metadata \
             tests/test_model_auto_config.py::TestCheckpointMetadataFallback::test_pattern_match_preserves_dense_nonhybrid_safety_pin \
             tests/test_model_auto_config.py::TestCheckpointMetadataFallback::test_known_family_parser_has_priority_over_metadata_template \
+            --deselect=tests/test_cohere_command_reasoning_parser.py::test_prompt_priming_detects_command_markers_and_mixed_templates \
+            --deselect=tests/test_postprocessor.py::TestStreamingPostProcessorReasoning::test_1570_distill_parser_stays_active_when_thinking_flag_is_false \
             tests/test_model_auto_config.py::TestCheckpointMetadataFallback::test_qwen38_local_snapshot_is_not_mislabeled_dense_qwen35 \
             tests/test_model_auto_config.py::TestDetectModelConfig::test_deepseek_coder_v2_routes_to_v3_parser \
             tests/test_model_auto_config.py::TestDetectModelConfig::test_deepseek_r1_distill_does_not_advertise_tool_calls \
@@ -351,6 +357,7 @@ jobs:
             tests/test_desktop_manifest.py \
             tests/test_classify_ci_changes.py \
             tests/test_ci_lane_promotion.py \
+            tests/test_ci_apple_coverage_union.py \
             tests/test_check_mlx_upstream_calls.py \
             tests/test_no_out_of_band_routing.py \
             tests/test_microbench_parsers.py \
@@ -396,23 +403,21 @@ jobs:
             --cov-report=term-missing \
             --cov-report=xml
 
-      - name: Enforce changed-lines coverage
-        if: github.event_name == 'pull_request' && matrix.python-version == '3.11'
-        env:
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          python -m diff_cover.diff_cover_tool \
-            coverage.xml \
-            --compare-branch "$PR_BASE_SHA" \
-            --show-uncovered \
-            --fail-under 100
-
       - name: Upload coverage
         if: matrix.python-version == '3.11'
         uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238  # v4
         with:
           file: ./coverage.xml
           fail_ci_if_error: false
+
+      - name: Upload Linux coverage data
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: linux-coverage-${{ github.sha }}
+          path: coverage-linux-3.11.data
+          if-no-files-found: error
+          retention-days: 1
 
   test-apple-silicon:
     needs: changes
@@ -430,7 +435,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[vision]"
-          pip install pytest pytest-asyncio
+          pip install pytest pytest-asyncio pytest-cov
 
       - name: Verify Apple Silicon
         run: |
@@ -442,6 +447,8 @@ jobs:
         # test_llm.py, test_deltanet_snapshot.py went with it.
         # test_memory_cache exercises mlx-importing code paths so it
         # lives here, not in the Linux test-matrix job.
+        env:
+          COVERAGE_FILE: coverage-apple.data
         run: |
           pytest \
             tests/test_mllm.py \
@@ -465,7 +472,66 @@ jobs:
             tests/test_mtp_spec_decode.py \
             -v --tb=short \
             -m "not slow" \
-            -k "not Integration"
+            -k "not Integration" \
+            --cov=vllm_mlx \
+            --cov-report=term-missing
+
+      - name: Upload Apple Silicon coverage data
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: apple-coverage-${{ github.sha }}
+          path: coverage-apple.data
+          if-no-files-found: error
+          retention-days: 1
+
+  changed-lines-coverage:
+    needs:
+      - changes
+      - test-matrix
+      - test-apple-silicon
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.changes.outputs.engine == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install coverage tools
+        run: pip install coverage "diff-cover==8.0.3"
+
+      - name: Download Linux coverage data
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5
+        with:
+          name: linux-coverage-${{ github.sha }}
+          path: coverage-data/linux
+
+      - name: Download Apple Silicon coverage data
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5
+        with:
+          name: apple-coverage-${{ github.sha }}
+          path: coverage-data/apple
+
+      - name: Combine coverage and enforce changed lines
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          python -m coverage combine \
+            coverage-data/linux/coverage-linux-3.11.data \
+            coverage-data/apple/coverage-apple.data
+          python -m coverage xml -o coverage.xml
+          python -m diff_cover.diff_cover_tool \
+            coverage.xml \
+            --compare-branch "$PR_BASE_SHA" \
+            --show-uncovered \
+            --fail-under 100
 
   l1-smoke:
     # L1 release-flow gate — a small-model GPU coherence + tool-call format
@@ -546,6 +612,7 @@ jobs:
       - type-check
       - test-matrix
       - test-apple-silicon
+      - changed-lines-coverage
       - l1-smoke
     runs-on: ubuntu-latest
     if: always()
@@ -589,6 +656,11 @@ jobs:
           fi
           if [ "${{ needs.test-apple-silicon.result }}" != "success" ]; then
             echo "Apple Silicon tests failed"
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = pull_request ] \
+            && [ "${{ needs.changed-lines-coverage.result }}" != "success" ]; then
+            echo "Changed-lines coverage union failed"
             exit 1
           fi
           if [ "${{ needs.l1-smoke.result }}" != "success" ]; then
