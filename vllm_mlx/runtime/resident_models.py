@@ -561,12 +561,22 @@ class ResidentModelManager:
             paused_engines: list[object] = []
             try:
                 if replace_group is not None:
-                    (
-                        candidates,
-                        paused_engines,
-                    ) = await self._quiesce_replacement_group_locked(
-                        replace_group, replace_mode
-                    )
+                    if replace_mode == "reject":
+                        # Reject is a non-destructive preflight: close admission
+                        # only after proving the old assistant is already idle,
+                        # so a busy rejection cannot evict unrelated residents.
+                        (
+                            candidates,
+                            paused_engines,
+                        ) = await self._quiesce_replacement_group_locked(
+                            replace_group, replace_mode
+                        )
+                    else:
+                        # Wait/abort may drain or terminate live traffic. Merely
+                        # identify the protected group here; do not mutate the
+                        # healthy assistant until the replacement has actually
+                        # materialized and passed its modality contract.
+                        candidates = self._replacement_candidates_locked(replace_group)
                 await self._evict_for_locked(
                     estimate,
                     exclude={model_name, *(item.model_id for item in candidates)},
@@ -596,7 +606,15 @@ class ResidentModelManager:
                         f"model {record.model_id!r} does not belong to replacement "
                         f"group {replace_group!r}"
                     )
-                if group is not None and replace_group is None:
+                if replace_group is not None and replace_mode != "reject":
+                    (
+                        candidates,
+                        paused_engines,
+                    ) = await self._quiesce_replacement_group_locked(
+                        replace_group,
+                        replace_mode,
+                    )
+                elif group is not None and replace_group is None:
                     candidates, paused_engines = await self._quiesce_group_locked(
                         record, group, replace_mode
                     )
@@ -606,7 +624,13 @@ class ResidentModelManager:
                 self.registry.add(entry)
                 self._index_record(record)
                 self.loads_total += 1
-                await self._evict_for_locked(0, exclude={record.model_id})
+                await self._evict_for_locked(
+                    0,
+                    exclude={
+                        record.model_id,
+                        *(item.model_id for item in candidates),
+                    },
+                )
                 if group is not None:
                     await self._commit_group_replacement_locked(
                         record, group, candidates
@@ -814,20 +838,11 @@ class ResidentModelManager:
     ) -> tuple[list[ResidencyRecord], list[object]]:
         """Close one group before any externally visible lifecycle mutation."""
 
-        if replace_mode not in {"reject", "wait", "abort"}:
-            raise ResidentModelError(f"unsupported replacement mode {replace_mode!r}")
-
-        candidates = [
-            record
-            for record in self._records.values()
-            if record.model_id != exclude_model_id
-            and _replacement_group(record.entry) == group
-        ]
-        for record in candidates:
-            if record.pinned and not record.primary:
-                raise ResidentModelError(
-                    f"pinned model {record.model_id!r} cannot be replaced"
-                )
+        candidates = self._replacement_candidates_locked(
+            group,
+            exclude_model_id=exclude_model_id,
+            replace_mode=replace_mode,
+        )
 
         paused_engines: list[object] = []
         try:
@@ -857,6 +872,31 @@ class ResidentModelManager:
             await self._resume_engines(paused_engines)
             raise
         return candidates, paused_engines
+
+    def _replacement_candidates_locked(
+        self,
+        group: str,
+        *,
+        exclude_model_id: str | None = None,
+        replace_mode: str = "reject",
+    ) -> list[ResidencyRecord]:
+        """Validate and identify a group without changing engine admission."""
+
+        if replace_mode not in {"reject", "wait", "abort"}:
+            raise ResidentModelError(f"unsupported replacement mode {replace_mode!r}")
+
+        candidates = [
+            record
+            for record in self._records.values()
+            if record.model_id != exclude_model_id
+            and _replacement_group(record.entry) == group
+        ]
+        for record in candidates:
+            if record.pinned and not record.primary:
+                raise ResidentModelError(
+                    f"pinned model {record.model_id!r} cannot be replaced"
+                )
+        return candidates
 
     async def _resume_engines(self, engines: list[object]) -> None:
         """Best-effort reopen every engine paused by a failed transaction."""

@@ -783,6 +783,8 @@ async def test_assistant_replacement_quiesces_before_primary_handoff(replace_mod
     events: list[str] = []
 
     async def loader(name: str, path: str | None, performance=None):
+        assert old_engine.pauses == []
+        events.append("loaded")
         return entry(name)
 
     class Handoff:
@@ -813,7 +815,39 @@ async def test_assistant_replacement_quiesces_before_primary_handoff(replace_mod
     assert old_engine.stopped is True
     assert replacement.primary is True
     assert registry.default_name == "chat-new"
-    assert events == ["handoff-start", "handoff-commit"]
+    assert events == ["loaded", "handoff-start", "handoff-commit"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_mode", ["wait", "abort"])
+async def test_failed_replacement_load_does_not_quiesce_active_assistant(
+    replace_mode,
+):
+    registry = ModelRegistry()
+    old_engine = FakeLifecycleEngine()
+    old_engine.running = 1
+    primary = entry("chat-old", old_engine)
+    registry.add(primary, is_default=True)
+
+    async def loader(name: str, path: str | None, performance=None):
+        raise ImportError("replacement checkpoint is unavailable")
+
+    manager = ResidentModelManager(registry, loader, memory_reader=lambda: 0)
+    manager.register_primary(primary, estimated_bytes=4 * GIB)
+
+    with pytest.raises(ImportError, match="unavailable"):
+        await manager.load(
+            "chat-invalid",
+            replace_group="assistant",
+            replace_mode=replace_mode,
+        )
+
+    assert old_engine.pauses == []
+    assert old_engine.running == 1
+    assert old_engine.paused is False
+    assert old_engine.stopped is False
+    assert registry.default_name == "chat-old"
+    assert [item.model_name for item in registry.list_entries()] == ["chat-old"]
 
 
 @pytest.mark.asyncio
@@ -956,7 +990,8 @@ async def test_cancelled_replacement_resumes_old_engine_and_discards_target():
     assert old_engine.paused is False
     assert old_engine.stopped is False
     assert "chat-new" not in registry
-    assert loaded is None
+    assert loaded is not None
+    assert loaded.engine.stopped is True
 
 
 @pytest.mark.asyncio
