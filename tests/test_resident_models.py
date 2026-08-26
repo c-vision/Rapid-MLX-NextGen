@@ -391,7 +391,14 @@ class FailingResumeLifecycleEngine(FakeLifecycleEngine):
 
 class FailingStopLifecycleEngine(FakeLifecycleEngine):
     async def stop(self) -> None:
+        self.stopped = True
         raise RuntimeError("stop failed")
+
+
+class CancellingStopLifecycleEngine(FakeLifecycleEngine):
+    async def stop(self) -> None:
+        self.stopped = True
+        raise asyncio.CancelledError
 
 
 class Clock:
@@ -523,6 +530,10 @@ def residency_activity_contract(monkeypatch):
 
         with pytest.raises(ResidentModelError, match="does not belong"):
             await reload_manager._quiesce_group_locked(replacement, "image", "reject")
+        with pytest.raises(ResidentModelError, match="unsupported replacement mode"):
+            reload_manager._replacement_candidates_locked(
+                "assistant", replace_mode="invalid"
+            )
 
         busy = await reload_manager.load("busy")
         busy.entry.engine.running = 1
@@ -992,6 +1003,49 @@ async def test_committed_replacement_does_not_rollback_to_stopped_sibling(caplog
     assert [item.model_name for item in registry.list_entries()] == ["chat-new"]
     assert {item["id"] for item in manager.snapshot()["models"]} == {"chat-new"}
     assert "Failed to stop replaced model 'chat-sibling'" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "engine_type", [FailingStopLifecycleEngine, CancellingStopLifecycleEngine]
+)
+async def test_primary_stop_failure_keeps_committed_replacement_routable(
+    caplog, engine_type
+):
+    registry = ModelRegistry()
+    old_engine = engine_type()
+    primary = entry("chat-old", old_engine)
+    registry.add(primary, is_default=True)
+    handoff_events: list[str] = []
+
+    async def loader(name: str, path: str | None, performance=None):
+        return entry(name)
+
+    class Handoff:
+        def commit(self, committed):
+            handoff_events.append(f"commit:{committed.model_name}")
+
+        def rollback(self):
+            handoff_events.append("rollback")
+
+    manager = ResidentModelManager(
+        registry,
+        loader,
+        memory_reader=lambda: 0,
+        on_primary_handoff=lambda _entry: Handoff(),
+    )
+    manager.register_primary(primary, estimated_bytes=4 * GIB)
+
+    replacement = await manager.load(
+        "chat-new", replace_group="assistant", replace_mode="wait"
+    )
+
+    assert replacement.primary is True
+    assert registry.default_name == "chat-new"
+    assert [item.model_name for item in registry.list_entries()] == ["chat-new"]
+    assert {item["id"] for item in manager.snapshot()["models"]} == {"chat-new"}
+    assert handoff_events == ["commit:chat-new"]
+    assert "Failed to stop replaced primary 'chat-old'" in caplog.text
 
 
 @pytest.mark.asyncio

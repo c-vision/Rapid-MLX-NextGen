@@ -944,13 +944,6 @@ class ResidentModelManager:
                 self.registry.set_default(target.model_id)
                 if self._on_primary_changed is not None:
                     self._on_primary_changed(target.entry)
-                # This is the transaction's only fallible retirement. Stop it
-                # before touching sibling candidates so rollback always points
-                # at a live primary/audio worker.
-                await self._evict_locked(
-                    old_primary,
-                    reason=f"replace_{group}",
-                )
         except BaseException:
             if old_primary is not None:
                 try:
@@ -968,14 +961,26 @@ class ResidentModelManager:
                         handoff.rollback()
             raise
         else:
-            # Once the old primary is stopped (or the group had none), routing
-            # publication is committed and cannot truthfully roll back. Finish
-            # retiring secondary candidates as non-failing cleanup: each is
-            # already quiesced and removed from routing before stop(), so a
-            # cleanup failure may leak resources but cannot resurrect a dead
-            # route or undo the committed primary handoff.
+            # Publishing the target is the point of no return. ``stop()`` may
+            # mutate an engine incrementally before raising or being cancelled,
+            # so no stop-attempted engine can truthfully be restored as primary.
             if handoff is not None:
                 handoff.commit(target.entry)
+            if old_primary is not None:
+                try:
+                    await self._evict_locked(
+                        old_primary,
+                        reason=f"replace_{group}",
+                    )
+                except (Exception, asyncio.CancelledError):
+                    logger.exception(
+                        "Failed to stop replaced primary %r after routing commit",
+                        old_primary.model_id,
+                    )
+            # Finish retiring secondary candidates as non-failing cleanup: each
+            # is already quiesced and removed from routing before stop(), so a
+            # cleanup failure may leak resources but cannot resurrect a dead
+            # route or undo the committed primary handoff.
             for record in candidates:
                 if record is old_primary:
                     continue

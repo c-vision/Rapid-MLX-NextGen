@@ -817,11 +817,11 @@ class MLLMScheduler:
         with self._request_state_lock():
             self.requests.pop(request_id, None)
             self._detokenizer_pool.pop(request_id, None)
-
-        # Do NOT write to output_queues here — this may run on the
-        # executor thread where asyncio.Queue is not safe.  Mark for
-        # signaling on the event loop thread via _distribute_outputs.
-        self._aborted_queue_ids.add(request_id)
+            # Do NOT write to output_queues here — this may run on the
+            # executor thread where asyncio.Queue is not safe. Mark for
+            # signaling on the event-loop thread while holding the same lock
+            # reset() uses to clear the reason and delivery ledgers.
+            self._aborted_queue_ids.add(request_id)
 
         logger.debug(f"Aborted request {request_id}")
         mx.clear_cache()
@@ -1359,9 +1359,14 @@ class MLLMScheduler:
                         queue.put_nowait(req_output)
 
         # Signal queues for requests aborted during this step
-        while self._aborted_queue_ids:
-            request_id = self._aborted_queue_ids.pop()
-            error_kind = getattr(self, "_abort_error_kinds", {}).pop(request_id, None)
+        while True:
+            with self._request_state_lock():
+                if not self._aborted_queue_ids:
+                    break
+                request_id = self._aborted_queue_ids.pop()
+                error_kind = getattr(self, "_abort_error_kinds", {}).pop(
+                    request_id, None
+                )
             queue = self.output_queues.get(request_id)
             if queue is not None:
                 if error_kind != "lifecycle":
@@ -2080,6 +2085,11 @@ class MLLMScheduler:
         self.running.clear()
         with self._request_state_lock():
             self.requests.clear()
+            self._pending_abort_ids.clear()
+            self._aborted_queue_ids.clear()
+            self._abort_error_kinds.clear()
+            self._cancelled_request_ids.clear()
+            self._disconnect_abort_ids.clear()
         self.finished_req_ids.clear()
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
@@ -2092,10 +2102,6 @@ class MLLMScheduler:
         # in-flight request can't interleave inconsistently, AND
         # under the lock so the clear is atomic against any
         # concurrent abort-path mutation.
-        with self._cancel_counter_lock:
-            self._cancelled_request_ids.clear()
-            self._disconnect_abort_ids.clear()
-
         if self.batch_generator is not None:
             self.batch_generator.close()
             self.batch_generator = None

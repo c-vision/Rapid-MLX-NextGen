@@ -1374,14 +1374,29 @@ def test_mllm_commit_abort_distribution_cleanup_and_reset(monkeypatch):
     scheduler.requests = {"reset": object()}
     scheduler.running = {}
     scheduler.waiting = deque()
-    scheduler._pending_abort_ids = set()
-    scheduler._aborted_queue_ids = set()
-    scheduler._abort_error_kinds = {}
-    scheduler._cancelled_request_ids = set()
-    scheduler._disconnect_abort_ids = set()
-    monkeypatch.setattr(scheduler, "abort_request", lambda _request_id: True)
+    scheduler._pending_abort_ids = {"reset"}
+    scheduler._aborted_queue_ids = {"reset"}
+    scheduler._abort_error_kinds = {"reset": "lifecycle"}
+    scheduler._cancelled_request_ids = {"reset"}
+    scheduler._disconnect_abort_ids = {"reset"}
     scheduler.reset()
     assert scheduler.requests == {}
+    assert scheduler._pending_abort_ids == set()
+    assert scheduler._aborted_queue_ids == set()
+    assert scheduler._abort_error_kinds == {}
+    assert scheduler._cancelled_request_ids == set()
+    assert scheduler._disconnect_abort_ids == set()
+
+    # Reusing the same request ID after reset must receive ordinary abort
+    # semantics rather than the stale lifecycle-replacement terminal error.
+    reused = MLLMRequest(request_id="reset", prompt="again")
+    scheduler.requests = {"reset": reused}
+    scheduler.waiting = deque([reused])
+    scheduler.output_queues = {"reset": asyncio.Queue()}
+    assert scheduler.abort_request("reset") is True
+    scheduler._process_pending_aborts()
+    scheduler._distribute_outputs(MLLMSchedulerOutput(outputs=[]))
+    assert scheduler.output_queues["reset"].get_nowait() is None
 
 
 @pytest.mark.asyncio
