@@ -12,12 +12,14 @@ extended operational guide, `docs/development/releasing.md`, defers to it.
 
 ## TL;DR — cut a release
 
-1. Bump `version` in `pyproject.toml` to `X.Y.Z`.
-2. In the same PR, `git mv docs/release-notes/unreleased.md
+1. Run the non-publishing auto-release dry run on the intended bump parent and
+   record its exact green run URL (procedure below).
+2. Bump `version` in `pyproject.toml` to `X.Y.Z`.
+3. In the same PR, `git mv docs/release-notes/unreleased.md
    docs/release-notes/vX.Y.Z.md` (optional — see "Release notes" below).
-3. Open a PR whose commit subject is exactly `chore: bump version to X.Y.Z`
+4. Open a PR whose commit subject is exactly `chore: bump version to X.Y.Z`
    (GitHub's `(#N)` squash suffix is fine), and merge it to `main`.
-4. Merging starts the pipeline. After the Desktop candidate validates the
+5. Merging starts the pipeline. After the Desktop candidate validates the
    exact commit, the live main head and release-blocker evidence are gathered,
    and the protected `rapid-mac-tag` deployment requests approval, a **reviewer
    inspects the exact SHA / main-head / blocker evidence** shown there and
@@ -28,6 +30,57 @@ There is **no separate manual tag or publish command** — no button, no
 hand-run script. The reviewer's approval at the protected environment gate is
 the **only manual transaction step** a release requires; everything else is
 automated.
+
+## Pre-bump auto-release dry run (no publication)
+
+`auto-release.yml` has a maintainer-only `workflow_dispatch` dry-run route that
+executes its real `detect`, `tier1-agent-gate`, and signed
+`desktop-candidate-gate` jobs at the selected branch or tag ref. It then stops:
+`release-prep` and `release` are explicitly skipped, the `rapid-mac-tag`
+environment is never requested, and no tag, GitHub Release, PyPI event, or
+updater pointer is created.
+
+Run it on the exact ref whose head you intend to validate:
+
+```bash
+DRY_RUN_REF=main  # or the pushed branch containing an auto-release change
+DRY_RUN_SHA="$(gh api \
+  "repos/raullenchai/Rapid-MLX/commits/$DRY_RUN_REF" --jq .sha)"
+DRY_RUN_DISPATCHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+gh workflow run auto-release.yml -R raullenchai/Rapid-MLX --ref "$DRY_RUN_REF" -f dry_run=true
+
+DRY_RUN_ID=
+for _ in {1..30}; do
+  DRY_RUN_ID="$(gh run list -R raullenchai/Rapid-MLX \
+    --workflow auto-release.yml --event workflow_dispatch \
+    --commit "$DRY_RUN_SHA" --created ">=$DRY_RUN_DISPATCHED_AT" \
+    --limit 10 --json databaseId,createdAt \
+    --jq 'sort_by(.createdAt) | last | .databaseId // empty')"
+  test -z "$DRY_RUN_ID" || break
+  sleep 2
+done
+test -n "$DRY_RUN_ID"
+test "$(gh run view "$DRY_RUN_ID" -R raullenchai/Rapid-MLX \
+  --json headSha --jq .headSha)" = "$DRY_RUN_SHA"
+gh run watch "$DRY_RUN_ID" -R raullenchai/Rapid-MLX --exit-status
+gh run view "$DRY_RUN_ID" -R raullenchai/Rapid-MLX
+```
+
+The timestamp-bounded lookup ensures `DRY_RUN_ID` belongs to this dispatch,
+rather than reusing an older run at the same SHA. The final `dry-run-summary`
+job must be green, bind the accepted Desktop SHA to
+`DRY_RUN_SHA`, and report that both publication jobs were skipped with no
+protected environment or release mutation. A failed or mismatched run is not
+evidence; fix the gate or ref selection and run it once on the corrected exact
+head.
+
+Every PR that changes `.github/workflows/auto-release.yml` or a script/action
+invoked by `tier1-agent-gate` or `desktop-candidate-gate` must link a green
+exact-head dry-run URL in its PR body. Before opening the version-bump PR, run
+the same dry run on the intended bump parent (`main` at that moment) and include
+its URL + full `headSha` in the bump PR evidence. This exercises gate changes
+before the bump commit can activate the publishing route.
 
 ## Desktop (Rapid-MLX Desktop) RC tags — validated before claimed
 
@@ -150,6 +203,12 @@ The two gates run **in parallel** (they share nothing — different runners,
 different checks) and `release-prep` `needs` BOTH, so **a canonical normal
 release cannot tag or publish unless *both* pass**: the Tier-1 engine gate and
 the signed Desktop candidate at the exact commit.
+
+For `workflow_dispatch` with `dry_run=true`, detect intentionally sets the gate
+route active with `force=false`; the same two gates run, then
+`dry-run-summary` records their exact-SHA result while `release-prep` and
+`release` remain skipped. This is pre-release evidence only and cannot request
+the production environment or publish.
 
 Exact invariant: canonical normal releases require the Tier-1 gate; the audited
 **emergency dispatch may bypass only the Tier-1 gate** (see below); the signed
