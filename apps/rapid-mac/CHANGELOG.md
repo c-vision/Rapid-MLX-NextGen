@@ -17,6 +17,184 @@ can actually understand.
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-08-26
+
+### Added
+
+- **Experimental Qwen3.8-Flash-Next text inference.** The M1 lane supports the
+  mixed 4-bit checkpoint through the `qwen3.8-flash-next-4bit` alias on Macs
+  with at least 128 GB of unified memory. This release exposes the experimental
+  text lane through the CLI and API; release validation used a 256 GB Mac, and
+  Desktop, MTP, and vision support remain planned for a later release.
+  ([#2433](https://github.com/raullenchai/Rapid-MLX/pull/2433))
+- **Assistant changes are explicit, safe transactions.** API clients can choose
+  whether a busy text or vision model switch should reject, wait, or abort
+  active assistant work. Desktop rejects a busy switch safely, and auxiliary
+  speech models remain resident. The `/v1/models/load` API defaults
+  `memory_policy` to `evict_first_if_needed`: it keeps the rollback-safe load
+  when old and new fit together, evicts the replaced assistant first only when
+  keeping both breaches the limit but the replacement alone fits, and otherwise
+  returns a typed 507 with `replacement_projection` before destructive mutation.
+  Set `memory_policy=keep_then_commit` to require rollback-safe loading.
+  ([#2369](https://github.com/raullenchai/Rapid-MLX/pull/2369))
+- **Large multi-variant repositories can download one serving format.** The CLI
+  accepts `--bits` or `--format`, so users do not need to fetch every
+  quantization in a repository. ([#2145](https://github.com/raullenchai/Rapid-MLX/issues/2145),
+  [#2338](https://github.com/raullenchai/Rapid-MLX/pull/2338))
+
+### Fixed
+
+- **Mirrored subfolder quantizations download from the fast path.** Models such
+  as LFM2.5 2.6B 4-bit no longer fall back to a slow or unreachable upstream
+  route merely because the quantization lives in a repository subfolder.
+  ([#2279](https://github.com/raullenchai/Rapid-MLX/pull/2279))
+- **Explicit weather requests have dedicated regression coverage.** Evaluation
+  scenarios detect models selecting general web search or claiming the
+  advertised Weather tool is unavailable. ([#2222](https://github.com/raullenchai/Rapid-MLX/issues/2222),
+  [#2327](https://github.com/raullenchai/Rapid-MLX/pull/2327))
+- **Desktop photo input uses the updated bundled vision runtime.** Release
+  validation now requires image-dependent answers from two cached vision
+  families before the sidecar can ship. ([#2384](https://github.com/raullenchai/Rapid-MLX/pull/2384),
+  [#2380](https://github.com/raullenchai/Rapid-MLX/issues/2380))
+- **Vision-capable Qwen checkpoints choose the working lane automatically.**
+  Vision-capable Qwen3.5, Qwen3.6, and supported Qwen3.8 checkpoints use the
+  vision lane automatically when mlx-vlm 0.6.16 or newer is installed and the
+  checkpoint meets its measured vision-memory recommendation. If automatic
+  admission cannot use that lane, serving falls back to text with a
+  machine-readable reason. The experimental Flash-Next checkpoint is explicitly
+  text-only in this release. CLI users can force text serving with `--no-mllm`,
+  and Desktop exposes the same per-model Performance choice. Requests that
+  enable MTP or another speculative decoder select the text lane, where that
+  decoder is supported.
+- **API validation fails early with actionable fields.** Requests accept scalar
+  or array `stop`, reject invalid timeouts and non-boolean residency controls,
+  and identify the exact invalid load field. ([#2367](https://github.com/raullenchai/Rapid-MLX/pull/2367),
+  [#2371](https://github.com/raullenchai/Rapid-MLX/pull/2371),
+  [#2372](https://github.com/raullenchai/Rapid-MLX/pull/2372))
+- **Guided setup accurately describes data preservation.** Its confirmation no
+  longer implies that onboarding reset deletes user data. ([#2239](https://github.com/raullenchai/Rapid-MLX/issues/2239),
+  [#2322](https://github.com/raullenchai/Rapid-MLX/pull/2322))
+- **Telemetry consent appears after Rapid demonstrates value.** The one-time
+  question follows a successful chat reply, delivered dictation transcript, or
+  generated image instead of interrupting first launch. Nothing is sent before
+  explicit consent. ([#2424](https://github.com/raullenchai/Rapid-MLX/pull/2424))
+- **Share CLI contracts use supported invocation forms and run in CI.**
+  ([#2377](https://github.com/raullenchai/Rapid-MLX/issues/2377),
+  [#2382](https://github.com/raullenchai/Rapid-MLX/pull/2382))
+- **Environment diagnosis identifies the CLI that is actually running.**
+  `rapid-mlx doctor` reports both the active-environment executable and a
+  different installation found on `PATH`, with actionable mismatch guidance.
+  ([#2352](https://github.com/raullenchai/Rapid-MLX/issues/2352),
+  [#2402](https://github.com/raullenchai/Rapid-MLX/pull/2402))
+- **Offline serving failures are concise and actionable.** An uncached model
+  now stops after one cache and connectivity explanation instead of repeating
+  download work or recommending an unrelated serving lane.
+  ([#2357](https://github.com/raullenchai/Rapid-MLX/issues/2357),
+  [#2423](https://github.com/raullenchai/Rapid-MLX/pull/2423))
+- **First run chooses a hardware-fit starter and photos use the correct lane.**
+  Eligible cached models remain preferred, and supported hybrid vision models
+  route automatically. ([#2385](https://github.com/raullenchai/Rapid-MLX/pull/2385),
+  [#2219](https://github.com/raullenchai/Rapid-MLX/issues/2219),
+  [#2388](https://github.com/raullenchai/Rapid-MLX/pull/2388))
+- **8 GB Macs start with a model that fits.** First run recommends
+  `lfm2.5-1b-4bit` on the lowest memory tier, avoiding the RAM warning produced
+  by the previous 2.6B starter. ([#2432](https://github.com/raullenchai/Rapid-MLX/pull/2432))
+- **Dictation remains available across chat-model switches.** The speech model
+  stays resident and is restored after switching chat models.
+  ([#2400](https://github.com/raullenchai/Rapid-MLX/pull/2400))
+- **MTP assistants survive loading a second model.** Generation remains bound
+  to its worker, so the original assistant continues answering instead of
+  losing its GPU stream. ([#2441](https://github.com/raullenchai/Rapid-MLX/pull/2441))
+- **Model-switch memory projections credit the assistant being replaced.** The
+  estimate uses the same fit thresholds as the replacement transaction.
+  Desktop's low-memory threshold moves from 85% to 100%: 95–100% shows
+  advisory guidance and above 100% requires confirmation. The previous
+  conservative threshold is superseded now that projections credit memory
+  freed by the model being replaced.
+  ([#2443](https://github.com/raullenchai/Rapid-MLX/pull/2443),
+  [#2444](https://github.com/raullenchai/Rapid-MLX/pull/2444))
+- **Speech to Text arms itself after model lifecycle changes.** When speech
+  input is enabled, it becomes ready without an extra manual start button.
+  ([#2448](https://github.com/raullenchai/Rapid-MLX/pull/2448))
+- **Structured text requests terminate normally on the vision lane.**
+  JSON-schema responses and bounded-thinking or title-generation requests now
+  terminate normally on the vision lane: their request-local output processors
+  and complete configured EOS set reach the multimodal scheduler, while photo
+  requests continue using the same server.
+  ([#2471](https://github.com/raullenchai/Rapid-MLX/pull/2471))
+- **Serving lanes honor the requested workload.** Experimental
+  Qwen3.8-Flash-Next remains on its supported text lane, MTP and other
+  speculative decoding requests choose the text lane, and text-diffusion
+  assistants can replace another assistant without a spurious group-conflict
+  response. ([#2472](https://github.com/raullenchai/Rapid-MLX/pull/2472))
+- **iPhone HEIC photos can be attached to chat.** Picker, drop, and paste share
+  one normalization boundary that converts supported still images to truthful
+  JPEG or PNG bytes while preserving the attachment size limit.
+  ([#2467](https://github.com/raullenchai/Rapid-MLX/pull/2467))
+- **High-resolution photos fit the model's vision budget.** Desktop downscales
+  oversized images before sending them, and a typed image rejection no longer
+  leaves a failed attachment turn that contaminates the conversation.
+- **Launch avoids full app-bundle identity revalidation.** Keychain namespace
+  selection checks the signing certificate without rehashing every sealed
+  resource, and Escape no longer silently declines the later telemetry-consent
+  invitation. ([#2470](https://github.com/raullenchai/Rapid-MLX/pull/2470))
+- **Photo rejection and multimodal reloads recover cleanly.** A rejected image
+  cannot poison the next text turn, and a reloaded vision model cannot reuse a
+  stale generation worker. ([#2379](https://github.com/raullenchai/Rapid-MLX/pull/2379),
+  [#2378](https://github.com/raullenchai/Rapid-MLX/issues/2378),
+  [#2401](https://github.com/raullenchai/Rapid-MLX/pull/2401),
+  [#2397](https://github.com/raullenchai/Rapid-MLX/issues/2397))
+- **Live API identity and cancellation are dependable.** Readiness and connect
+  guidance use the live port and served model name, and public streaming IDs
+  are cancellable. ([#2386](https://github.com/raullenchai/Rapid-MLX/pull/2386),
+  [#2348](https://github.com/raullenchai/Rapid-MLX/issues/2348),
+  [#2395](https://github.com/raullenchai/Rapid-MLX/pull/2395),
+  [#2353](https://github.com/raullenchai/Rapid-MLX/issues/2353),
+  [#2398](https://github.com/raullenchai/Rapid-MLX/pull/2398),
+  [#2342](https://github.com/raullenchai/Rapid-MLX/issues/2342))
+- **Reload failures preserve a truthful serving state.** Registry, residency,
+  routing, readiness, and speech handoff remain consistent even when both a
+  primary reload and its restoration fail. ([#2394](https://github.com/raullenchai/Rapid-MLX/pull/2394),
+  [#2360](https://github.com/raullenchai/Rapid-MLX/issues/2360))
+- **Download status and size warnings stay truthful offline.** Catalog size is
+  retained when remote metadata is unavailable, and cached pulls report
+  verification rather than a new download. ([#2391](https://github.com/raullenchai/Rapid-MLX/pull/2391),
+  [#2350](https://github.com/raullenchai/Rapid-MLX/issues/2350),
+  [#2392](https://github.com/raullenchai/Rapid-MLX/pull/2392),
+  [#2349](https://github.com/raullenchai/Rapid-MLX/issues/2349))
+- **Cached speech checkpoints are recognized by their real layouts.** Complete
+  Kokoro and Whisper Turbo snapshots count as runnable when their verified
+  family-specific weights are present. ([#2406](https://github.com/raullenchai/Rapid-MLX/issues/2406),
+  [#2417](https://github.com/raullenchai/Rapid-MLX/pull/2417))
+- **System-prompt settings explain what is actually sent.** Saved and effective
+  prompts are distinguished, and optional credentials are read only when
+  needed. ([#2341](https://github.com/raullenchai/Rapid-MLX/pull/2341))
+- **Complete offline snapshots remain available without a branch ref.** A
+  single immutable cached revision is recognized as runnable, while ambiguous
+  multi-snapshot caches still fail closed. ([#2351](https://github.com/raullenchai/Rapid-MLX/issues/2351),
+  [#2404](https://github.com/raullenchai/Rapid-MLX/pull/2404))
+- **Model switching no longer scans mounted filesystems to discover servers.**
+  Live socket ownership supplies the same port and process facts without
+  prompting for access to unrelated volumes. ([#2343](https://github.com/raullenchai/Rapid-MLX/issues/2343),
+  [#2408](https://github.com/raullenchai/Rapid-MLX/pull/2408))
+- **Files can be dropped directly into the chat composer.** Supported native
+  file URLs use the existing attachment importer, while unsupported drops
+  cannot leak a local path into the message. Contributed by
+  [osdodo](https://github.com/osdodo). ([#2396](https://github.com/raullenchai/Rapid-MLX/pull/2396))
+
+### Documentation
+
+- Corrected the 0.13.0 Nemotron Labs Diffusion description to identify its
+  supported text-model path. ([#2376](https://github.com/raullenchai/Rapid-MLX/pull/2376))
+- Published a reproducible M2 Pro comparison of 0.13.0 and 0.12.18.
+  ([#2375](https://github.com/raullenchai/Rapid-MLX/pull/2375))
+
+### Known issues
+
+- Suffix decoding with sliding-window models such as Gemma 4 and GPT-OSS can
+  abort a request at a window boundary. Disable suffix decoding for these
+  models as a workaround. ([#2463](https://github.com/raullenchai/Rapid-MLX/issues/2463))
+
 ## [0.13.0] — 2026-08-26
 
 Rapid-MLX 0.13.0 makes first setup clearer, expands local model support, keeps
@@ -3200,7 +3378,8 @@ Older versions: see the
 [GitHub Releases page](https://github.com/machinefi/rapid-desktop/releases)
 for auto-generated notes against earlier tags.
 
-[Unreleased]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.12.16...HEAD
+[Unreleased]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.13.1...HEAD
+[0.13.1]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.13.0...rapid-mac-v0.13.1
 [0.5.16]: https://github.com/machinefi/rapid-desktop/compare/v0.5.15...v0.5.16
 [0.5.15]: https://github.com/machinefi/rapid-desktop/compare/v0.5.14...v0.5.15
 [0.5.14]: https://github.com/machinefi/rapid-desktop/compare/v0.5.13...v0.5.14
