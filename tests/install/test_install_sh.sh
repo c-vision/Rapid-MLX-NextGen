@@ -193,6 +193,64 @@ check "dispatch create -> only venv create" "$CALLS" " create"
 CALLS=""; dispatch_venv rebuild
 check "dispatch rebuild -> reset then create" "$CALLS" " reset create"
 
+# ── 13. first-chat starter mirrors Desktop Quickstart (#2385) ────────────────
+check "15 GB fresh install uses the safe 1.2B starter" \
+    "$(select_starter_model 15 '')" "lfm2.5-1b-4bit"
+check "16 GB fresh install uses the standard starter" \
+    "$(select_starter_model 16 '')" "qwen3.5-4b-4bit"
+check "32 GB fresh install does not suggest an uncached 27B model" \
+    "$(select_starter_model 32 '')" "qwen3.5-4b-4bit"
+check "eligible cached model is preferred" \
+    "$(select_starter_model 32 $'qwen3.5-4b-4bit\nqwen3.8-27b-4bit')" \
+    "qwen3.8-27b-4bit"
+check "cached model above the RAM tier is never selected" \
+    "$(select_starter_model 16 $'qwen3.8-27b-4bit\nlfm2.5-2.6b-4bit')" \
+    "lfm2.5-2.6b-4bit"
+check "cache matching is exact, not a substring" \
+    "$(select_starter_model 32 'prefix-qwen3.8-27b-4bit-suffix')" \
+    "qwen3.5-4b-4bit"
+
+CACHE_FIXTURE="$WORK/cache_fixture"; mkdir -p "$CACHE_FIXTURE/bin"
+cat > "$CACHE_FIXTURE/bin/rapid-mlx" <<'EOF'
+#!/bin/bash
+printf '%s\n' '{"cached":[{"alias":"qwen3.5-9b-4bit","state":"ok"},{"alias":"qwen3.8-27b-4bit","state":"ok"},{"alias":"partial","state":"incomplete"},{"alias":null,"state":"unmapped"}]}'
+EOF
+cat > "$CACHE_FIXTURE/bin/python" <<'EOF'
+#!/bin/bash
+exec python3 "$@"
+EOF
+chmod +x "$CACHE_FIXTURE/bin/rapid-mlx" "$CACHE_FIXTURE/bin/python"
+OLD_INSTALL_DIR="$INSTALL_DIR"; INSTALL_DIR="$CACHE_FIXTURE"
+check "structured cache reader returns only runnable mapped aliases" \
+    "$(installed_cached_aliases)" $'qwen3.5-9b-4bit\nqwen3.8-27b-4bit'
+check "multiple structured cached aliases feed the selector independently" \
+    "$(select_starter_model 32 "$(installed_cached_aliases)")" \
+    "qwen3.8-27b-4bit"
+RAM_GB=32 RECOMMENDED_MODEL="qwen3.5-4b-4bit" RECOMMENDED_FLAGS=""
+refresh_starter_from_installed_cache
+BANNER="$(print_quick_start_commands)"
+case "$BANNER" in
+    *"rapid-mlx serve qwen3.8-27b-4bit"*"rapid-mlx chat qwen3.8-27b-4bit --port 8000"*)
+        ok "post-install structured cache choice reaches both quick-start commands" ;;
+    *)
+        bad "post-install structured cache choice reaches both quick-start commands"
+        printf '        banner: %s\n' "$BANNER" ;;
+esac
+
+# A subprocess can print a syntactically valid partial result and still fail.
+# install.sh's top-level pipefail must make that entire cache query fail so the
+# banner uses the RAM baseline rather than trusting output from a failed scan.
+cat > "$CACHE_FIXTURE/bin/rapid-mlx" <<'EOF'
+#!/bin/bash
+printf '%s\n' '{"cached":[{"alias":"qwen3.8-27b-4bit","state":"ok"}]}'
+exit 7
+EOF
+RECOMMENDED_MODEL="stale"
+refresh_starter_from_installed_cache
+check "failed cache scan with valid partial JSON falls back to RAM baseline" \
+    "$RECOMMENDED_MODEL" "qwen3.5-4b-4bit"
+INSTALL_DIR="$OLD_INSTALL_DIR"
+
 echo
 printf 'passed %d, failed %d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
