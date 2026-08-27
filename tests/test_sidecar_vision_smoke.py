@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import socket
 from pathlib import Path
 
@@ -32,16 +33,18 @@ def test_release_workflow_runs_content_addressed_real_image_gate() -> None:
         Path(__file__).parents[1] / ".github/workflows/auto-release.yml"
     ).read_text()
     assert "timeout-minutes: 165" in workflow
-    assert "SIDECAR_VISION_SMOKE_MODEL: mlx-community/Qwen3.5-9B-4bit" in workflow
-    assert (
-        "SIDECAR_VISION_SMOKE_REVISION: 8b2b98c00a6b4d291155e4890773ca8f769aee53"
-        in workflow
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "apps/rapid-mac/scripts/sidecar-smoke-models.json"
+        ).read_text()
     )
-    assert "SIDECAR_GEMMA_SMOKE_MODEL: mlx-community/gemma-4-e2b-it-8bit" in workflow
+    assert manifest["models"]["qwen"]["repository"] == "mlx-community/Qwen3.5-9B-4bit"
     assert (
-        "SIDECAR_GEMMA_SMOKE_REVISION: 03dcf209f3f549b4075e7191e77cf69b3d48e1b2"
-        in workflow
+        manifest["models"]["gemma"]["repository"] == "mlx-community/gemma-4-e2b-it-8bit"
     )
+    assert "steps.sidecar-pins.outputs.qwen_model" in workflow
+    assert "steps.sidecar-pins.outputs.gemma_revision" in workflow
     assert "HF_HUB_OFFLINE=1 bash apps/rapid-mac/scripts/build-sidecar.sh" in workflow
     assert '"$SIDE/python/bin/python3.12"' in workflow
     assert '--model "$SIDECAR_GEMMA_SMOKE_MODEL"' in workflow

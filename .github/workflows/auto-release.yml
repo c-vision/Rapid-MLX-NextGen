@@ -288,6 +288,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
+      - name: Preflight immutable sidecar smoke snapshots
+        id: sidecar-pins
+        run: |
+          /opt/homebrew/opt/python@3.12/bin/python3.12 \
+            apps/rapid-mac/scripts/check-sidecar-smoke-cache.py \
+            --manifest apps/rapid-mac/scripts/sidecar-smoke-models.json \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: Re-verify Tier-1 agents against the release source
         env:
           VERSION: ${{ needs.detect.outputs.version }}
@@ -307,10 +315,10 @@ jobs:
           # real image gate below. The Studio runner is intentionally the only
           # release host with model weights; offline resolution makes cache
           # drift or eviction fail closed instead of silently downloading.
-          SIDECAR_VISION_SMOKE_MODEL: mlx-community/Qwen3.5-9B-4bit
-          SIDECAR_VISION_SMOKE_REVISION: 8b2b98c00a6b4d291155e4890773ca8f769aee53
-          SIDECAR_GEMMA_SMOKE_MODEL: mlx-community/gemma-4-e2b-it-8bit
-          SIDECAR_GEMMA_SMOKE_REVISION: 03dcf209f3f549b4075e7191e77cf69b3d48e1b2
+          SIDECAR_VISION_SMOKE_MODEL: ${{ steps.sidecar-pins.outputs.qwen_model }}
+          SIDECAR_VISION_SMOKE_REVISION: ${{ steps.sidecar-pins.outputs.qwen_revision }}
+          SIDECAR_GEMMA_SMOKE_MODEL: ${{ steps.sidecar-pins.outputs.gemma_model }}
+          SIDECAR_GEMMA_SMOKE_REVISION: ${{ steps.sidecar-pins.outputs.gemma_revision }}
         run: |
           set -euo pipefail
           export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
