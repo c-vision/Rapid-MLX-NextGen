@@ -343,6 +343,8 @@ jobs:
             tests/test_streaming_newlines.py \
             tests/test_minimax_reasoning_parser.py \
             tests/test_pr_validate_runner.py \
+            tests/test_pr_validate_merge_base.py \
+            tests/test_pr_validate_diff_coverage.py \
             tests/test_pr_validate_codex.py \
             tests/test_release_baselines.py \
             tests/test_sidecar_distribution_constraints.py \
