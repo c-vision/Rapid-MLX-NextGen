@@ -260,7 +260,7 @@ final class ResidentLoadRejectProtocol: URLProtocol, @unchecked Sendable {
 /// can never fire and no responder is needed: the suite asserts the resident
 /// rejection/load behaviour on fixtures, not on the host's real RAM.
 @MainActor
-@Suite("Resident-load rejection feedback", .serialized)
+@Suite("Resident-load rejection feedback", .serialized, TestTimeouts.hangProne)
 struct ResidentLoadFeedbackTests {
     @Test("Resident admission publishes alias-scoped working state immediately", .timeLimit(.minutes(1)))
     func publishesResidentLoadInFlightState() async {

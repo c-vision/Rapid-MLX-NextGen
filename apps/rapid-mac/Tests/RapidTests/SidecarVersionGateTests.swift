@@ -29,7 +29,7 @@ import Testing
 /// can't quietly delete any one of them. The bug class is too
 /// expensive (100% slim-DMG install failure rate; only caught by
 /// release-day dogfood) to rely on a single point of defence.
-@Suite("Sidecar version SemVer gate (#411) — four-layer regression pins")
+@Suite("Sidecar version SemVer gate (#411) — four-layer regression pins", TestTimeouts.hangProne)
 struct SidecarVersionGateTests {
 
     private static var sourceRoot: URL {

@@ -96,6 +96,32 @@ let package = Package(
             name: "SwiftMathVendorTests",
             dependencies: ["SwiftMath"],
             path: "Vendor/SwiftMath/Tests"
+        ),
+        // #2488: the Desktop test-suite hang watchdog.
+        //
+        // ``RapidDesktopTestWatchdog`` is a small library holding the pure,
+        // seam-injectable hang-watchdog logic (deadline math, artifact path,
+        // sample invocation) that the CI wrapper
+        // (``scripts/desktop-test-timeout.sh``) uses to convert a hung
+        // `swift test` run into a fast, readable failure with a sampled stack
+        // artifact. Its decision logic is unit-tested in
+        // ``RapidDesktopTestWatchdogTests`` with fake clock / process / sample
+        // seams. It deliberately does NOT ship in the `.app` (the ``Rapid``
+        // executable target does not depend on it) — it is a CI/test-runner
+        // concern only.
+        .target(
+            name: "RapidDesktopTestWatchdog",
+            path: "Sources/RapidDesktopTestWatchdog"
+        ),
+        .executableTarget(
+            name: "RapidDesktopTestWatchdogRun",
+            dependencies: ["RapidDesktopTestWatchdog"],
+            path: "Sources/RapidDesktopTestWatchdogRun"
+        ),
+        .testTarget(
+            name: "RapidDesktopTestWatchdogTests",
+            dependencies: ["RapidDesktopTestWatchdog"],
+            path: "Tests/RapidDesktopTestWatchdogTests"
         )
         // NOTE (2026-08-05): the RapidTests target is BACK in the manifest,
         // above. It had been excluded on the reasoning that the strip

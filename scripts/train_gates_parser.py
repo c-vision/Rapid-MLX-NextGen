@@ -261,16 +261,27 @@ def parse_diff_cover_invocation() -> dict[str, Any]:
 
 
 def parse_swift_test_invocation() -> dict[str, Any]:
-    """Parse the Desktop ``swift test`` invocation from rapid-mac-ci.yml."""
+    """Parse the Desktop ``swift test`` invocation from rapid-mac-ci.yml.
+
+    Since #2488 the hosted Desktop gate wraps ``swift test --no-parallel`` in
+    ``scripts/desktop-test-timeout.sh`` (per-run hang deadline + sample
+    artifact). The authoritative invocation is now that wrapper; the legacy
+    bare ``swift test --no-parallel`` remains accepted so an unpinned checkout
+    (or a pre-#2488 branch) doesn't drift-fail. ``train_gates.sh`` Gate 5 runs
+    the real ``swift test --no-parallel`` itself; this parser's value only
+    feeds the deterministic gates-hash.
+    """
+    desktop_wrapper = "./scripts/desktop-test-timeout.sh"
     parsed = yaml.safe_load(MAC_CI_WORKFLOW.read_text())
     for job in parsed["jobs"].values():
         for step in job.get("steps", []):
             if isinstance(step, dict) and step.get("name") == "swift test":
                 run = step["run"].strip()
-                if run != "swift test --no-parallel":
+                if run not in (desktop_wrapper, "swift test --no-parallel"):
                     raise _drift(
                         f"Desktop swift test drifted: expected "
-                        f"'swift test --no-parallel', found {run!r}"
+                        f"{desktop_wrapper!r} or 'swift test --no-parallel', "
+                        f"found {run!r}"
                     )
                 return {"cmd": run}
     raise _drift("could not find the Desktop 'swift test' step")

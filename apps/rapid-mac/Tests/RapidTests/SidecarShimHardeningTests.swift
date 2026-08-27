@@ -22,7 +22,7 @@ import Testing
 ///
 /// Pattern mirrors ``ToolUseCapabilitySourceGuardTests`` (PR #343):
 /// strip comments/whitespace, then assert canonical substrings.
-@Suite("Sidecar shim cwd-hijack hardening (#361)")
+@Suite("Sidecar shim cwd-hijack hardening (#361)", TestTimeouts.hangProne)
 struct SidecarShimHardeningTests {
 
     /// Repository root, derived from ``#filePath`` so the test runs

@@ -4,6 +4,15 @@ import XCTest
 
 @MainActor
 final class ChatAttachmentJourneyTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        // #2488: bound each XCUI journey to 2 minutes so a hung UI test (the
+        // #2481 ledger hang) fails fast instead of stalling the XCUITest run.
+        // This is the XCUITest-target analog of the Swift Testing
+        // `TestTimeouts.hangProne` suite trait.
+        executionTimeAllowance = 120
+    }
+
     func testPickerAttachmentsStayWithTheirConversationAndWirePayload() throws {
         continueAfterFailure = false
         let harness = try RapidUITestHarness(

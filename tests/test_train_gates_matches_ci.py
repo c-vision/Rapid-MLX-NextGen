@@ -342,9 +342,19 @@ def test_train_gates_refuses_base_equal_to_head() -> None:
 # Desktop swift test (Gate 5)
 # ---------------------------------------------------------------------------
 def test_swift_test_invocation_matches_workflow() -> None:
+    # Since #2488 the hosted Desktop gate wraps `swift test --no-parallel` in
+    # ``scripts/desktop-test-timeout.sh``. The parser must reflect THAT as the
+    # authoritative desktop-test invocation (it feeds the gates-hash).
     parsed = parse_swift_test_invocation()
-    assert parsed == {"cmd": "swift test --no-parallel"}
-    assert "swift test --no-parallel" in MAC_CI
+    assert parsed in (
+        {"cmd": "swift test --no-parallel"},
+        {"cmd": "./scripts/desktop-test-timeout.sh"},
+    )
+    hosted = MAC_CI
+    assert (
+        "swift test --no-parallel" in hosted
+        or "./scripts/desktop-test-timeout.sh" in hosted
+    )
 
 
 # ---------------------------------------------------------------------------

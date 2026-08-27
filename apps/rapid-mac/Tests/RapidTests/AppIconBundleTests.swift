@@ -14,7 +14,7 @@ import Testing
 /// macOS reads 5 base sizes off an icns (16, 32, 128, 256, 512) and
 /// each has a `@2x` retina pair, so 10 representations total. We
 /// assert all 10 are present and decode to a non-empty PNG payload.
-@Suite("AppIcon.icns subimage coverage")
+@Suite("AppIcon.icns subimage coverage", TestTimeouts.hangProne)
 struct AppIconBundleTests {
     /// Locate the shipped icns by walking up from the test bundle
     /// to the repo root, since `swift test` doesn't expose Resources/

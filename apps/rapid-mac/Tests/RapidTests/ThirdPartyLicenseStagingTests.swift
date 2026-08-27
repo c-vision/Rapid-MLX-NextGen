@@ -23,7 +23,7 @@ import Testing
 /// vendored SwiftMath notice exists in-tree, `THIRD_PARTY.md` points at the
 /// shipped `Contents/Resources/Licenses/` location, and `build.sh` actually
 /// invokes the staging script.
-@Suite("Third-party license staging")
+@Suite("Third-party license staging", TestTimeouts.hangProne)
 struct ThirdPartyLicenseStagingTests {
     /// Repository root, derived from this file's own compile-time location:
     /// `<root>/apps/rapid-mac/Tests/RapidTests/<this file>`.

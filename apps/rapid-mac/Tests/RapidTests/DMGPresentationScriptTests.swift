@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 
-@Suite("DMG presentation scripts")
+@Suite("DMG presentation scripts", TestTimeouts.hangProne)
 struct DMGPresentationScriptTests {
     @Test("Validator preserves legacy compatibility and detaches by device")
     func validatorCompatibilityAndCleanup() throws {
