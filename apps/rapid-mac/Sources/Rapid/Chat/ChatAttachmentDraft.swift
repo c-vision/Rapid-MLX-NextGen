@@ -39,6 +39,10 @@ struct ChatAttachmentDraft: Equatable {
     mutating func beginImageImport() -> UUID? {
         guard imageImportID == nil else { return nil }
         let id = UUID()
+        // A new selection supersedes an old notice. Any notice produced by
+        // that selection after async image decoding starts must survive its
+        // later completion.
+        notice = nil
         imageImportID = id
         return id
     }
@@ -51,7 +55,13 @@ struct ChatAttachmentDraft: Equatable {
     ) -> Bool {
         guard imageImportID == id else { return false }
         appendImages(imported)
-        self.notice = notice
+        if let notice {
+            if let current = self.notice, current != notice {
+                self.notice = "\(current) \(notice)"
+            } else {
+                self.notice = notice
+            }
+        }
         imageImportID = nil
         return true
     }

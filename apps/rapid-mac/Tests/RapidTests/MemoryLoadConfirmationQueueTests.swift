@@ -233,6 +233,33 @@ struct MemoryLoadConfirmationQueueTests {
         #expect(refreshed.new.plannedReleaseGB == 6)
     }
 
+    @Test("pre-stop replacement refresh keeps its pending release credit")
+    func liveRefreshCreditsPendingReplacement() throws {
+        let gib = UInt64(1 << 30)
+        let queue = MemoryLoadConfirmationQueue()
+        let original = ModelSizing.MemoryWarning(
+            alias: "next-chat",
+            hfPath: nil,
+            isAutoRespawn: false,
+            severity: .unsafe,
+            footprintGB: 7,
+            freeGB: 2,
+            totalGB: 18,
+            plannedReleaseGB: 4,
+            plannedReleaseIsPending: true
+        )
+        queue.enqueue(warning: original, requestID: nil)
+
+        let result = queue.refreshCurrentWarning(
+            snapshot: .init(totalBytes: 18 * gib, usedBytes: 12 * gib)
+        )
+        let refreshed = try #require(result)
+
+        #expect(refreshed.new.severity == .safe)
+        #expect(refreshed.new.freeGB == 10)
+        #expect(refreshed.new.plannedReleaseIsPending)
+    }
+
     @Test("refresh is ignored after the visible decision starts launching")
     func liveRefreshCannotRewriteLaunchingDecision() {
         let gib = UInt64(1 << 30)

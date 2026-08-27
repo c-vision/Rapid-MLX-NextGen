@@ -31,6 +31,28 @@ struct ChatAttachmentDraftTests {
         #expect(draft.sourcePaths.count == 1)
     }
 
+    @Test("async image completion preserves a rejection from the same mixed selection")
+    func mixedSelectionNoticeSurvivesImageCompletion() throws {
+        let conversationID = UUID()
+        var store = ChatAttachmentDraftStore()
+        store[conversationID].notice = "Old notice"
+        let startedRequest = store.beginImageImport(conversationID: conversationID)
+        let request = try #require(startedRequest)
+        #expect(store[conversationID].notice == nil)
+
+        store[conversationID].notice = "That file type isn't supported."
+        let image = try makeImage(name: "accepted.png")
+        let accepted = store.finishImageImport(
+            request: request,
+            [(image, URL(fileURLWithPath: "/tmp/accepted.png"))],
+            notice: nil
+        )
+
+        #expect(accepted)
+        #expect(store[conversationID].images == [image])
+        #expect(store[conversationID].notice == "That file type isn't supported.")
+    }
+
     @Test("consume atomically clears attachments, identity, notice, and import state")
     func consumeClearsEveryTransientField() throws {
         let image = try makeImage(name: "first.png")

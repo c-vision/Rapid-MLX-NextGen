@@ -800,21 +800,26 @@ enum ChatStreamError: LocalizedError {
         }
     }
 
-    /// Only the typed image-rejection contract is safe, user-facing copy.
-    /// Other structured 4xx/5xx envelopes may contain operational details and
-    /// must continue through the normal actionable-error diagnosis.
+    /// A typed client-side rejection on an image-bearing request is terminal
+    /// for that attachment. The caller uses this only when the request owns an
+    /// image turn, so later plain-text turns can omit the rejected payload.
     var attachmentFailureMessage: String? {
         guard case .httpStatus(let code, let body) = self,
-              (400..<600).contains(code),
+              (400..<500).contains(code),
               let data = body.data(using: .utf8),
               let envelope = try? JSONDecoder().decode(Wire.ErrorEnvelope.self, from: data),
               envelope.error.type == "invalid_request_error",
-              envelope.error.code == "image_input_unsupported",
               let message = envelope.error.message?.trimmingCharacters(
                 in: .whitespacesAndNewlines
               ),
               !message.isEmpty
         else { return nil }
+
+        if message.localizedCaseInsensitiveContains("vision-request prompt tokens"),
+           message.localizedCaseInsensitiveContains("exceeds the per-batch cap") {
+            return "That image is too large for this model. Try an image no larger than 2,048 pixels on its longest side."
+        }
+        guard envelope.error.code == "image_input_unsupported" else { return nil }
         return message
     }
 }

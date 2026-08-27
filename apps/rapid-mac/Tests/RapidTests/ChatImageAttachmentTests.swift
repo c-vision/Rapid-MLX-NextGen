@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import ImageIO
 import Testing
@@ -13,6 +14,41 @@ struct ChatImageAttachmentTests {
         #expect(!ChatImageAttachment.dimensionsFit(width: 8_001, height: 8_000))
         #expect(!ChatImageAttachment.dimensionsFit(width: 20_000, height: 1))
         #expect(!ChatImageAttachment.dimensionsFit(width: 0, height: 4_000))
+    }
+
+    @Test("vision-bound dimensions preserve aspect ratio with a 2048-pixel long edge")
+    func visionDimensionBudget() {
+        #expect(ChatImageAttachment.normalizedPixelSize(width: 5_000, height: 4_000) == (2_048, 1_638))
+        #expect(ChatImageAttachment.normalizedPixelSize(width: 3_840, height: 2_160) == (2_048, 1_152))
+        #expect(ChatImageAttachment.normalizedPixelSize(width: 140, height: 140) == (140, 140))
+    }
+
+    @Test("large JPEG is normalized at the attachment boundary while a small PNG stays unchanged")
+    func largeStandardImageNormalizes() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rapid-image-normalization-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let jpeg = root.appendingPathComponent("photo.jpg")
+        try Self.writeSolidImage(to: jpeg, width: 5_000, height: 4_000, type: .jpeg)
+        let normalized = try ChatImageAttachment(contentsOf: jpeg)
+        let normalizedSource = try #require(
+            CGImageSourceCreateWithData(normalized.data as CFData, nil)
+        )
+        let normalizedProperties = try #require(
+            CGImageSourceCopyPropertiesAtIndex(normalizedSource, 0, nil) as? [CFString: Any]
+        )
+        #expect((normalizedProperties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue == 2_048)
+        #expect((normalizedProperties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue == 1_638)
+
+        let png = root.appendingPathComponent("small.png")
+        try Self.writeSolidImage(to: png, width: 140, height: 140, type: .png)
+        let originalPNG = try Data(contentsOf: png)
+        let unchanged = try ChatImageAttachment(contentsOf: png)
+        #expect(unchanged.filename == "small.png")
+        #expect(unchanged.mimeType == "image/png")
+        #expect(unchanged.data == originalPNG)
     }
 
     @Test("real HEIC fixture normalizes to truthful JPEG attachment bytes")
@@ -420,5 +456,35 @@ struct ChatImageAttachmentTests {
         #expect(throws: ChatImageAttachment.ValidationError.self) {
             try ChatImageAttachment(filename: "x.webp", mimeType: "image/webp", data: Data())
         }
+    }
+
+    private static func writeSolidImage(
+        to url: URL,
+        width: Int,
+        height: Int,
+        type: UTType
+    ) throws {
+        let context = try #require(CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.setFillColor(red: 0.9, green: 0.4, blue: 0.1, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let image = try #require(context.makeImage())
+        let output = NSMutableData()
+        let destination = try #require(CGImageDestinationCreateWithData(
+            output,
+            type.identifier as CFString,
+            1,
+            nil
+        ))
+        CGImageDestinationAddImage(destination, image, nil)
+        #expect(CGImageDestinationFinalize(destination))
+        try (output as Data).write(to: url)
     }
 }

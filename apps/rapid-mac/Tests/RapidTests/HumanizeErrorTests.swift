@@ -55,8 +55,24 @@ struct HumanizeErrorTests {
         #expect(!ChatViewModel.humanize(error).contains("image input"))
     }
 
+    @Test("Vision token-cap rejection becomes actionable terminal image copy")
+    func visionTokenCapBecomesAttachmentRejection() {
+        let body = #"{"error":{"message":"Vision-request prompt tokens (16329) exceeds the per-batch cap (8192 = vision token budget 8192 × 1 vision request(s)). For image inputs, downscale the image.","type":"invalid_request_error","code":null}}"#
+        let message = ChatStreamError.httpStatus(400, body).attachmentFailureMessage
+        #expect(
+            message
+                == "That image is too large for this model. Try an image no larger than 2,048 pixels on its longest side."
+        )
+        #expect(message?.contains("tokens") == false)
+        #expect(message?.contains("8192") == false)
+    }
+
     @Test("Unrelated structured server failures remain private diagnostics")
     func structuredServerFailureReasonStaysPrivate() {
+        #expect(ChatStreamError.httpStatus(
+            400,
+            #"{"error":{"message":"Context length exceeded","type":"invalid_request_error","code":"context_length_exceeded"}}"#
+        ).attachmentFailureMessage == nil)
         #expect(ChatStreamError.httpStatus(
             500,
             #"{"error":{"message":"Internal server error"}}"#

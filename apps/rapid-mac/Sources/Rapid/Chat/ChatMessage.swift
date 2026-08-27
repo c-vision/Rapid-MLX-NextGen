@@ -4,6 +4,10 @@ import UniformTypeIdentifiers
 
 struct ChatImageAttachment: Codable, Equatable, Hashable, Identifiable, Sendable {
     static let maxBytes = 20 * 1024 * 1024
+    /// Keep image preprocessing below the embedded engine's per-request
+    /// vision-token budget. A 2048 × 1536 image is roughly 4K vision tokens
+    /// on the recommended model, leaving useful margin below its 8K cap.
+    static let maxVisionLongEdge = 2_048
     /// Bounds decoded memory before ImageIO creates a full bitmap. This still
     /// admits 48 MP iPhone captures while rejecting compressed image bombs.
     static let maxPixelCount = 64_000_000
@@ -15,6 +19,16 @@ struct ChatImageAttachment: Codable, Equatable, Hashable, Identifiable, Sendable
             && width <= maxPixelDimension
             && height <= maxPixelDimension
             && width <= maxPixelCount / height
+    }
+
+    static func normalizedPixelSize(width: Int, height: Int) -> (width: Int, height: Int) {
+        let longEdge = max(width, height)
+        guard longEdge > maxVisionLongEdge else { return (width, height) }
+        let scale = Double(maxVisionLongEdge) / Double(longEdge)
+        return (
+            max(1, Int((Double(width) * scale).rounded())),
+            max(1, Int((Double(height) * scale).rounded()))
+        )
     }
 
     let id: UUID
@@ -41,30 +55,43 @@ struct ChatImageAttachment: Codable, Equatable, Hashable, Identifiable, Sendable
     init(contentsOf url: URL) throws {
         let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentTypeKey])
         guard (values.fileSize ?? 0) <= Self.maxBytes else { throw ValidationError.tooLarge }
+        guard values.contentType?.conforms(to: .image) == true,
+              let source = CGImageSourceCreateWithURL(url as CFURL, nil)
+        else { throw ValidationError.unsupportedType }
+        guard CGImageSourceGetCount(source) == 1 else { throw ValidationError.animatedGIF }
+        let sourceProperties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+            as? [CFString: Any] ?? [:]
+        guard let width = (sourceProperties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (sourceProperties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              Self.dimensionsFit(width: width, height: height)
+        else { throw ValidationError.tooManyPixels }
+
         let type = values.contentType
-        if type?.conforms(to: .png) == true {
+        let fitsVisionBudget = max(width, height) <= Self.maxVisionLongEdge
+        if type?.conforms(to: .png) == true, fitsVisionBudget {
             try self.init(
                 filename: url.lastPathComponent,
                 mimeType: "image/png",
                 data: Data(contentsOf: url)
             )
-        } else if type?.conforms(to: .jpeg) == true {
+        } else if type?.conforms(to: .jpeg) == true, fitsVisionBudget {
             try self.init(
                 filename: url.lastPathComponent,
                 mimeType: "image/jpeg",
                 data: Data(contentsOf: url)
             )
-        } else if type?.conforms(to: .gif) == true {
+        } else if type?.conforms(to: .gif) == true, fitsVisionBudget {
             try self.init(
                 filename: url.lastPathComponent,
                 mimeType: "image/gif",
                 data: Data(contentsOf: url)
             )
         } else {
-            guard type?.conforms(to: .image) == true else {
-                throw ValidationError.unsupportedType
-            }
-            let normalized = try Self.normalizedStaticImage(at: url)
+            let normalized = try Self.normalizedStaticImage(
+                source: source,
+                sourceProperties: sourceProperties,
+                at: url
+            )
             try self.init(
                 filename: normalized.filename,
                 mimeType: normalized.mimeType,
@@ -75,30 +102,34 @@ struct ChatImageAttachment: Codable, Equatable, Hashable, Identifiable, Sendable
 
     /// Normalize native still-image formats at the attachment boundary so the
     /// persisted attachment, preview, and wire request all share one truthful
-    /// MIME/byte contract. PNG/JPEG/GIF stay byte-for-byte unchanged above;
-    /// every other decodable static image becomes JPEG, or PNG when alpha must
-    /// be preserved. The ordinary initializer applies the same 20 MB wire cap
-    /// to the normalized result.
+    /// MIME/byte contract. Small PNG/JPEG/GIF files stay byte-for-byte
+    /// unchanged above. Larger or native still images become JPEG, or PNG when
+    /// alpha must be preserved. The ordinary initializer applies the same 20 MB
+    /// wire cap to the normalized result.
     private static func normalizedStaticImage(
+        source: CGImageSource,
+        sourceProperties: [CFString: Any],
         at url: URL
     ) throws -> (filename: String, mimeType: String, data: Data) {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              CGImageSourceGetCount(source) == 1
-        else { throw ValidationError.unsupportedType }
-        let sourceProperties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
-            as? [CFString: Any] ?? [:]
-        guard let width = (sourceProperties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
-              let height = (sourceProperties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
-              dimensionsFit(width: width, height: height)
-        else { throw ValidationError.tooManyPixels }
-        guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxVisionLongEdge,
+            kCGImageSourceShouldCacheImmediately: true,
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            thumbnailOptions as CFDictionary
+        ) else {
             throw ValidationError.unsupportedType
         }
 
-        let preservesAlpha: Bool = switch image.alphaInfo {
-        case .none, .noneSkipFirst, .noneSkipLast: false
-        case .premultipliedFirst, .premultipliedLast, .first, .last, .alphaOnly: true
-        @unknown default: true
+        let preservesAlpha: Bool
+        if let sourceHasAlpha = sourceProperties[kCGImagePropertyHasAlpha] as? NSNumber {
+            preservesAlpha = sourceHasAlpha.boolValue
+        } else {
+            preservesAlpha = Self.containsTransparentPixel(image)
         }
         let targetType: UTType = preservesAlpha ? .png : .jpeg
         let mimeType = preservesAlpha ? "image/png" : "image/jpeg"
@@ -111,6 +142,8 @@ struct ChatImageAttachment: Codable, Equatable, Hashable, Identifiable, Sendable
         ) else { throw ValidationError.unsupportedType }
 
         var properties = sourceProperties
+        // The thumbnail transform has already applied EXIF orientation.
+        properties[kCGImagePropertyOrientation] = 1
         if !preservesAlpha {
             properties[kCGImageDestinationLossyCompressionQuality] = 0.9
         }
@@ -122,6 +155,29 @@ struct ChatImageAttachment: Codable, Equatable, Hashable, Identifiable, Sendable
         let base = url.deletingPathExtension().lastPathComponent
         let suffix = preservesAlpha ? "png" : "jpg"
         return ("\(base).\(suffix)", mimeType, output as Data)
+    }
+
+    /// Thumbnail backing stores may carry an alpha channel for an opaque
+    /// source. Inspect the already-bounded thumbnail instead of treating the
+    /// channel's mere presence as transparency.
+    private static func containsTransparentPixel(_ image: CGImage) -> Bool {
+        switch image.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast: return false
+        default: break
+        }
+        let bytesPerRow = image.width * 4
+        var pixels = [UInt8](repeating: 255, count: bytesPerRow * image.height)
+        guard let context = CGContext(
+            data: &pixels,
+            width: image.width,
+            height: image.height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return true }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return stride(from: 3, to: pixels.count, by: 4).contains { pixels[$0] < 255 }
     }
 
     var dataURL: String { "data:\(mimeType);base64,\(data.base64EncodedString())" }

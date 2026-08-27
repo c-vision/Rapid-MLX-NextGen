@@ -109,6 +109,15 @@ final class MemoryLoadConfirmationQueue {
         pending[0].phase = .awaitingDecision
     }
 
+    func cancelChecking(warningID: UUID) {
+        guard pending.first?.warning.id == warningID,
+              pending.first?.phase == .checkingDecision else { return }
+        if let requestID = pending[0].requestID {
+            decisions[requestID] = .cancelled
+        }
+        pending.removeFirst()
+    }
+
     func confirmChecking(
         warningID: UUID,
         sequence: Int
@@ -162,26 +171,28 @@ final class MemoryLoadConfirmationQueue {
         _ old: ModelSizing.MemoryWarning,
         snapshot: MemoryProbe.Snapshot
     ) -> ModelSizing.MemoryWarning {
-        // Replacement admission reaches this queue only after `ensureServing`
-        // has awaited `stop()`. The fresh host sample therefore already
-        // reflects whatever memory macOS has reclaimed from the old process;
-        // subtracting `plannedReleaseGB` again would understate live use. Keep
-        // the value solely to explain which release the initial projection
-        // accounted for.
-        ModelSizing.MemoryWarning(
+        let gib = Double(UInt64(1) << 30)
+        let pendingReleaseBytes = old.plannedReleaseIsPending
+            ? UInt64(max(0, old.plannedReleaseGB) * gib)
+            : 0
+        let projectedUsedBytes = snapshot.usedBytes
+            - min(snapshot.usedBytes, pendingReleaseBytes)
+        return ModelSizing.MemoryWarning(
             id: old.id,
             alias: old.alias,
             hfPath: old.hfPath,
             isAutoRespawn: old.isAutoRespawn,
             severity: ModelSizing.memorySafety(
                 footprintGB: old.footprintGB,
-                usedBytes: snapshot.usedBytes,
+                usedBytes: projectedUsedBytes,
                 totalBytes: snapshot.totalBytes
             ),
             footprintGB: old.footprintGB,
-            freeGB: Double(snapshot.freeBytes) / Double(1 << 30),
+            freeGB: Double(snapshot.totalBytes - projectedUsedBytes) / gib,
             totalGB: Double(snapshot.totalBytes) / Double(1 << 30),
-            plannedReleaseGB: old.plannedReleaseGB
+            plannedReleaseGB: old.plannedReleaseGB,
+            plannedReleaseIsPending: old.plannedReleaseIsPending,
+            plannedReleaseAlias: old.plannedReleaseAlias
         )
     }
 }
@@ -1359,6 +1370,60 @@ final class ServerManager {
         // surface as a hard failure instead of the process swap they actually
         // need — audio runs as its own ``serve <alias>`` (audio-mode) process.
         let readyWithChild: Bool = { if case .ready = state, child != nil { return true }; return false }()
+        // The engine owns keep-vs-evict admission inside its real memory
+        // ceiling, but Desktop can intentionally evaluate a smaller hardware
+        // fixture than the host sidecar. Preserve the app-wide >100% safety
+        // contract before an assistant replacement reaches the resident-load
+        // endpoint: credit only the resident assistant that the replacement
+        // policy may free. Cancel therefore leaves the current model and its
+        // streams untouched; confirmation reuses the existing stop/start
+        // override rather than inventing a second bypass path.
+        if replacementGroup == .assistant,
+           readyWithChild,
+           let currentAlias = launchedChildAlias,
+           currentAlias != trimmed,
+           let host = memorySnapshotProvider() {
+            let admission = Self.memoryAdmissionForTransition(
+                host: host,
+                residency: residency,
+                plan: .releaseModel(alias: currentAlias)
+            ) ?? MemoryAdmissionContext(snapshot: host, plannedReleaseBytes: 0)
+            let footprint = estimatedMemoryGB ?? ModelSizing.estimate(alias: trimmed).totalGB
+            let safety = ModelSizing.memorySafety(
+                footprintGB: footprint,
+                usedBytes: admission.snapshot.usedBytes,
+                totalBytes: admission.snapshot.totalBytes
+            )
+            if ModelSizing.requiresMemoryConfirmation(safety) {
+                let memoryRequestID = UUID()
+                memoryConfirmations.enqueue(
+                    warning: ModelSizing.MemoryWarning(
+                        alias: trimmed,
+                        hfPath: hfPath,
+                        isAutoRespawn: false,
+                        severity: safety,
+                        footprintGB: footprint,
+                        freeGB: Double(admission.snapshot.freeBytes) / Double(1 << 30),
+                        totalGB: Double(admission.snapshot.totalBytes) / Double(1 << 30),
+                        plannedReleaseGB: Double(admission.plannedReleaseBytes)
+                            / Double(1 << 30),
+                        plannedReleaseIsPending: true,
+                        plannedReleaseAlias: currentAlias
+                    ),
+                    requestID: memoryRequestID
+                )
+                guard let decision = await awaitMemoryDecision(for: memoryRequestID) else {
+                    return false
+                }
+                switch decision {
+                case .cancelled:
+                    return false
+                case .confirmed(let sequence):
+                    await awaitConfirmedLaunch(sequence)
+                    return isServing(trimmed)
+                }
+            }
+        }
         // The resident loader deliberately refuses to replace a busy model.
         // Once the user approves the destructive action, bypass that route and
         // use the existing process stop/start fallback so "Switch" performs
@@ -1545,6 +1610,7 @@ final class ServerManager {
     enum MemoryResidencyPlan: Sendable, Equatable {
         case keepResidentModels
         case releaseResidentModels
+        case releaseModel(alias: String)
     }
 
     struct MemoryAdmissionContext: Sendable, Equatable {
@@ -1575,21 +1641,28 @@ final class ServerManager {
     /// One-shot host-memory view for the transition the lifecycle will run.
     ///
     /// A process replacement releases every resident engine before spawning
-    /// the target, regardless of whether the outgoing lane is chat, image, or
-    /// audio. An in-process load keeps its residents and therefore receives no
-    /// credit here; the residency loader owns its own admission/eviction plan.
-    /// Returning `nil` for a release with no trustworthy residency evidence
-    /// deliberately preserves the ordinary post-stop live probe.
+    /// the target. An assistant replacement credits only the exact outgoing
+    /// assistant that the engine policy may evict; audio and other auxiliary
+    /// residents remain charged. Returning `nil` for a release with no
+    /// trustworthy residency evidence preserves the ordinary live probe.
     nonisolated static func memoryAdmissionForTransition(
         host: MemoryProbe.Snapshot,
         residency: ModelResidencySnapshot,
         plan: MemoryResidencyPlan
     ) -> MemoryAdmissionContext? {
-        guard plan == .releaseResidentModels else {
+        guard plan != .keepResidentModels else {
             return MemoryAdmissionContext(snapshot: host, plannedReleaseBytes: 0)
         }
         var reclaimableBytes: UInt64 = 0
-        for resident in residency.models where resident.state != "evicting" {
+        let residentsToRelease = residency.models.filter { resident in
+            guard resident.state != "evicting" else { return false }
+            switch plan {
+            case .keepResidentModels: return false
+            case .releaseResidentModels: return true
+            case .releaseModel(let alias): return resident.matches(alias)
+            }
+        }
+        for resident in residentsToRelease {
             let bytes = resident.displayBytes
             reclaimableBytes += min(bytes, host.usedBytes - reclaimableBytes)
             if reclaimableBytes == host.usedBytes { break }
@@ -1857,6 +1930,18 @@ final class ServerManager {
             snapshot: snapshot
         ) else { return }
 
+        let plannedReleaseChanged = latestWarning.plannedReleaseAlias.map { expectedAlias in
+            guard let liveAlias = launchedChildAlias else { return true }
+            return ModelSwitchDecision.requiresRevalidation(
+                validatedAlias: expectedAlias,
+                liveAlias: liveAlias
+            )
+        } ?? false
+        if plannedReleaseChanged {
+            memoryConfirmations.cancelChecking(warningID: warning.id)
+            return
+        }
+
         // Only the explicit unsafe action is a waiver. An ordinary Load that
         // became unsafe during this activation remains parked on the same
         // queue entry, preserving its waiter and presenting the new facts.
@@ -1874,7 +1959,11 @@ final class ServerManager {
         ) else { return }
         memoryConfirmRunning.insert(seq)
         if child != nil {
-            await stop()
+            await stop(
+                preservingLastServedAlias: Self.memoryConfirmationPreservesResumeAlias(
+                    currentWarning
+                )
+            )
         }
         // The activation sample above is the guard for this exact click.
         // Avoid a second sample after the queue has entered `.launching`,
@@ -1887,6 +1976,12 @@ final class ServerManager {
         )
         memoryConfirmRunning.remove(seq)
         memoryConfirmations.completeConfirmedLaunch(warningID: currentWarning.id)
+    }
+
+    nonisolated static func memoryConfirmationPreservesResumeAlias(
+        _ warning: ModelSizing.MemoryWarning
+    ) -> Bool {
+        warning.plannedReleaseAlias != nil
     }
 
     /// The user backed out of a memory-risky load. Just drops the

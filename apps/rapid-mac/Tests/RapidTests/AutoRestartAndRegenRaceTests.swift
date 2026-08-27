@@ -111,6 +111,27 @@ struct AutoRestartAndRegenRaceTests {
             expectedStop: true,
             preservingLastServedAlias: false
         ))
+        #expect(ServerManager.memoryConfirmationPreservesResumeAlias(
+            ModelSizing.MemoryWarning(
+                alias: "new-chat",
+                hfPath: nil,
+                isAutoRespawn: false,
+                severity: .unsafe,
+                footprintGB: 44,
+                freeGB: 10,
+                plannedReleaseAlias: "known-good-chat"
+            )
+        ))
+        #expect(!ServerManager.memoryConfirmationPreservesResumeAlias(
+            ModelSizing.MemoryWarning(
+                alias: "cold-start",
+                hfPath: nil,
+                isAutoRespawn: false,
+                severity: .unsafe,
+                footprintGB: 44,
+                freeGB: 10
+            )
+        ))
     }
 
     @Test("audio aliases skip the in-process residency load and use stop/start")
