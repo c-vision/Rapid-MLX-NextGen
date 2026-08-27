@@ -312,6 +312,66 @@ test = [
     "pytest-cov>=4.0.0",
     "diff-cover>=8.0.0,<9.0.0",
 ]
+# CI declared dependency sets — replaces the ad hoc `pip install <list>` lines
+# that used to live inline in `.github/workflows/ci.yml`. Each workflow lane's
+# runtime surface is versioned and reviewed here instead of buried in a YAML
+# one-liner that supply-chain review can't scope. Follows the same declaration
+# style as `vision`/`dflash`/`mtp`.
+#
+# Install mode differs per lane because `ci-linux` must stay no-MLX:
+#   * Apple lanes (`ci-apple`, a superset of `ci-linux`) install `-e .[<extra>]`
+#     — MLX is legitimate there (it IS the engine).
+#   * The Linux `test-matrix` lane installs `-e . --no-deps` (so the base
+#     package's mlx / mlx-lm deps never land on Linux) plus the ci-linux test
+#     set from `config/requirements-ci-linux.txt`, which is a SYNCED MIRROR of
+#     this extra (a drift test in tests/test_ci_apple_coverage_union.py fails
+#     closed if they fall out of step).
+#
+# `ci-linux` = the exact dependency set the Linux `test-matrix` lane needs to
+# import the no-MLX unit suite and run those tests with coverage. It is the
+# union of the old ad hoc line PLUS the *undeclared-optional* `jinja2` that
+# made #2445 / #2446 red on that lane: the reasoning/template tests render
+# chat templates via ``transformers.utils.chat_template_utils._compile_jinja_template``
+# which requires jinja2 at runtime, and neither transformers nor pandas pulls
+# it transitively. Declared explicitly, so the two tests below are un-deselected:
+#   * tests/test_cohere_command_reasoning_parser.py::test_prompt_priming_detects_command_markers_and_mixed_templates
+#   * tests/test_postprocessor.py::TestStreamingPostProcessorReasoning::test_1570_distill_parser_stays_active_when_thinking_flag_is_false
+ci-linux = [
+    # Test infra — floors mirrored from `test`.
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    # App runtime surface the Linux (no-MLX) lane imports at module load.
+    # Pin the floors identical to the core `dependencies` block so the
+    # no-MLX lane resolves against the same minimum the shipped engine is
+    # validated on — a bare, unpinned name here could resolve a newer minor
+    # and silently diverge from what macOS is shipping (the drift test in
+    # tests/test_ci_apple_coverage_union.py fails closed on any gap). jinja2
+    # is the one deliberate extra: the reasoning/template tests render chat
+    # templates via ``transformers.utils.chat_template_utils`` which requires
+    # jinja2 at runtime, and neither transformers nor pandas pulls it
+    # transitively (#2445 / #2446).
+    "pydantic",
+    "fastapi>=0.100.0",
+    "jsonschema>=4.0.0",
+    "httpx",
+    "psutil>=5.9.0",
+    "transformers>=5.0.0,<5.13",
+    "requests>=2.28.0",
+    "pyyaml>=6.0",
+    "python-multipart",
+    "uvicorn>=0.23.0",
+    "websockets>=12.0",
+    "jinja2",
+]
+# `ci-apple` = the pytest + coverage set the `test-apple-silicon` lane installs
+# on top of `[vision]`. Same test-infra floors as `[ci-linux]`; the lane's MLX
+# runtime comes from `[vision]` + core deps.
+ci-apple = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+]
 dev = [
     # Test runtime (must mirror the `test` extras above; a unit test in
     # tests/test_pr_validate_test_env.py asserts every `test` dep is
