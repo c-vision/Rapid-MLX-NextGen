@@ -173,10 +173,11 @@ final class ServerModelProfileTests {
         // vision-capable model" sends a user who is already running one after
         // the wrong fix — that is the bug this case exists to prevent.
         #expect(message.contains("memory"))
-        // "Smaller" is what makes it actionable: the engine gates on physical
-        // RAM, so a same-size vision model fails identically and freeing
-        // memory changes nothing.
-        #expect(message.contains("smaller"))
+        // The gate is a per-alias physical-RAM floor (`vision_min_memory_gb`),
+        // not model size: a smaller quant of the same model hits the identical
+        // floor and freeing memory changes nothing. The only remedy the user
+        // can apply is a different vision-capable model.
+        #expect(message.contains("different vision-capable model"))
         #expect(message != Self.genericLaneCopy)
     }
 
@@ -197,6 +198,8 @@ final class ServerModelProfileTests {
         // This downgrade is a throughput tradeoff, not a capability limit, and
         // it is the one reason here the user can undo directly.
         #expect(message.contains("speculative decoding"))
+        // Settings paths use the app-wide "Settings → X" arrow convention.
+        #expect(message.contains("Settings → Performance"))
         #expect(message != Self.genericLaneCopy)
     }
 

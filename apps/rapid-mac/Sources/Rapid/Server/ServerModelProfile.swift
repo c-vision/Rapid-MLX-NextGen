@@ -208,18 +208,21 @@ struct ImageInputAvailability: Equatable, Sendable {
             // picker is the only way out.
             return "This model runs text-only; its vision path isn't available. Choose a vision-capable model to add photos."
         case "text_lane_speculative_decode":
-            return "This model is running text-only because speculative decoding is on. Turn it off in Settings › Performance to send photos."
+            return "This model is running text-only because speculative decoding is on. Turn it off in Settings → Performance to add photos."
         case "vision_memory_insufficient":
-            // The engine gates on physical RAM, not free RAM, so quitting apps
-            // cannot lift this — only a smaller vision model fits.
-            return "This model's vision mode needs more memory than this Mac has. Choose a smaller vision-capable model to add photos."
+            // The engine gates on physical RAM against a per-alias floor
+            // (`vision_min_memory_gb`), not on free RAM or model size: quitting
+            // apps cannot lift this, and a smaller quant of the same model
+            // carries the same floor. Only a different vision-capable model
+            // is a remedy the user can actually apply.
+            return "This model's vision mode needs more memory than this Mac has. Choose a different vision-capable model to add photos."
         case "vision_hybrid_runtime_unsupported":
             return "This model is running text-only because its vision runtime isn't supported here. Choose a different vision-capable model to add photos."
         case "vision_architecture_unavailable", "vision_hybrid_cache_unsupported",
              "vision_weights_unavailable":
-            return "This model is running text-only because its vision features aren't available. Choose a vision-capable model to add photos."
+            return "This model is running text-only because its vision features aren't available. Choose a different vision-capable model to add photos."
         case "text_checkpoint":
-            return "This model doesn't support photos. Choose a vision-capable model to add one."
+            return "This model doesn't support photos. Choose a vision-capable model to add photos."
         default:
             return "This model is running text-only. Photos need a vision-capable model."
         }
