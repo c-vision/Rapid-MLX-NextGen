@@ -2,10 +2,10 @@ name: Desktop releasable candidate
 description: >-
   Build, sign, notarise and DMG-validate the rapid-mac desktop app at an exact
   commit while producing and verifying a Desktop release manifest. This is the
-  SINGLE shared build+validate contract used by BOTH the pre-tag candidate gate
-  (auto-release.yml) and the tag-triggered publishing lane (rapid-mac-release.yml),
-  so the two lanes can never drift apart. It NEVER creates a tag, release, updater
-  pointer, or any public asset — publishing stays entirely with the caller.
+  shared build+validate contract used by the pre-tag candidate gate and by
+  standalone tag/manual builds. Auto-release promotes the candidate's exact
+  bytes instead of invoking this action again. It NEVER creates a tag, release,
+  updater pointer, or public asset — publishing stays with the caller.
 
 inputs:
   checkout_path:
@@ -39,21 +39,21 @@ inputs:
     default: 'false'
   publish_sparkle:
     description: >-
-      'true' only for the tagged publishing lane, which builds the Sparkle ZIP +
-      appcast (needs the SPARKLE_ED_PRIVATE_KEY and the previous rapid-mac tag).
+      'true' for a releasable candidate or tagged standalone build that must
+      produce the Sparkle ZIP + appcast (needs SPARKLE_ED_PRIVATE_KEY).
     required: false
     default: 'false'
   release_notes_file:
     description: >-
-      Absolute path to the staged release-notes markdown (tagged lane only),
+      Absolute path to the staged release-notes markdown (Sparkle lane only),
       embedded into the Sparkle appcast so the release body and the updater
-      carry identical notes. Empty for the candidate lane.
+      carry identical notes. Empty only when Sparkle publication is disabled.
     required: false
     default: ''
   sparkle_cdn_base:
     description: >-
       CDN base URL (https://dl.rapidmlx.com) for the Signed Sparkle ZIP +
-      appcast download prefix. Tagged lane only.
+      appcast download prefix. Sparkle lane only.
     required: false
     default: ''
   previous_stable_tag:
@@ -266,9 +266,8 @@ runs:
       # strictly exceed the build of EVERY prior rapid-mac release INCLUDING RCs
       # (rc2 must beat rc1; a stable must beat its latest rc), so an already-
       # installed app never rejects the update. Runs in BOTH the candidate and
-      # tagged lanes whenever a prior release exists — INDEPENDENT of Sparkle
-      # publication — so the candidate validates it BEFORE the immutable tag,
-      # not only in the post-tag publishing run.
+      # standalone-build lanes whenever a prior release exists — INDEPENDENT of Sparkle
+      # publication — so the candidate validates it BEFORE the immutable tag.
       if: inputs.signed == 'true' && inputs.previous_release_tag != ''
       env:
         TAG: ${{ inputs.app_tag }}
@@ -378,8 +377,8 @@ runs:
         bash scripts/dmg.sh
 
     - name: Bundle size delta gate (block if DMG grew > cap vs previous rapid-mac release)
-      # Runs in BOTH the candidate and tagged lanes so the DMG size-delta is a
-      # real pre-tag gate, not just a publish-time check. Only skipped when there
+      # Runs in BOTH the candidate and standalone-build lanes, so DMG size delta
+      # remains a real pre-tag gate. Only skipped when there
       # is no previous release baseline. DELTA_COMPARED tells the manifest whether
       # a comparison actually happened so no lane claims dmg-size-delta it skipped.
       if: inputs.previous_stable_tag != ''

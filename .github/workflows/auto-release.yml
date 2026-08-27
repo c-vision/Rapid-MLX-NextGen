@@ -384,9 +384,9 @@ jobs:
     permissions:
       contents: read
     env:
-      # The candidate must be the REAL signed, notarised lane. Derived identically
-      # to the tagged lane's SIGNED, so a candidate accepted here is the exact
-      # product the tag lane is expected to reproduce. auto-release.yml runs on
+      # The candidate must be the REAL signed, notarised lane. Its exact bytes
+      # become the tagged release, so accepting an ad-hoc candidate is forbidden.
+      # auto-release.yml runs on
       # push to main / workflow_dispatch (never pull_request), so these secrets
       # are available here.
       SIGNED: ${{ secrets.MACOS_DEVID_CERT_P12_BASE64 != '' && secrets.MACOS_DEVID_CERT_PASSWORD != '' && secrets.AC_API_KEY_P8_BASE64 != '' && secrets.AC_API_KEY_ID != '' && secrets.AC_API_ISSUER_ID != '' }}
@@ -427,6 +427,24 @@ jobs:
           echo "previous_release_tag=${PREV_RELEASE:-}" >> "$GITHUB_OUTPUT"
           echo "::notice::DMG size-delta baseline: ${PREV_STABLE:-<none>}; Sparkle monotonic predecessor: ${PREV_RELEASE:-<none>}"
 
+      - name: Stage Desktop release notes for the exact candidate
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/release-notes.md"
+          awk -v needle="## [${VERSION}]" '
+            {
+              if (index($0, needle) == 1) { in_section = 1; print; next }
+              if (in_section && /^## /) { exit }
+              if (in_section) { print }
+            }
+          ' apps/rapid-mac/CHANGELOG.md > "$OUT"
+          [[ -s "$OUT" ]] || {
+            echo "::error::apps/rapid-mac/CHANGELOG.md has no ## [${VERSION}] section"
+            exit 1
+          }
+
       - uses: ./.github/actions/desktop-releasable
         id: releasable
         with:
@@ -436,7 +454,11 @@ jobs:
           app_tag: rapid-mac-v${{ needs.detect.outputs.version }}
           signed: ${{ secrets.MACOS_DEVID_CERT_P12_BASE64 != '' && secrets.MACOS_DEVID_CERT_PASSWORD != '' && secrets.AC_API_KEY_P8_BASE64 != '' && secrets.AC_API_KEY_ID != '' && secrets.AC_API_ISSUER_ID != '' }}
           require_signed: 'true'
-          publish_sparkle: 'false'
+          # Build the canonical Sparkle bytes here too. The protected tagged
+          # lane promotes this exact signed/notarised bundle; it never rebuilds.
+          publish_sparkle: 'true'
+          release_notes_file: ${{ runner.temp }}/release-notes.md
+          sparkle_cdn_base: ${{ vars.RAPID_MAC_DIST_CDN_BASE }}
           previous_stable_tag: ${{ steps.prev.outputs.previous_stable_tag }}
           previous_release_tag: ${{ steps.prev.outputs.previous_release_tag }}
           MACOS_DEVID_CERT_P12_BASE64: ${{ secrets.MACOS_DEVID_CERT_P12_BASE64 }}
@@ -445,6 +467,7 @@ jobs:
           AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
           AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
           AC_API_KEY_P8_BASE64: ${{ secrets.AC_API_KEY_P8_BASE64 }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
           SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
 
       - name: Accept the desktop candidate (bind evidence to the full SHA)
@@ -476,13 +499,34 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "signed=${SIGNED}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload desktop candidate DMG + manifest
+      - name: Stage exact pre-tag Desktop candidate bundle
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          BUNDLE="$RUNNER_TEMP/desktop-pre-tag-candidate"
+          mkdir -p "$BUNDLE/sparkle"
+          cp apps/rapid-mac/build/rapid-mlx-desktop.dmg "$BUNDLE/"
+          cp apps/rapid-mac/build/rapid-mlx-desktop.manifest.json "$BUNDLE/"
+          cp "$RUNNER_TEMP/release-notes.md" "$BUNDLE/release-notes.md"
+          cp apps/rapid-mac/build/sparkle/appcast.xml "$BUNDLE/sparkle/"
+          cp apps/rapid-mac/build/sparkle/*.zip "$BUNDLE/sparkle/"
+          python3 scripts/desktop_promotion.py create \
+            --bundle "$BUNDLE" \
+            --output "$BUNDLE/desktop-promotion-manifest.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow .github/workflows/auto-release.yml \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --source-sha "$GITHUB_SHA" \
+            --version "$VERSION" \
+            --app-tag "rapid-mac-v${VERSION}"
+
+      - name: Upload SHA-labelled pre-tag Desktop candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: rapid-mlx-desktop-dmg
-          path: |
-            apps/rapid-mac/build/rapid-mlx-desktop.dmg
-            apps/rapid-mac/build/rapid-mlx-desktop.manifest.json
+          name: rapid-mlx-desktop-pre-tag-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/desktop-pre-tag-candidate
           if-no-files-found: error
           retention-days: 7
 
@@ -563,7 +607,6 @@ jobs:
       accepted_sha: ${{ steps.accepted.outputs.accepted_sha }}
       main_sha: ${{ steps.mainhead.outputs.main_sha }}
       open_ids: ${{ steps.blockers.outputs.open_ids }}
-      have_pat: ${{ steps.appcheck.outputs.have_pat }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -581,12 +624,6 @@ jobs:
         id: appcheck
         env:
           VERSION: ${{ needs.detect.outputs.version }}
-          # Presence only — the value never enters the log. The app tag has to
-          # be created by a real user or the DMG workflow never fires (see the
-          # tag step in release-tag), so whether we hold a PAT decides whether
-          # this release can cut the app half at all. Deciding it HERE before
-          # anything is published is what makes the skip recoverable.
-          HAVE_PAT: ${{ secrets.RELEASE_PAT != '' }}
         run: |
           set -euo pipefail
           if ! grep -qE "^## \[${VERSION//./\\.}\]" apps/rapid-mac/CHANGELOG.md; then
@@ -594,18 +631,6 @@ jobs:
             exit 1
           fi
           echo "apps/rapid-mac/CHANGELOG.md has a [${VERSION}] section."
-
-          # Fail HERE, before anything is published, because there is no good
-          # answer later. Skipping the app tag would leave a green run with only
-          # the engine released, and a re-run then sees the published engine
-          # Release, sets should_release=false and never reaches the app step —
-          # the version would be permanently engine-only. Failing now costs
-          # nothing: set the secret and re-run, and the whole release proceeds.
-          if [ "$HAVE_PAT" != "true" ]; then
-            echo "::error::RELEASE_PAT is not set. The app tag has to be created by a real user — a ref written with the default GITHUB_TOKEN triggers no workflow, so no DMG would ever be built for ${VERSION}. Nothing has been published yet: add the RELEASE_PAT secret and re-run this workflow."
-            exit 1
-          fi
-          echo "have_pat=${HAVE_PAT}" >> "$GITHUB_OUTPUT"
 
       - name: Build release notes
         id: changelog
@@ -776,8 +801,8 @@ jobs:
     environment: rapid-mac-tag
     permissions:
       contents: write
-      # read the live ``rapid-mac-tag`` environment protection below.
-      actions: read
+      # Read protection and explicitly dispatch the exact promotion workflow.
+      actions: write
       # The pre-tag re-query re-reads the live open ``release-blocker`` issue set
       # immediately before the immutable tag is claimed (TOCTOU guard).
       issues: read
@@ -888,8 +913,9 @@ jobs:
       # flow rather than stranding a version as engine-only forever.
       - name: Tag the desktop app at the exact validated SHA
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-          HAVE_PAT: ${{ needs.release-prep.outputs.have_pat }}
+          # Intentional default token: its tag event cannot recursively trigger
+          # another build. The next step performs one exact explicit dispatch.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.detect.outputs.version }}
           RELEASE_SHA: ${{ needs.release-prep.outputs.release_sha }}
           # The SHA the candidate gate validated and release-prep printed for
@@ -899,24 +925,50 @@ jobs:
           set -euo pipefail
           bash scripts/tag_desktop_app.sh
 
+      - name: Dispatch exact Desktop candidate promotion
+        id: desktop_dispatch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          APP_TAG: rapid-mac-v${{ needs.detect.outputs.version }}
+          ACCEPTED_SHA: ${{ needs.release-prep.outputs.accepted_sha }}
+          PRODUCER_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          PAYLOAD="$(jq -nc \
+            --arg ref "$APP_TAG" \
+            --arg run_id "$PRODUCER_RUN_ID" \
+            --arg sha "$ACCEPTED_SHA" \
+            '{ref: $ref, inputs: {promote_run_id: $run_id, promote_sha: $sha}}')"
+          RESPONSE="$(gh api \
+            --method POST \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${REPO}/actions/workflows/rapid-mac-release.yml/dispatches" \
+            --input - <<<"$PAYLOAD")"
+          DESKTOP_RUN_ID="$(jq -er '.workflow_run_id | select(type == "number" and . > 0)' <<<"$RESPONSE")"
+          echo "desktop_run_id=$DESKTOP_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "::notice::dispatched exact Desktop promotion run ${DESKTOP_RUN_ID} from auto-release run ${PRODUCER_RUN_ID} at ${ACCEPTED_SHA}"
+
       # An existing same-SHA tag is an idempotent success for the tag claim, but
       # it does not prove the Desktop workflow ever completed. Wait for the exact
       # tagged workflow run and its published non-empty DMG before exposing the
       # engine release. API/auth/malformed/mismatch/failure/timeout all fail
-      # closed. Recovery is an explicit rerun/dispatch at this immutable tag;
-      # this gate never moves/deletes a tag or starts a workflow itself.
+      # closed. Recovery reruns the exact failed promotion; this gate never
+      # moves/deletes a tag or broadens the producer identity.
       - name: Wait for exact Desktop tagged publication
         timeout-minutes: 360
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APP_TAG: rapid-mac-v${{ needs.detect.outputs.version }}
           ACCEPTED_SHA: ${{ needs.release-prep.outputs.accepted_sha }}
+          EXPECTED_RUN_ID: ${{ steps.desktop_dispatch.outputs.desktop_run_id }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           python3 scripts/check_desktop_publish.py \
             --app-tag "$APP_TAG" \
             --accepted-sha "$ACCEPTED_SHA" \
+            --expected-run-id "$EXPECTED_RUN_ID" \
             --repo "$REPO" \
             --workflow rapid-mac-release.yml \
             --deadline-min 350 \

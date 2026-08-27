@@ -4,12 +4,14 @@
 # private desktop repo's release.yml. It builds apps/rapid-mac/ (the
 # SwiftUI app + its bundled rapid-mlx sidecar), signs it with a Developer
 # ID identity, notarises + staples both the .app and the .dmg, and
-# attaches the DMG to the GitHub Release for the tag.
+# attaches the DMG to the GitHub Release for the tag. Auto-release dispatches
+# this workflow with a producer run/SHA to promote its exact pre-tag bytes;
+# standalone tag pushes and input-free manual dispatches retain the build path.
 #
 # Trigger: pushing a ``rapid-mac-v*`` tag. The ``rapid-mac-v`` prefix keeps
 # app releases from colliding with the engine's own ``v*`` release tags in
-# this same monorepo. A manual workflow_dispatch does the same build but
-# only uploads a workflow artifact (no GitHub Release), so signing can be
+# this same monorepo. An input-free manual workflow_dispatch does the same build
+# but only uploads a workflow artifact (no GitHub Release), so signing can be
 # dry-run without cutting a tag.
 #
 # ── Required GitHub Actions secrets (Settings → Secrets and variables →
@@ -61,6 +63,15 @@ on:
     tags:
       - "rapid-mac-v*"
   workflow_dispatch:
+    inputs:
+      promote_run_id:
+        description: Exact auto-release run that produced the pre-tag candidate bundle.
+        required: false
+        type: string
+      promote_sha:
+        description: Exact 40-character source SHA bound into that candidate bundle.
+        required: false
+        type: string
 
 permissions:
   contents: write   # attach the .dmg to the GitHub Release
@@ -68,6 +79,11 @@ permissions:
 
 jobs:
   build:
+    # Standalone tag pushes and input-free manual dry runs retain the complete
+    # build path. Auto-release supplies both promotion inputs and skips rebuild.
+    if: >-
+      github.event_name != 'workflow_dispatch'
+      || (inputs.promote_run_id == '' && inputs.promote_sha == '')
     runs-on: macos-15   # default Xcode 16 → Swift 6.0 (Package.swift tools 6.0)
     timeout-minutes: 120
     outputs:
@@ -225,10 +241,9 @@ jobs:
 
       - name: Build + sign + notarise + DMG-validate (shared contract)
         id: releasable
-        # #2301: the tag-triggered lane runs the EXACT same signed/notarised/
-        # DMG-validated gate as the pre-tag candidate lane, via the single
-        # desktop-releasable composite action, so the two can never drift. It
-        # produces + verifies the Desktop manifest and creates no pointer.
+        # Standalone tag pushes and input-free dry runs use the shared build
+        # contract. Auto-release promotion skips this job and re-verifies the
+        # already-built candidate in promote-candidate below.
         uses: ./.github/actions/desktop-releasable
         with:
           checkout_path: ${{ github.workspace }}
@@ -318,6 +333,191 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  promote-candidate:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && inputs.promote_run_id != ''
+      && inputs.promote_sha != ''
+    runs-on: macos-15
+    timeout-minutes: 45
+    outputs:
+      signed: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify exact tag and producer run identity
+        id: producer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PROMOTE_RUN_ID: ${{ inputs.promote_run_id }}
+          PROMOTE_SHA: ${{ inputs.promote_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$PROMOTE_RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::promote_run_id must be a positive integer"
+            exit 1
+          }
+          [[ "$PROMOTE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::promote_sha must be a full lowercase commit SHA"
+            exit 1
+          }
+          [[ "$TAG" =~ ^rapid-mac-v[0-9]+\.[0-9]+\.[0-9]+(-rc[1-9][0-9]*)?$ ]] || {
+            echo "::error::promotion must be dispatched at a rapid-mac-v* tag"
+            exit 1
+          }
+          source scripts/resolve_github_tag.sh
+          TAG_SHA="$(resolve_github_tag_commit "$TAG")"
+          [[ "$TAG_SHA" == "$PROMOTE_SHA" && "$GITHUB_SHA" == "$PROMOTE_SHA" ]] || {
+            echo "::error::tag=${TAG_SHA}, checkout=${GITHUB_SHA}, requested=${PROMOTE_SHA}; refusing cross-SHA promotion"
+            exit 1
+          }
+
+          RUN_JSON="$RUNNER_TEMP/producer-run.json"
+          gh api "repos/${REPO}/actions/runs/${PROMOTE_RUN_ID}" > "$RUN_JSON"
+          python3 - "$RUN_JSON" "$REPO" "$PROMOTE_SHA" <<'PY'
+          import json, pathlib, sys
+          run = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          expected_repo, expected_sha = sys.argv[2:]
+          checks = {
+              "repository": (run.get("repository") or {}).get("full_name") == expected_repo,
+              "workflow": run.get("path") == ".github/workflows/auto-release.yml",
+              "source": run.get("head_sha") == expected_sha,
+              "event": run.get("event") in {"push", "workflow_dispatch"},
+              "attempt": type(run.get("run_attempt")) is int and run["run_attempt"] > 0,
+          }
+          failed = [name for name, ok in checks.items() if not ok]
+          if failed:
+              raise SystemExit("producer run identity mismatch: " + ", ".join(failed))
+          print(run["run_attempt"])
+          PY
+          echo "version=${TAG#rapid-mac-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact SHA-labelled pre-tag candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: rapid-mlx-desktop-pre-tag-candidate-${{ inputs.promote_sha }}
+          path: candidate
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.promote_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify provenance, signing, notarization, and tag binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PROMOTE_RUN_ID: ${{ inputs.promote_run_id }}
+          PROMOTE_SHA: ${{ inputs.promote_sha }}
+          VERSION: ${{ steps.producer.outputs.version }}
+        run: |
+          set -euo pipefail
+          RUN_ATTEMPT="$(python3 - <<'PY'
+          import json
+          manifest = json.load(open("candidate/desktop-promotion-manifest.json"))
+          attempt = (manifest.get("producer") or {}).get("run_attempt")
+          if type(attempt) is not int or attempt < 1:
+              raise SystemExit("candidate manifest has no positive producer run_attempt")
+          print(attempt)
+          PY
+          )"
+          JOBS="$RUNNER_TEMP/producer-jobs.json"
+          gh api \
+            "repos/${REPO}/actions/runs/${PROMOTE_RUN_ID}/attempts/${RUN_ATTEMPT}/jobs?per_page=100" \
+            > "$JOBS"
+          python3 - "$JOBS" <<'PY'
+          import json, pathlib, sys
+          jobs = json.loads(pathlib.Path(sys.argv[1]).read_text()).get("jobs")
+          matches = [j for j in jobs or [] if j.get("name") == "desktop-candidate-gate"]
+          if len(matches) != 1 or matches[0].get("conclusion") != "success":
+              raise SystemExit("artifact-producing desktop-candidate-gate attempt is not exactly one successful job")
+          PY
+          python3 scripts/desktop_promotion.py verify \
+            --bundle candidate \
+            --manifest candidate/desktop-promotion-manifest.json \
+            --repository "$REPO" \
+            --workflow .github/workflows/auto-release.yml \
+            --run-id "$PROMOTE_RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --source-sha "$PROMOTE_SHA" \
+            --version "$VERSION" \
+            --app-tag "$TAG"
+
+          PROJ="apps/rapid-mac"
+          mkdir -p "$PROJ/build"
+          cp candidate/rapid-mlx-desktop.dmg "$PROJ/build/rapid-mlx-desktop.dmg"
+          cp candidate/rapid-mlx-desktop.manifest.json "$PROJ/build/rapid-mlx-desktop.manifest.json"
+          MOUNT="$RUNNER_TEMP/promoted-dmg"
+          mkdir -p "$MOUNT"
+          hdiutil attach candidate/rapid-mlx-desktop.dmg -nobrowse -readonly -mountpoint "$MOUNT"
+          trap 'hdiutil detach "$MOUNT" -quiet || hdiutil detach "$MOUNT" -force -quiet || true' EXIT
+          ditto "$MOUNT/Rapid-MLX Desktop.app" "$PROJ/build/Rapid-MLX Desktop.app"
+          hdiutil detach "$MOUNT" -quiet
+          trap - EXIT
+          python3 scripts/desktop_manifest.py verify \
+            --app-dir "$PROJ" \
+            --dmg candidate/rapid-mlx-desktop.dmg \
+            --manifest candidate/rapid-mlx-desktop.manifest.json
+          bash "$PROJ/scripts/validate-dmg.sh" candidate/rapid-mlx-desktop.dmg
+          xcrun stapler validate candidate/rapid-mlx-desktop.dmg
+          spctl --assess --type open --context context:primary-signature --verbose=2 \
+            candidate/rapid-mlx-desktop.dmg
+
+      - name: Promote exact DMG + manifest bytes into this run
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: rapid-mlx-desktop-dmg
+          path: |
+            candidate/rapid-mlx-desktop.dmg
+            candidate/rapid-mlx-desktop.manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Promote exact release-note bytes into this run
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: rapid-mac-release-notes
+          path: candidate/release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Promote exact Sparkle bytes into this run
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: rapid-mac-sparkle-update
+          path: |
+            candidate/sparkle/*.zip
+            candidate/sparkle/appcast.xml
+          if-no-files-found: error
+          retention-days: 7
+
+  desktop-ready:
+    needs: [build, promote-candidate]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      signed: ${{ steps.mode.outputs.signed }}
+    steps:
+      - name: Require exactly one successful Desktop source lane
+        id: mode
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          PROMOTE_RESULT: ${{ needs.promote-candidate.result }}
+          BUILD_SIGNED: ${{ needs.build.outputs.signed }}
+        run: |
+          set -euo pipefail
+          if [[ "$BUILD_RESULT" == "success" && "$PROMOTE_RESULT" == "skipped" ]]; then
+            echo "signed=$BUILD_SIGNED" >> "$GITHUB_OUTPUT"
+          elif [[ "$BUILD_RESULT" == "skipped" && "$PROMOTE_RESULT" == "success" ]]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::expected exactly one successful Desktop source lane; build=$BUILD_RESULT promotion=$PROMOTE_RESULT"
+            exit 1
+          fi
+
   # ─────────────────────────────────────────────────────────────────────
   # REQUIRED FOR TAGS: mirror the notarised DMG and update the static fallback.
   #
@@ -334,7 +534,7 @@ jobs:
   #   * The manifest is uploaded last, after the immutable DMG, so clients can
   #     never observe a release whose artifact is not available yet.
   mirror-dist:
-    needs: build
+    needs: desktop-ready
     runs-on: ubuntu-latest
     timeout-minutes: 30
     if: startsWith(github.ref, 'refs/tags/')
@@ -352,7 +552,7 @@ jobs:
           path: notes
 
       - name: Download the signed Sparkle update
-        if: needs.build.outputs.signed == 'true'
+        if: needs.desktop-ready.outputs.signed == 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: rapid-mac-sparkle-update
@@ -403,7 +603,7 @@ jobs:
           npx --yes wrangler@4.120.0 r2 object put "${R2_BUCKET}/${VERSIONED_KEY}" \
             --file "$DMG" --content-type application/x-apple-diskimage --remote
 
-          if [[ "${{ needs.build.outputs.signed }}" == "true" ]]; then
+          if [[ "${{ needs.desktop-ready.outputs.signed }}" == "true" ]]; then
             SPARKLE_ZIP="$(find sparkle -maxdepth 1 -type f -name '*.zip' -print -quit)"
             [[ -n "$SPARKLE_ZIP" && -f "$SPARKLE_ZIP" ]] || {
               echo "::error::missing signed Sparkle ZIP"
@@ -457,7 +657,7 @@ jobs:
           if-no-files-found: error
 
       - name: Stage Sparkle appcast for serialized publication
-        if: needs.build.outputs.signed == 'true'
+        if: needs.desktop-ready.outputs.signed == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: rapid-mac-sparkle-appcast
@@ -468,7 +668,7 @@ jobs:
   # serialized here. Turnstyle queues every run (unlike native concurrency,
   # which keeps only one pending run and can drop an intermediate tag).
   publish-updater-fallback:
-    needs: [build, mirror-dist]
+    needs: [desktop-ready, mirror-dist]
     runs-on: ubuntu-latest
     # Includes the turnstyle queue plus final updater/Release publication.
     timeout-minutes: 120
@@ -505,7 +705,7 @@ jobs:
           path: notes
 
       - name: Download staged Sparkle appcast
-        if: needs.build.outputs.signed == 'true'
+        if: needs.desktop-ready.outputs.signed == 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: rapid-mac-sparkle-appcast
@@ -615,7 +815,7 @@ jobs:
             --file dist/latest.json --content-type application/json \
             --cache-control "no-cache, must-revalidate" --remote
 
-          if [[ "${{ needs.build.outputs.signed }}" == "true" ]]; then
+          if [[ "${{ needs.desktop-ready.outputs.signed }}" == "true" ]]; then
             [[ -s sparkle/appcast.xml ]] || { echo "::error::missing appcast.xml"; exit 1; }
             npx --yes wrangler@4.120.0 r2 object put "${R2_BUCKET}/appcast.xml" \
               --file sparkle/appcast.xml --content-type application/xml \
@@ -667,7 +867,7 @@ jobs:
           # ``GH_REPO`` lets gh resolve the repo without a working tree.
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-          SIGNED: ${{ needs.build.outputs.signed }}
+          SIGNED: ${{ needs.desktop-ready.outputs.signed }}
         run: |
           set -euo pipefail
           VERSION="${TAG#rapid-mac-v}"

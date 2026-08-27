@@ -206,35 +206,14 @@ OUT=$(CHAIN_LEN=99 run taken_chain "$SHA_GOOD") && RC=0 || RC=$?
                      || bad "refuses a chain deeper than the peel bound"
 
 # ==========================================================================
-echo "== 6c. no PAT: refuse to run at all =="
-# ==========================================================================
-# A tag written with GITHUB_TOKEN fires no workflow AND blocks every retry: the
-# re-run finds it already at the right commit and exits green, so the DMG can
-# never be built for that version without hand-deleting a published tag.
-# Skipping quietly is no better — the run would end green with only the engine
-# released, and the next re-run sees the published engine Release and decides
-# there is nothing left to release. So this fails, and the workflow asks the
-# same question before anything irreversible happens.
-#
-# The EMPTY case is the one that bites in production: a workflow expression
-# that evaluates to nothing would otherwise hit the "unset means a human is
-# running this" default and recreate the dead-tag failure.
-for BAD_PAT in false ""; do
-  OUT=$(HAVE_PAT="$BAD_PAT" run free "") && RC=0 || RC=$?
-  [ "${RC:-0}" -ne 0 ] && ok "non-zero with HAVE_PAT='$BAD_PAT'" || bad "non-zero with HAVE_PAT='$BAD_PAT'"
-  lacks "$(cat "$TMP/calls")" "git/refs" "creates NO tag with HAVE_PAT='$BAD_PAT'"
-  contains "$OUT" "RELEASE_PAT is not available" "says which secret is missing (HAVE_PAT='$BAD_PAT')"
-done
-
-# ==========================================================================
 echo "== 7. workflow wiring =="
 # ==========================================================================
-# The app tag MUST be created through the API under the PAT. A ``git push``
-# uses the credential actions/checkout persisted (GITHUB_TOKEN), and GitHub
-# suppresses workflow runs caused by GITHUB_TOKEN pushes — the step would go
-# green with no app build, signing, notarisation or DMG.
+# The app tag is created through the atomic API under GITHUB_TOKEN. GitHub
+# suppresses that token's push event, so auto-release must explicitly dispatch
+# the exact already-built candidate immediately afterwards.
 APP_STEP=$(sed -n '/Tag the desktop app at the exact validated SHA/,/^      - name:/p' "$WORKFLOW")
-contains "$APP_STEP" "secrets.RELEASE_PAT" "app tag step runs under the PAT"
+contains "$APP_STEP" 'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}' \
+  "app tag step intentionally uses the recursion-safe default token"
 contains "$APP_STEP" "scripts/tag_desktop_app.sh" "app tag step calls the tested script"
 contains "$APP_STEP" "ACCEPTED_SHA: \${{ needs.release-prep.outputs.accepted_sha }}" \
   "app tag step is bound to the pre-approval accepted SHA"
@@ -246,26 +225,18 @@ contains "$APP_STEP" "ACCEPTED_SHA: \${{ needs.release-prep.outputs.accepted_sha
 lacks "$APP_STEP" "TAG_APPROVED" \
   "app tag step does not self-assert a meaningless approval boolean"
 lacks "$APP_STEP" "git push" "app tag step does not git push the tag"
-# Finding RELEASE_PAT in the env is not enough — the step falls back to
-# GITHUB_TOKEN, so it must also be TOLD whether the token it got can trigger a
-# workflow. Without this wiring the script's own guard defaults to "true" and
-# the fallback silently creates a dead tag. The pre-approval job derives it and
-# passes it to the environment-gated release job the same way the old in-job
-# appcheck did.
-contains "$APP_STEP" "HAVE_PAT: \${{ needs.release-prep.outputs.have_pat }}" \
-  "app tag step is told whether the PAT is actually present"
-# Assert the EXACT expression and the EXACT guard. A bare "have_pat=" check
-# passed even when the published value was empty — which the script's
-# "unset means a human" default then read as consent, recreating the very
-# dead-tag failure this wiring exists to prevent. Pin what is written, not
-# that something is.
-PREFLIGHT=$(sed -n '/Pre-check the desktop app CHANGELOG/,/Build release notes/p' "$WORKFLOW")
-contains "$PREFLIGHT" "HAVE_PAT: \${{ secrets.RELEASE_PAT != '' }}" \
-  "pre-flight derives have_pat from the secret's presence"
-contains "$PREFLIGHT" 'echo "have_pat=${HAVE_PAT}" >> "$GITHUB_OUTPUT"' \
-  "pre-flight publishes that value verbatim, not a literal"
-contains "$PREFLIGHT" 'if [ "$HAVE_PAT" != "true" ]; then' \
-  "pre-flight refuses before anything is published"
+
+DISPATCH_STEP=$(sed -n '/name: Dispatch exact Desktop candidate promotion/,/name: Wait for exact Desktop/p' "$WORKFLOW")
+contains "$DISPATCH_STEP" 'actions/workflows/rapid-mac-release.yml/dispatches' \
+  "auto-release explicitly dispatches the Desktop publisher through the API"
+contains "$DISPATCH_STEP" '--arg ref "$APP_TAG"' \
+  "dispatch is bound to the immutable Desktop tag"
+contains "$DISPATCH_STEP" 'promote_run_id: $run_id' \
+  "dispatch passes the exact producer run"
+contains "$DISPATCH_STEP" 'promote_sha: $sha' \
+  "dispatch passes the exact accepted SHA"
+contains "$DISPATCH_STEP" '.workflow_run_id' \
+  "dispatch captures the exact child run ID returned by GitHub"
 
 # Everything that can refuse the app half has to happen BEFORE the engine
 # Release is published. Publishing is the irreversible step: once the Release

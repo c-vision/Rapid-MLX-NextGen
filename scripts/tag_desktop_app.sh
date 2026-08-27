@@ -9,21 +9,18 @@
 # ``rapid-mac-vX.Y.Z`` tag was a manual step somebody had to remember, and
 # for four releases nobody did.
 #
-# Creating ``refs/tags/rapid-mac-v$VERSION`` hands off to
-# .github/workflows/rapid-mac-release.yml, which builds, signs, notarises
-# and attaches the DMG.
+# Creating ``refs/tags/rapid-mac-v$VERSION`` records the immutable release
+# identity. The caller explicitly dispatches .github/workflows/rapid-mac-release.yml
+# with the pre-tag producer run and SHA, so that workflow promotes the already
+# signed/notarised bytes instead of rebuilding them.
 #
 # WHY THE API AND NOT ``git push``
 # --------------------------------
-# actions/checkout persists the default ``GITHUB_TOKEN`` as the credential
-# for ``origin``, and GitHub suppresses workflow runs caused by pushes
-# authenticated with ``GITHUB_TOKEN`` (its anti-loop guard). A ``git push``
-# of this tag would therefore succeed, the step would go green, and NO app
-# build, signing, notarisation or DMG would ever happen — the silent
-# half-release this whole change exists to prevent. Going through
-# ``gh api`` uses ``GH_TOKEN``, which the workflow sets to the RELEASE_PAT
-# user; a ref created by a real user does fire ``push``. This is the same
-# reason create_release.sh runs under the PAT.
+# The API makes the tag claim atomic and token-independent. Auto-release uses
+# its default ``GITHUB_TOKEN`` intentionally: GitHub suppresses the resulting
+# push-triggered workflow, then the caller issues one explicit workflow_dispatch
+# carrying the exact producer run and source SHA. That avoids a duplicate build
+# while preserving standalone PAT/manual tag pushes as a supported rebuild path.
 #
 # Idempotency is a POST, not a pre-check: ``POST /git/refs`` fails 422 when
 # the ref already exists, so the claim is atomic. Only on that failure do we
@@ -34,21 +31,6 @@
 # rapid-mac tags are annotated). Same tree → done. Different tree → refuse:
 # moving a published tag would ship one version's notes against another's
 # build.
-#
-# WHY A MISSING PAT IS FATAL RATHER THAN A FALLBACK
-# -------------------------------------------------
-# Creating the tag under GITHUB_TOKEN would be worse than not creating it. The
-# ref would exist and this step would go green, but the run it should have
-# triggered is suppressed — and the recovery (restore the secret, re-run) then
-# finds a tag that already points at the right commit and exits 0 without
-# emitting any event. The app could never be built for that version again
-# without hand-deleting a published tag.
-#
-# Skipping quietly is no better: the run ends green with only the engine
-# released, and a re-run sees the published engine Release, decides there is
-# nothing to release, and never reaches this step again. So this refuses to
-# run at all. In the workflow the same condition is checked BEFORE anything is
-# published, which is what makes "set the secret and re-run" an actual fix.
 #
 # Required environment:
 #   VERSION            X.Y.Z — the version the engine just released
@@ -61,13 +43,8 @@
 #                      validated. This is what stops an RC tag from preceding its
 #                      validated artifact commit (#2301).
 #   GITHUB_REPOSITORY  owner/repo
-#   GH_TOKEN           consumed by ``gh`` (RELEASE_PAT in the workflow)
+#   GH_TOKEN           consumed by ``gh`` (GITHUB_TOKEN in auto-release)
 # Optional:
-#   HAVE_PAT           "true" when GH_TOKEN is the RELEASE_PAT. Anything else,
-#                      INCLUDING the empty string, refuses to tag (see above).
-#                      Only a genuinely unset value defaults to true, for a
-#                      hand-run — an empty one means a workflow expression
-#                      evaluated to nothing, which must not read as consent.
 #   GH                 path to the gh binary (tests point this at a mock)
 #
 # Exit status: 0 tag created or already correct, 1 anything else.
@@ -79,7 +56,6 @@ set -euo pipefail
 : "${ACCEPTED_SHA:?tag_desktop_app.sh: ACCEPTED_SHA is required — a desktop tag can only be claimed at the SHA a candidate build validated}"
 : "${GITHUB_REPOSITORY:?tag_desktop_app.sh: GITHUB_REPOSITORY is required}"
 GH_BIN="${GH:-gh}"
-HAVE_PAT="${HAVE_PAT-true}"
 
 # Both SHAs must be full 40-character commits. Comparing short SHAs would let a
 # collision or a truncation mistake read as the same commit, and a human must be
@@ -113,12 +89,6 @@ fi
 
 APP_TAG="rapid-mac-v${VERSION}"
 
-if [ "$HAVE_PAT" != "true" ]; then
-  echo "::error::refusing to create ${APP_TAG}: RELEASE_PAT is not available, and a tag written with the default GITHUB_TOKEN triggers no workflow — no DMG would ever be built, and the tag's existence would then block every retry." >&2
-  echo "   Set the RELEASE_PAT secret and run again." >&2
-  exit 1
-fi
-
 # Print the exact identity being claimed BEFORE the irreversible POST, so the
 # run log and the environment-approval audit both carry the full commit that a
 # candidate build validated — never a branch name or short SHA.
@@ -127,7 +97,7 @@ echo "Claiming $APP_TAG at validated candidate SHA $RELEASE_SHA"
 
 if "$GH_BIN" api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
     -f "ref=refs/tags/$APP_TAG" -f "sha=$RELEASE_SHA" >/dev/null 2>&1; then
-  echo "Created $APP_TAG at $RELEASE_SHA → rapid-mac-release.yml"
+  echo "Created $APP_TAG at $RELEASE_SHA; caller must dispatch rapid-mac-release.yml with the exact candidate run"
   exit 0
 fi
 

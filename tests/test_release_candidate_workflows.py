@@ -5,6 +5,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
+AUTO_RELEASE = ROOT / ".github/workflows/auto-release.yml"
 DESKTOP_WORKFLOW = ROOT / ".github/workflows/rapid-mac-release.yml"
 DESKTOP_RELEASABLE = ROOT / ".github/actions/desktop-releasable/action.yml"
 PREFLIGHT_WORKFLOW = ROOT / ".github/workflows/release-preflight.yml"
@@ -32,6 +33,40 @@ def test_desktop_raw_bundle_headroom_does_not_weaken_dmg_growth_gate():
     assert 'BUNDLE_SIZE_DELTA_CAP_MB: "50"' in workflow
     assert 'CAP_MB="${BUNDLE_SIZE_CAP_MB:-550}"' in shared_action
     assert 'DELTA_CAP_MB="${BUNDLE_SIZE_DELTA_CAP_MB:-50}"' in shared_action
+
+
+def test_auto_release_stages_one_sha_labelled_complete_desktop_bundle():
+    workflow = AUTO_RELEASE.read_text(encoding="utf-8")
+    candidate = _step(workflow, "Stage exact pre-tag Desktop candidate bundle")
+    upload = _step(workflow, "Upload SHA-labelled pre-tag Desktop candidate")
+    assert "desktop_promotion.py create" in candidate
+    assert "rapid-mlx-desktop.dmg" in candidate
+    assert "rapid-mlx-desktop.manifest.json" in candidate
+    assert "release-notes.md" in candidate
+    assert "sparkle/appcast.xml" in candidate
+    assert "sparkle/*.zip" in candidate
+    assert "rapid-mlx-desktop-pre-tag-candidate-${{ github.sha }}" in upload
+
+
+def test_tagged_promotion_and_standalone_build_are_mutually_exclusive():
+    workflow = yaml.load(DESKTOP_WORKFLOW.read_text(), Loader=yaml.BaseLoader)
+    inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {"promote_run_id", "promote_sha"}
+    jobs = workflow["jobs"]
+    assert "github.event_name != 'workflow_dispatch'" in jobs["build"]["if"]
+    assert "inputs.promote_run_id == ''" in jobs["build"]["if"]
+    assert "inputs.promote_sha == ''" in jobs["build"]["if"]
+    assert "github.event_name == 'workflow_dispatch'" in jobs["promote-candidate"]["if"]
+    assert jobs["promote-candidate"]["if"] == (
+        "github.event_name == 'workflow_dispatch' "
+        "&& inputs.promote_run_id != '' && inputs.promote_sha != ''"
+    )
+    assert jobs["desktop-ready"]["needs"] == ["build", "promote-candidate"]
+    assert jobs["mirror-dist"]["needs"] == "desktop-ready"
+    assert jobs["publish-updater-fallback"]["needs"] == [
+        "desktop-ready",
+        "mirror-dist",
+    ]
 
 
 def test_release_preflight_is_dispatch_only_and_exact_head_bound():

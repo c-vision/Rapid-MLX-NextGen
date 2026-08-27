@@ -13,10 +13,10 @@ all of the following hold:
   1. ``app_tag`` is a valid release version (via the shared release_version
      parser) and the tag resolves (peeling annotated objects) to exactly
      ``accepted_sha`` — the SHA the candidate lane validated.
-  2. An EXACT `rapid-mac-release.yml` run reaches SUCCESS within the deadline. A
-     run is exact when its ref/branch is the tag, its head_sha equals
-     ``accepted_sha``, and its event is the tag push (or an explicit
-     ``workflow_dispatch`` at the tag ref — a recovery we never create here).
+  2. The EXACT `rapid-mac-release.yml` run ID returned by auto-release's
+     ``workflow_dispatch`` reaches SUCCESS within the deadline. Its ref/branch
+     must be the tag, its head_sha must equal ``accepted_sha``, and its event
+     must be ``workflow_dispatch``. A concurrent manual/tag run cannot qualify.
      Poll policy: prefer any exact success; keep waiting while an exact run is
      active (queued/in_progress); fail only when no exact run is active and a
      failed one remains.
@@ -29,9 +29,9 @@ all of the following hold:
      deadline.
 
 If the tag exists but no successful exact run/release is reached, the diagnostic
-directs recovery to: rerun the failed exact workflow, or dispatch
-``rapid-mac-release.yml`` at ``--ref <tag>``, then re-run auto-release. It never
-moves or deletes the tag, and it never auto-dispatches or broadens publication.
+directs recovery to rerun that exact promotion or rerun auto-release, whose
+dispatch supplies both required ``promote_run_id`` and ``promote_sha`` inputs.
+This helper never moves/deletes a tag or broadens publication.
 
 All logic is exercised with raw ``gh`` output (never text/regex on structured
 fields) and a deadline + sleep that are injectable, so the poll behaviour is
@@ -174,14 +174,19 @@ def _resolve_tag(gh: str, repo: str, app_tag: str) -> str:
 
 
 def _qualifying_runs(
-    gh: str, repo: str, workflow: str, app_tag: str, accepted_sha: str
+    gh: str,
+    repo: str,
+    workflow: str,
+    app_tag: str,
+    accepted_sha: str,
+    expected_run_id: int,
 ) -> list[dict]:
     """List rapid-mac-release.yml runs; return those BOUND exactly to this tag+candidate.
 
     Uses the official workflow-runs API filtered by ``branch == app_tag``, then
-    requires, in Python: ``head_branch == app_tag`` (exact ref), ``head_sha ==
-    accepted_sha`` (exact candidate), and ``event`` in {push, workflow_dispatch}
-    (push is the expected trigger; dispatch-at-tag is an explicit recovery).
+    requires, in Python: the exact run ID returned by the dispatch,
+    ``head_branch == app_tag``, ``head_sha == accepted_sha``, and event
+    ``workflow_dispatch``. Tag pushes and other manual dispatches are ignored.
     API discontinuity (call fails, malformed JSON) fails immediately here.
     """
     runs_json = _run(
@@ -208,7 +213,6 @@ def _qualifying_runs(
         ) from exc
     if not isinstance(runs, list):
         raise PublishGateError("workflow-runs API did not return an array")
-    allowed_events = {"push", "workflow_dispatch"}
     bound = []
     for r in runs:
         if not isinstance(r, dict):
@@ -233,9 +237,10 @@ def _qualifying_runs(
                 f"workflow-runs API returned malformed record: {r!r}"
             )
         if (
-            head_branch == app_tag
+            run_id == expected_run_id
+            and head_branch == app_tag
             and head_sha == accepted_sha
-            and event in allowed_events
+            and event == "workflow_dispatch"
         ):
             bound.append(
                 {
@@ -421,6 +426,7 @@ def verify(
     *,
     app_tag: str,
     accepted_sha: str,
+    expected_run_id: int,
     repo: str,
     workflow: str,
     gh: str,
@@ -430,6 +436,8 @@ def verify(
     """Return evidence lines or raise PublishGateError."""
     _assert_app_tag(app_tag)
     _assert_sha(accepted_sha)
+    if type(expected_run_id) is not int or expected_run_id < 1:
+        raise PublishGateError("expected-run-id must be a positive integer")
 
     evidence: list[str] = []
 
@@ -443,14 +451,14 @@ def verify(
         )
     evidence.append(f"tag {app_tag} resolves to validated candidate {accepted_sha}")
 
-    # 2) Poll the exact rapid-mac-release.yml run(s) bound to app_tag+accepted_sha.
-    #    Prefer any exact success; wait while an exact run is active; fail only
-    #    when no exact run is active and a failed one remains. API discontinuities
-    #    are fatal immediately (raised by _qualifying_runs/_run).
+    # 2) Poll only the exact run ID returned by the dispatch. A concurrent
+    #    input-free manual dispatch or tag-push rebuild cannot satisfy this gate.
     deadline = time.monotonic() + deadline_sec
     success_run = None
     while True:
-        bound = _qualifying_runs(gh, repo, workflow, app_tag, accepted_sha)
+        bound = _qualifying_runs(
+            gh, repo, workflow, app_tag, accepted_sha, expected_run_id
+        )
         completed = [r for r in bound if r.get("status") == "completed"]
         active = [
             r
@@ -458,9 +466,8 @@ def verify(
             if r.get("status") in ("queued", "in_progress", "waiting", "pending")
         ]
 
-        # Once the set settles, its newest exact run is authoritative. A newer
-        # failed rerun invalidates an older success; otherwise engine/Desktop
-        # identity could be certified from stale publication evidence.
+        # A rerun preserves its workflow run ID, so its latest state remains
+        # bound to the same dispatch without accepting any neighboring run.
         if bound and not active:
             newest = max(bound, key=lambda run: run["databaseId"])
             if (
@@ -477,17 +484,18 @@ def verify(
             raise PublishGateError(
                 f"{app_tag}: rapid-mac-release.yml run(s) on the tag ref completed "
                 f"without success and no exact run is active. The tagged Desktop "
-                "publish failed. Recovery: re-run the failed exact workflow run, or "
-                f"dispatch rapid-mac-release.yml at --ref {app_tag}, then re-run "
-                "auto-release. Do NOT move or delete the tag."
+                "publish failed. Recovery: re-run the failed exact promotion, or "
+                "re-run auto-release so it dispatches rapid-mac-release.yml with "
+                "the exact promote_run_id and promote_sha. Do NOT move or delete "
+                "the tag."
             )
         if time.monotonic() >= deadline:
             raise PublishGateError(
                 f"{app_tag}: no successful, exact rapid-mac-release.yml run on the tag "
                 "ref within the deadline. The tagged Desktop publish did not "
-                "complete. Recovery: re-run the failed exact workflow, or dispatch "
-                f"rapid-mac-release.yml at --ref {app_tag}, then re-run auto-release. "
-                "Do NOT move or delete the tag."
+                "complete. Recovery: re-run the failed exact promotion, or re-run "
+                "auto-release so it supplies the exact promote_run_id and "
+                "promote_sha. Do NOT move or delete the tag."
             )
         time.sleep(sleep_sec)
 
@@ -515,8 +523,8 @@ def verify(
             f"{app_tag}: the run succeeded but no published (non-draft) GitHub "
             "Release with an uploaded non-zero rapid-mlx-desktop.dmg asset exists. "
             "The Desktop artifact was not published; the engine must not release. "
-            "Recovery: re-run the failed exact workflow, or dispatch "
-            f"rapid-mac-release.yml at --ref {app_tag}, then re-run auto-release."
+            "Recovery: re-run the failed exact promotion, or re-run auto-release "
+            "so it supplies the exact promote_run_id and promote_sha."
         )
     release_digest, release_size = release_identity
     if (release_digest, release_size) != (run_digest, run_size):
@@ -547,6 +555,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--app-tag", required=True)
     p.add_argument("--accepted-sha", required=True)
+    p.add_argument("--expected-run-id", type=int, required=True)
     p.add_argument("--repo", required=True)
     p.add_argument("--workflow", default="rapid-mac-release.yml")
     p.add_argument("--gh", default="gh")
@@ -561,6 +570,7 @@ def main(argv: list[str] | None = None) -> int:
         evidence = verify(
             app_tag=args.app_tag,
             accepted_sha=args.accepted_sha,
+            expected_run_id=args.expected_run_id,
             repo=args.repo,
             workflow=args.workflow,
             gh=args.gh,

@@ -164,7 +164,7 @@ def _run_record(
     *,
     status="completed",
     conclusion="success",
-    event="push",
+    event="workflow_dispatch",
     head_sha=ACCEPTED,
     head_branch="rapid-mac-v0.13.0-rc2",
 ):
@@ -204,10 +204,19 @@ def _asset(
     return a
 
 
-def _verify(gate, gh, state, *, deadline_sec=0.05, sleep_sec=0.0):
+def _verify(
+    gate,
+    gh,
+    state,
+    *,
+    expected_run_id=1,
+    deadline_sec=0.05,
+    sleep_sec=0.0,
+):
     return gate.verify(
         app_tag="rapid-mac-v0.13.0-rc2",
         accepted_sha=ACCEPTED,
+        expected_run_id=expected_run_id,
         repo="raullenchai/Rapid-MLX",
         workflow="rapid-mac-release.yml",
         gh=str(gh),
@@ -237,20 +246,20 @@ def test_older_failure_plus_active_rerun_waits_then_succeeds(gate, tmp_path):
         echo "$((n + 1))" > "{state}/count"
         if [[ "$n" == "0" ]]; then
           echo '['
-          echo '  {{"id": 10, "event": "push", "head_sha": "{ACCEPTED}", "head_branch": "rapid-mac-v0.13.0-rc2", "status": "completed", "conclusion": "failure"}},'
-          echo '  {{"id": 11, "event": "push", "head_sha": "{ACCEPTED}", "head_branch": "rapid-mac-v0.13.0-rc2", "status": "in_progress", "conclusion": null}}'
+          echo '  {{"id": 10, "event": "workflow_dispatch", "head_sha": "{ACCEPTED}", "head_branch": "rapid-mac-v0.13.0-rc2", "status": "completed", "conclusion": "failure"}},'
+          echo '  {{"id": 11, "event": "workflow_dispatch", "head_sha": "{ACCEPTED}", "head_branch": "rapid-mac-v0.13.0-rc2", "status": "in_progress", "conclusion": null}}'
           echo ']'
         else
           echo '['
-          echo '  {{"id": 10, "event": "push", "head_sha": "{ACCEPTED}", "head_branch": "rapid-mac-v0.13.0-rc2", "status": "completed", "conclusion": "failure"}},'
-          echo '  {{"id": 11, "event": "push", "head_sha": "{ACCEPTED}", "head_branch": "rapid-mac-v0.13.0-rc2", "status": "completed", "conclusion": "success"}}'
+          echo '  {{"id": 10, "event": "workflow_dispatch", "head_sha": "{ACCEPTED}", "head_branch": "rapid-mac-v0.13.0-rc2", "status": "completed", "conclusion": "failure"}},'
+          echo '  {{"id": 11, "event": "workflow_dispatch", "head_sha": "{ACCEPTED}", "head_branch": "rapid-mac-v0.13.0-rc2", "status": "completed", "conclusion": "success"}}'
           echo ']'
         fi
         """
     )
     _write(state, "runs.sh", runs_script)
     _write(state, "release.json", _release_with(_asset()))
-    evidence = _verify(gate, gh, state, deadline_sec=10)
+    evidence = _verify(gate, gh, state, expected_run_id=11, deadline_sec=10)
     assert any("run 11 succeeded" in e for e in evidence)
 
 
@@ -262,7 +271,7 @@ def test_old_failure_plus_success_prefers_success(gate, tmp_path):
         _runs_with(_run_record(10, conclusion="failure"), _run_record(11)),
     )
     _write(state, "release.json", _release_with(_asset()))
-    evidence = _verify(gate, gh, state)
+    evidence = _verify(gate, gh, state, expected_run_id=11)
     assert any("run 11 succeeded" in e for e in evidence)
 
 
@@ -275,7 +284,7 @@ def test_newer_failed_rerun_invalidates_older_success(gate, tmp_path):
     )
     _write(state, "release.json", _release_with(_asset()))
     with pytest.raises(gate.PublishGateError, match="completed without success"):
-        _verify(gate, gh, state)
+        _verify(gate, gh, state, expected_run_id=11)
 
 
 def test_success_waits_for_active_exact_rerun_then_uses_newest(gate, tmp_path):
@@ -294,7 +303,7 @@ def test_success_waits_for_active_exact_rerun_then_uses_newest(gate, tmp_path):
     )
     _write(state, "runs.sh", runs_script)
     _write(state, "release.json", _release_with(_asset()))
-    evidence = _verify(gate, gh, state, deadline_sec=10)
+    evidence = _verify(gate, gh, state, expected_run_id=11, deadline_sec=10)
     assert any("run 11 succeeded" in e for e in evidence)
     assert (state / "count").read_text().strip() == "2"
 
@@ -311,7 +320,7 @@ def test_delayed_tag_run_appearance_is_polled_to_success(gate, tmp_path):
     )
     _write(state, "runs.sh", runs_script)
     _write(state, "release.json", _release_with(_asset()))
-    evidence = _verify(gate, gh, state, deadline_sec=10)
+    evidence = _verify(gate, gh, state, expected_run_id=12, deadline_sec=10)
     assert any("run 12 succeeded" in e for e in evidence)
     assert (state / "count").read_text().strip() == "4"
 
@@ -320,7 +329,7 @@ def test_only_failed_no_active_fails_closed(gate, tmp_path):
     gh, state = _mock_state(tmp_path)
     _write(state, "runs.sh", _runs_with(_run_record(10, conclusion="failure")))
     with pytest.raises(gate.PublishGateError, match="completed without success"):
-        _verify(gate, gh, state, deadline_sec=0.05)
+        _verify(gate, gh, state, expected_run_id=10, deadline_sec=0.05)
 
 
 def test_still_in_progress_times_out(gate, tmp_path):
@@ -332,7 +341,14 @@ def test_still_in_progress_times_out(gate, tmp_path):
         _runs_with(_run_record(10, status="in_progress", conclusion=None)),
     )
     with pytest.raises(gate.PublishGateError, match="within the deadline"):
-        _verify(gate, gh, state, deadline_sec=0.05, sleep_sec=0.0)
+        _verify(
+            gate,
+            gh,
+            state,
+            expected_run_id=10,
+            deadline_sec=0.05,
+            sleep_sec=0.0,
+        )
 
 
 def test_api_failure_fails_immediately(gate, tmp_path):
@@ -352,14 +368,14 @@ def test_wrong_head_branch_is_not_exact(gate, tmp_path):
     )
     # Resolution still says ACCEPTED (ref.json) but no exact run -> timeout/fail.
     with pytest.raises(gate.PublishGateError):
-        _verify(gate, gh, state, deadline_sec=0.05)
+        _verify(gate, gh, state, expected_run_id=9, deadline_sec=0.05)
 
 
 def test_wrong_head_sha_is_not_exact(gate, tmp_path):
     gh, state = _mock_state(tmp_path)
     _write(state, "runs.sh", _runs_with(_run_record(9, head_sha=OTHER)))
     with pytest.raises(gate.PublishGateError):
-        _verify(gate, gh, state, deadline_sec=0.05)
+        _verify(gate, gh, state, expected_run_id=9, deadline_sec=0.05)
 
 
 def test_exact_tag_workflow_dispatch_recovery_is_accepted(gate, tmp_path):
@@ -370,15 +386,37 @@ def test_exact_tag_workflow_dispatch_recovery_is_accepted(gate, tmp_path):
         _runs_with(_run_record(12, event="workflow_dispatch")),
     )
     _write(state, "release.json", _release_with(_asset()))
-    evidence = _verify(gate, gh, state)
+    evidence = _verify(gate, gh, state, expected_run_id=12)
     assert any("event workflow_dispatch" in line for line in evidence)
+
+
+def test_concurrent_manual_success_cannot_replace_failed_dispatched_run(gate, tmp_path):
+    gh, state = _mock_state(tmp_path)
+    _write(
+        state,
+        "runs.sh",
+        _runs_with(
+            _run_record(77, conclusion="failure"),
+            _run_record(88, conclusion="success"),
+        ),
+    )
+    _write(state, "release.json", _release_with(_asset()))
+    with pytest.raises(gate.PublishGateError, match="completed without success"):
+        _verify(gate, gh, state, expected_run_id=77)
+
+
+def test_push_run_with_dispatched_id_is_not_accepted(gate, tmp_path):
+    gh, state = _mock_state(tmp_path)
+    _write(state, "runs.sh", _runs_with(_run_record(91, event="push")))
+    with pytest.raises(gate.PublishGateError, match="within the deadline"):
+        _verify(gate, gh, state, expected_run_id=91, deadline_sec=0.05)
 
 
 def test_unrelated_event_is_not_exact(gate, tmp_path):
     gh, state = _mock_state(tmp_path)
     _write(state, "runs.sh", _runs_with(_run_record(13, event="pull_request")))
     with pytest.raises(gate.PublishGateError, match="within the deadline"):
-        _verify(gate, gh, state, deadline_sec=0.05)
+        _verify(gate, gh, state, expected_run_id=13, deadline_sec=0.05)
 
 
 def test_malformed_workflow_run_fails_immediately(gate, tmp_path):
@@ -387,7 +425,7 @@ def test_malformed_workflow_run_fails_immediately(gate, tmp_path):
     del malformed["status"]
     _write(state, "runs.sh", _runs_with(malformed))
     with pytest.raises(gate.PublishGateError, match="malformed record"):
-        _verify(gate, gh, state, deadline_sec=10)
+        _verify(gate, gh, state, expected_run_id=14, deadline_sec=10)
 
 
 def test_draft_release_fails(gate, tmp_path):
@@ -548,6 +586,7 @@ def test_invalid_app_tag_fails(gate, tmp_path):
         gate.verify(
             app_tag="rapid-mac-v0.13",
             accepted_sha=ACCEPTED,
+            expected_run_id=1,
             repo="raullenchai/Rapid-MLX",
             workflow="rapid-mac-release.yml",
             gh=str(gh),
