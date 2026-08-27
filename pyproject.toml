@@ -55,16 +55,18 @@ dependencies = [
     "mlx-lm>=0.31.3,<0.32",  # 0.31.1+ required for presence_penalty/frequency_penalty kwargs on make_logits_processors (#512); 0.31.3 added thread-local generation_stream but cross-thread eval is still broken (see shim sites). Upper cap <0.32 (#1248).
     # mlx-vlm is opt-in via [vision] extras (saves ~322 MB for text-only users)
     #
-    # Upper cap <5.13 (release-blocker): mlx-lm and mlx-vlm both float
-    # transformers with no upper bound, but transformers 5.13.0 tightened
+    # transformers 5.13.0 tightened
     # ``AutoTokenizer.register`` to dereference ``key.__module__`` while mlx-lm
     # still registers tokenizers by *string* class name (mlx_lm/
     # tokenizer_utils.py:505) — so under 5.13 even a bare ``import mlx_lm``
     # (and therefore every serve / gemma-4 / DiffusionGemma launch) raises
     # ``AttributeError: 'str' object has no attribute '__module__'`` at import
-    # time. 5.5.0-5.12.x import cleanly (a fresh resolve currently lands
-    # 5.12.1). Drop the cap once mlx-lm registers real tokenizer classes.
-    # Mirrors the rapid-desktop sidecar pin (PR #498).
+    # time. The regression is specific to 5.13.0; 5.13.1 fixed string-key
+    # registration, and the 5.15.x line completed the dependency-coherence
+    # sweep with mlx-lm 0.31.3. Keep the bad release excluded explicitly and
+    # retain a next-minor cap so a new Transformers runtime cannot arrive
+    # unswept. The Desktop's reduced sidecar runtime remains independently
+    # pinned and validated.
     #
     # HY3 vendor note (2026-07-09): the 0.11.0 Hy3 vendor drop
     # (``vllm_mlx/models/hy_v3.py``) was validated end-to-end against
@@ -78,7 +80,7 @@ dependencies = [
     # in the HY3 hot path. If a future transformers release above 5.7
     # introduces an HY3-specific regression, we tighten the floor with a
     # dedicated bump PR + Phase-0 re-audit rather than pinning here.
-    "transformers>=5.0.0,<5.13",
+    "transformers>=5.0.0,!=5.13.0,<5.16",
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
     "numpy>=1.24.0",
@@ -156,14 +158,11 @@ dependencies = [
 # Required for any model with vision input. Text-only models work without this.
 # 0.5.0+ also unlocks DFlash speculative decoding (see [dflash] extras).
 vision = [
-    # 0.6.3: DiffusionGemma (Gemma 4 DLM PR #1347 + long-context prefill PR #1348). 0.6.1 floor: gemma4_unified architecture. 0.5.0 baseline: gemma4 multi-image + tool-parser fixes, TurboQuant race-condition fix, continuous-batching guard. Also unlocks DFlash spec-decode hooks (see [dflash] extras).
-    # !=0.6.4 EXCLUDED: 0.6.4 ships a broken qwen3_5 GatedDeltaNet SSM forward
-    # (garbage output; this is why Bonsai 27B is served text-only via mlx-lm).
-    # It is the CURRENT PyPI latest with no 0.6.5 fix, so a bare ``>=0.6.3``
-    # resolves a fresh install straight to the broken build. All five extras
-    # that pull mlx-vlm carry this exclusion — enforced by
-    # tests/test_vision_extra_install.py so a new extra can't silently regress.
-    "mlx-vlm>=0.6.3,!=0.6.4,<0.7",  # upper cap <0.7 (#1248): pin to validated 0.6.x line; raising it is a gated coherence event (scripts/check_mlx_bound_move.py).
+    # Keep the optional runtime identical to the signed Desktop sidecar.
+    # A floating 0.6.x range backtracks to 0.6.3 under older Transformers
+    # constraints and can also advance CLI users beyond the Desktop's validated
+    # lane. Updating this exact pin is a gated coherence event (#1248).
+    "mlx-vlm==0.6.16",
     "opencv-python>=4.8.0",
     "torch>=2.3.0",
     "torchvision>=0.18.0",
@@ -177,7 +176,7 @@ vision = [
 # the vision extras do. Only enable if you serve a DFlash-eligible alias
 # (e.g. qwen3.5-27b-8bit) with --speculative-config '{"method":"dflash"}'.
 dflash = [
-    "mlx-vlm>=0.6.3,!=0.6.4,<0.7",  # upper cap <0.7 (#1248): pin to validated 0.6.x line; raising it is a gated coherence event (scripts/check_mlx_bound_move.py).
+    "mlx-vlm==0.6.16",
 ]
 # MTP (Multi-Token Prediction) speculative decoding — Gemma 4 external
 # assistant path via ``--speculative-config '{"method":"mtp","model":"<path>"}'``.
@@ -227,7 +226,7 @@ chat = [
 # pip install .[all] and editable installs.
 all = [
     # vision
-    "mlx-vlm>=0.6.3,!=0.6.4,<0.7",  # upper cap <0.7 (#1248): pin to validated 0.6.x line; raising it is a gated coherence event (scripts/check_mlx_bound_move.py).
+    "mlx-vlm==0.6.16",
     "opencv-python>=4.8.0",
     "torch>=2.3.0",
     "torchvision>=0.18.0",
@@ -295,7 +294,7 @@ test = [
     # ``pytest tests/`` without hand-installed local extras.
     "aiohttp>=3.9.0",
     "pillow>=10.0.0",
-    "mlx-vlm>=0.6.3,!=0.6.4,<0.7; platform_system == 'Darwin'",  # upper cap <0.7 (#1248): pin to validated 0.6.x line; raising it is a gated coherence event.
+    "mlx-vlm==0.6.16; platform_system == 'Darwin'",
     "mlx-audio>=0.2.9,<0.4.4; platform_system == 'Darwin'",
     # Powers the property-based invariant suite in tests/property/ — encodes
     # numeric/validation invariants over the whole input space (e.g. the
@@ -325,7 +324,7 @@ dev = [
     'tomli>=2.0.1; python_version < "3.11"',
     "aiohttp>=3.9.0",
     "pillow>=10.0.0",
-    "mlx-vlm>=0.6.3,!=0.6.4,<0.7; platform_system == 'Darwin'",  # upper cap <0.7 (#1248): pin to validated 0.6.x line; raising it is a gated coherence event.
+    "mlx-vlm==0.6.16; platform_system == 'Darwin'",
     "mlx-audio>=0.2.9,<0.4.4; platform_system == 'Darwin'",
     # Mirror of the [test] entry — keep `dev` a strict superset of `test`
     # (enforced by tests/test_pr_validate_test_env.py).
