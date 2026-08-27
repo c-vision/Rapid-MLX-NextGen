@@ -110,6 +110,21 @@ async def model_residency():
     return snapshot
 
 
+def _resolved_group_for_profile(modality: str) -> str:
+    """Map a request-facing profile modality to its lifecycle replacement group.
+
+    Mirrors ``resident_models._replacement_group`` (assistant for text, mllm,
+    vision, and text-diffusion): a diffusion-gemma-26b checkpoint runs as a text
+    engine whose lifecycle group is "assistant", so the request-facing profile
+    modality ("text-diffusion") must resolve to the same group or the
+    ``resolved_group != replace_group`` guard raises a spurious 409 when the
+    Desktop picks it with a chat model resident.  Kept in one place so both the
+    request FIX path here and the engine-derived group stay in parity
+    (#0131-routing-groups Fix 2).
+    """
+    return "assistant" if modality in {"text", "vision", "text-diffusion"} else modality
+
+
 @router.post("/v1/models/load")
 async def load_resident_model(request: ModelLoadRequest):
     """Load a model into the current process, evicting idle LRU entries first."""
@@ -135,11 +150,7 @@ async def load_resident_model(request: ModelLoadRequest):
         profile = path_profile if request.model_path else model_profile
         resolved_group = None
         if profile is not None:
-            resolved_group = (
-                "assistant"
-                if profile.modality in {"text", "vision"}
-                else profile.modality
-            )
+            resolved_group = _resolved_group_for_profile(profile.modality)
         if (
             performance is not None
             and profile is not None

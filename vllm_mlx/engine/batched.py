@@ -2120,6 +2120,15 @@ class BatchedEngine(BaseEngine):
                 for k in ("repetition_penalty", "presence_penalty", "frequency_penalty")
                 if k in kwargs
             }
+            _mllm_logits_processors = []
+            for processor_key in (
+                "grammar_logits_processor",
+                "reasoning_budget_logits_processor",
+                "suppressed_tokens_logits_processor",
+            ):
+                processor = kwargs.pop(processor_key, None)
+                if processor is not None:
+                    _mllm_logits_processors.append(processor)
             try:
                 output = await self._mllm_scheduler.generate(
                     prompt=prompt,
@@ -2133,6 +2142,7 @@ class BatchedEngine(BaseEngine):
                     video_max_frames=kwargs.pop("video_max_frames", None),
                     lifecycle_admission_token=admission_token,
                     on_request_committed=request_committed,
+                    logits_processors=_mllm_logits_processors,
                     **_mllm_penalty_kwargs,
                 )
             except BaseException:
@@ -2372,6 +2382,15 @@ class BatchedEngine(BaseEngine):
                 for k in ("repetition_penalty", "presence_penalty", "frequency_penalty")
                 if k in kwargs
             }
+            _mllm_logits_processors = [
+                processor
+                for processor in (
+                    kwargs.pop("grammar_logits_processor", None),
+                    kwargs.pop("reasoning_budget_logits_processor", None),
+                    kwargs.pop("suppressed_tokens_logits_processor", None),
+                )
+                if processor is not None
+            ]
             try:
                 request_id = await self._mllm_scheduler.add_request_async(
                     request_id=request_id,
@@ -2386,6 +2405,7 @@ class BatchedEngine(BaseEngine):
                     video_max_frames=kwargs.pop("video_max_frames", None),
                     lifecycle_admission_token=admission_token,
                     on_request_committed=commit_admission,
+                    logits_processors=_mllm_logits_processors,
                     **_mllm_penalty_kwargs,
                 )
             except BaseException:

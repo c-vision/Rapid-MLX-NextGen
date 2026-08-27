@@ -293,11 +293,12 @@ async def test_startup_and_runtime_use_identical_checkpoint_lane_contract(
             {
                 "force_mllm": False,
                 "force_text": False,
+                "requested_spec_decode": "none",
             },
         ),
         (
             "publisher/model",
-            {"force_text": False},
+            {"force_text": False, "requested_spec_decode": "none"},
         ),
     ]
     assert startup_kwargs["model_name"] == runtime.engine.kwargs["model_name"]

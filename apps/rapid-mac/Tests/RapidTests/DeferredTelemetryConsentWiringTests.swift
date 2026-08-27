@@ -70,7 +70,9 @@ struct DeferredTelemetryConsentWiringTests {
             #expect(banner.contains("TelemetryConsent.PostValue\(identifier == "Banner" ? "" : ".")\(identifier)"))
         }
         #expect(!banner.contains(".isModal"))
-        #expect(banner.contains(".keyboardShortcut(.cancelAction)"))
+        #expect(banner.contains("Button(\"No thanks\", role: .cancel) { consent.decline() }"))
+        #expect(!banner.contains(".keyboardShortcut(.cancelAction)"),
+                "Escape belongs to the active app interaction; only an explicit click may decline")
         #expect(!banner.contains("@FocusState"))
     }
 }

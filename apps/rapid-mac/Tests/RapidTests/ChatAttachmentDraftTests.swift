@@ -5,6 +5,32 @@ import Testing
 
 @Suite("Chat attachment draft state")
 struct ChatAttachmentDraftTests {
+    @Test("HEIC picker/drop import becomes a previewable draft image")
+    func heicImportUsesSharedDraftBoundary() throws {
+        let fixture = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("__Snapshots__/cheetah-logo-96.heic")
+        let conversationID = UUID()
+        var store = ChatAttachmentDraftStore()
+        let startedRequest = store.beginImageImport(conversationID: conversationID)
+        let request = try #require(startedRequest)
+
+        let outcome = ChatView.loadImageAttachments([fixture])
+        let accepted = store.finishImageImport(
+            request: request,
+            outcome.accepted,
+            notice: outcome.rejection
+        )
+        let draft = store[conversationID]
+
+        #expect(accepted)
+        #expect(draft.notice == nil)
+        #expect(draft.images.count == 1)
+        #expect(draft.images.first?.filename == "cheetah-logo-96.jpg")
+        #expect(draft.images.first?.mimeType == "image/jpeg")
+        #expect(draft.sourcePaths.count == 1)
+    }
+
     @Test("consume atomically clears attachments, identity, notice, and import state")
     func consumeClearsEveryTransientField() throws {
         let image = try makeImage(name: "first.png")

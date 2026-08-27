@@ -1246,7 +1246,7 @@ is_vlm_model = is_mllm_model
 # multimodal routing automatically once a dependency bump ships support —
 # no code change needed here (remove the entry when the vendored backbone
 # itself is retired).
-_VENDORED_TEXT_FALLBACK_MODEL_TYPES = ("muse_glimmer",)
+_VENDORED_TEXT_FALLBACK_MODEL_TYPES = ("muse_glimmer", "qwen4_exp")
 
 
 def mllm_arch_unsupported_but_text_vendored(model_name: str) -> bool:
@@ -1378,10 +1378,37 @@ def resolve_serving_lane_decision(
     force_mllm: bool = False,
     force_text: bool = False,
     vision_min_memory_gb: float | None = None,
+    requested_spec_decode: str = "none",
 ) -> ServingLaneDecision:
-    """Resolve one lane contract for startup, residency, and diagnostics."""
+    """Resolve one lane contract for startup, residency, and diagnostics.
+
+    ``requested_spec_decode`` carries the operator-requested speculative
+    decoder ("none" when none). The MLLM/VLM lane ignores speculative
+    decoding entirely — ``_start_llm`` consumes ``scheduler_config.spec_decode``
+    while ``_start_mllm`` never reads it — so on a vision-capable checkpoint a
+    requested spec_decode would silently be dropped and throughput would regress
+    vs the text lane. Route such a model back onto the text lane (where the
+    requested decoder is honoured) with reason ``text_lane_speculative_decode``.
+    """
     if force_text:
         return ServingLaneDecision(False, "text_lane_forced")
+    # A requested speculative decoder is only honoured by the text lane
+    # (``_start_llm`` consumes ``scheduler_config.spec_decode``; ``_start_mllm``
+    # never reads it).  Give it the same precedence as force_text — above
+    # ``force_mllm`` — so ``--mllm`` + spec-decode still keeps the decoder on
+    # the text lane rather than silently dropping it, exactly as ``force_text``
+    # already outranks ``force_mllm`` here.  ``None`` is treated as "none".
+    if requested_spec_decode not in (None, "none"):
+        if not is_mllm_model(model_name):
+            logger.info(
+                "Speculative decode requested (spec_decode=%r) on a text "
+                "checkpoint — text lane already selected; decoder honoured.",
+                requested_spec_decode,
+            )
+            return ServingLaneDecision(False, "text_checkpoint")
+        return ServingLaneDecision(
+            False, "text_lane_speculative_decode", auto_text_fallback=True
+        )
     if force_mllm:
         return ServingLaneDecision(True, "vision_lane_forced")
     if not is_mllm_model(model_name):
@@ -1420,7 +1447,11 @@ def resolve_serving_lane_decision(
 
 
 def resolve_serving_lane(
-    model_name: str, *, force_mllm: bool = False, force_text: bool = False
+    model_name: str,
+    *,
+    force_mllm: bool = False,
+    force_text: bool = False,
+    requested_spec_decode: str = "none",
 ) -> tuple[bool, bool]:
     """Decide the FINAL serving lane for a model, resolving the automatic
     hybrid→text-only fallback up front so every consumer (PFlash defaulting,
@@ -1454,7 +1485,10 @@ def resolve_serving_lane(
     engine (#352 dogfood P1-②).
     """
     decision = resolve_serving_lane_decision(
-        model_name, force_mllm=force_mllm, force_text=force_text
+        model_name,
+        force_mllm=force_mllm,
+        force_text=force_text,
+        requested_spec_decode=requested_spec_decode,
     )
     return decision.is_mllm, decision.auto_text_fallback
 

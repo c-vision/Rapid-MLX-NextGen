@@ -20,6 +20,7 @@ The route-level tests reuse the lightweight-engine fixture pattern from
 engine, which keeps CI hermetic.
 """
 
+import contextvars
 import json
 import sys
 import types
@@ -326,6 +327,7 @@ class _RecordingEngine:
     """
 
     preserve_native_tool_format = False
+    is_mllm = False
 
     def __init__(self):
         self.calls: list[SimpleNamespace] = []
@@ -350,8 +352,14 @@ def _install_lightweight_engine_modules(monkeypatch):
     base_mod.BaseEngine = _BaseEngine
     base_mod.GenerationOutput = _GenerationOutput
 
+    batched_mod = types.ModuleType("vllm_mlx.engine.batched")
+    batched_mod._admission_engine_context = contextvars.ContextVar(
+        "test_admission_engine", default=None
+    )
+
     monkeypatch.setitem(sys.modules, "vllm_mlx.engine", engine_pkg)
     monkeypatch.setitem(sys.modules, "vllm_mlx.engine.base", base_mod)
+    monkeypatch.setitem(sys.modules, "vllm_mlx.engine.batched", batched_mod)
 
 
 _IMPORTED_UNDER_LIGHTWEIGHT_ENGINE = (
@@ -359,6 +367,7 @@ _IMPORTED_UNDER_LIGHTWEIGHT_ENGINE = (
     "vllm_mlx.config.server_config",
     "vllm_mlx.engine",
     "vllm_mlx.engine.base",
+    "vllm_mlx.engine.batched",
     "vllm_mlx.middleware.auth",
     "vllm_mlx.service.helpers",
     "vllm_mlx.routes.anthropic",
@@ -560,3 +569,137 @@ class TestRouteOutputConfigSurface:
             "output_config.effort leaked into engine chat kwargs — "
             "this field belongs to Pick 1 (concurrent PR)."
         )
+
+
+@pytest.mark.asyncio
+async def test_mllm_output_schema_attaches_request_local_processor(monkeypatch):
+    """Claude-shaped structured output is constrained on the MLLM lane."""
+    from vllm_mlx.api import guided
+    from vllm_mlx.routes import anthropic as anthropic_route
+
+    marker = object()
+    schema = {"type": "object", "properties": {"title": {"type": "string"}}}
+    monkeypatch.setattr(
+        anthropic_route,
+        "extract_json_schema_for_guided",
+        lambda _response_format: schema,
+    )
+    monkeypatch.setattr(
+        guided,
+        "build_json_schema_logits_processor",
+        lambda tokenizer, actual_schema: (
+            marker if tokenizer == "tok" and actual_schema == schema else None
+        ),
+    )
+    request = SimpleNamespace(response_format=object(), tools=[])
+    engine = SimpleNamespace(is_mllm=True, tokenizer="tok")
+    chat_kwargs = {}
+
+    await anthropic_route._attach_mllm_schema_processor(engine, request, chat_kwargs)
+
+    assert chat_kwargs["grammar_logits_processor"] is marker
+    assert chat_kwargs["enable_thinking"] is False
+
+
+@pytest.mark.asyncio
+async def test_mllm_output_schema_does_not_replace_tool_grammar(monkeypatch):
+    """Combined tools/schema requests retain the existing tool-call contract."""
+    from vllm_mlx.api import guided
+    from vllm_mlx.routes import anthropic as anthropic_route
+
+    monkeypatch.setattr(
+        guided,
+        "build_json_schema_logits_processor",
+        lambda *_args: pytest.fail("whole-response schema must not replace tools"),
+    )
+    request = SimpleNamespace(response_format=object(), tools=[object()])
+    engine = SimpleNamespace(is_mllm=True, tokenizer="tok")
+    chat_kwargs = {}
+
+    await anthropic_route._attach_mllm_schema_processor(engine, request, chat_kwargs)
+
+    assert chat_kwargs == {}
+
+
+@pytest.mark.asyncio
+async def test_mllm_output_schema_fails_closed_when_schema_is_unusable(monkeypatch):
+    from vllm_mlx.routes import anthropic as anthropic_route
+
+    monkeypatch.setattr(
+        anthropic_route,
+        "extract_json_schema_for_guided",
+        lambda _response_format: None,
+    )
+    request = SimpleNamespace(response_format=object(), tools=[])
+    engine = SimpleNamespace(is_mllm=True, tokenizer="tok")
+    chat_kwargs = {}
+
+    await anthropic_route._attach_mllm_schema_processor(engine, request, chat_kwargs)
+
+    assert chat_kwargs == {}
+
+
+@pytest.mark.asyncio
+async def test_output_schema_ignores_engines_without_mllm_capability():
+    from vllm_mlx.routes import anthropic as anthropic_route
+
+    request = SimpleNamespace(response_format=object(), tools=[])
+    chat_kwargs = {}
+
+    await anthropic_route._attach_mllm_schema_processor(
+        SimpleNamespace(tokenizer="tok"), request, chat_kwargs
+    )
+
+    assert chat_kwargs == {}
+
+
+def test_mllm_streaming_schema_disables_reasoning_classification(
+    monkeypatch, anthropic_client
+):
+    """The Anthropic streaming path treats schema bytes as answer content."""
+    from vllm_mlx.api import guided
+
+    marker = object()
+    monkeypatch.setattr(
+        guided,
+        "build_json_schema_logits_processor",
+        lambda *_args: marker,
+    )
+
+    async def _stream_chat(engine, messages, **kwargs):
+        engine.calls.append(SimpleNamespace(messages=messages, kwargs=kwargs))
+        yield _GenerationOutput(
+            text='{"name":"alice"}',
+            raw_text='{"name":"alice"}',
+            new_text='{"name":"alice"}',
+            tokens=[1],
+            prompt_tokens=3,
+            completion_tokens=1,
+            finish_reason="stop",
+        )
+
+    engine = anthropic_client.engine
+    engine.is_mllm = True
+    engine.tokenizer.chat_template = "<think>"
+    engine.stream_chat = types.MethodType(_stream_chat, engine)
+
+    response = anthropic_client.client.post(
+        "/v1/messages",
+        json=_payload(
+            stream=True,
+            output_config={
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                    },
+                }
+            },
+        ),
+    )
+
+    assert response.status_code == 200, response.text
+    assert engine.calls[0].kwargs["grammar_logits_processor"] is marker
+    assert engine.calls[0].kwargs["enable_thinking"] is False
+    assert '"type": "thinking"' not in response.text

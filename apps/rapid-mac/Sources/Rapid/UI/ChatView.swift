@@ -950,7 +950,9 @@ struct ChatView: View {
 
     private func choosePhotos() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.png, .jpeg, .gif]
+        // ImageIO normalizes native still-image formats at the shared draft
+        // boundary; the picker must expose the same contract as paste/drop.
+        panel.allowedContentTypes = [.image]
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
@@ -1001,8 +1003,7 @@ struct ChatView: View {
 
         if !imageURLs.isEmpty {
             if supportsImageInput {
-                addImageURLs(imageURLs)
-                accepted = true
+                accepted = addImageURLs(imageURLs) || accepted
             } else {
                 rejectImageInputForCurrentModel()
             }
@@ -1016,17 +1017,26 @@ struct ChatView: View {
         return accepted
     }
 
-    private func addImageURLs(_ urls: [URL]) {
-        var accepted: [(attachment: ChatImageAttachment, sourceURL: URL)] = []
-        var rejection: String?
-        for url in urls {
-            do {
-                accepted.append((try ChatImageAttachment(contentsOf: url), url))
-            }
-            catch { rejection = error.localizedDescription }
+    /// ImageIO decoding and transcoding can be meaningful work for a 20–48 MP
+    /// phone capture, so keep it off the main actor. The conversation-keyed
+    /// generation contract mirrors document imports: a late result cannot land
+    /// in whichever conversation happens to be visible by then.
+    @discardableResult
+    private func addImageURLs(_ urls: [URL]) -> Bool {
+        guard let importRequest = attachmentDrafts.beginImageImport(
+            conversationID: viewModel.activeConversationID
+        ) else { return false }
+        Task { @MainActor in
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Self.loadImageAttachments(urls)
+            }.value
+            attachmentDrafts.finishImageImport(
+                request: importRequest,
+                outcome.accepted,
+                notice: outcome.rejection
+            )
         }
-        attachmentDraft.appendImages(accepted)
-        attachmentDraft.notice = rejection
+        return true
     }
 
     @discardableResult
@@ -1087,6 +1097,28 @@ struct ChatView: View {
                     attachment: try ChatFileAttachment(contentsOf: url),
                     sourceURL: url
                 ))
+            } catch {
+                rejection = error.localizedDescription
+            }
+        }
+        return (accepted, rejection)
+    }
+
+    nonisolated static func loadImageAttachments(
+        _ urls: [URL]
+    ) -> (
+        accepted: [(attachment: ChatImageAttachment, sourceURL: URL)],
+        rejection: String?
+    ) {
+        var accepted: [(attachment: ChatImageAttachment, sourceURL: URL)] = []
+        var rejection: String?
+        for url in urls {
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer {
+                if accessed { url.stopAccessingSecurityScopedResource() }
+            }
+            do {
+                accepted.append((try ChatImageAttachment(contentsOf: url), url))
             } catch {
                 rejection = error.localizedDescription
             }

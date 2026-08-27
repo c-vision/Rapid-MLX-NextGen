@@ -16,6 +16,7 @@ Test Cases:
 import base64
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -631,6 +632,70 @@ class TestVideoFpsForwarding:
         batch_req = bg.unprocessed_requests[0]
         assert batch_req.video_fps == 3.0
         assert batch_req.video_max_frames == 24
+
+
+@_skip_no_mlx_lm
+class TestMLLMEosContract:
+    """The MLLM generator must honor the loaded model's EOS contract."""
+
+    def test_model_config_eos_reaches_batch_generator(self):
+        """A processor/model EOS mismatch must still terminate generation.
+
+        Qwen3.5's processor tokenizer uses ``<|im_end|>`` while the loaded
+        multimodal model resolves ``<|endoftext|>`` as its model EOS.  The
+        latter is the token emitted by the affected title-generation path.
+        """
+        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+
+        tokenizer = SimpleNamespace(eos_token_id=248046)
+        processor = SimpleNamespace(tokenizer=tokenizer)
+        model = SimpleNamespace(config=SimpleNamespace(eos_token_id=248044))
+
+        scheduler = MLLMScheduler(model, processor, MLLMSchedulerConfig())
+        scheduler._ensure_batch_generator()
+
+        assert scheduler.stop_tokens == {248044, 248046}
+        assert scheduler.batch_generator is not None
+        assert scheduler.batch_generator.stop_tokens == {248044, 248046}
+
+    def test_nested_text_config_eos_is_a_supported_fallback(self):
+        """Raw config-shaped MLLM models may retain EOS under text_config."""
+        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+
+        processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=11))
+        model = SimpleNamespace(config={"text_config": {"eos_token_id": [12, 13]}})
+
+        scheduler = MLLMScheduler(model, processor, MLLMSchedulerConfig())
+
+        assert scheduler.stop_tokens == {11, 12, 13}
+
+    def test_boolean_model_eos_is_not_a_token_id(self):
+        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+
+        processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=11))
+        model = SimpleNamespace(config=SimpleNamespace(eos_token_id=True))
+
+        scheduler = MLLMScheduler(model, processor, MLLMSchedulerConfig())
+
+        assert scheduler.stop_tokens == {11}
+
+    def test_request_logits_processor_reaches_batch_generator(self):
+        """Structured-output state stays request-local through admission."""
+        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+
+        constraint = MagicMock()
+        processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=7))
+        model = SimpleNamespace(config=SimpleNamespace(eos_token_id=7))
+        scheduler = MLLMScheduler(model, processor, MLLMSchedulerConfig())
+
+        scheduler.add_request(prompt="title", logits_processors=[constraint])
+        scheduler._schedule_waiting()
+
+        assert scheduler.batch_generator is not None
+        assert scheduler.batch_generator.active_batch is None
+        assert scheduler.batch_generator.unprocessed_requests[0].logits_processors == [
+            constraint
+        ]
 
 
 @_skip_no_mlx_lm

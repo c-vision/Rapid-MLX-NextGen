@@ -745,6 +745,85 @@ def test_step_homogeneous_requests_call_shared_sampler_once(monkeypatch):
     assert sampled.shape == (4,)
 
 
+def test_step_request_processor_sees_compute_ahead_token(monkeypatch):
+    """Constraints see the token already fed into the decode step.
+
+    ``request.output_tokens`` trails ``input_tokens`` by one token in the
+    MLLM compute-ahead pipeline.  Omitting that current token desynchronizes an
+    incremental grammar after its first generated token and makes it fail open.
+    """
+    histories = []
+
+    def constraint(token_ids, logits):
+        histories.append(list(token_ids))
+        constrained = mx.full(logits.shape, -float("inf"), dtype=logits.dtype)
+        constrained[..., 2] = 0
+        return constrained
+
+    monkeypatch.setattr(
+        "vllm_mlx.mllm_batch_generator.make_sampler",
+        lambda **_kwargs: lambda logprobs: mx.argmax(logprobs, axis=-1),
+    )
+    gen = _make_step_stub_generator()
+    request = _make_sampling_request(0, 0.0, 1.0)
+    request.logits_processors = [constraint]
+
+    sampled, _ = MLLMBatchGenerator._step(
+        gen,
+        mx.array([[3]], dtype=mx.uint32),
+        cache=[],
+        requests=[request],
+    )
+    history_id = id(request.logits_processor_tokens)
+    MLLMBatchGenerator._step(
+        gen,
+        mx.array([[4]], dtype=mx.uint32),
+        cache=[],
+        requests=[request],
+    )
+
+    assert histories == [[3], [3, 4]]
+    assert request.logits_processor_tokens == [3, 4]
+    assert id(request.logits_processor_tokens) == history_id
+    assert int(sampled.item()) == 2
+
+
+def test_prefill_first_token_uses_request_logits_processor(monkeypatch):
+    """A request constraint owns token zero, not only steady-state decode."""
+    from mlx_lm.models import cache as cache_module
+
+    class _Cache:
+        def merge(self, _caches):
+            return self
+
+    monkeypatch.setattr(cache_module, "make_prompt_cache", lambda _model: [_Cache()])
+    monkeypatch.setattr(
+        "vllm_mlx.mllm_batch_generator.first_incompatible_mllm_cache_type",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.mllm_batch_generator.make_sampler",
+        lambda **_kwargs: lambda logprobs: mx.argmax(logprobs, axis=-1),
+    )
+
+    model = _RecordingModel()
+    gen = _make_generator(model)
+    gen._preprocess_request = lambda _request: None
+    gen._run_vision_encoding = lambda _request, cache: mx.zeros((1, 1, 4))
+    request = _make_request(pixel_values=None)
+
+    def _force_token_two(_token_ids, logits):
+        constrained = mx.full(logits.shape, -float("inf"), dtype=logits.dtype)
+        constrained[..., 2] = 0
+        return constrained
+
+    request.logits_processors = [_force_token_two]
+
+    batch = gen._process_prompts([request])
+
+    assert int(batch.y.item()) == 2
+
+
 def test_step_caches_shared_sampler_across_calls(monkeypatch):
     """Repeated steps with the same (temp, top_p) reuse the cached sampler."""
     make_sampler_calls = []

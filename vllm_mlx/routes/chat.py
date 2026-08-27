@@ -4853,6 +4853,31 @@ async def _create_chat_completion_impl(
     if response_format and not request.tools:
         json_schema = extract_json_schema_for_guided(response_format)
         if json_schema:
+            # MLLM continuous batching owns its decode loop, so the legacy
+            # model-owning ``GuidedGenerator`` cannot be used without routing
+            # the request away from the vision-capable lane. Build the same
+            # llguidance grammar as a request-local logits processor instead.
+            _mllm_schema_processor = None
+            if engine.is_mllm:
+                from ..api.guided import build_json_schema_logits_processor
+
+                _mllm_schema_processor = await asyncio.to_thread(
+                    build_json_schema_logits_processor,
+                    engine.tokenizer,
+                    json_schema,
+                )
+                if _mllm_schema_processor is not None:
+                    chat_kwargs["grammar_logits_processor"] = _mllm_schema_processor
+                    # The schema grammar owns token zero, so the request cannot
+                    # also carry a processor that forces a ``</think>`` token
+                    # after a reasoning budget.  That token is outside the JSON
+                    # grammar and would make the constraint fail open.
+                    chat_kwargs.pop("reasoning_budget_logits_processor", None)
+                    # The schema grammar owns the complete assistant payload
+                    # from token zero, so it cannot admit a reasoning preamble.
+                    # Keep prompt rendering and output classification aligned.
+                    chat_kwargs["enable_thinking"] = False
+
             # ``supports_guided_generation`` and ``generate_with_schema``
             # are on the BaseEngine contract — defaults are False /
             # NotImplementedError, so engines without guided decoding
@@ -4867,7 +4892,20 @@ async def _create_chat_completion_impl(
                 # so operators see uniform traffic shape across the
                 # guided / postgen-validation / disabled arms.
                 incr_strict_request()
-                if not use_guided:
+                if _mllm_schema_processor is not None and strict_enforcement_active:
+                    # The request-local matcher intentionally fails open if a
+                    # committed token desynchronizes it. Strict mode therefore
+                    # keeps the existing post-generation validator as a second
+                    # line of enforcement; a fail-open can preserve liveness,
+                    # but it cannot turn invalid JSON into a successful strict
+                    # response.
+                    use_strict_postgen_validation = True
+                    logger.info(
+                        "Strict json_schema mode on the MLLM lane — engaging "
+                        "request-local constrained decoding plus post-generate "
+                        "validation."
+                    )
+                elif not use_guided and _mllm_schema_processor is None:
                     # R12-4: pre-R12-4 this branch raised 400
                     # ``guided_extra_required``. That broke
                     # pydantic-ai end-to-end (Astrid r3) — every
@@ -4907,7 +4945,7 @@ async def _create_chat_completion_impl(
                         "Using guided generation for JSON schema "
                         "enforcement (strict=true)"
                     )
-            elif use_guided:
+            elif use_guided or _mllm_schema_processor is not None:
                 logger.info("Using guided generation for JSON schema enforcement")
             else:
                 # Surface the silent-degradation case: client asked for
@@ -5410,8 +5448,22 @@ async def _create_chat_completion_impl(
                 "tool_choice",
                 "logprobs",
                 "top_logprobs",
+                # The schema matcher is request-local and stateful. Reusing
+                # its cursor would constrain the repair as a continuation of
+                # the abandoned document rather than a fresh JSON value. The
+                # repair prompt plus post-check are the established
+                # unconstrained second-attempt contract.
+                "grammar_logits_processor",
             ):
                 repair_kwargs.pop(_k, None)
+            if engine.is_mllm and "grammar_logits_processor" in chat_kwargs:
+                # A whole-response schema grammar owns token zero on MLLM and
+                # explicitly rendered the first attempt with thinking off.
+                # Its reasoning processor (if one was prepared before that
+                # decision) is stateful and inapplicable to the fresh repair.
+                # Other engines keep their pre-existing reasoning budget, and
+                # token suppression remains intact on every lane.
+                repair_kwargs.pop("reasoning_budget_logits_processor", None)
             # H-06 #267b: re-check the context-length gate AGAINST the
             # POST-BUILD repair prompt. ``build_repair_messages`` builds a
             # strictly larger prompt than the initial request (prepended

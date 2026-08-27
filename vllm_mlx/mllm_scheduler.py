@@ -157,6 +157,7 @@ class MLLMRequest:
     num_prompt_tokens: int = 0
     num_output_tokens: int = 0
     lifecycle_admission_token: str | None = None
+    logits_processors: list[Callable] = field(default_factory=list)
 
 
 def _find_stop_match_in_new_window(
@@ -430,7 +431,11 @@ class MLLMScheduler:
         """Get stop token IDs from tokenizer.
 
         Mirrors ``Scheduler._get_stop_tokens`` — see that docstring
-        for the rationale behind each of the four sources.
+        for the rationale behind the tokenizer sources.  Multimodal
+        loaders also expose the resolved model EOS on ``model.config``;
+        that value can differ from the processor tokenizer's primary EOS
+        (Qwen3.5 is one such checkpoint), so it must participate in the
+        same union used by the batch generator.
         """
         from .utils.tokenizer import RAPID_EXTRA_EOS_ATTR
 
@@ -464,6 +469,32 @@ class MLLMScheduler:
         extras = getattr(tokenizer, RAPID_EXTRA_EOS_ATTR, None)
         if extras:
             stop_tokens.update(extras)
+
+        # Source 5: the loaded model configuration.  mlx-vlm resolves
+        # architecture-specific/nested ``text_config.eos_token_id`` onto
+        # the live model config.  Keep the nested read as a fail-closed
+        # fallback for config shapes that do not perform that resolution.
+        def _config_value(config: Any, name: str) -> Any:
+            if isinstance(config, dict):
+                return config.get(name)
+            return getattr(config, name, None)
+
+        def _add_ids(value: Any) -> None:
+            if isinstance(value, bool):
+                return
+            if isinstance(value, int):
+                stop_tokens.add(value)
+            elif isinstance(value, (list, set, tuple)):
+                stop_tokens.update(
+                    item
+                    for item in value
+                    if isinstance(item, int) and not isinstance(item, bool)
+                )
+
+        model_config = getattr(self, "model_config", None)
+        _add_ids(_config_value(model_config, "eos_token_id"))
+        text_config = _config_value(model_config, "text_config")
+        _add_ids(_config_value(text_config, "eos_token_id"))
 
         return stop_tokens
 
@@ -570,6 +601,7 @@ class MLLMScheduler:
         repetition_penalty = _pop_penalty("repetition_penalty", 1.0)
         presence_penalty = _pop_penalty("presence_penalty", 0.0)
         frequency_penalty = _pop_penalty("frequency_penalty", 0.0)
+        logits_processors = list(kwargs.pop("logits_processors", ()) or ())
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -589,6 +621,7 @@ class MLLMScheduler:
             video_fps=video_fps,
             video_max_frames=video_max_frames,
             lifecycle_admission_token=kwargs.pop("lifecycle_admission_token", None),
+            logits_processors=logits_processors,
         )
 
         # D-M01-2X (0.8.2 dogfood, codex r10 BLOCKING follow-up):
@@ -870,6 +903,7 @@ class MLLMScheduler:
                 repetition_penalty=request.sampling_params.repetition_penalty,
                 presence_penalty=request.sampling_params.presence_penalty,
                 frequency_penalty=request.sampling_params.frequency_penalty,
+                logits_processors=request.logits_processors,
                 video_fps=request.video_fps,
                 video_max_frames=request.video_max_frames,
             )

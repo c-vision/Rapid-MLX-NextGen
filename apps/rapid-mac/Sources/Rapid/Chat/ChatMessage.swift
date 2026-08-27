@@ -4,6 +4,18 @@ import UniformTypeIdentifiers
 
 struct ChatImageAttachment: Codable, Equatable, Hashable, Identifiable, Sendable {
     static let maxBytes = 20 * 1024 * 1024
+    /// Bounds decoded memory before ImageIO creates a full bitmap. This still
+    /// admits 48 MP iPhone captures while rejecting compressed image bombs.
+    static let maxPixelCount = 64_000_000
+    static let maxPixelDimension = 16_384
+
+    static func dimensionsFit(width: Int, height: Int) -> Bool {
+        width > 0
+            && height > 0
+            && width <= maxPixelDimension
+            && height <= maxPixelDimension
+            && width <= maxPixelCount / height
+    }
 
     let id: UUID
     let filename: String
@@ -30,22 +42,97 @@ struct ChatImageAttachment: Codable, Equatable, Hashable, Identifiable, Sendable
         let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentTypeKey])
         guard (values.fileSize ?? 0) <= Self.maxBytes else { throw ValidationError.tooLarge }
         let type = values.contentType
-        let mime: String
-        if type?.conforms(to: .png) == true { mime = "image/png" }
-        else if type?.conforms(to: .jpeg) == true { mime = "image/jpeg" }
-        else if type?.conforms(to: .gif) == true { mime = "image/gif" }
+        if type?.conforms(to: .png) == true {
+            try self.init(
+                filename: url.lastPathComponent,
+                mimeType: "image/png",
+                data: Data(contentsOf: url)
+            )
+        } else if type?.conforms(to: .jpeg) == true {
+            try self.init(
+                filename: url.lastPathComponent,
+                mimeType: "image/jpeg",
+                data: Data(contentsOf: url)
+            )
+        } else if type?.conforms(to: .gif) == true {
+            try self.init(
+                filename: url.lastPathComponent,
+                mimeType: "image/gif",
+                data: Data(contentsOf: url)
+            )
+        } else {
+            guard type?.conforms(to: .image) == true else {
+                throw ValidationError.unsupportedType
+            }
+            let normalized = try Self.normalizedStaticImage(at: url)
+            try self.init(
+                filename: normalized.filename,
+                mimeType: normalized.mimeType,
+                data: normalized.data
+            )
+        }
+    }
+
+    /// Normalize native still-image formats at the attachment boundary so the
+    /// persisted attachment, preview, and wire request all share one truthful
+    /// MIME/byte contract. PNG/JPEG/GIF stay byte-for-byte unchanged above;
+    /// every other decodable static image becomes JPEG, or PNG when alpha must
+    /// be preserved. The ordinary initializer applies the same 20 MB wire cap
+    /// to the normalized result.
+    private static func normalizedStaticImage(
+        at url: URL
+    ) throws -> (filename: String, mimeType: String, data: Data) {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              CGImageSourceGetCount(source) == 1
         else { throw ValidationError.unsupportedType }
-        try self.init(filename: url.lastPathComponent, mimeType: mime, data: Data(contentsOf: url))
+        let sourceProperties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+            as? [CFString: Any] ?? [:]
+        guard let width = (sourceProperties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (sourceProperties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              dimensionsFit(width: width, height: height)
+        else { throw ValidationError.tooManyPixels }
+        guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw ValidationError.unsupportedType
+        }
+
+        let preservesAlpha: Bool = switch image.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast: false
+        case .premultipliedFirst, .premultipliedLast, .first, .last, .alphaOnly: true
+        @unknown default: true
+        }
+        let targetType: UTType = preservesAlpha ? .png : .jpeg
+        let mimeType = preservesAlpha ? "image/png" : "image/jpeg"
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output,
+            targetType.identifier as CFString,
+            1,
+            nil
+        ) else { throw ValidationError.unsupportedType }
+
+        var properties = sourceProperties
+        if !preservesAlpha {
+            properties[kCGImageDestinationLossyCompressionQuality] = 0.9
+        }
+        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else {
+            throw ValidationError.unsupportedType
+        }
+
+        let base = url.deletingPathExtension().lastPathComponent
+        let suffix = preservesAlpha ? "png" : "jpg"
+        return ("\(base).\(suffix)", mimeType, output as Data)
     }
 
     var dataURL: String { "data:\(mimeType);base64,\(data.base64EncodedString())" }
 
     enum ValidationError: LocalizedError {
-        case tooLarge, unsupportedType, animatedGIF
+        case tooLarge, tooManyPixels, unsupportedType, animatedGIF
         var errorDescription: String? {
             switch self {
             case .tooLarge: return "Images must be 20 MB or smaller."
-            case .unsupportedType: return "Choose a PNG, JPEG, or non-animated GIF."
+            case .tooManyPixels: return "Images must be 64 megapixels or smaller."
+            case .unsupportedType: return "Choose a supported still image."
             case .animatedGIF: return "Animated GIFs aren't supported."
             }
         }

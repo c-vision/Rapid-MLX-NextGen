@@ -367,6 +367,7 @@ jobs:
             tests/test_music_engine.py \
             tests/test_audio_model_worker.py \
             tests/test_server_load_model_order.py \
+            tests/test_routing_groups_0131.py \
             tests/test_ready_banner_timing.py \
             tests/test_api_validation_bundle.py \
             tests/test_aliases_contract.py \
@@ -455,6 +456,12 @@ jobs:
             tests/test_server.py \
             tests/test_paged_cache.py \
             tests/test_mllm_continuous_batching.py \
+            tests/test_mllm_batch_generator.py \
+            tests/test_mllm_penalty_passthrough.py \
+            tests/test_guided.py \
+            tests/test_chat_streaming_guided.py \
+            tests/test_anthropic_output_config.py \
+            tests/test_response_format_json_schema_strict.py \
             tests/test_mllm_cache.py \
             tests/test_memory_cache.py \
             tests/test_optimizations.py \
@@ -476,6 +483,7 @@ jobs:
             tests/test_suffix_decoding.py \
             tests/test_qwen4_exp_artifact_parity.py \
             tests/test_qwen4_exp_reference_parity.py \
+            tests/test_routing_groups_0131.py \
             tests/test_qwen4_exp_vendored.py \
             -v --tb=short \
             -m "not slow" \

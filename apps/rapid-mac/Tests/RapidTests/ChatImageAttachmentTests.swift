@@ -1,9 +1,40 @@
 import Foundation
+import ImageIO
 import Testing
+import UniformTypeIdentifiers
 @testable import Rapid
 
 @Suite("Chat image attachments")
 struct ChatImageAttachmentTests {
+    @Test("decoded image dimensions are bounded before bitmap creation")
+    func decodedDimensionBudget() {
+        #expect(ChatImageAttachment.dimensionsFit(width: 5_000, height: 4_000))
+        #expect(ChatImageAttachment.dimensionsFit(width: 8_000, height: 8_000))
+        #expect(!ChatImageAttachment.dimensionsFit(width: 8_001, height: 8_000))
+        #expect(!ChatImageAttachment.dimensionsFit(width: 20_000, height: 1))
+        #expect(!ChatImageAttachment.dimensionsFit(width: 0, height: 4_000))
+    }
+
+    @Test("real HEIC fixture normalizes to truthful JPEG attachment bytes")
+    func heicNormalizesAtAttachmentBoundary() throws {
+        let fixture = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("__Snapshots__/cheetah-logo-96.heic")
+        let sourceType = try fixture.resourceValues(forKeys: [.contentTypeKey]).contentType
+        #expect(sourceType?.conforms(to: .heic) == true)
+
+        let attachment = try ChatImageAttachment(contentsOf: fixture)
+
+        #expect(attachment.filename == "cheetah-logo-96.jpg")
+        #expect(attachment.mimeType == "image/jpeg")
+        #expect(attachment.data.count <= ChatImageAttachment.maxBytes)
+        let normalizedSource = try #require(
+            CGImageSourceCreateWithData(attachment.data as CFData, nil)
+        )
+        #expect(CGImageSourceGetType(normalizedSource) as String? == UTType.jpeg.identifier)
+        #expect(CGImageSourceGetCount(normalizedSource) == 1)
+    }
+
     @Test("multimodal user message encodes text followed by image_url data URI")
     func wireEncoding() throws {
         let attachment = try ChatImageAttachment(

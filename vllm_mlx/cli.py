@@ -2815,10 +2815,16 @@ def _serve_will_run_on_mllm_lane(args) -> bool:
     """
     from .api.utils import resolve_serving_lane
 
+    requested_spec_decode = getattr(args, "spec_decode", "none") or "none"
+    if requested_spec_decode == "none" and getattr(args, "enable_mtp", False):
+        requested_spec_decode = "mtp"
+    elif requested_spec_decode == "none" and getattr(args, "force_spec_decode", False):
+        requested_spec_decode = "auto"
     is_mllm_lane, _auto_text_fallback = resolve_serving_lane(
         args.model,
         force_mllm=getattr(args, "mllm", False),
         force_text=getattr(args, "no_mllm", False),
+        requested_spec_decode=requested_spec_decode,
     )
     return is_mllm_lane
 
@@ -3305,10 +3311,16 @@ def serve_command(args):
     # that auto-downgrades to the text-only lane is PFlash-capable there,
     # exactly as an explicit ``--text-only`` run would be (#352 dogfood P1-②).
     if not args.enable_dflash:
+        _requested_spec_decode = getattr(args, "spec_decode", "none") or "none"
+        if _requested_spec_decode == "none" and getattr(
+            args, "force_spec_decode", False
+        ):
+            _requested_spec_decode = "auto"
         _serve_is_mllm, _ = resolve_serving_lane(
             args.model,
             force_mllm=getattr(args, "mllm", False),
             force_text=getattr(args, "no_mllm", False),
+            requested_spec_decode=_requested_spec_decode,
         )
         # Resolve BOTH per-alias PFlash defaults (mode + keep_ratio, e.g.
         # bonsai-27b-2bit → always @ 0.50) and build the config in one shared

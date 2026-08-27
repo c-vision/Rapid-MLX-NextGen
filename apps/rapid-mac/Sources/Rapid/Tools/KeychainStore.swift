@@ -267,8 +267,20 @@ struct SystemKeychain: KeychainStoring {
 
     private static func isDeveloperIDApplication(_ code: SecStaticCode) -> Bool {
         guard let requirement = developerIDApplicationCodeRequirement() else { return false }
-        return SecStaticCodeCheckValidity(code, [], requirement) == errSecSuccess
+        return SecStaticCodeCheckValidity(
+            code,
+            developerIDApplicationValidationFlags,
+            requirement
+        ) == errSecSuccess
     }
+
+    /// The namespace decision only needs to establish that the signing
+    /// certificate satisfies the Developer ID Application requirement. Do not
+    /// revalidate the executable or every sealed app resource here: this runs
+    /// while the app constructs its settings model, before the first window.
+    static let developerIDApplicationValidationFlags = SecCSFlags(
+        rawValue: kSecCSDoNotValidateResources | kSecCSDoNotValidateExecutable
+    )
 
     static func developerIDApplicationRequirementCompiles() -> Bool {
         developerIDApplicationCodeRequirement() != nil

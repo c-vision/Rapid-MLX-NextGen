@@ -411,6 +411,38 @@ def test_strict_true_guided_unavailable_returns_422_on_violation_non_streaming()
     assert snap["strict_repairs_succeeded_total"] == 0
 
 
+def test_strict_mllm_processor_fail_open_still_validates_response(monkeypatch):
+    """A request-local matcher failure cannot weaken ``strict=true``."""
+    from vllm_mlx.api import guided
+    from vllm_mlx.routes import chat as chat_route
+
+    marker = object()
+    budget = object()
+    monkeypatch.setattr(
+        guided,
+        "build_json_schema_logits_processor",
+        lambda _tokenizer, _schema: marker,
+    )
+    monkeypatch.setattr(
+        chat_route,
+        "_build_reasoning_budget_processor",
+        lambda *_args, **_kwargs: budget,
+    )
+    engine = _Engine(supports_guided=False, chat_text=_INVALID_PAYLOAD_OUT_OF_RANGE)
+    engine.is_mllm = True
+    client = _make_client(engine)
+
+    resp = client.post("/v1/chat/completions", json=_payload(strict=True))
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["code"] == "json_schema_violation"
+    assert len(engine.chat_calls) == 2
+    assert engine.chat_calls[0]["kwargs"]["grammar_logits_processor"] is marker
+    assert "reasoning_budget_logits_processor" not in engine.chat_calls[0]["kwargs"]
+    assert "grammar_logits_processor" not in engine.chat_calls[1]["kwargs"]
+    assert "reasoning_budget_logits_processor" not in engine.chat_calls[1]["kwargs"]
+
+
 def test_strict_true_guided_unavailable_returns_200_when_initial_output_valid():
     """R12-4 happy-path — strict+no-guided + initial output valid →
     200 with the validated body (no repair retry needed)."""

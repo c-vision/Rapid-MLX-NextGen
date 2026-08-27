@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import Testing
 @testable import Rapid
 
@@ -100,6 +101,14 @@ struct SettingsWebSearchKeyDraftTests {
     @Test("Developer ID Application uses a valid system code requirement")
     func developerIDRequirementCompiles() {
         #expect(SystemKeychain.developerIDApplicationRequirementCompiles())
+    }
+
+    @Test("Developer ID namespace detection never revalidates the app bundle")
+    func developerIDNamespaceCheckSkipsSealedResourcesAndExecutable() {
+        let flags = SystemKeychain.developerIDApplicationValidationFlags
+
+        #expect(flags.contains(SecCSFlags(rawValue: kSecCSDoNotValidateResources)))
+        #expect(flags.contains(SecCSFlags(rawValue: kSecCSDoNotValidateExecutable)))
     }
 
     @Test("Explicit save recovers from an inaccessible current-identity item")

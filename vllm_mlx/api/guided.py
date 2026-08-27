@@ -25,6 +25,7 @@ Two constraint modes are supported, matching the two the OpenAI
   ``response_format={"type":"json_object"}`` mode).
 """
 
+import json
 import logging
 from typing import Any
 
@@ -625,6 +626,43 @@ class GuidedGenerator:
         except Exception:
             logger.exception("JSON object generation failed")
             return None
+
+
+def build_json_schema_logits_processor(tokenizer, json_schema: dict):
+    """Build the shared incremental JSON-schema processor for a scheduler.
+
+    Unlike :class:`GuidedGenerator`, this does not own a model or a decode
+    loop. It lets continuous-batching engines apply the same llguidance
+    grammar inside their existing per-request logits-processor pipeline.
+    """
+    if not HAS_LLGUIDANCE:
+        return None
+
+    from .tool_grammar import (
+        GrammarLogitsProcessor,
+        get_lltokenizer,
+        model_stop_token_ids,
+    )
+
+    try:
+        lltokenizer = get_lltokenizer(tokenizer)
+        if lltokenizer is None:
+            return None
+        grammar = LLMatcher.grammar_from_json_schema(
+            json.dumps(json_schema),
+            overrides={"whitespace_flexible": True},
+        )
+        processor = GrammarLogitsProcessor(
+            lltokenizer,
+            grammar,
+            tokenizer=tokenizer,
+            stop_token_ids=model_stop_token_ids(tokenizer),
+            force_stop_when_accepting=True,
+        )
+        return None if processor.is_broken() else processor
+    except Exception:
+        logger.exception("guided decode: failed to build incremental JSON processor")
+        return None
 
 
 def generate_with_schema(

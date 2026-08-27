@@ -24,7 +24,10 @@ from ..api.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
-from ..api.tool_calling import convert_tools_for_template
+from ..api.tool_calling import (
+    convert_tools_for_template,
+    extract_json_schema_for_guided,
+)
 from ..api.utils import (
     StreamingThinkRouter,
     StreamingToolCallFilter,
@@ -99,6 +102,32 @@ def _resolved_sampling_kwargs(openai_request) -> dict:
     }
     out.update(build_extended_sampling_kwargs(openai_request))
     return out
+
+
+async def _attach_mllm_schema_processor(engine, openai_request, chat_kwargs) -> None:
+    """Keep Anthropic structured output on the MLLM scheduler decode path."""
+    if (
+        not getattr(engine, "is_mllm", False)
+        or openai_request.response_format is None
+        or openai_request.tools
+    ):
+        return
+    schema = extract_json_schema_for_guided(openai_request.response_format)
+    if not schema:
+        return
+    from ..api.guided import build_json_schema_logits_processor
+
+    processor = await asyncio.to_thread(
+        build_json_schema_logits_processor,
+        engine.tokenizer,
+        schema,
+    )
+    if processor is not None:
+        chat_kwargs["grammar_logits_processor"] = processor
+        # This grammar owns the complete assistant payload from token zero;
+        # a reasoning preamble is outside its language. Keep prompt rendering
+        # and response classification aligned with that decode contract.
+        chat_kwargs["enable_thinking"] = False
 
 
 logger = logging.getLogger(__name__)
@@ -839,6 +868,7 @@ async def create_anthropic_message(
         )
         if effective_thinking is not None:
             chat_kwargs["enable_thinking"] = effective_thinking
+        await _attach_mllm_schema_processor(engine, openai_request, chat_kwargs)
 
         start_time = time.perf_counter()
         timeout = cfg.default_timeout
@@ -1612,6 +1642,8 @@ async def _stream_anthropic_messages(
     resolved_thinking = _resolve_enable_thinking(openai_request)
     if resolved_thinking is not None:
         chat_kwargs["enable_thinking"] = resolved_thinking
+    await _attach_mllm_schema_processor(engine, openai_request, chat_kwargs)
+    _schema_constrained = "grammar_logits_processor" in chat_kwargs
 
     # Issue #702: per-request alias-level reasoning capability gate.
     # When the served alias declares ``reasoning_parser: null`` in
@@ -1905,6 +1937,11 @@ async def _stream_anthropic_messages(
         unconditional=cfg.reasoning_parser_name == "deepseek_r1_distill",
         tools_requested=bool(chat_kwargs.get("tools")),
     )
+    if _schema_constrained:
+        # The grammar owns token zero and cannot admit a reasoning preamble;
+        # classify its JSON bytes as answer content rather than opening a
+        # phantom thinking block that terminal reconciliation would duplicate.
+        _starts_thinking = False
     think_router = StreamingThinkRouter(start_in_thinking=_starts_thinking)
     # D-ANTHRO-TOOL-USAGE F5: seed the running counter with the
     # pre-message_start estimate so the terminal ``message_delta`` is
@@ -2030,6 +2067,8 @@ async def _stream_anthropic_messages(
     # blocks on literal ``<think>`` tags in the raw stream (and is
     # itself gated by ``_gate_thinking_pieces`` below).
     if not _reasoning_enabled:
+        reasoning_parser = None
+    if _schema_constrained:
         reasoning_parser = None
     if reasoning_parser:
         configure_request = getattr(reasoning_parser, "configure_request", None)

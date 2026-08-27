@@ -35,6 +35,63 @@ requires_guided = pytest.mark.skipif(
 )
 
 
+def test_scheduler_json_schema_processor_returns_none_without_backend(monkeypatch):
+    from vllm_mlx.api import guided
+
+    monkeypatch.setattr(guided, "HAS_LLGUIDANCE", False)
+    assert guided.build_json_schema_logits_processor(object(), {}) is None
+
+
+@requires_guided
+def test_scheduler_json_schema_processor_fails_closed(monkeypatch):
+    from vllm_mlx.api import guided, tool_grammar
+
+    monkeypatch.setattr(tool_grammar, "get_lltokenizer", lambda _tokenizer: None)
+    assert guided.build_json_schema_logits_processor(object(), {}) is None
+
+    def _raise(_tokenizer):
+        raise RuntimeError("bad tokenizer")
+
+    monkeypatch.setattr(tool_grammar, "get_lltokenizer", _raise)
+    assert guided.build_json_schema_logits_processor(object(), {}) is None
+
+
+@requires_guided
+def test_scheduler_json_schema_processor_forces_eos_after_complete_value():
+    """A complete JSON value terminates instead of admitting whitespace forever."""
+    import math
+
+    import mlx.core as mx
+
+    from vllm_mlx.api.guided import build_json_schema_logits_processor
+
+    tokenizer = _build_byte_level_fast_tokenizer()
+    processor = build_json_schema_logits_processor(
+        tokenizer,
+        {
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+            "additionalProperties": False,
+        },
+    )
+    assert processor is not None
+    processor._stop_ids = (-1, tokenizer.eos_token_id)
+
+    prompt = tokenizer.encode("title:", add_special_tokens=False)
+    processor(prompt, mx.zeros((1, len(tokenizer))))
+    generated = tokenizer.encode('{"title":"OK"}', add_special_tokens=False)
+    masked = processor(prompt + generated, mx.zeros((1, len(tokenizer))))
+    row = masked[0].tolist()
+    eos_id = tokenizer.eos_token_id
+
+    assert math.isfinite(row[eos_id])
+    assert not math.isfinite(row[-1])
+    assert all(
+        not math.isfinite(value) for idx, value in enumerate(row) if idx != eos_id
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fake MLX model + tokenizer helpers (for the decode-loop tests)
 # ---------------------------------------------------------------------------

@@ -64,7 +64,7 @@ def test_ax_dump_omits_non_finite_numbers_before_json_serialization():
     assert "origin.x.isFinite" in bounds and "extent.height.isFinite" in bounds
 
 
-def test_ax_escape_posts_a_real_key_to_the_target_process():
+def test_ax_escape_posts_a_real_key_without_answering_nonmodal_consent():
     source = DRIVER.read_text()
     key = source.split('if command == "key" {', 1)[1].split("\n}", 1)[0]
     assert 'wanted == "escape"' in key
@@ -76,7 +76,14 @@ def test_ax_escape_posts_a_real_key_to_the_target_process():
         HARNESS.read_text().split("flow_fresh_install() {", 1)[1].split("\n}", 1)[0]
     )
     assert '"$AX_DRIVER" key "$APP_PID" escape' in fresh_install
-    assert "Escape did not dismiss the telemetry invitation" in fresh_install
+    assert (
+        "wait_identifier TelemetryConsent.PostValueBanner"
+        ' "$OUT/post-value-consent-after-escape.json"'
+    ) in fresh_install
+    assert "TelemetryConsent.PostValue.Decline" in fresh_install
+    assert (
+        "explicit No thanks did not dismiss the telemetry invitation" in fresh_install
+    )
     assert "dismissed telemetry invitation returned after relaunch" in fresh_install
 
 

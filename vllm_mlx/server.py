@@ -1735,6 +1735,7 @@ def _resolve_serving_checkpoint(
     *,
     force_mllm: bool = False,
     force_text: bool = False,
+    requested_spec_decode: str = "none",
 ) -> _ServingCheckpoint:
     """Resolve alias, local checkpoint, and serving lane as one contract.
 
@@ -1764,6 +1765,7 @@ def _resolve_serving_checkpoint(
         vision_min_memory_gb=(
             profile.vision_min_memory_gb if profile is not None else None
         ),
+        requested_spec_decode=requested_spec_decode,
     )
     return _ServingCheckpoint(
         model_path=model_path,
@@ -2078,6 +2080,11 @@ def load_model(
             model_name,
             force_mllm=force_mllm,
             force_text=force_text,
+            requested_spec_decode=(
+                getattr(scheduler_config, "spec_decode", "none")
+                if scheduler_config is not None
+                else "none"
+            ),
         )
         _engine_model_path = _serving_checkpoint.load_path
         _auto_text_fallback = _serving_checkpoint.auto_text_fallback
@@ -2395,6 +2402,9 @@ async def _load_dynamic_resident_model(
         serving_checkpoint = _resolve_serving_checkpoint(
             resolved_path,
             force_text=profile_force_text,
+            # Residency loads carry no spec-decode request; keep the lane
+            # contract identical to startup (whose default is also "none").
+            requested_spec_decode="none",
         )
         resolved_path = serving_checkpoint.model_path
         load_path = serving_checkpoint.load_path
@@ -3438,10 +3448,16 @@ Examples:
     _srv_force_text = getattr(args, "no_mllm", False)
     if not _srv_force_mllm and not _srv_force_text and not _srv_generative_media:
         _ensure_routing_config(args.model)
+    _srv_requested_spec_decode = getattr(args, "spec_decode", "none") or "none"
+    if _srv_requested_spec_decode == "none" and getattr(
+        args, "force_spec_decode", False
+    ):
+        _srv_requested_spec_decode = "auto"
     _srv_is_mllm, _ = resolve_serving_lane(
         args.model,
         force_mllm=_srv_force_mllm,
         force_text=_srv_force_text,
+        requested_spec_decode=_srv_requested_spec_decode,
     )
     # Resolve mode AND per-alias keep_ratio through the single shared helper —
     # the same call ``cli.py`` uses for ``serve``/``bench``. Going through

@@ -1312,9 +1312,14 @@ flow_fresh_install() {
     wait_identifier TelemetryConsent.PostValueBanner "$OUT/post-value-consent-visible.json"
     assert_tree_text "$OUT/post-value-consent-visible.json" "Hello"
     baseline fresh-install.post-value-consent "$OUT/post-value-consent-visible.json"
-    # Exercise the native cancel shortcut rather than only the button action:
-    # closing this invitation is a durable decline and must never re-prompt.
+    # The invitation is part of the main window, not a modal. Escape belongs
+    # to the active app interaction and must never answer a permanent privacy
+    # choice on the user's behalf.
     "$AX_DRIVER" key "$APP_PID" escape > "$OUT/post-value-consent-escape.json"
+    wait_identifier TelemetryConsent.PostValueBanner "$OUT/post-value-consent-after-escape.json"
+    press "$OUT/post-value-consent-after-escape.json" \
+        TelemetryConsent.PostValue.Decline \
+        "$OUT/post-value-consent-explicit-decline.json"
     for _ in {1..40}; do
         see_main "$OUT/post-value-consent-declined.json"
         if ! jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.PostValueBanner")' \
@@ -1325,7 +1330,7 @@ flow_fresh_install() {
     done
     if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.PostValueBanner")' \
         "$OUT/post-value-consent-declined.json" >/dev/null; then
-        die "Escape did not dismiss the telemetry invitation"
+        die "explicit No thanks did not dismiss the telemetry invitation"
     fi
     relaunch_persona
     wait_identifier rapid.chat.compose "$OUT/post-value-consent-relaunch.json"

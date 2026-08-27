@@ -2245,6 +2245,7 @@ class GrammarLogitsProcessor:
         think_excluded_ids: Any = None,
         tokenizer: Any = None,
         stop_token_ids: Any = None,
+        force_stop_when_accepting: bool = False,
     ):
         self._lltok = lltokenizer
         # Reuse a cached compiled-grammar TEMPLATE (deep-copied per request) so
@@ -2335,6 +2336,7 @@ class GrammarLogitsProcessor:
         )
         self._stop_ids: tuple[int, ...] = tuple(stop_ids)
         self._stop_ids_arr = None
+        self._force_stop_when_accepting = force_stop_when_accepting
         if self._stop_ids:
             import mlx.core as mx
 
@@ -2521,6 +2523,23 @@ class GrammarLogitsProcessor:
             if self._think_excluded_ids:
                 return self._apply_think_exclusion(logits)
             return logits
+
+        if self._force_stop_when_accepting and self._matcher.is_accepting():
+            # JSON-schema generation is one complete value, unlike the tool
+            # grammar's optional/repeated-call language. Once that value is
+            # accepted, force one of the model's real EOS tokens so the
+            # scheduler terminates deterministically instead of admitting
+            # trailing whitespace and relying on a later natural stop.
+            if self._stop_ids:
+                import mlx.core as mx
+
+                allowed = [
+                    token for token in self._stop_ids if 0 <= token < logits.shape[-1]
+                ]
+                if allowed:
+                    out = mx.full(logits.shape, -float("inf"), dtype=logits.dtype)
+                    out[..., allowed] = logits[..., allowed]
+                    return out
 
         if self._matcher.is_stopped():
             return logits

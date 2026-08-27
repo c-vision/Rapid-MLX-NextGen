@@ -300,6 +300,11 @@ class MLLMBatchRequest:
     repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    # Per-request decode processors (structured output, reasoning budget,
+    # token suppression).  These use the same ``(token_ids, logits)``
+    # contract as the text scheduler and are owned by this request.
+    logits_processors: list[Callable] = field(default_factory=list)
+    logits_processor_tokens: list[int] = field(default_factory=list)
     video_fps: float | None = None  # Caller-specified video FPS
     video_max_frames: int | None = None  # Caller-specified max video frames
 
@@ -537,6 +542,18 @@ def _maybe_apply_penalty_processors(
     tokens = req.output_tokens
     for processor in cached[1]:
         row_logits = processor(tokens, row_logits)
+    return row_logits
+
+
+def _apply_request_logits_processors(
+    req: MLLMBatchRequest,
+    row_logits: mx.array,
+    token_ids: list[int] | None = None,
+) -> mx.array:
+    """Apply request-owned processors using its cumulative output tokens."""
+    history = req.logits_processor_tokens if token_ids is None else token_ids
+    for processor in req.logits_processors:
+        row_logits = processor(history, row_logits)
     return row_logits
 
 
@@ -1378,6 +1395,12 @@ class MLLMBatchGenerator:
 
                 # Extract last token logits and sample with per-request params
                 last_logits = logits[:, -1, :]
+                # Request-local constraints must own token zero as well as
+                # steady-state decode. Applying them only in ``_step`` lets an
+                # invalid first token escape during prefill; the grammar then
+                # sees an already-committed token it never allowed and must
+                # drop the constraint.
+                last_logits = _apply_request_logits_processors(req, last_logits)
                 logprobs = last_logits - mx.logsumexp(
                     last_logits, axis=-1, keepdims=True
                 )
@@ -1511,6 +1534,36 @@ class MLLMBatchGenerator:
                     _maybe_apply_penalty_processors(req, logits[i : i + 1])
                 )
             logits = mx.concatenate(processed_rows, axis=0)
+
+        if (
+            requests
+            and len(requests) == logits.shape[0]
+            and any(request.logits_processors for request in requests)
+        ):
+            # Materialize the current token batch once, then keep each
+            # processor's cumulative host history incrementally. Rebuilding
+            # ``[*output_tokens, current.item()]`` per request would copy the
+            # full sequence on every step (quadratic over a long response) and
+            # synchronize the device once per active request.
+            current_tokens = input_tokens[:, -1].tolist()
+            for request, token in zip(requests, current_tokens):
+                if request.logits_processors:
+                    request.logits_processor_tokens.append(int(token))
+            logits = mx.concatenate(
+                [
+                    (
+                        _apply_request_logits_processors(
+                            request,
+                            logits[i : i + 1],
+                            request.logits_processor_tokens,
+                        )
+                        if request.logits_processors
+                        else logits[i : i + 1]
+                    )
+                    for i, request in enumerate(requests)
+                ],
+                axis=0,
+            )
 
         # Sample per-request with correct temperature/top_p.
         # Fast path: when all requests in the batch share (temp, top_p),
