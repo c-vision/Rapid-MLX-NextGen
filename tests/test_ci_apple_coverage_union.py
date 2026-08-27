@@ -62,7 +62,11 @@ def test_changed_lines_gate_unions_linux_and_apple_coverage() -> None:
 
     aggregate_needs = set(jobs["tests"]["needs"])
     assert "changed-lines-coverage" in aggregate_needs
-    aggregate_run = jobs["tests"]["steps"][0]["run"]
+    aggregate_run = next(
+        step["run"]
+        for step in jobs["tests"]["steps"]
+        if step.get("name") == "Check test results"
+    )
     assert "needs.changed-lines-coverage.result" in aggregate_run
 
     # Non-engine PRs return before inspecting the intentionally skipped union

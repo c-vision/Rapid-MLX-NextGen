@@ -43,6 +43,12 @@ on:
     # Do not add a paths filter here. This context is eligible to be a required
     # check, and GitHub leaves path-filtered required workflows pending forever
     # when they are skipped. The job exits quickly when the version is unchanged.
+  # A required check must also report on GitHub's synthetic merge-queue SHA.
+  # The PR event already validated any release-specific title/body contract;
+  # the queue event supplies the stable context while tests/desktop-tests
+  # validate the combined candidate tree.
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   actions: read
@@ -59,6 +65,7 @@ jobs:
 
       - name: Determine whether the version line changed
         id: verchange
+        if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -304,5 +311,9 @@ jobs:
           echo "✓ Complete bump contract: one commit, synchronized notes, and exact-head pre-flight run $RUN_ID."
 
       - name: Pass — no stray version change
-        if: steps.verchange.outputs.changed != 'true'
+        if: github.event_name == 'pull_request' && steps.verchange.outputs.changed != 'true'
         run: echo "✓ Version line unchanged — nothing to guard."
+
+      - name: Pass — PR contract already validated before merge queue
+        if: github.event_name == 'merge_group'
+        run: echo "✓ Merge-group candidate receives the stable required context; combined-tree validation belongs to tests and desktop-tests."

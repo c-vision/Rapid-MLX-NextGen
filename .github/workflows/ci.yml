@@ -643,7 +643,28 @@ jobs:
       - l1-smoke
     runs-on: ubuntu-latest
     if: always()
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      statuses: write
     steps:
+      - name: Start an internal PR merge status pending
+        if: >-
+          github.event_name == 'pull_request' &&
+          needs.changes.outputs.engine == 'true' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          jq -n \
+            --arg target_url "$RUN_URL" \
+            '{state: "pending", context: "tests", description: "Evaluating the required engine merge gate", target_url: $target_url}' \
+            | gh api --method POST "repos/${REPO}/statuses/${HEAD_SHA}" --input - >/dev/null
+
       - name: Check test results
         run: |
           if [ "${{ needs.changes.result }}" != success ]; then
@@ -674,8 +695,8 @@ jobs:
           fi
           if [ "${{ github.event_name }}" = "pull_request" ] \
             && [ "${{ needs.changes.outputs.full_gate }}" != "true" ]; then
-            echo "Engine PR gate passed; apply the full-ci label when this PR is ready to merge"
-            exit 1
+            echo "Engine PR checks passed; the required tests status remains pending until the full-ci label is applied"
+            exit 0
           fi
           if [ "${{ needs.test-matrix.result }}" != "success" ]; then
             echo "Unit tests failed"
@@ -694,3 +715,40 @@ jobs:
             echo "Small-model tool-loop contract failed"
             exit 1
           fi
+
+      - name: Settle a successful internal full-CI status
+        if: >-
+          github.event_name == 'pull_request' &&
+          needs.changes.outputs.engine == 'true' &&
+          needs.changes.outputs.full_gate == 'true' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          LIVE_PR_JSON="$RUNNER_TEMP/live-pr.json"
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" > "$LIVE_PR_JSON"
+          LIVE_STATE=$(jq -r '.state' "$LIVE_PR_JSON")
+          LIVE_BASE_REF=$(jq -r '.base.ref' "$LIVE_PR_JSON")
+          LIVE_HEAD_SHA=$(jq -r '.head.sha' "$LIVE_PR_JSON")
+          LIVE_FULL_CI=$(jq -r 'any(.labels[]; .name == "full-ci")' "$LIVE_PR_JSON")
+
+          RUNS_JSON="$RUNNER_TEMP/ci-runs.json"
+          gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${HEAD_SHA}&event=pull_request&per_page=100" > "$RUNS_JSON"
+          LATEST_RUN_ID=$(jq -r '[.workflow_runs[]] | if length > 0 then max_by(.id).id else "" end' "$RUNS_JSON")
+          if [ "$LIVE_STATE" != open ] || [ "$LIVE_BASE_REF" != main ] || \
+             [ "$LIVE_HEAD_SHA" != "$HEAD_SHA" ] || [ "$LIVE_FULL_CI" != true ] || \
+             [ "$LATEST_RUN_ID" != "$RUN_ID" ]; then
+            echo "Not settling stale or unpromoted engine evidence (state=$LIVE_STATE base=$LIVE_BASE_REF live=$LIVE_HEAD_SHA run_head=$HEAD_SHA full_ci=$LIVE_FULL_CI latest_run=${LATEST_RUN_ID:-missing} run_id=$RUN_ID)."
+            exit 0
+          fi
+
+          jq -n \
+            --arg target_url "$RUN_URL" \
+            '{state: "success", context: "tests", description: "Exact-head full-CI merge gate passed", target_url: $target_url}' \
+            | gh api --method POST "repos/${REPO}/statuses/${HEAD_SHA}" --input - >/dev/null

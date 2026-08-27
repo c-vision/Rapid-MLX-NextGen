@@ -1,0 +1,240 @@
+name: Full CI label gate
+
+# Keep the required tests / desktop-tests contexts pending until a product PR
+# is promoted with the full-ci label. pull_request_target is deliberate: this
+# metadata-only workflow must be able to publish statuses for fork PRs, whose
+# pull_request GITHUB_TOKEN is read-only. It checks out only the trusted base
+# policy and never executes code from the PR head.
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Open PR number to re-evaluate (operator rehearsal/recovery)"
+        required: true
+        type: number
+  workflow_run:
+    workflows: [CI, rapid-mac CI]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: full-ci-label-gate-${{ github.event.pull_request.number || inputs.pr_number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
+  # Every invocation reads live PR metadata. Serializing them prevents a label
+  # event from cancelling the completion hook that turns pending into success.
+  cancel-in-progress: false
+
+jobs:
+  publish-required-statuses:
+    if: github.event_name != 'workflow_run'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the live PR and fail closed first
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          PR_JSON="$RUNNER_TEMP/pr.json"
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" > "$PR_JSON"
+
+          PR_STATE=$(jq -r '.state' "$PR_JSON")
+          BASE_REF=$(jq -r '.base.ref' "$PR_JSON")
+          BASE_SHA=$(jq -r '.base.sha' "$PR_JSON")
+          HEAD_SHA=$(jq -r '.head.sha' "$PR_JSON")
+          FULL_CI=$(jq -r 'any(.labels[]; .name == "full-ci")' "$PR_JSON")
+          if [ "$PR_STATE" != open ] || [ "$BASE_REF" != main ] || \
+             ! [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || \
+             ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::PR #$PR_NUMBER must be open, target main, and expose exact base/head SHAs (state=$PR_STATE base=$BASE_REF base_sha=$BASE_SHA head=$HEAD_SHA)." >&2
+            exit 1
+          fi
+
+          post_status() {
+            local context=$1 state=$2 description=$3
+            jq -n \
+              --arg state "$state" \
+              --arg context "$context" \
+              --arg description "$description" \
+              --arg target_url "$RUN_URL" \
+              '{state: $state, context: $context, description: $description, target_url: $target_url}' \
+              | gh api --method POST "repos/${REPO}/statuses/${HEAD_SHA}" --input - >/dev/null
+          }
+
+          # Publish pending before any classifier work. A checkout, API, or
+          # policy failure after this point leaves both required contexts
+          # blocked instead of reusing stale success from an earlier label.
+          post_status tests pending "Evaluating whether this PR needs the full-ci label"
+          post_status desktop-tests pending "Evaluating whether this PR needs the full-ci label"
+
+          {
+            echo "pr_number=$PR_NUMBER"
+            echo "base_sha=$BASE_SHA"
+            echo "head_sha=$HEAD_SHA"
+            echo "full_ci=$FULL_CI"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the trusted policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # pull_request_target runs in the base repository. Pin the checkout
+          # explicitly so no future default change can execute a fork's head.
+          ref: ${{ steps.pr.outputs.base_sha }}
+
+      - name: Classify changed paths from GitHub metadata
+        id: policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          PATHS="$RUNNER_TEMP/changed-paths"
+          gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+            --jq '.[].filename' > "$PATHS"
+          python3 scripts/classify_ci_changes.py \
+            --paths-file "$PATHS" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Publish the label requirement
+        env:
+          DESKTOP: ${{ steps.policy.outputs.desktop }}
+          ENGINE: ${{ steps.policy.outputs.engine }}
+          FULL_CI: ${{ steps.pr.outputs.full_ci }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          post_status() {
+            local context=$1 state=$2 description=$3
+            jq -n \
+              --arg state "$state" \
+              --arg context "$context" \
+              --arg description "$description" \
+              --arg target_url "$RUN_URL" \
+              '{state: $state, context: $context, description: $description, target_url: $target_url}' \
+              | gh api --method POST "repos/${REPO}/statuses/${HEAD_SHA}" --input - >/dev/null
+          }
+
+          # Refuse to settle a policy result if a synchronize or label event
+          # raced this invocation after its initial live snapshot.
+          LIVE_PR_JSON="$RUNNER_TEMP/live-pr.json"
+          gh api "repos/${REPO}/pulls/${{ steps.pr.outputs.pr_number }}" > "$LIVE_PR_JSON"
+          LIVE_STATE=$(jq -r '.state' "$LIVE_PR_JSON")
+          LIVE_BASE_REF=$(jq -r '.base.ref' "$LIVE_PR_JSON")
+          LIVE_HEAD_SHA=$(jq -r '.head.sha' "$LIVE_PR_JSON")
+          LIVE_FULL_CI=$(jq -r 'any(.labels[]; .name == "full-ci")' "$LIVE_PR_JSON")
+          if [ "$LIVE_STATE" != open ] || [ "$LIVE_BASE_REF" != main ] || \
+             [ "$LIVE_HEAD_SHA" != "$HEAD_SHA" ] || [ "$LIVE_FULL_CI" != "$FULL_CI" ]; then
+            echo "::error::PR metadata changed during evaluation; leaving the captured head pending for the next event." >&2
+            exit 1
+          fi
+
+          if [ "$ENGINE" = true ]; then
+            if [ "$FULL_CI" = true ]; then
+              DESCRIPTION="Waiting for the required engine full-CI run"
+            else
+              DESCRIPTION="Apply the full-ci label to run the required engine merge gate"
+            fi
+            post_status tests pending "$DESCRIPTION"
+            echo "$DESCRIPTION"
+          else
+            post_status tests success "Engine full-ci gate not applicable to this PR"
+          fi
+
+          if [ "$DESKTOP" = true ]; then
+            if [ "$FULL_CI" = true ]; then
+              DESCRIPTION="Waiting for the required Desktop full-CI run"
+            else
+              DESCRIPTION="Apply the full-ci label to run the required Desktop merge gate"
+            fi
+            post_status desktop-tests pending "$DESCRIPTION"
+            echo "$DESCRIPTION"
+          else
+            post_status desktop-tests success "Desktop full-ci gate not applicable to this PR"
+          fi
+
+  settle-completed-gate:
+    if: github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Settle an exact-head full-CI status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_NAME: ${{ github.event.workflow_run.name }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER=$(jq -r '.workflow_run.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH")
+          if [ -z "$PR_NUMBER" ]; then
+            echo "Completed workflow is not associated with a pull request; nothing to settle."
+            exit 0
+          fi
+
+          case "$RUN_NAME" in
+            CI)
+              CONTEXT=tests
+              WORKFLOW_FILE=ci.yml
+              ;;
+            "rapid-mac CI")
+              CONTEXT=desktop-tests
+              WORKFLOW_FILE=rapid-mac-ci.yml
+              ;;
+            *)
+              echo "::error::Unexpected source workflow: $RUN_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          PR_JSON="$RUNNER_TEMP/pr.json"
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" > "$PR_JSON"
+          PR_STATE=$(jq -r '.state' "$PR_JSON")
+          BASE_REF=$(jq -r '.base.ref' "$PR_JSON")
+          LIVE_HEAD_SHA=$(jq -r '.head.sha' "$PR_JSON")
+          FULL_CI=$(jq -r 'any(.labels[]; .name == "full-ci")' "$PR_JSON")
+          if [ "$PR_STATE" != open ] || [ "$BASE_REF" != main ] || \
+             [ "$LIVE_HEAD_SHA" != "$RUN_SHA" ] || [ "$FULL_CI" != true ]; then
+            echo "Not settling stale or unpromoted evidence (PR=$PR_NUMBER state=$PR_STATE base=$BASE_REF live=$LIVE_HEAD_SHA run=$RUN_SHA full_ci=$FULL_CI)."
+            exit 0
+          fi
+
+          RUNS_JSON="$RUNNER_TEMP/source-runs.json"
+          gh api "repos/${REPO}/actions/workflows/${WORKFLOW_FILE}/runs?head_sha=${RUN_SHA}&event=pull_request&per_page=100" > "$RUNS_JSON"
+          LATEST_RUN_ID=$(jq -r '[.workflow_runs[]] | if length > 0 then max_by(.id).id else "" end' "$RUNS_JSON")
+          if [ "$LATEST_RUN_ID" != "$RUN_ID" ]; then
+            echo "Not settling superseded $RUN_NAME evidence (latest_run=${LATEST_RUN_ID:-missing} completed_run=$RUN_ID)."
+            exit 0
+          fi
+
+          JOB_PAGES="$RUNNER_TEMP/jobs.json"
+          gh api --paginate --slurp \
+            "repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" > "$JOB_PAGES"
+          JOB_CONCLUSION=$(jq -r --arg context "$CONTEXT" \
+            '[.[] | .jobs[] | select(.name == $context)] | if length == 1 then .[0].conclusion else "" end' \
+            "$JOB_PAGES")
+          if [ "$WORKFLOW_CONCLUSION" != success ] || [ "$JOB_CONCLUSION" != success ]; then
+            echo "The exact-head $RUN_NAME run did not pass its $CONTEXT aggregate (workflow=$WORKFLOW_CONCLUSION job=${JOB_CONCLUSION:-missing}); leaving status pending."
+            exit 0
+          fi
+
+          jq -n \
+            --arg context "$CONTEXT" \
+            --arg target_url "$RUN_URL" \
+            '{state: "success", context: $context, description: "Exact-head full-CI merge gate passed", target_url: $target_url}' \
+            | gh api --method POST "repos/${REPO}/statuses/${RUN_SHA}" --input - >/dev/null

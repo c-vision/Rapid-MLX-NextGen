@@ -31,11 +31,13 @@ and commands. Whole-repository Ruff and engine/Desktop version synchronization
 remain universal because Desktop support code includes Python and either side
 of the shared version contract may change.
 
-The required checks are the stable aggregate jobs `tests` and `desktop-tests`.
-They must not be renamed or hidden behind workflow-level path filters without a
-matching branch-protection migration. `tests` includes lint, type-check job
-health, the MLX dependency-bound guard on pull requests, and all selected engine
-test lanes; `desktop-tests` includes every selected Desktop lane.
+The strict required checks are the stable aggregate jobs `tests`,
+`desktop-tests`, and `version-bump-guard`. They must not be renamed or hidden
+behind workflow-level path filters without a matching branch-protection
+migration. `tests` includes lint, type-check job health, the MLX
+dependency-bound guard on pull requests, and all selected engine test lanes;
+`desktop-tests` includes every selected Desktop lane. `version-bump-guard`
+runs for every pull request, passing quickly when the version is unchanged.
 
 ### Type-error budget
 
@@ -103,15 +105,44 @@ cannot silently disappear.
 
 The label never changes lane classification. This prevents an engine-only PR
 from allocating the full Desktop gate, or a Desktop-only PR from allocating
-the full model gate. The selected product aggregate intentionally remains
-non-successful until the label is present, so branch protection cannot bypass
-its merge gate.
+the full model gate.
 
-The workflows also subscribe to GitHub's `merge_group` event. After the
-repository becomes eligible for GitHub merge queues, every queue candidate will
-automatically receive the same full coverage against its synthetic candidate
-commit. This validates the combined state that will actually reach `main`,
-rather than repeatedly validating each PR against an obsolete base.
+### Pending, not failing, before promotion
+
+An unpromoted product PR is a waiting release candidate, not a test failure.
+The aggregate Action check therefore passes after its inexpensive PR checks,
+while `.github/workflows/full-ci-label-gate.yml` publishes a same-name pending
+commit status for each selected product lane. GitHub requires both a check run
+and a commit status when they share a required name, so the pending status keeps
+the merge blocked without showing a false red failure.
+
+The status transition is fail closed:
+
+1. A trusted `pull_request_target` workflow reads the live PR and immediately
+   posts pending `tests` and `desktop-tests` statuses before classification.
+2. It checks out only the base revision of the policy and classifies filenames
+   obtained from the GitHub API. It never checks out or executes the PR head.
+3. An unselected lane becomes successful immediately. A selected lane remains
+   pending both before and after the `full-ci` label is applied.
+4. Only a successful exact-head full-CI aggregate may replace that selected
+   lane's pending status with success. The aggregate job settles same-repository
+   PRs directly; a trusted `workflow_run` completion hook settles fork PRs.
+5. A stale SHA, removed label, superseded exact-head run, failed/cancelled
+   workflow, missing aggregate job, classifier failure, or metadata mismatch
+   leaves the status pending.
+
+Do not replace this with a job-level `if` condition. GitHub reports a skipped
+job as successful, which would allow a required skipped context to bypass the
+promotion gate. Do not publish success when the label is observed: doing so
+would briefly reuse old exact-SHA check evidence during label churn.
+
+All three required workflows subscribe to GitHub's `merge_group` event. Every
+queue candidate will therefore receive `tests`, `desktop-tests`, and
+`version-bump-guard` on its synthetic candidate commit. Product workflows run
+full combined-tree coverage for merge groups. The version guard emits its
+stable context because the individual PR contract was already validated before
+queue entry. This validates the state that will actually reach `main`, rather
+than repeatedly validating each PR against an obsolete base.
 
 Pushes to `main` retain the full engine coverage as a post-merge signal.
 
@@ -146,17 +177,56 @@ organization, or private repositories owned by an Enterprise Cloud
 organization. Rapid-MLX is a public repository owned by a personal account, so
 the queue cannot be enabled until ownership moves to an organization.
 
-After that eligibility change, and after the workflows containing
-`merge_group` support are present on `main`:
+The current `main` protection is strict and requires three GitHub Actions
+contexts from app id `15368`: `tests`, `desktop-tests`, and
+`version-bump-guard`. There are no repository rulesets. Keep that protection
+unchanged until the owner enables a queue.
 
-1. Require `tests` and `desktop-tests` for `main`.
-2. Require branches to be up to date through the merge queue, rather than
-   asking authors or agents to rebase every open PR after each merge.
-3. Use squash as the merge method and start with a small queue batch. Increase
-   batching only after observing queue latency and failure isolation.
+After ownership moves to an eligible organization and these workflows are on
+the default branch, the owner should enable **Require merge queue** in the
+existing non-wildcard `main` branch-protection rule and configure:
 
-Do not enable the queue before the workflow trigger reaches `main`: otherwise
-GitHub creates a merge-group commit whose required checks never start.
+- merge queue required and squash as the allowed merge method;
+- required status checks `tests`, `desktop-tests`, and `version-bump-guard`;
+- the existing strict status-check policy retained; the queue candidate
+  provides the up-to-date combined tree without repeated author rebases;
+- build concurrency `1` initially;
+- merge only non-failing entries enabled;
+- status-check timeout `60 minutes`;
+- minimum and maximum merge group size `1`, with a `0` minute minimum wait.
+
+After five consecutive green merge groups, increase maximum group size to `3`
+and use a `5` minute wait to amortize busy integration trains. Keep concurrency
+at `1` until failure attribution and runner capacity are demonstrated at that
+batch size.
+
+Before changing `main`, rehearse on a scratch target branch in an eligible
+organization-owned repository:
+
+1. Create the scratch branch from the intended `main` SHA and temporarily add
+   that branch to all three workflows' event filters in the sandbox only.
+2. Apply the exact required contexts and queue settings above to the scratch
+   branch.
+3. Queue one documentation-only PR and one harmless cross-cutting workflow PR.
+   Confirm all three contexts appear on both synthetic merge-group SHAs, and
+   confirm the cross-cutting PR runs both product lanes.
+4. Queue two PRs concurrently. Confirm strict protection groups or restacks
+   them without direct pushes, and that deliberately failing the second PR
+   removes only its group.
+5. Remove the sandbox changes and record run URLs before applying the settings
+   to `main`.
+
+A hosted scratch rehearsal cannot be performed in the current personal-account
+repository because GitHub does not expose merge queues there. Local event
+fixtures and workflow contract tests verify the `merge_group` wiring now; the
+organization-owned scratch rehearsal above remains a hard prerequisite to the
+owner's production configuration change.
+
+Do not enable the queue before every required workflow trigger reaches `main`:
+otherwise GitHub creates a merge-group commit whose required check remains
+`Expected` forever. Treat an indefinitely expected
+`version-bump-guard` as a trigger defect and stop; never bypass the required
+context.
 
 ## Rollback
 
