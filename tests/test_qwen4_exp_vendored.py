@@ -619,6 +619,28 @@ def test_qsa_attention_uses_reference_dense_path_below_sparse_budget(monkeypatch
     assert cache[0].offset == cache[1].offset == 5
 
 
+def test_qsa_vectorized_mask_preserves_budget_tail_and_causality():
+    args = _args(indexer_budget=8, indexer_compress_ratio=2)
+    selected = QSAIndexer(args)(
+        mx.zeros((1, 65, args.hidden_size)),
+        QSAIndexCache(compress_ratio=2),
+        physical_kv_length=65,
+    )
+    assert selected is not None
+    mx.eval(selected)
+    mask = np.array(selected[0, 0])
+
+    expected_counts = []
+    for position in range(65):
+        complete = (position + 1) // 2
+        tail = position + 1 - complete * 2
+        expected_counts.append(min(complete, 4) * 2 + tail)
+    np.testing.assert_array_equal(mask.sum(axis=-1), expected_counts)
+    assert mask[0, 0]
+    assert mask[-1, -1]
+    assert not np.any(np.triu(mask, k=1))
+
+
 def test_qsa_batch_prefill_builds_mask_before_kv_update(monkeypatch):
     args = _args(indexer_budget=8, indexer_compress_ratio=2)
     attention = QSAAttention(args)

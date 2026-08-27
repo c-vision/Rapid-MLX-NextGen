@@ -187,6 +187,62 @@ fallback means the run does not establish token-level schema enforcement.
 | 8,192 (8,156) | 24.246 s | 336.4 | 37.38 | 12.85 GiB | 17.6 GB |
 | 32,768 (32,732) | 107.244 s | 305.2 | 32.58 | 12.87 GiB | 24.1 GB |
 
+## QSA prefill follow-up
+
+A follow-up candidate for 0.13.2 removes host synchronization from the QSA
+selection-mask builder. The attention math, top-k selection, 2,048-token
+budget, compressed-index cache, and dense SDPA input remain unchanged. The
+implementation constructs the selected block and tail-token indices as MLX
+arrays and scatters them into the existing mask in one device-side operation,
+instead of iterating over every query in Python and converting each row of
+selected blocks to a host list.
+
+The candidate was measured on the same machine, artifact revision,
+quantization, prompt builder, cache-clear procedure, and 3-run/256-decode-token
+methodology as the 0.13.1 table above. It used MLX 0.32.2, MLX-LM 0.31.3, and
+Transformers 5.12.1. The server ran from candidate commit
+`dfcacbb2d80a3a423433d7e8054b9e966cc1b9dc`; the baseline is the published
+0.13.1 quiet-window result.
+
+```bash
+HF_HUB_OFFLINE=1 /private/tmp/rapid-flash-pypi-0131/bin/python \
+  -m vllm_mlx.cli serve \
+  /path/to/dcf657e4acda2aae72da99cde65b6c491cd96998 \
+  --served-model-name qwen3.8-flash-next-4bit \
+  --host 127.0.0.1 --port 8464
+
+/private/tmp/rapid-flash-pypi-0131/bin/python \
+  .orca/flash-next-eval/benchmark.py \
+  --url http://127.0.0.1:8464/v1 \
+  --model qwen3.8-flash-next-4bit \
+  --tokenizer-path /path/to/dcf657e4acda2aae72da99cde65b6c491cd96998 \
+  --server-pid SERVER_PID \
+  --label qsa-vectorized-dfcacbb2 \
+  --rapid-sha dfcacbb2d80a3a423433d7e8054b9e966cc1b9dc \
+  --artifact-revision dcf657e4acda2aae72da99cde65b6c491cd96998 \
+  --output /private/tmp/flash-next-qsa-vectorized-benchmark.json
+```
+
+| Target (reported) | 0.13.1 TTFT | Candidate TTFT | TTFT speedup | 0.13.1 prefill | Candidate prefill | Candidate decode | MLX active |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 (92) | 0.380 s | 0.385 s | 0.99x | 241.8 tok/s | 238.9 tok/s | 25.62 tok/s | 103.1 GB |
+| 2,048 (2,012) | 3.274 s | 3.346 s | 0.98x | 614.6 tok/s | 601.4 tok/s | 24.17 tok/s | 103.1 GB |
+| 8,192 (8,156) | 37.984 s | 13.689 s | **2.77x** | 214.7 tok/s | **595.8 tok/s** | 23.25 tok/s | 103.4 GB |
+| 32,768 (32,732) | 186.201 s | 62.851 s | **2.96x** | 175.8 tok/s | **520.8 tok/s** | 21.52 tok/s | 104.7 GB |
+
+The optimization activates only after the QSA budget boundary, so the 128 and
+2K rows are unchanged code paths; their small differences are run-to-run
+noise. Five deterministic user-path checks were byte-identical to the 0.13.1
+baseline: short exact text, strict JSON, a forced tool call, 8K needle recall,
+and 32K needle recall. The two long-context answers remained `MANGO-4827` and
+`ZEPHYR-9135`.
+
+A compact gather experiment was also rejected. Gathering approximately 2,051
+K/V tokens separately for each query lowered the synthetic 8K layer's peak
+allocation but made it 1.8x slower because MLX had to materialize the gathered
+rows. A future direct sparse-attention kernel can consume the compact indices
+without that copy; the rejected gather path is not included in the candidate.
+
 ## Interpretation
 
 Flash-Next reached the first visible token sooner at the 128- and 2K-target

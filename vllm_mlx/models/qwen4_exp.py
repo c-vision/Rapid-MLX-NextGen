@@ -575,6 +575,28 @@ def apply_qwen4_exp_rope(
     return output
 
 
+@dataclass(frozen=True)
+class _QSASelection:
+    """Compact per-query physical KV indices produced by the QSA indexer."""
+
+    token_indices: mx.array
+    valid: mx.array
+    physical_kv_length: int
+
+    def dense_mask(self) -> mx.array:
+        """Materialize the reference mask for unsupported sparse consumers."""
+        batch, length, _ = self.token_indices.shape
+        # Invalid compact slots share a sentinel column so they cannot clear a
+        # real token when put_along_axis sees duplicate indices.
+        sentinel = self.physical_kv_length
+        indices = mx.where(self.valid, self.token_indices, sentinel)
+        selected = mx.zeros(
+            (batch, length, self.physical_kv_length + 1), dtype=mx.bool_
+        )
+        selected = mx.put_along_axis(selected, indices, self.valid, axis=-1)
+        return selected[:, None, :, : self.physical_kv_length]
+
+
 class QSAIndexer(nn.Module):
     """Weight-bearing QSA selector backed by raw-ring/compressed-key state."""
 
@@ -647,12 +669,13 @@ class QSAIndexer(nn.Module):
         # (MIT), without its O(B*L*topk*K) token-mask materialization.
         if physical_kv_length // self.compress_ratio <= self.block_topk:
             return None
-        selected = mx.zeros((batch, length, physical_kv_length), dtype=mx.bool_)
         left_padding = (
             [0] * batch
             if cache.left_padding is None
             else [int(value) for value in cache.left_padding.tolist()]
         )
+        compact_indices = []
+        compact_valid = []
         for batch_index in range(batch):
             input_start, valid_length = valid_spans[batch_index]
             available_blocks = cache._compressed_counts[batch_index]
@@ -677,34 +700,68 @@ class QSAIndexer(nn.Module):
                 scores = mx.where(valid_blocks, scores, -mx.inf)
                 selected_blocks = mx.argpartition(
                     scores, kth=-self.block_topk, axis=-1
-                )[..., -self.block_topk :]
-            for query_index in range(input_start, input_start + valid_length):
-                logical_position = offsets[batch_index] + query_index - input_start
-                complete_blocks = (logical_position + 1) // self.compress_ratio
-                token_indices: list[int] = []
-                if complete_blocks:
-                    if complete_blocks <= self.block_topk:
-                        blocks = list(range(complete_blocks))
-                    else:
-                        if selected_blocks is None:
-                            raise RuntimeError(
-                                "QSA sparse selection was not materialized"
-                            )
-                        blocks = [
-                            int(value)
-                            for value in selected_blocks[query_index].tolist()
-                        ]
-                    for block in blocks:
-                        start = block * self.compress_ratio
-                        token_indices.extend(range(start, start + self.compress_ratio))
-                tail_start = complete_blocks * self.compress_ratio
-                token_indices.extend(range(tail_start, logical_position + 1))
-                if token_indices:
-                    physical_indices = [
-                        left_padding[batch_index] + index for index in token_indices
-                    ]
-                    selected[batch_index, query_index, physical_indices] = True
-        return selected[:, None, :, :]
+                )[..., -self.block_topk :].astype(mx.int32)
+            query_indices = mx.arange(length, dtype=mx.int32)
+            logical_positions = offsets[batch_index] + query_indices - input_start
+            complete_counts = mx.maximum(
+                (logical_positions + 1) // self.compress_ratio, 0
+            )
+            if selected_blocks is None:
+                max_complete = (
+                    offsets[batch_index] + valid_length
+                ) // self.compress_ratio
+                if max_complete > self.block_topk:
+                    raise RuntimeError("QSA sparse selection was not materialized")
+                selected_blocks = mx.broadcast_to(
+                    mx.arange(self.block_topk, dtype=mx.int32)[None, :],
+                    (length, self.block_topk),
+                )
+
+            dense_blocks = mx.broadcast_to(
+                mx.arange(self.block_topk, dtype=mx.int32)[None, :],
+                (length, self.block_topk),
+            )
+            blocks = mx.where(
+                complete_counts[:, None] > self.block_topk,
+                selected_blocks,
+                dense_blocks,
+            )
+            block_valid = mx.arange(self.block_topk)[None, :] < mx.minimum(
+                complete_counts[:, None], self.block_topk
+            )
+            block_tokens = (
+                blocks[:, :, None] * self.compress_ratio
+                + mx.arange(self.compress_ratio, dtype=mx.int32)[None, None, :]
+            ).reshape(length, self.token_budget)
+            block_token_valid = mx.broadcast_to(
+                block_valid[:, :, None],
+                (length, self.block_topk, self.compress_ratio),
+            ).reshape(length, self.token_budget)
+
+            tail_start = complete_counts * self.compress_ratio
+            tail_counts = logical_positions + 1 - tail_start
+            tail_offsets = mx.arange(self.compress_ratio, dtype=mx.int32)[None, :]
+            tail_tokens = tail_start[:, None] + tail_offsets
+            tail_valid = tail_offsets < tail_counts[:, None]
+
+            query_valid = (query_indices >= input_start) & (
+                query_indices < input_start + valid_length
+            )
+            indices = mx.concatenate([block_tokens, tail_tokens], axis=-1)
+            valid = mx.concatenate([block_token_valid, tail_valid], axis=-1)
+            valid = valid & query_valid[:, None]
+            indices = mx.clip(
+                indices + left_padding[batch_index], 0, physical_kv_length - 1
+            )
+            compact_indices.append(indices)
+            compact_valid.append(valid)
+
+        selection = _QSASelection(
+            token_indices=mx.stack(compact_indices),
+            valid=mx.stack(compact_valid),
+            physical_kv_length=physical_kv_length,
+        )
+        return selection.dense_mask()
 
 
 class QSAAttention(nn.Module):
