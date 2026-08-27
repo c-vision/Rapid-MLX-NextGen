@@ -117,6 +117,70 @@ Full step list, gating logic, and how to add steps: [`scripts/pr_validate/README
 
 It's still new. File an issue with `[pr_validate]` in the title and the artifacts under `/tmp/pr_validate/pr-<N>/` attached.
 
+## Training gates
+
+Before an engine change is **frozen** into a train, it must pass the same 5
+validation gates the hosted CI matrix runs — now reproducible locally on one
+machine:
+
+```bash
+scripts/train_gates.sh "$(git merge-base origin/main HEAD)"
+scripts/train_gates.sh --help
+```
+
+A PR is "frozen" for a train only when `scripts/train_gates.sh <merge-base>`
+prints `GATES OK <sha> <gates-hash>  (python X.Y.Z)` (exit 0) on the exact
+head you intend to freeze. The `<base-sha>` must be a strict ancestor of
+`HEAD` — the script refuses `HEAD` itself and any forward/foreign base (exit 2)
+because an empty diff would pass diff-cover at 100% by construction; an
+unresolvable base or bad arguments print one error line plus usage (exit 2),
+as does an unusable control interpreter (no PyYAML, or python < 3.10). If any
+gate fails, the run still executes every remaining gate (so you see every
+failure in one pass) and ends with `GATES FAILED` plus one `FAILURE gate N`
+line per failed gate (exit 1); if no gate failed but fewer than 5 passed
+because one was skipped, it ends with `GATES INCOMPLETE` (exit 1) — a skip is
+not a pass. A working tree with modified or staged **tracked** files still runs
+every gate but never earns the literal `GATES OK`: its receipt is
+`GATES DIRTY <sha> <gates-hash>  (python X.Y.Z)` with exit 3 (untracked files
+are ignored by that check — they are not part of the validated `<sha>`).
+
+The 5 gates (and their hosted CI equivalents):
+
+| Gate | What it runs | Hosted equivalent |
+|---|---|---|
+| 1 | Linux no-MLX pytest (the hosted install verbatim: `pip install -e . --no-deps` + `config/requirements-ci-linux.txt`, asserts `import mlx` fails, then the parsed Linux test roster) | `ci.yml` `test-matrix` |
+| 2 | Pinned mypy error budget (`config/mypy-requirements.txt` → `check_mypy_error_budget.py`) | `ci.yml` `type-check` |
+| 3 | Coverage union + `diff-cover --fail-under 100` against `<base-sha>`, in a fresh venv with `coverage` + the `diff-cover==X.Y.Z` pin parsed from `ci.yml` | `ci.yml` `changed-lines-coverage` |
+| 4 | Apple-MLX pytest (the parsed Apple test roster, in an mlx-capable venv) | `ci.yml` `test-apple-silicon` |
+| 5 | Desktop `swift test --no-parallel` (only if `apps/` changed vs base; PASS-BY-N/A if `apps/` is unchanged) | `rapid-mac-ci.yml` `build` job's `swift test` step only |
+
+The gate definitions are **not hardcoded** in the script: they are parsed at
+runtime from `.github/workflows/ci.yml` and `.github/workflows/rapid-mac-ci.yml`
+by `scripts/train_gates_parser.py`. The drift test
+`tests/test_train_gates_matches_ci.py` (which runs in the Linux CI `test-matrix`
+job) fails if a CI-definition edit — a test added to a pytest roster, a mypy
+budget pin change, a diff-cover knob — drifts the local reproduction out of
+sync with the workflows. The printed `gates-hash` is a deterministic hash over
+the exact gate definitions, so a CI-definition change changes the hash.
+
+Environment knobs (all optional): `TRAIN_GATES_PYTHON` (the control
+interpreter — it only needs `pyyaml`; every gate builds its own fresh venv from
+it, so use a **python3.11** to match the hosted coverage union, which is
+3.11-only — any other version prints a warning); `TRAIN_GATES_APPLE_VENV` /
+`TRAIN_GATES_ALLOW_APPLE_INSTALL=1` / `TRAIN_GATES_SKIP_APPLE=1` for the Apple
+gate; `TRAIN_GATES_SKIP_SWIFT=1` for the Desktop gate. Transient coverage
+artifacts and the per-gate venvs live in one `TMPDIR` run directory (never the
+repo root, never loose in `TMPDIR`); it is deleted on success and kept (path
+printed) when a gate fails, so the per-gate coverage inputs and venvs can be
+inspected. `GATES OK` requires all
+5 gates to pass. A **skip is not a pass** — skipping only happens for a genuine
+environment constraint (missing `swift` toolchain, missing `apps/` dir, or an
+explicit `TRAIN_GATES_SKIP_*` flag) and leaves the train un-frozen. A **PASS,
+marked `(N/A)`**, does count toward the 5 — this is used when Gate 5 finds
+`apps/` unchanged vs the base, so the Desktop `swift test` step has nothing to
+run: the outcome is deterministic (not an environment shortfall), so it
+satisfies the "all five must pass" contract.
+
 ## Ways to Contribute
 
 ### 🟢 Easy — No model download needed

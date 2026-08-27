@@ -394,6 +394,7 @@ jobs:
             tests/test_share_cli.py \
             tests/test_cli_models.py \
             tests/test_doctor_env_health.py \
+            tests/test_train_gates_matches_ci.py \
             -v --tb=short \
             -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache" \
             --cov=vllm_mlx \
