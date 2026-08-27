@@ -280,6 +280,7 @@ jobs:
             tests/test_cli_connect.py \
             tests/test_cli_offline_serve.py \
             tests/test_cli_chat.py \
+            tests/test_cli_cheetah_banner.py \
             tests/test_mcp_security.py \
             tests/test_structured_output.py \
             tests/test_reasoning_parser.py \
