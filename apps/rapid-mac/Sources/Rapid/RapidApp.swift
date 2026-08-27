@@ -110,6 +110,9 @@ struct RapidApp: App {
     @State private var dockPromptStore: DockVisibilityPromptStore
     /// View → Keep Window on Top toggle (session state, not persisted).
     @State private var keepWindowOnTop: Bool = false
+    /// Same defaults key ContentView's footer toggle and drawer close button
+    /// write, so all three stay in lockstep.
+    @AppStorage(ContentView.showLogsKey) private var showLogs: Bool = false
     /// Web-search backend + API key, shared by the tool runner and Settings.
     @State private var webSearch: WebSearchConfig
     /// Per-fetch approval gate for the ``browse`` tool, shared by the tool
@@ -495,6 +498,12 @@ struct RapidApp: App {
                     .onChange(of: keepWindowOnTop) { _, newValue in
                         Self.applyWindowOnTop(newValue)
                     }
+                // A menu path to the log drawer, so its visibility is never
+                // reachable ONLY through a control the drawer itself can push
+                // off screen. The footer toggle and the drawer's own close
+                // button both drive this same flag.
+                Toggle("Show Server Log", isOn: $showLogs)
+                    .keyboardShortcut("l", modifiers: [.command, .shift])
             }
         }
 

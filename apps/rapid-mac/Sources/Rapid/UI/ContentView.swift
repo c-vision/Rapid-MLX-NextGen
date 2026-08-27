@@ -41,6 +41,33 @@ struct ContentView: View {
     static let minWindowWidth: CGFloat = 720
     static let minWindowHeight: CGFloat = 560
 
+    /// Heights the shell's fixed rows keep for themselves. Named rather than
+    /// inlined because they are the rows that DON'T yield — the detail pane
+    /// absorbs what is left — so it should be obvious where the shell's
+    /// vertical commitments are and how few of them there are.
+
+    /// Floor for the drawer's SCROLLING part — the log itself.
+    static let logDrawerScrollMinHeight: CGFloat = 100
+    /// The drawer's own header: title, close button, and the rule under it
+    /// (11pt text on 5pt padding either side, plus a 1pt divider).
+    static let logDrawerHeaderHeight: CGFloat = 26
+    /// What the drawer commits in the shell. Header + log, not just log: the
+    /// two used to be the same number because the drawer was nothing BUT the
+    /// scroll view, and adding the header inside the same frame quietly took
+    /// its 26pt out of the viewport instead of out of the shell.
+    static let logDrawerMinHeight: CGFloat =
+        logDrawerScrollMinHeight + logDrawerHeaderHeight
+    static let statusFooterMinHeight: CGFloat = 30
+
+    /// Defaults key backing the log drawer's visibility. Shared with the View
+    /// menu command in ``RapidApp`` so both toggles drive one flag.
+    static let showLogsKey = "Rapid.showLogs"
+
+    // There is deliberately no detail-pane height floor here. The detail is a
+    // scrolling surface with no natural vertical minimum; the only vertical
+    // floor in the shell is ``minWindowHeight``, applied once at the root.
+    // See the note beside the detail's `.frame(minWidth: 440)`.
+
     @Environment(ServerManager.self) private var server
     @Environment(DownloadManager.self) private var downloads
     @Environment(ChatViewModel.self) private var chat
@@ -65,7 +92,14 @@ struct ContentView: View {
     @State private var section: SidebarSection = .chat
     /// Window-level conversation search, opened from the toolbar.
     @State private var showConversationSearch = false
-    @SceneStorage("Rapid.showLogs") private var showLogs: Bool = false
+    // Was @SceneStorage. Moved to @AppStorage so the View menu command in
+    // RapidApp can drive the same flag — a scene-scoped value is not reachable
+    // from the app's `.commands` block — and so the flag lands somewhere a
+    // stuck user can actually clear (`defaults write com.rapidmlx.rapid
+    // Rapid.showLogs -bool false`). Scene storage lives in opaque state
+    // restoration data. With a single main window the persistence scope is
+    // the same in practice.
+    @AppStorage(ContentView.showLogsKey) private var showLogs: Bool = false
     /// Per-session "browse all models" dismissal of the Quickstart card.
     @State private var quickstartDismissedThisSession: Bool = false
     /// Explicit recovery route from the no-model empty state into the
@@ -444,7 +478,24 @@ struct ContentView: View {
                 // graceful compression. The floor is 720 now, so this has
                 // 80pt of slack; it stays at 440 because it is the detail's
                 // own minimum, not a number derived from the window.
-                .frame(minWidth: 440, minHeight: Self.minWindowHeight)
+                //
+                // WIDTH ONLY, deliberately. There used to be a matching
+                // `minHeight` here — first `Self.minWindowHeight`, then a
+                // smaller "budgeted" number — and both were wrong for the same
+                // reason: the detail is a scrolling surface with no natural
+                // vertical minimum, so any figure it claims is one it will not
+                // give back. Claiming 560 meant the detail alone committed
+                // every point the window could shrink to, and the log drawer
+                // and status footer stacked under it had to come out of
+                // nothing; the footer, being last, was what disappeared.
+                //
+                // The vertical floor belongs to the window and is stated once,
+                // at the root of this view. A row that must keep its height
+                // (the drawer, the footer) declares one; the detail absorbs
+                // whatever is left and compresses when the others need room.
+                // That is the whole invariant, and it needs no arithmetic
+                // between the three.
+                .frame(minWidth: 440)
                     .background(RapidTheme.surfaceCanvas)
             }
             // Background pulls are process-wide, not chat-only.  Keep their
@@ -458,8 +509,17 @@ struct ContentView: View {
                 }
             )
             if showLogs {
-                LogDrawer(server: server)
-                    .frame(minHeight: 100, idealHeight: 150, maxHeight: 220)
+                LogDrawer(server: server, onClose: hideLogs)
+                    // Floor and ideal are both header-inclusive so the LOG
+                    // keeps the 100/150 it had before the header existed. The
+                    // 220 ceiling is left alone on purpose: it bounds what the
+                    // drawer may take from the shell, not what it promises to
+                    // show, and raising it would take space the detail keeps.
+                    .frame(
+                        minHeight: Self.logDrawerMinHeight,
+                        idealHeight: 150 + Self.logDrawerHeaderHeight,
+                        maxHeight: 220
+                    )
                     .accessibilityIdentifier("ContentView.LogDrawer")
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
@@ -1179,13 +1239,19 @@ struct ContentView: View {
         }
     }
 
+    private func setLogs(_ visible: Bool) {
+        withAnimation(RapidMotion.resolve(RapidMotion.standard, reduceMotion: reduceMotion)) {
+            showLogs = visible
+        }
+    }
+
+    private func hideLogs() { setLogs(false) }
+
     private var statusFooter: some View {
         HStack(spacing: 8) {
             SettingsGearButton()
             Button {
-                withAnimation(RapidMotion.resolve(RapidMotion.standard, reduceMotion: reduceMotion)) {
-                    showLogs.toggle()
-                }
+                setLogs(!showLogs)
             } label: {
                 Image(systemName: "terminal")
                     .font(.system(size: 13))
@@ -1201,7 +1267,7 @@ struct ContentView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 7)
-        .frame(minHeight: 30)
+        .frame(minHeight: Self.statusFooterMinHeight)
         .background(.bar)
     }
 
@@ -1861,12 +1927,61 @@ struct DesktopVersionPill: View {
 private struct LogDrawer: View {
     @Bindable var server: ServerManager
 
+    /// Dismiss the drawer from inside it.
+    ///
+    /// The drawer had no close control of its own: the only way out was the
+    /// terminal toggle in ``statusFooter``, which sits BELOW the drawer in the
+    /// same VStack. When the column over-committed, the footer was the row
+    /// that got clipped — so the control that closes the drawer was the one
+    /// the drawer pushed off screen, with no menu item or shortcut to escape
+    /// through either. The over-commit is fixed separately and properly; this
+    /// exists so the drawer is dismissible on its own terms no matter how the
+    /// layout is squeezed by a later change.
+    var onClose: () -> Void
+
     /// Stable id for the invisible bottom marker we scroll to on every
     /// log append. Lives outside the ``ForEach`` so adding rows can't
     /// invalidate it.
     private static let bottomAnchor = "Rapid.LogDrawer.bottom"
 
     var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            logScroll
+        }
+        // Seal the bottom edge the way ``DownloadStrip`` seals its own. The
+        // log surface is `.textBackgroundColor` and the footer under it is
+        // `.bar`; in light mode those are near enough that without a rule the
+        // two read as one surface, and the footer's icons look like they are
+        // floating on the bottom of the log panel against the window's corner
+        // radius rather than sitting in a strip of their own. An overlay, not
+        // a VStack row, so the rule costs the scroll area no height.
+        .overlay(Divider(), alignment: .bottom)
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Text("Server log")
+                .scaledSystemFont(11, weight: .medium)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("Hide logs")
+            .accessibilityLabel("Hide logs")
+            .accessibilityIdentifier("LogDrawer.Close")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(.bar)
+    }
+
+    private var logScroll: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 1) {

@@ -661,4 +661,88 @@ struct CoreWorkspaceVisualFoundationTests {
             """
         )
     }
+
+    /// The vertical counterpart, and the one that actually bit.
+    ///
+    /// The detail pane used to declare a `minHeight` as well as a `minWidth`.
+    /// It is a scrolling surface with no natural vertical minimum, so whatever
+    /// it claimed it would not give back: at `minWindowHeight` it committed
+    /// every point the window could shrink to, and the log drawer and status
+    /// footer stacked under it had to come out of nothing. The footer, last in
+    /// the column, was what vanished — taking the toggle that closes the
+    /// drawer with it.
+    ///
+    /// Two plausible-looking fixes were tried and both were worse, which is
+    /// why this asserts the ABSENCE of the floor rather than any arithmetic:
+    ///
+    ///   * Budgeting — giving the detail a smaller floor so detail + drawer +
+    ///     footer "fit". A frame minimum can only RAISE a floor, so a number
+    ///     under the pane's real content minimum is inert, and a test summing
+    ///     those constants passes by construction while the footer goes right
+    ///     on disappearing on screen.
+    ///   * Pinning the footer with `.safeAreaInset`. That does keep the footer,
+    ///     but the detail then draws BEHIND it, and the chat composer — which
+    ///     anchors to the bottom of the detail — was clipped by the footer
+    ///     whenever the drawer was closed.
+    ///
+    /// The invariant that actually holds: exactly one vertical floor in the
+    /// shell, at the root, and rows that must keep their height declare one
+    /// while the detail absorbs the remainder.
+    @Test("The detail pane claims no vertical floor of its own")
+    func detailPaneDeclaresNoHeightFloor() throws {
+        let source = try strippedSource("Sources/Rapid/UI/ContentView.swift")
+        #expect(
+            source.contains(".frame(minWidth:440)"),
+            "The detail pane must state its width floor and nothing about height."
+        )
+        #expect(
+            !source.contains(".frame(minWidth:440,minHeight:"),
+            "A detail height floor starves the drawer and footer stacked under it; the shell's only vertical floor is minWindowHeight at the root."
+        )
+        #expect(
+            !source.contains(".safeAreaInset(edge:.bottom"),
+            "Pinning the footer makes the detail draw behind it and clips the chat composer; the footer stays an ordinary row."
+        )
+    }
+
+    /// Geometry is the fix; this is the belt.
+    ///
+    /// A drawer whose only dismiss control lives OUTSIDE it, below it, in a
+    /// container it can overflow, is a one-way door waiting for the next
+    /// layout change. It must be closable on its own terms.
+    @Test("The log drawer carries its own close control")
+    func logDrawerClosesItself() throws {
+        let source = try strippedSource("Sources/Rapid/UI/ContentView.swift")
+        #expect(
+            source.contains(#"accessibilityIdentifier("LogDrawer.Close")"#),
+            "LogDrawer must keep a close control of its own, not rely on the footer toggle it can push off screen."
+        )
+        #expect(
+            source.contains("LogDrawer(server:server,onClose:hideLogs)"),
+            "LogDrawer's close control must be wired to the same flag the footer toggle drives."
+        )
+    }
+
+    /// And the braces: a menu path survives any layout, and puts the flag
+    /// somewhere a stuck user can reach without the window cooperating.
+    @Test("Log drawer visibility has a menu path")
+    func logDrawerHasAMenuCommand() throws {
+        let app = try strippedSource("Sources/Rapid/RapidApp.swift")
+        // `canonicalSource(literals: .preserve)` keeps literal CONTENT but the
+        // whitespace strip still runs inside it, so the menu title canonicalises
+        // to "ShowServerLog". Match what the helper actually emits, not what the
+        // source reads like.
+        #expect(
+            app.contains(#"Toggle("ShowServerLog",isOn:$showLogs)"#),
+            "The View menu must be able to toggle the log drawer independently of the footer control."
+        )
+        #expect(
+            app.contains(#".keyboardShortcut("l",modifiers:[.command,.shift])"#),
+            "The menu command needs a shortcut; a menu the user has to hunt for is barely better than a clipped button."
+        )
+        #expect(
+            app.contains(#"@AppStorage(ContentView.showLogsKey)"#),
+            "The menu command and the in-window controls must read one flag; a scene-scoped value is unreachable from .commands."
+        )
+    }
 }

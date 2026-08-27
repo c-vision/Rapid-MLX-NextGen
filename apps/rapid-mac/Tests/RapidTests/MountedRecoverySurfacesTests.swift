@@ -25,7 +25,10 @@ struct MountedRecoverySurfacesTests {
         #expect(content.contains("FailedReplaceBanner()"))
         #expect(content.contains("DownloadStrip("))
         #expect(content.contains("downloads: downloads"))
-        #expect(content.contains("LogDrawer(server: server)"))
+        // Match the call, not its full argument list: the drawer gained an
+        // `onClose:` so it can be dismissed from inside itself, and this pin is
+        // about the surface being MOUNTED, not about its signature.
+        #expect(content.contains("LogDrawer(server: server"))
         #expect(content.contains("ServerStatusPill(state: server.state)"))
     }
 
