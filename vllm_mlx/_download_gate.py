@@ -966,6 +966,102 @@ def split_model_local_snapshot(repo_id: str) -> str | None:
     return snap_dir if os.path.isdir(snap_dir) else None
 
 
+def _snapshot_is_complete_wan_model(repo_id: str) -> bool:
+    """True when a ``WAN_REVISIONS``-pinned Wan checkpoint is cached & loadable.
+
+    Wan video repos (``video/wan.py``'s ``WAN_REVISIONS``) are pinned to an
+    exact commit sha, so ``snapshot_download(repo, revision=<sha>)`` caches
+    under ``snapshots/<sha>`` WITHOUT advancing ``refs/main`` (exactly the
+    ``IMAGE_MODEL_REVISIONS`` mflux case). The generic probes miss this warm
+    cache: ``is_repo_cached`` resolves via ``refs/main``;
+    :func:`_snapshot_is_complete_split_model` requires a ``split_model.json``
+    manifest (Wan checkpoints ship none); :func:`_snapshot_is_complete_mflux_model`
+    is image-gen-only. Without this, a warm-cached Wan snapshot reads as
+    *weightless* / non-runnable and would re-download on every start.
+
+    Deterministic, verified-filename-only completeness mirroring what
+    ``mlx_video.models.wan_2.generate`` loads from ``model_dir``. The pinned
+    checkpoints share the common encoder + VAE files (``config.json``,
+    ``t5_encoder.safetensors``, ``vae.safetensors``); the diffusion transformer
+    layout is **family-exact**, not inferred from whichever files happen to be
+    present: the 5B checkpoints ship a single ``model.safetensors``, the A14B
+    checkpoints ship ``high_noise_model.safetensors`` AND
+    ``low_noise_model.safetensors``. A repo whose id does not indicate a known
+    family (5B / A14B) fails closed rather than guessing, so an incomplete A14B
+    snapshot with a stray ``model.safetensors`` is never accepted. No
+    speculative generic ``*.safetensors``: an unrelated stray weight must not
+    make the snapshot look runnable.
+
+    Every file must be present, non-empty, and resolve **strictly inside the
+    repo's own ``blobs`` directory** (HF snapshot leaves symlink into
+    ``blobs/<etag>``). Requiring under ``blobs`` — not merely under the repo
+    root — stops a snapshot from borrowing files from a sibling snapshot via a
+    crafted symlink.
+
+    Returns ``False`` for an unpinned / non-``WAN_REVISIONS`` repo, an
+    unclassifiable family, or on any internal error, so the caller falls
+    through to the generic probes.
+    """
+    try:
+        from vllm_mlx.video.wan import WAN_REVISIONS
+
+        pinned_revision = WAN_REVISIONS.get(repo_id)
+        if pinned_revision is None or not isinstance(pinned_revision, str):
+            # Not a registered pinned Wan checkpoint — not our lane.
+            return False
+
+        # Family-exact transformer layout, keyed off the repo id (matches the
+        # four pinned checkpoints: 5B -> single, A14B -> dual). Fail closed on
+        # an unclassifiable repo rather than inferring from file presence.
+        repo_lower = repo_id.casefold()
+        if "a14b" in repo_lower:
+            transformer_names: tuple[str, ...] = (
+                "high_noise_model.safetensors",
+                "low_noise_model.safetensors",
+            )
+        elif "5b" in repo_lower:
+            transformer_names = ("model.safetensors",)
+        else:
+            return False
+
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        repo_root = os.path.join(
+            HF_HUB_CACHE,
+            f"models--{repo_id.replace('/', '--')}",
+        )
+        snap_dir = os.path.join(repo_root, "snapshots", pinned_revision)
+        if not os.path.isdir(snap_dir):
+            return False
+
+        repo_root_real = os.path.realpath(repo_root)
+        # HF snapshot leaves symlink into this repo's own ``blobs`` dir.
+        blobs_prefix = repo_root_real + os.sep + "blobs" + os.sep
+
+        def _on_repo(name: str) -> bool:
+            path = os.path.join(snap_dir, name)
+            if not os.path.isfile(path):
+                return False
+            if os.path.getsize(path) <= 0:
+                return False
+            real = os.path.realpath(path)
+            # Must resolve strictly inside this repo's ``blobs`` — a symlink
+            # escaping to blobs (or a file) elsewhere in the cache is rejected,
+            # and so is borrowing from a sibling snapshot whose files live under
+            # the same repo root but not under ``blobs``.
+            return real.startswith(blobs_prefix)
+
+        transformer_ok = all(_on_repo(n) for n in transformer_names)
+        return (
+            transformer_ok
+            and _on_repo("config.json")
+            and _on_repo("t5_encoder.safetensors")
+            and _on_repo("vae.safetensors")
+        )
+    except Exception:
+        return False
+
+
 #: Repos whose weights must resolve to an exact, previously-verified commit,
 #: mirroring ``video/wan.py``'s ``WAN_REVISIONS``. Without this, an alias
 #: only ever resolves whatever ``refs/main`` currently points to (see
