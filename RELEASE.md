@@ -18,8 +18,13 @@ extended operational guide, `docs/development/releasing.md`, defers to it.
 3. In the same PR, `git mv docs/release-notes/unreleased.md
    docs/release-notes/vX.Y.Z.md` (optional — see "Release notes" below).
 4. Open a PR whose commit subject is exactly `chore: bump version to X.Y.Z`
-   (GitHub's `(#N)` squash suffix is fine), and merge it to `main`.
-5. Merging starts the pipeline. After the Desktop candidate validates the
+   (GitHub's `(#N)` squash suffix is fine).
+5. Run the secret/environment pre-flight on that exact bump-PR head (see
+   "Release pre-flight" below), wait for the roll-up to be green, and paste the
+   successful run's `Release-Preflight:` URL into the PR body. The required
+   `version-check.yml` gate verifies that evidence against the live PR head;
+   without it the PR cannot merge.
+6. Merging starts the pipeline. After the Desktop candidate validates the
    exact commit, the live main head and release-blocker evidence are gathered,
    and the protected `rapid-mac-tag` deployment requests approval, a **reviewer
    inspects the exact SHA / main-head / blocker evidence** shown there and
@@ -82,6 +87,79 @@ the same dry run on the intended bump parent (`main` at that moment) and include
 its URL + full `headSha` in the bump PR evidence. This exercises gate changes
 before the bump commit can activate the publishing route.
 
+## Release pre-flight (secret / environment gates, maintainer dispatch)
+
+The secret- and environment-aware release gates (**PF-2** release-secret + var
+presence and credential probe, **PF-3** `rapid-mac-tag` environment protection
+read-back, plus the macOS **G1** release-smoke and **G11** escape-hatch
+registry) do **not** run automatically on every PR. Running them on
+`pull_request` would request the privileged Actions context on every bump PR,
+leaving each one stuck in `action_required` before any gate could run. Instead
+`release-preflight.yml` is an explicit maintainer `workflow_dispatch` bound to
+**one exact bump-PR head** (anti-TOCTOU). Because it is an explicit dispatch it
+can read secrets and the protected environment read-back without creating a
+privileged PR-event context.
+
+To run it, first resolve the exact current bump-PR head **and its branch ref**,
+then dispatch with the PR number and that SHA. The `--ref` is essential:
+without it the dispatch runs on `main`, and `bind-bump-pr` rejects the
+selection immediately ("Stale or wrong pre-flight selection") because the
+dispatch SHA won't equal the bump-PR head:
+
+```bash
+PR_NUMBER=<bump-pr>
+BUMP_BRANCH="$(gh api \
+  "repos/raullenchai/Rapid-MLX/pulls/$PR_NUMBER" --jq .head.ref)"
+EXPECTED_SHA="$(gh api \
+  "repos/raullenchai/Rapid-MLX/pulls/$PR_NUMBER" --jq .head.sha)"
+
+gh workflow run release-preflight.yml -R raullenchai/Rapid-MLX \
+  --ref "$BUMP_BRANCH" \
+  -f pr_number="$PR_NUMBER" -f expected_sha="$EXPECTED_SHA"
+gh run watch "$(gh run list -R raullenchai/Rapid-MLX --workflow release-preflight.yml \
+  --branch "$BUMP_BRANCH" --limit 1 \
+  --json databaseId --jq '.[0].databaseId')" -R raullenchai/Rapid-MLX --exit-status
+```
+
+`--branch "$BUMP_BRANCH" --limit 1` on the run lookup picks the dispatch exactly
+on the bump branch (not some other dispatch racing on the same workflow).
+
+The first job, `bind-bump-pr`, resolves the PR through the GitHub API and fails
+unless it is **open, targeting `main`, from the same repository**, the given
+`expected_sha` equals both the dispatch ref and the PR's live `head.sha`, and
+the title is the canonical bump subject. Everything downstream (`pf1-release-
+contract`, `pf2-release-secrets`, `pf3-tag-environment`, `g1-release-smoke`,
+`g10-upstream-mlx-scan`, `g11-escape-hatch`) `needs: bind-bump-pr`, so a stale
+or wrong SHA never reaches the credential or protected-environment gates.
+
+A successful roll-up prints the evidence line the bump PR must carry:
+
+```
+Release-Preflight: https://github.com/raullenchai/Rapid-MLX/actions/runs/<run-id>
+```
+
+Paste that single line into the bump PR body. The required `version-check.yml`
+gate extracts it (via `validate_release_subject.py --pr-body --repository
+--print-preflight-run-id`) and verifies live through `gh api` that the run is a
+`workflow_dispatch` of `release-preflight.yml`, completed successfully, on
+**exactly** the bump PR head. The gate also enforces that the bump PR contain
+exactly one commit and that the CHANGELOG `## [X.Y.Z]` section
+(`apps/rapid-mac/CHANGELOG.md`) and `docs/release-notes/vX.Y.Z.md` are
+synchronized with the new version. A bump PR therefore cannot merge without a
+valid green exact-head pre-flight run recorded in its body — while the
+pre-flight itself, being a maintainer dispatch, never blocks on a PR-event
+approval prompt.
+
+**Keeping the bump PR current is a REBASE, not a merge.** GitHub's "Update
+branch" creates a merge commit that trips the gate's exactly-one-commit check,
+so keep the bump PR on a single commit by rebasing (`git rebase origin/main`
+then force-push your branch — it is a feature branch, not `main`). And because
+the pre-flight binds to **one exact head**, any `main` advance after the green
+run changes nothing about the run already on the old head — but if you rebase
+the bump branch to a new head, the evidence line is now stale: **re-dispatch
+the pre-flight on the new exact head** and paste the fresh run URL before
+merging. This strictness is intentional (anti-TOCTOU).
+
 ## Desktop (Rapid-MLX Desktop) RC tags — validated before claimed
 
 The engine release also drives the Desktop app: a `rapid-mac-vX.Y.Z[-rcN]` tag
@@ -115,7 +193,7 @@ signed/notarised/DMG-validated lane, and which is still the live `main` head**:
 - An RC needing correction is **superseded by the next RC** on its own validated
   commit; an existing RC tag is never moved, force-pushed, or deleted.
 
-On the bump PR only PF-3 runs — a fail-closed read-back that the
+One of the dispatch pre-flight's jobs, PF-3, is a fail-closed read-back that the
 `rapid-mac-tag` environment exists and is protected (required reviewer,
 `prevent_self_review=false`, deployment policy exactly `main`), so an
 unprotected/drifted environment is a NO-GO before any release rather than a

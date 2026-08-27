@@ -355,6 +355,7 @@ jobs:
             tests/test_sidecar_distribution_constraints.py \
             tests/test_sidecar_vision_smoke.py \
             tests/test_validate_release_subject.py \
+            tests/test_check_release_notes.py \
             tests/test_check_gha_pinning.py \
             tests/test_check_mypy_error_budget.py \
             tests/test_release_version.py \
