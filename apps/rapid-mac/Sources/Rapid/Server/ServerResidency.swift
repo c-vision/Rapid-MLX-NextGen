@@ -274,6 +274,18 @@ struct ModelSwitchRisk: Equatable, Sendable {
     }
 }
 
+/// User preference for the advisory active-request switch guard. The missing
+/// key means enabled so upgrades keep the safe interactive behavior, while
+/// unattended automation can explicitly opt out in Settings.
+enum ModelSwitchConfirmationPreference {
+    static let storageKey = "rapid.server.confirm_active_request_switch.v1"
+    static let defaultValue = true
+
+    static func isEnabled(in defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: storageKey) as? Bool ?? defaultValue
+    }
+}
+
 /// Result of the Desktop's advisory active-request guard. An explicit user
 /// approval must use the existing stop/start path because the resident loader
 /// correctly refuses to evict a model while it is serving a request.

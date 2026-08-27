@@ -837,14 +837,13 @@ struct ModelReadinessTests {
 
     // MARK: - Actions
 
-    /// ``chooseModel`` must not render a button: the picker already
-    /// carries those exact words 40pt away, and a second control saying
-    /// the same thing is the duplicate-action defect.
+    /// An empty conversation offers a visible route to the RAM-aware model
+    /// selection surface instead of relying on picker discovery.
     @Test
-    func testChooseModelIsNamedButNotRendered() {
+    func testChooseModelIsNamedAndRendered() {
         let state = ModelReadiness.noModel
         XCTAssertEqual(state.action, .chooseModel)
-        XCTAssertEqual(state.action?.isRenderable, false)
+        XCTAssertEqual(state.action?.isRenderable, true)
         XCTAssertEqual(state.action?.title, "Choose a model")
         XCTAssertNil(state.action?.alias)
     }

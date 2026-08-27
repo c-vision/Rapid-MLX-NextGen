@@ -483,6 +483,15 @@ final class ServerManager {
             residency: residency
         ) else { return .notNeeded }
 
+        // Headless automation may explicitly skip the UI-only confirmation.
+        // Keep the fresh residency evaluation above: the decision still has
+        // to distinguish a safe in-process load from an approved destructive
+        // switch, even when no dialog is presented.
+        let defaults = sessionDefaults ?? .standard
+        guard ModelSwitchConfirmationPreference.isEnabled(in: defaults) else {
+            return .approved
+        }
+
         let request = PendingModelSwitch(id: UUID(), risk: risk)
         if pendingModelSwitch == nil {
             pendingModelSwitch = request

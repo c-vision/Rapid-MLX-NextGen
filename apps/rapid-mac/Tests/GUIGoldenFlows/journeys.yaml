@@ -37,6 +37,14 @@ journeys:
     fixtures: [fake-sidecar, cached-model, isolated-home]
     source_paths: [apps/rapid-mac/Sources/Rapid/Server/]
     owns_baseline: false
+  - name: model-switch-active-request
+    group: models
+    risk: high
+    driver: ax
+    ci_tier: pr
+    fixtures: [fake-sidecar, slow-stream, isolated-home]
+    source_paths: [apps/rapid-mac/Sources/Rapid/Server/, apps/rapid-mac/Sources/Rapid/UI/ContentView.swift]
+    owns_baseline: false
   - name: download-progress
     group: onboarding-settings
     risk: medium

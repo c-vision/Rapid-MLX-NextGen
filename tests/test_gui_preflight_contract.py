@@ -128,6 +128,7 @@ def test_peekaboo_requirement_is_default_deny():
         "cached-quickstart",
         "cached-curated-tradeup",
         "cached-variant-collapse",
+        "model-switch-active-request",
         "download-progress",
         "settings-persistence",
         "settings-mtp",

@@ -82,6 +82,12 @@ struct SettingsModelManagementPanel: View {
     /// next-launch spawn while leaving every manual start path untouched.
     @AppStorage(AutoStartPreference.storageKey) private var autoStartOnLaunch: Bool = AutoStartPreference.defaultValue
 
+    /// Safety prompt for interactive model switches that would interrupt
+    /// active API or streaming requests. Automation can opt out explicitly;
+    /// the safe default remains on for existing and new installations.
+    @AppStorage(ModelSwitchConfirmationPreference.storageKey)
+    private var confirmActiveRequestSwitch = ModelSwitchConfirmationPreference.defaultValue
+
     /// codex r1 P2 (#210): without this we'd ride the stale catalog
     /// snapshot after a background download finishes — the row
     /// flips from ``Downloading…`` straight back to ``Not cached``
@@ -293,13 +299,13 @@ struct SettingsModelManagementPanel: View {
 
     // MARK: - Preferences
 
-    /// The two model-behaviour toggles that used to live in a separate
+    /// Model-behaviour toggles, including the two that used to live in a separate
     /// "Models" tab. Folded in here — the surface that already owns
     /// everything about your models — as one labelled card so the app
     /// has a single place to manage models rather than two competing
     /// ones. Styled to match ``modelsFolderSection`` above: a secondary
-    /// section label over a hairline card, the two toggles split by a
-    /// divider so they read as a pair without two floating boxes.
+    /// section label over a hairline card, with dividers keeping the controls
+    /// distinct without creating several floating boxes.
     @ViewBuilder
     private var preferencesSection: some View {
         SettingsSection("Preferences") {
@@ -331,6 +337,19 @@ struct SettingsModelManagementPanel: View {
                 .accessibilityHint("When off, opening Rapid-MLX will not load a model until you start one manually from the picker.")
                 // Stable AX hook kept as `Settings.Models.*` across the move.
                 .accessibilityIdentifier("Settings.Models.AutoStartOnLaunchToggle")
+
+                SettingsRowDivider()
+
+                Toggle(isOn: $confirmActiveRequestSwitch) {
+                    SettingsRowLabel(
+                        title: "Confirm before interrupting active requests",
+                        description: "Ask before switching models when the current model is still serving API or streaming requests. Turn this off only for unattended automation."
+                    )
+                }
+                .toggleStyle(TrailingSettingsToggleStyle())
+                .accessibilityLabel("Confirm before interrupting active requests")
+                .accessibilityHint("When off, model switches may interrupt active API or streaming requests without asking.")
+                .accessibilityIdentifier("Settings.Models.ConfirmActiveRequestSwitchToggle")
         }
     }
 

@@ -43,6 +43,17 @@ struct QuickstartBrowseAllDestinationTests {
         }
     }
 
+    private static var contentViewSource: String {
+        get throws {
+            let url = URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()  // RapidTests
+                .deletingLastPathComponent()  // Tests
+                .deletingLastPathComponent()  // rapid-mac
+                .appendingPathComponent("Sources/Rapid/UI/ContentView.swift")
+            return try String(contentsOf: url, encoding: .utf8)
+        }
+    }
+
     /// Comment- and whitespace-stripped source, shared with the other
     /// source-guard suites. Comments must go, not just whitespace: otherwise a
     /// doc comment that *describes* a call counts as the call, and a wiring
@@ -58,6 +69,27 @@ struct QuickstartBrowseAllDestinationTests {
     }
 
     // MARK: - The link is wired
+
+    @Test("The no-model CTA re-enters the RAM-aware chooser")
+    func noModelCTAReentersQuickstartChooser() throws {
+        let source = Self.stripped(try Self.contentViewSource)
+        guard let start = source.range(of: "case.chooseModel:") else {
+            Issue.record("ContentView has no choose-model action branch")
+            return
+        }
+        let tail = source[start.upperBound...]
+        guard let end = tail.range(of: "case.download") else {
+            Issue.record("could not isolate ContentView's choose-model action")
+            return
+        }
+        let branch = String(tail[..<end.lowerBound])
+
+        #expect(branch.contains("quickstart.returnToChooser()"))
+        #expect(branch.contains("quickstartDismissedThisSession=false"))
+        #expect(branch.contains("modelChoiceRecoveryRequested=true"))
+        #expect(!branch.contains("openModelManagement"))
+        #expect(!branch.contains("openWindow"))
+    }
 
     @Test("The link's action calls browseAllModels(), not a dismiss flag")
     func browseAllIsWiredToTheCatalogue() throws {

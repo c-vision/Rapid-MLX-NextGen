@@ -112,7 +112,7 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "trust" {
 
 guard CommandLine.arguments.count >= 3,
       let pid = pid_t(CommandLine.arguments[2]) else {
-    fail("usage: rapid-ax <dump|press|key|click-center|set-scroll-value|increment|decrement|set-value|paste-file|set-window-size|close-window|trust> <pid> [identifier-or-window-title] [value]")
+    fail("usage: rapid-ax <dump|press|select-menu-title|key|click-center|set-scroll-value|increment|decrement|set-value|paste-file|set-window-size|close-window|trust> <pid> [identifier-or-window-title] [value]")
 }
 
 let command = CommandLine.arguments[1]
@@ -427,6 +427,54 @@ case "click-center":
     down.post(tap: .cghidEventTap)
     up.post(tap: .cghidEventTap)
     usleep(150_000)
+case "select-menu-title":
+    guard CommandLine.arguments.count > 4 else {
+        fail("select-menu-title requires the exact searchable menu title")
+    }
+    let searchText = CommandLine.arguments[4]
+    guard let origin = point(target, kAXPositionAttribute as CFString),
+          let extent = size(target, kAXSizeAttribute as CFString),
+          extent.width > 0, extent.height > 0
+    else { fail("select-menu-title \(identifier) has no usable AX bounds") }
+    let center = CGPoint(x: origin.x + extent.width / 2, y: origin.y + extent.height / 2)
+    guard let mouseDown = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
+                                  mouseCursorPosition: center, mouseButton: .left),
+          let mouseUp = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp,
+                                mouseCursorPosition: center, mouseButton: .left)
+    else { fail("could not create menu click events for \(identifier)") }
+    mouseDown.post(tap: .cghidEventTap)
+    mouseUp.post(tap: .cghidEventTap)
+    usleep(200_000)
+
+    let utf16 = Array(searchText.utf16)
+    guard let typeDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+          let typeUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false),
+          let returnDown = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: true),
+          let returnUp = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: false)
+    else { fail("could not create menu keyboard events for \(identifier)") }
+    utf16.withUnsafeBufferPointer { buffer in
+        guard let base = buffer.baseAddress else { return }
+        typeDown.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: base)
+        typeUp.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: base)
+    }
+    typeDown.postToPid(pid)
+    typeUp.postToPid(pid)
+    usleep(150_000)
+    returnDown.postToPid(pid)
+    returnUp.postToPid(pid)
+    usleep(150_000)
+    let payload: [String: Any] = [
+        "success": true,
+        "identifier": identifier,
+        "selected_title": searchText,
+        "action": command,
+    ]
+    let data = try! JSONSerialization.data(
+        withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]
+    )
+    FileHandle.standardOutput.write(data)
+    FileHandle.standardOutput.write(Data("\n".utf8))
+    exit(0)
 case "set-scroll-value":
     guard CommandLine.arguments.count > 3,
           let value = Double(CommandLine.arguments[3]),

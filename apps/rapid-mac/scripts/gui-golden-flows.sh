@@ -146,7 +146,7 @@ flow_requires_screen_recording() {
 flow_requires_peekaboo() {
     case "$FLOW" in
         fresh-install|cached-quickstart|cached-curated-tradeup|cached-variant-collapse|download-progress|settings-persistence|settings-mtp|chat-restore|message-actions|restored-tools|tool-loop-budget|chat-depth|math-rendering|browse-all-destination|no-dead-controls|catalog-integrity|update-state|update-busy|campaign-banner|launch-integrations) return 1 ;;
-        slow-stream-stop|model-crash-recovery|low-memory-choice|chat-document-attachment|chat-multimodal-attachments|image-generation|dictation|dictation-rc2-upgrade|audio-readiness|window-close-prompt|resident-load-rejected) return 1 ;;
+        slow-stream-stop|model-switch-active-request|model-crash-recovery|low-memory-choice|chat-document-attachment|chat-multimodal-attachments|image-generation|dictation|dictation-rc2-upgrade|audio-readiness|window-close-prompt|resident-load-rejected) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -4801,6 +4801,70 @@ flow_dictation_rc2_upgrade() {
 }
 
 
+flow_model_switch_active_request() {
+    log "flow: model-switch-active-request"
+    start_persona model-switch-active-request \
+        FAKE_CHAT_RESPONSE_DELAY_MS=10000 \
+        FAKE_INTER_TOKEN_SLEEP_S=0.02 \
+        FAKE_CONTENT_REPEAT=250
+    dismiss_first_run
+    start_model
+    send_prompt "shape:long keep this stream active" "busy-stream"
+
+    # The fake residency endpoint reports the real in-flight handler count.
+    # Wait for the independent handler-lifecycle fact before asking the picker
+    # to switch; the app's own refresh then observes that same count.
+    local i busy=0
+    for ((i=0; i<80; i++)); do
+        if jq -e 'select(.event == "chat_active" and .active_requests > 0)' \
+            "$OUT/fake-events.jsonl" >/dev/null 2>&1; then
+            busy=1; break
+        fi
+        sleep 0.1
+    done
+    [[ "$busy" == 1 ]] || die "fake residency never reported the active stream"
+
+    see_main "$OUT/busy.json"
+    # SwiftUI bridges these rows into a transient native NSMenu, outside the
+    # window-only AX tree used for evidence dumps. Exercise the standard macOS
+    # type-to-select interaction, then let the switch guard prove it resolved
+    # the requested alternate alias.
+    "$AX_DRIVER" select-menu-title "$APP_PID" ModelPickerBar.ModelMenu \
+        fake-external-alias > "$OUT/switch-requested.json" \
+        || die "alternate cached model could not be selected during an active stream"
+    wait_identifier ModelSwitchGuard.Cancel "$OUT/switch-guard.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "ModelSwitchGuard.Cancel")' \
+        "$OUT/switch-guard.json" >/dev/null \
+        || die "active stream did not present the native switch guard"
+    # This is a native confirmation dialog, whose cancel role maps to Escape.
+    # Hosted SwiftUI exposes the enabled Cancel button in AX but may reject
+    # AXPress for that transient element. Exercise the platform cancel action
+    # and let the state assertions below prove that it took effect.
+    "$AX_DRIVER" key "$APP_PID" escape > "$OUT/switch-cancelled.json" \
+        || die "switch guard did not honor the native Cancel action"
+
+    # Cancellation occurs before /v1/models/load or process teardown. The
+    # original stream must complete and the original model remains selected.
+    for ((i=0; i<240; i++)); do
+        grep -q '"event": "chat_finished"' "$OUT/fake-events.jsonl" 2>/dev/null && break
+        sleep 0.25
+    done
+    grep -q '"event": "chat_finished"' "$OUT/fake-events.jsonl" \
+        || die "Cancel did not preserve the active stream through completion"
+    [[ "$(jq -s '[.[] | select(.event == "server_started")] | length' "$OUT/fake-events.jsonl")" == 1 ]] \
+        || die "Cancel replaced the running sidecar"
+    ! grep -q '"event": "model_load"' "$OUT/fake-events.jsonl" \
+        || die "Cancel reached the resident model-load endpoint"
+    see_main "$OUT/settled.json"
+    [[ "$(element_field "$OUT/settled.json" ModelPickerBar.ModelMenu value)" == "fake-alias" ]] \
+        || die "Cancel changed the selected model"
+
+    log "  active-request confirmation and cancellation preservation OK"
+    cleanup_persona
+}
+
+
 flow_dictation() {
     log "flow: dictation"
     start_persona dictation \
@@ -5010,6 +5074,7 @@ case "$FLOW" in
     chat-depth) flow_chat_depth ;;
     math-rendering) flow_math_rendering ;;
     slow-stream-stop) flow_slow_stream_stop ;;
+    model-switch-active-request) flow_model_switch_active_request ;;
     model-crash-recovery) flow_model_crash_recovery ;;
     low-memory-choice) flow_low_memory_choice ;;
     update-state) flow_update_state ;;
@@ -5042,6 +5107,7 @@ case "$FLOW" in
         flow_chat_depth
         flow_math_rendering
         flow_slow_stream_stop
+        flow_model_switch_active_request
         flow_model_crash_recovery
         flow_low_memory_choice
         flow_update_state

@@ -489,6 +489,12 @@ jobs:
         env:
           RAPID_GUI_GOLDEN_OUT: ${{ runner.temp }}/golden/cached-variant-collapse
 
+      - name: 'Golden flow: model-switch-active-request'
+        continue-on-error: true
+        run: ./scripts/gui-golden-flows.sh --flow model-switch-active-request
+        env:
+          RAPID_GUI_GOLDEN_OUT: ${{ runner.temp }}/golden/model-switch-active-request
+
       - name: 'Golden flow: download-progress'
         continue-on-error: true
         run: ./scripts/gui-golden-flows.sh --flow download-progress

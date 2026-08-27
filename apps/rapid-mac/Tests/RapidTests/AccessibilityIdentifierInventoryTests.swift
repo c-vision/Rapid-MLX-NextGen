@@ -36,6 +36,15 @@ struct AccessibilityIdentifierInventoryTests {
         )
     }
 
+    @Test("Model switch guard preference has a stable Settings control")
+    func modelSwitchGuardPreferenceIdentifier() throws {
+        try assertDeclared(
+            [#""Settings.Models.ConfirmActiveRequestSwitchToggle""#],
+            in: "Sources/Rapid/UI/SettingsModelManagementPanel.swift",
+            surface: "Settings → Model Management switch guard preference"
+        )
+    }
+
     @Test("Settings → App names the re-onboarding confirmation controls")
     func settingsAppReonboardingIdentifiers() throws {
         try assertDeclared(
