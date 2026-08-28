@@ -24,6 +24,13 @@ inputs:
   app_tag:
     description: The intended immutable tag, rapid-mac-v<release_version>.
     required: true
+  candidate_identity:
+    description: >-
+      Optional candidate-only display identity, candidate-<8 lowercase hex>.
+      It is embedded as a separate Info.plist field and never changes the
+      numeric CFBundleVersion or the Sparkle release version.
+    required: false
+    default: ''
   signed:
     description: >-
       'true' when the Developer ID + notary secrets are all present (the real
@@ -205,6 +212,7 @@ runs:
         # Developer-ID-signed installation because code-signing continuity
         # validation correctly rejects it.
         SPARKLE_PUBLIC_ED_KEY: ${{ inputs.signed == 'true' && inputs.SPARKLE_PUBLIC_ED_KEY || '' }}
+        RAPID_CANDIDATE_IDENTITY: ${{ inputs.candidate_identity }}
         SIGNED: ${{ inputs.signed }}
       shell: bash
       run: |

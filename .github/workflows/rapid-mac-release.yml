@@ -205,6 +205,7 @@ jobs:
              && [[ "$REF_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc[1-9][0-9]*)?$ ]]; then
             APP_VERSION="$REF_VERSION"
             IS_TAG="true"
+            CANDIDATE_IDENTITY=""
           else
             # Manual workflow_dispatch dry-run on a branch: there is no tag to
             # derive the version from, so read the version the build will
@@ -214,6 +215,7 @@ jobs:
             # dry-run and validates the real tree under development. Nothing is
             # published or tagged (#2301).
             IS_TAG="false"
+            CANDIDATE_IDENTITY="candidate-${GITHUB_SHA:0:8}"
             SOURCE_PLIST="apps/rapid-mac/Resources/Info.plist"
             APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SOURCE_PLIST")"
             [[ "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc[1-9][0-9]*)?$ ]] || {
@@ -233,11 +235,14 @@ jobs:
             | python3 scripts/release_version.py preceding "${APP_VERSION}")"
           PREV_RELEASE="$(git tag -l 'rapid-mac-v*' --sort=v:refname \
             | python3 scripts/release_version.py preceding-release "${APP_VERSION}")"
-          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
-          echo "is_tag=$IS_TAG" >> "$GITHUB_OUTPUT"
-          echo "app_tag=rapid-mac-v$APP_VERSION" >> "$GITHUB_OUTPUT"
-          echo "previous_stable_tag=${PREV_STABLE:-}" >> "$GITHUB_OUTPUT"
-          echo "previous_release_tag=${PREV_RELEASE:-}" >> "$GITHUB_OUTPUT"
+          {
+            echo "app_version=$APP_VERSION"
+            echo "is_tag=$IS_TAG"
+            echo "app_tag=rapid-mac-v$APP_VERSION"
+            echo "candidate_identity=$CANDIDATE_IDENTITY"
+            echo "previous_stable_tag=${PREV_STABLE:-}"
+            echo "previous_release_tag=${PREV_RELEASE:-}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build + sign + notarise + DMG-validate (shared contract)
         id: releasable
@@ -253,6 +258,7 @@ jobs:
           # branch workflow_dispatch dry-run it is a SYNTHETIC rapid-mac-v<version>
           # used only to bind the manifest — never claimed/tagged.
           app_tag: ${{ steps.appmeta.outputs.app_tag }}
+          candidate_identity: ${{ steps.appmeta.outputs.candidate_identity }}
           signed: ${{ secrets.MACOS_DEVID_CERT_P12_BASE64 != '' && secrets.MACOS_DEVID_CERT_PASSWORD != '' && secrets.AC_API_KEY_P8_BASE64 != '' && secrets.AC_API_KEY_ID != '' && secrets.AC_API_ISSUER_ID != '' }}
           # A REAL rapid-mac-v* tag run must be SIGNED (this is a user-facing
           # release satisfying the approved evidence): use require_signed=true so
@@ -313,6 +319,30 @@ jobs:
           path: |
             apps/rapid-mac/build/rapid-mlx-desktop.dmg
             apps/rapid-mac/build/rapid-mlx-desktop.manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Stage candidate-labelled tester DMG
+        if: steps.appmeta.outputs.is_tag != 'true'
+        env:
+          CANDIDATE_IDENTITY: ${{ steps.appmeta.outputs.candidate_identity }}
+        run: |
+          set -euo pipefail
+          cd apps/rapid-mac/build
+          SOURCE="rapid-mlx-desktop.dmg"
+          TARGET="rapid-mlx-desktop-${CANDIDATE_IDENTITY}.dmg"
+          [[ "$CANDIDATE_IDENTITY" =~ ^candidate-[0-9a-f]{8}$ ]]
+          [[ -s "$SOURCE" ]]
+          cp "$SOURCE" "$TARGET"
+          cmp -s "$SOURCE" "$TARGET"
+          echo "CANDIDATE_DMG=$PWD/$TARGET" >> "$GITHUB_ENV"
+
+      - name: Upload candidate-labelled tester DMG
+        if: steps.appmeta.outputs.is_tag != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: rapid-mlx-desktop-${{ steps.appmeta.outputs.candidate_identity }}
+          path: ${{ env.CANDIDATE_DMG }}
           if-no-files-found: error
           retention-days: 7
 

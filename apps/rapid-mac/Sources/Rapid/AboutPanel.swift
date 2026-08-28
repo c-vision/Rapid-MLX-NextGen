@@ -51,6 +51,7 @@ enum AboutPanel {
         let view = AboutView(
             version: bundleShortVersion(),
             build: bundleBuildNumber(),
+            candidateIdentity: bundleCandidateIdentity(),
             engine: engineIdentity(resolution: server.binaryResolution),
             website: website,
             repoURL: repoURL,
@@ -100,6 +101,31 @@ enum AboutPanel {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String
     }
 
+    static func bundleCandidateIdentity() -> String? {
+        guard let identity = Bundle.main.infoDictionary?["RapidCandidateIdentity"] as? String,
+              !identity.isEmpty else {
+            return nil
+        }
+        return identity
+    }
+
+    static func versionLine(
+        version: String,
+        build: String?,
+        candidateIdentity: String?
+    ) -> String {
+        var line: String
+        if let build, !build.isEmpty, build != version {
+            line = "Version \(version) (\(build))"
+        } else {
+            line = "Version \(version)"
+        }
+        if let candidateIdentity, !candidateIdentity.isEmpty {
+            line += " · \(candidateIdentity)"
+        }
+        return line
+    }
+
     /// Describe the binary the server will actually spawn, rather than the
     /// sidecar merely shipped inside this app bundle. A runtime override can
     /// legitimately win version selection; surfacing that fact prevents a
@@ -121,16 +147,18 @@ enum AboutPanel {
 private struct AboutView: View {
     let version: String
     let build: String?
+    let candidateIdentity: String?
     let engine: AboutPanel.EngineIdentity?
     let website: String
     let repoURL: String
     let privacyURL: String
 
     private var versionLine: String {
-        if let build, !build.isEmpty, build != version {
-            return "Version \(version) (\(build))"
-        }
-        return "Version \(version)"
+        AboutPanel.versionLine(
+            version: version,
+            build: build,
+            candidateIdentity: candidateIdentity
+        )
     }
 
     var body: some View {

@@ -41,6 +41,18 @@ cp "$ROOT/.build/$CONFIG/Rapid" "$CONTENTS/MacOS/Rapid"
 cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$CONTENTS/Resources/AppIcon.icns"
 
+# Candidate builds keep the release/Sparkle version fields byte-for-byte
+# identical to source. A separate, validated identity lets About and tester
+# filenames expose the exact source without making CFBundleVersion non-numeric.
+if [[ -n "${RAPID_CANDIDATE_IDENTITY:-}" ]]; then
+    if [[ ! "$RAPID_CANDIDATE_IDENTITY" =~ ^candidate-[0-9a-f]{8}$ ]]; then
+        echo "ERR: RAPID_CANDIDATE_IDENTITY must be candidate-<8 lowercase hex>" >&2
+        exit 1
+    fi
+    plutil -insert RapidCandidateIdentity -string "$RAPID_CANDIDATE_IDENTITY" \
+        "$CONTENTS/Info.plist"
+fi
+
 # SwiftPM links Sparkle dynamically but this app is assembled by hand rather
 # than by Xcode, so its normal "Embed & Sign" phase does not run for us. Copy
 # the complete framework (including symlinks and installer helpers), then add
