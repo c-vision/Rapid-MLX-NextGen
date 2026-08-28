@@ -167,10 +167,14 @@ jobs:
             bash "$t"
           done
 
-      # Parser microbench — catches >10x regressions in tool-call
-      # extraction. Pure Python (parsers don't import mlx); thresholds
-      # are intentionally generous (3-5x measured M3 numbers) to
-      # absorb ubuntu-latest's shared-hardware variance.
+      # Parser microbench — reports order-of-magnitude (>12x) regressions in
+      # tool-call extraction. Pure Python (parsers don't import mlx). The
+      # relative budget scales parser μs/call by a same-run control workload;
+      # interleaved rounds and a median reduce uniform machine-speed noise and
+      # isolated scheduler pauses. Different operations do not necessarily
+      # scale together across hosted architectures, so this shared-runner lane
+      # is intentionally ADVISORY (#2344). The serial M3 release check runs the
+      # same script without `--report` and remains the enforced timing gate.
       #
       # PYTHONPATH=. so `from vllm_mlx.tool_parsers...` resolves
       # without installing the package — pytest auto-adds rootdir but
@@ -181,7 +185,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           pip install pydantic transformers jsonschema openai-harmony
-          python scripts/microbench_parsers.py
+          python scripts/microbench_parsers.py --report
 
   mlx-bound-guard:
     # #1248 — a change to an mlx / mlx-lm / mlx-vlm version bound can re-open the
@@ -462,6 +466,13 @@ jobs:
         run: |
           python -c "import platform; assert platform.machine() == 'arm64', 'Not ARM64'"
           python -c "import mlx.core as mx; print(f'MLX OK: {mx.default_device()}')"
+
+      # Shared Linux runners only report this timing signal because their
+      # allocation varies enough to false-fail unchanged parsers (#2344).
+      # Keep the relative budget enforced automatically on the existing
+      # Apple-Silicon lane; this adds no runner allocation or model load.
+      - name: Enforce parser relative-budget gate
+        run: python scripts/microbench_parsers.py
 
       - name: Run MLX-dependent tests
         # SimpleEngine was removed in PR #156 — test_simple_engine.py,

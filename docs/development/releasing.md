@@ -193,7 +193,7 @@ This is the rule. No exceptions. CI doesn't fake-inference with a tiny model on 
 | G6 | Live-server fix-path repro | **M3** | `make release-check-m3` | fix doesn't ship to user-visible path |
 | G7 | SDK integration (anthropic / pydantic_ai / smolagents) | **M3** | `make release-check-m3` | router-level breakage unit tests miss |
 | G7b | Agent harness layer — Part A: `rapid-mlx bench <model> --tier harness` (single command, sweeps codex/opencode/hermes/aider/langchain Chat Completions); Part B: `/v1/responses` curl + SSE probe | **M3** | `make release-check-m3` | live-server harness regressions on Chat Completions (OpenCode tool-call parser, Hermes 62-tool stress, Codex profile shape, Aider streaming/text-edit format, LangChain 6-test suite incl. structured output) + Codex-only `/v1/responses` route regressions (the `AgentTestRunner` only knows Chat Completions, so the shim needs its own probe) |
-| G8a | Parser microbench (×10k iters) | CI | `ci.yml` lint (ubuntu) | >10× parser regression |
+| G8a | Parser microbench (×10k iters) | CI | `ci.yml` test-apple-silicon (macOS-14; Linux reports only) | >10× parser regression |
 | G8b | Decode-throughput perf gate — measures the warm gauntlet server's decode tok/s and enforces the reviewed floor in [`harness/perf_floors.json`](../../harness/perf_floors.json) (advisory until a floor for `MODEL` is committed) | **M3** | `make release-check-m3` | KV-cache / hot-path decode regressions |
 | G9 | 10-sequential latency | **M3** | `make release-check-m3` | tok/s stability degradation |
 | G10 | MLX upstream cross-chip-family audit | CI | `release-preflight.yml` advisory (macOS-14) | M5-style #404 landmines |
