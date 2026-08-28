@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Contracts for lane-scoped full-CI promotion.
 
-These tests intentionally inspect the workflows: a future cleanup must not
-restore the expensive behavior where applying ``full-ci`` changed an
-engine-only or Desktop-only PR into an all-product run.
+These tests intentionally inspect the workflows: ordinary PRs must keep their
+fast product checks while release-grade model/GUI lanes are reserved for a
+``full-ci`` promotion or an integration candidate.
 """
 
-import json
 import os
 import subprocess
 from pathlib import Path
@@ -16,7 +15,6 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 ENGINE_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 DESKTOP_WORKFLOW = ROOT / ".github/workflows/rapid-mac-ci.yml"
-LABEL_GATE_WORKFLOW = ROOT / ".github/workflows/full-ci-label-gate.yml"
 VERSION_WORKFLOW = ROOT / ".github/workflows/version-check.yml"
 
 
@@ -35,361 +33,127 @@ def _workflow_strings(workflow: Path) -> dict[str, object]:
     return yaml.load(workflow.read_text(), Loader=yaml.BaseLoader)
 
 
-def test_engine_full_ci_still_classifies_the_pr_diff():
-    run = _step_run(ENGINE_WORKFLOW, "changes", "Classify validation lanes")
-    assert 'git diff --no-renames --name-only "$PR_BASE_SHA" "$GITHUB_SHA"' in run
-    assert 'full_gate="$FULL_CI"' in run
-    assert 'if [ "$FULL_CI" = true ]' not in run
+def test_product_promotion_keeps_diff_scope_and_accepts_train_heads():
+    for workflow, job_name, step_name in (
+        (ENGINE_WORKFLOW, "changes", "Classify validation lanes"),
+        (DESKTOP_WORKFLOW, "changes", "Classify desktop lane"),
+    ):
+        run = _step_run(workflow, job_name, step_name)
+        assert 'git diff --no-renames --name-only "$PR_BASE_SHA" "$GITHUB_SHA"' in run
+        assert '[ "$FULL_CI" = true ] ||' in run
+        assert '[[ "$HEAD_REF" == train/* ]] && [ "$HEAD_REPO" = "$REPO" ]' in run
+        assert 'echo "full_gate=$full_gate"' in run
 
 
-def test_desktop_full_ci_still_classifies_the_pr_diff():
-    run = _step_run(DESKTOP_WORKFLOW, "changes", "Classify desktop lane")
-    assert 'git diff --no-renames --name-only "$PR_BASE_SHA" "$GITHUB_SHA"' in run
-    assert 'echo "full_gate=$FULL_CI"' in run
-    assert '|| [ "$FULL_CI" = true ]' not in run
+def _execute_promotion(
+    workflow: Path, job_name: str, step_name: str, **env: str
+) -> str:
+    run = _step_run(workflow, job_name, step_name)
+    start = run.index("full_gate=false")
+    end = run.index('echo "full_gate=$full_gate"', start)
+    snippet = run[start : end + len('echo "full_gate=$full_gate" >> "$GITHUB_OUTPUT"')]
+    output = Path(env.pop("GITHUB_OUTPUT"))
+    subprocess.run(
+        ["bash", "-c", snippet],
+        check=True,
+        env=os.environ | env | {"GITHUB_OUTPUT": str(output)},
+    )
+    return output.read_text().strip()
 
 
-def test_non_engine_change_exits_before_full_ci_requirement():
+def test_fork_cannot_claim_train_branch_promotion(tmp_path):
+    for index, (workflow, job_name, step_name) in enumerate(
+        (
+            (ENGINE_WORKFLOW, "changes", "Classify validation lanes"),
+            (DESKTOP_WORKFLOW, "changes", "Classify desktop lane"),
+        )
+    ):
+        common = {
+            "FULL_CI": "false",
+            "HEAD_REF": "train/spoofed",
+            "REPO": "owner/repo",
+        }
+        assert (
+            _execute_promotion(
+                workflow,
+                job_name,
+                step_name,
+                GITHUB_OUTPUT=str(tmp_path / f"fork-{index}"),
+                HEAD_REPO="attacker/fork",
+                **common,
+            )
+            == "full_gate=false"
+        )
+        assert (
+            _execute_promotion(
+                workflow,
+                job_name,
+                step_name,
+                GITHUB_OUTPUT=str(tmp_path / f"internal-{index}"),
+                HEAD_REPO="owner/repo",
+                **common,
+            )
+            == "full_gate=true"
+        )
+
+
+def test_only_promoted_heads_allocate_expensive_lanes():
+    l1 = str(_job(ENGINE_WORKFLOW, "l1-smoke")["if"])
+    assert "needs.changes.outputs.engine == 'true'" in l1
+    assert "needs.changes.outputs.full_gate == 'true'" in l1
+
+    for job_name in ("gui-app-build", "gui-golden-flows"):
+        condition = str(_job(DESKTOP_WORKFLOW, job_name)["if"])
+        assert "needs.changes.outputs.desktop == 'true'" in condition
+        assert "needs.changes.outputs.full_gate == 'true'" in condition
+
+
+def test_unpromoted_engine_aggregate_requires_fast_linux_and_apple_lanes():
     run = _step_run(ENGINE_WORKFLOW, "tests", "Check test results")
-    classifier_gate = run.index("needs.changes.result")
-    common_gate = run.index("needs.lint.result")
     no_lane = run.index('if [ "$expected" != "true" ]')
     engine_gate = run.index("needs.engine-contracts.result")
-    promotion = run.index("needs.changes.outputs.full_gate")
-    assert classifier_gate < common_gate < no_lane < engine_gate < promotion
+    linux_gate = run.index("needs.test-matrix.result")
+    apple_gate = run.index("needs.test-apple-silicon.result")
+    promotion = run.index('needs.changes.outputs.full_gate }}" = "true"')
+    assert no_lane < engine_gate < linux_gate < apple_gate < promotion
+    assert "status remains pending" not in run
+    assert 'needs.l1-smoke.result }}" != "skipped"' in run
 
 
-def test_non_desktop_change_exits_before_full_ci_requirement():
+def test_unpromoted_desktop_aggregate_requires_fast_lane_and_skips_gui():
     run = _step_run(DESKTOP_WORKFLOW, "desktop-tests", "Check desktop results")
-    classifier_gate = run.index("needs.changes.result")
     no_lane = run.index('if [ "$DESKTOP_EXPECTED" != true ]')
-    promotion = run.index('if [ "${{ github.event_name }}" = pull_request ]')
-    assert classifier_gate < no_lane < promotion
+    build_gate = run.index('for result in "$IDENTIFIERS"')
+    promotion = run.index('if [ "$FULL_GATE" = true ]')
+    skipped_gate = run.index('elif [ "$GUI_APP_BUILD" != skipped ]')
+    assert no_lane < build_gate < promotion < skipped_gate
+    assert "status remains pending" not in run
 
 
-def test_unpromoted_product_aggregates_pass_without_publishing_success():
-    for workflow, job_name, result_step in (
-        (ENGINE_WORKFLOW, "tests", "Check test results"),
-        (DESKTOP_WORKFLOW, "desktop-tests", "Check desktop results"),
+def test_required_aggregates_do_not_publish_shadow_commit_statuses():
+    for workflow, job_name in (
+        (ENGINE_WORKFLOW, "tests"),
+        (DESKTOP_WORKFLOW, "desktop-tests"),
     ):
-        run = _step_run(workflow, job_name, result_step)
-        promotion = run.index("full_gate" if job_name == "tests" else "FULL_GATE")
-        unpromoted_branch = run[promotion : run.index("fi", promotion) + 2]
-        assert "status remains pending" in unpromoted_branch
-        assert "exit 0" in unpromoted_branch
-        assert "exit 1" not in unpromoted_branch
+        job = _job(workflow, job_name)
+        assert "permissions" not in job
+        names = {step.get("name") for step in job["steps"]}
+        assert "Start an internal PR merge status pending" not in names
+        assert "Settle a successful internal full-CI status" not in names
+
+    assert not (ROOT / ".github/workflows/full-ci-label-gate.yml").exists()
 
 
-def test_internal_product_aggregates_own_pending_to_success_transition():
-    for workflow, job_name, lane, context in (
-        (ENGINE_WORKFLOW, "tests", "engine", "tests"),
-        (DESKTOP_WORKFLOW, "desktop-tests", "desktop", "desktop-tests"),
-    ):
-        steps = _job(workflow, job_name)["steps"]
-        pending = next(
-            step
-            for step in steps
-            if step.get("name") == "Start an internal PR merge status pending"
-        )
-        settle = next(
-            step
-            for step in steps
-            if step.get("name") == "Settle a successful internal full-CI status"
-        )
+def test_main_pushes_keep_full_engine_and_desktop_validation():
+    for workflow in (ENGINE_WORKFLOW, DESKTOP_WORKFLOW):
+        triggers = _workflow_strings(workflow)["on"]
+        assert triggers["push"]["branches"] == ["main"]
 
-        pending_condition = str(pending["if"])
-        assert f"needs.changes.outputs.{lane} == 'true'" in pending_condition
-        assert "head.repo.full_name == github.repository" in pending_condition
-        assert "full_gate" not in pending_condition
-        assert f'context: "{context}"' in pending["run"]
-        assert 'state: "pending"' in pending["run"]
-
-        settle_condition = str(settle["if"])
-        assert "needs.changes.outputs.full_gate == 'true'" in settle_condition
-        assert "head.repo.full_name == github.repository" in settle_condition
-        assert f'context: "{context}"' in settle["run"]
-        assert 'state: "success"' in settle["run"]
-
-        permissions = _job(workflow, job_name)["permissions"]
-        assert permissions == {
-            "actions": "read",
-            "contents": "read",
-            "pull-requests": "read",
-            "statuses": "write",
-        }
-
-
-def _execute_internal_settlement(
-    tmp_path: Path,
-    *,
-    workflow: Path,
-    job_name: str,
-    full_ci: bool,
-    latest_run_id: int,
-) -> str | None:
-    run = _step_run(workflow, job_name, "Settle a successful internal full-CI status")
-    mock_bin = tmp_path / "bin"
-    mock_bin.mkdir()
-    mock_gh = mock_bin / "gh"
-    mock_gh.write_text(
-        """#!/bin/bash
-set -euo pipefail
-case "$*" in
-  "api repos/test/repo/pulls/7") cat "$MOCK_PR_JSON" ;;
-  *"/actions/workflows/"*"/runs?"*) cat "$MOCK_RUNS_JSON" ;;
-  *"--method POST"*) cat > "$MOCK_POST" ;;
-  *) echo "unexpected gh invocation: $*" >&2; exit 91 ;;
-esac
-"""
-    )
-    mock_gh.chmod(0o755)
-
-    head_sha = "a" * 40
-    pr_json = tmp_path / "pr.json"
-    pr_json.write_text(
-        json.dumps(
-            {
-                "state": "open",
-                "base": {"ref": "main"},
-                "head": {"sha": head_sha},
-                "labels": [{"name": "full-ci"}] if full_ci else [],
-            }
-        )
-    )
-    runs_json = tmp_path / "runs.json"
-    runs_json.write_text(json.dumps({"workflow_runs": [{"id": latest_run_id}]}))
-    post = tmp_path / "post.json"
-    env = os.environ | {
-        "GH_TOKEN": "test-token",
-        "HEAD_SHA": head_sha,
-        "MOCK_POST": str(post),
-        "MOCK_PR_JSON": str(pr_json),
-        "MOCK_RUNS_JSON": str(runs_json),
-        "PATH": f"{mock_bin}:{os.environ['PATH']}",
-        "PR_NUMBER": "7",
-        "REPO": "test/repo",
-        "RUN_ID": "100",
-        "RUN_URL": "https://example.invalid/run/100",
-        "RUNNER_TEMP": str(tmp_path),
-    }
-    subprocess.run(["bash", "-c", run], check=True, env=env, capture_output=True)
-    return post.read_text() if post.exists() else None
-
-
-def test_internal_settlement_rejects_removed_label_and_superseded_run(tmp_path):
-    for index, (workflow, job_name) in enumerate(
-        (
-            (ENGINE_WORKFLOW, "tests"),
-            (DESKTOP_WORKFLOW, "desktop-tests"),
-        )
-    ):
-        removed = tmp_path / f"removed-{index}"
-        removed.mkdir()
-        assert (
-            _execute_internal_settlement(
-                removed,
-                workflow=workflow,
-                job_name=job_name,
-                full_ci=False,
-                latest_run_id=100,
-            )
-            is None
-        )
-
-        superseded = tmp_path / f"superseded-{index}"
-        superseded.mkdir()
-        assert (
-            _execute_internal_settlement(
-                superseded,
-                workflow=workflow,
-                job_name=job_name,
-                full_ci=True,
-                latest_run_id=101,
-            )
-            is None
-        )
-
-
-def test_internal_settlement_accepts_live_label_on_latest_exact_head(tmp_path):
-    for index, (workflow, job_name, context) in enumerate(
-        (
-            (ENGINE_WORKFLOW, "tests", "tests"),
-            (DESKTOP_WORKFLOW, "desktop-tests", "desktop-tests"),
-        )
-    ):
-        lane = tmp_path / f"valid-{index}"
-        lane.mkdir()
-        posted = _execute_internal_settlement(
-            lane,
-            workflow=workflow,
-            job_name=job_name,
-            full_ci=True,
-            latest_run_id=100,
-        )
-        assert posted is not None
-        payload = json.loads(posted)
-        assert payload["state"] == "success"
-        assert payload["context"] == context
-
-
-def test_metadata_gate_is_trusted_fail_closed_and_never_executes_pr_head():
-    workflow = _workflow_strings(LABEL_GATE_WORKFLOW)
-    triggers = workflow["on"]
-    assert "pull_request_target" in triggers
-    assert "workflow_dispatch" in triggers
-    assert "workflow_run" in triggers
-    assert "pull_request" not in triggers
-    assert workflow["permissions"] == {
-        "contents": "read",
-        "pull-requests": "read",
-        "statuses": "write",
-    }
-
-    job = workflow["jobs"]["publish-required-statuses"]
-    steps = job["steps"]
-    assert steps[0]["name"] == "Resolve the live PR and fail closed first"
-    resolve = steps[0]["run"]
-    assert 'gh api "repos/${REPO}/pulls/${PR_NUMBER}"' in resolve
-    assert "post_status tests pending" in resolve
-    assert "post_status desktop-tests pending" in resolve
-    assert "PR_STATE" in resolve and "BASE_REF" in resolve and "HEAD_SHA" in resolve
-
-    checkout = steps[1]
-    assert checkout["name"] == "Check out the trusted policy"
-    assert checkout["with"]["ref"] == "${{ steps.pr.outputs.base_sha }}"
-    workflow_text = LABEL_GATE_WORKFLOW.read_text()
-    assert "pull_request.head.sha" not in checkout["with"]["ref"]
-    assert "github.event.pull_request.title" not in workflow_text
-    assert "github.event.pull_request.body" not in workflow_text
-
-    classify = steps[2]["run"]
-    assert "pulls/${PR_NUMBER}/files" in classify
-    assert "scripts/classify_ci_changes.py" in classify
-
-    publish = steps[3]["run"]
-    assert 'LIVE_HEAD_SHA" != "$HEAD_SHA' in publish
-    assert 'LIVE_FULL_CI" != "$FULL_CI' in publish
-
-
-def test_metadata_gate_settles_only_live_exact_head_successful_full_ci():
-    workflow = _workflow_strings(LABEL_GATE_WORKFLOW)
-    settle = workflow["jobs"]["settle-completed-gate"]
-    assert settle["if"] == "github.event_name == 'workflow_run'"
-    run = settle["steps"][0]["run"]
-    assert 'LIVE_HEAD_SHA" != "$RUN_SHA' in run
-    assert 'FULL_CI" != true' in run
-    assert 'JOB_CONCLUSION" != success' in run
-    assert '.conclusion != "cancelled"' in run
-    assert 'EVIDENCE_RUN_CONCLUSION" != success' in run
-    assert "actions/runs/${EVIDENCE_RUN_ID}/jobs" in run
-    assert "actions/workflows/${WORKFLOW_FILE}/runs" in run
-    assert 'state: "success"' in run
-    assert "statuses/${RUN_SHA}" in run
-
-
-def _execute_metadata_settlement(
-    tmp_path: Path, *, runs: list[tuple[int, str]]
-) -> tuple[dict[str, str] | None, str]:
-    run = _step_run(
-        LABEL_GATE_WORKFLOW,
-        "settle-completed-gate",
-        "Settle an exact-head full-CI status",
-    )
-    mock_bin = tmp_path / "bin"
-    mock_bin.mkdir()
-    mock_gh = mock_bin / "gh"
-    mock_gh.write_text(
-        """#!/bin/bash
-set -euo pipefail
-case "$*" in
-  "api repos/test/repo/pulls/7") cat "$MOCK_PR_JSON" ;;
-  *"/actions/workflows/rapid-mac-ci.yml/runs?"*) cat "$MOCK_RUNS_JSON" ;;
-  *"/actions/runs/"*"/jobs?"*) cat "$MOCK_JOBS_JSON" ;;
-  *"--method POST"*) cat > "$MOCK_POST" ;;
-  *) echo "unexpected gh invocation: $*" >&2; exit 91 ;;
-esac
-"""
-    )
-    mock_gh.chmod(0o755)
-
-    head_sha = "b" * 40
-    event = tmp_path / "event.json"
-    event.write_text(json.dumps({"workflow_run": {"pull_requests": [{"number": 7}]}}))
-    pr_json = tmp_path / "mock-pr.json"
-    pr_json.write_text(
-        json.dumps(
-            {
-                "state": "open",
-                "base": {"ref": "main"},
-                "head": {"sha": head_sha},
-                "labels": [{"name": "full-ci"}],
-            }
-        )
-    )
-    runs_json = tmp_path / "runs.json"
-    runs_json.write_text(
-        json.dumps(
-            {
-                "workflow_runs": [
-                    {
-                        "id": run_id,
-                        "head_sha": head_sha,
-                        "status": "completed",
-                        "conclusion": conclusion,
-                        "html_url": f"https://example.invalid/run/{run_id}",
-                    }
-                    for run_id, conclusion in runs
-                ]
-            }
-        )
-    )
-    jobs_json = tmp_path / "mock-jobs.json"
-    jobs_json.write_text(
-        json.dumps([{"jobs": [{"name": "desktop-tests", "conclusion": "success"}]}])
-    )
-    post = tmp_path / "post.json"
-    env = os.environ | {
-        "GH_TOKEN": "test-token",
-        "GITHUB_EVENT_PATH": str(event),
-        "MOCK_JOBS_JSON": str(jobs_json),
-        "MOCK_POST": str(post),
-        "MOCK_PR_JSON": str(pr_json),
-        "MOCK_RUNS_JSON": str(runs_json),
-        "PATH": f"{mock_bin}:{os.environ['PATH']}",
-        "REPO": "test/repo",
-        "RUN_NAME": "rapid-mac CI",
-        "RUN_SHA": head_sha,
-        "RUNNER_TEMP": str(tmp_path),
-        "TRIGGER_RUN_ID": str(max(run_id for run_id, _ in runs)),
-    }
-
-    completed = subprocess.run(
-        ["bash", "-c", run], check=True, env=env, capture_output=True, text=True
-    )
-    payload = json.loads(post.read_text()) if post.exists() else None
-    return payload, completed.stdout + completed.stderr
-
-
-def test_metadata_gate_uses_success_before_higher_cancelled_duplicate(tmp_path):
-    payload, output = _execute_metadata_settlement(
-        tmp_path, runs=[(91, "cancelled"), (90, "success")]
-    )
-    assert payload is not None, output
-    assert payload == {
-        "state": "success",
-        "context": "desktop-tests",
-        "description": "Exact-head full-CI merge gate passed",
-        "target_url": "https://example.invalid/run/90",
-    }
-
-
-def test_metadata_gate_does_not_mask_newer_failure_with_older_success(tmp_path):
-    payload, output = _execute_metadata_settlement(
-        tmp_path,
-        runs=[(92, "failure"), (91, "cancelled"), (90, "success")],
-    )
-    assert payload is None
-    assert "evidence_run=92 workflow=failure" in output
+    engine = _step_run(ENGINE_WORKFLOW, "changes", "Classify validation lanes")
+    desktop = _step_run(DESKTOP_WORKFLOW, "changes", "Classify desktop lane")
+    assert "else" in engine and "echo 'full_gate=true'" in engine
+    assert 'if [ "$EVENT_NAME" != "pull_request" ]' in desktop
+    assert "echo 'full_gate=true'" in desktop
 
 
 def test_all_strict_required_workflows_emit_on_merge_group():

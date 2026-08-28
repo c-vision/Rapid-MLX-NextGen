@@ -25,6 +25,8 @@
 name: rapid-mac CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
@@ -57,11 +59,14 @@ jobs:
         id: policy
         env:
           EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          REPO: ${{ github.repository }}
           FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = "merge_group" ]; then
+          if [ "$EVENT_NAME" != "pull_request" ]; then
             # A future merge queue candidate may combine independently scoped
             # PRs, so validate both product lanes.
             python scripts/classify_ci_changes.py --github-output "$GITHUB_OUTPUT"
@@ -82,7 +87,12 @@ jobs:
             python scripts/select_gui_flows.py \
               --paths-file /tmp/changed-paths \
               --github-output "$GITHUB_OUTPUT"
-            echo "full_gate=$FULL_CI" >> "$GITHUB_OUTPUT"
+            full_gate=false
+            if [ "$FULL_CI" = true ] || \
+              { [[ "$HEAD_REF" == train/* ]] && [ "$HEAD_REPO" = "$REPO" ]; }; then
+              full_gate=true
+            fi
+            echo "full_gate=$full_gate" >> "$GITHUB_OUTPUT"
           fi
 
   # Pure text lint over the diff — no Swift toolchain, no simulator, no app
@@ -784,9 +794,9 @@ jobs:
           echo "All selected native XCUITests passed"
 
   desktop-tests:
-    # Stable required-check facade. It is present even on non-desktop PRs,
-    # unlike workflow-level path filters, and upgrades merge-queue candidates
-    # to the complete GUI golden-flow gate.
+  # Stable required-check facade. It is present even on non-desktop PRs,
+  # unlike workflow-level path filters. Ordinary PRs settle after the fast
+  # Desktop lane; promoted and integration heads add the GUI golden-flow gate.
     needs:
       - changes
       - accessibility-identifiers
@@ -797,28 +807,7 @@ jobs:
       - gui-golden-flows
     if: always()
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      pull-requests: read
-      statuses: write
     steps:
-      - name: Start an internal PR merge status pending
-        if: >-
-          github.event_name == 'pull_request' &&
-          needs.changes.outputs.desktop == 'true' &&
-          github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          REPO: ${{ github.repository }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          jq -n \
-            --arg target_url "$RUN_URL" \
-            '{state: "pending", context: "desktop-tests", description: "Evaluating the required Desktop merge gate", target_url: $target_url}' \
-            | gh api --method POST "repos/${REPO}/statuses/${HEAD_SHA}" --input - >/dev/null
-
       - name: Check desktop results
         env:
           DESKTOP_EXPECTED: ${{ needs.changes.outputs.desktop }}
@@ -839,10 +828,6 @@ jobs:
             echo "Desktop lane not required for this PR"
             exit 0
           fi
-          if [ "${{ github.event_name }}" = pull_request ] && [ "$FULL_GATE" != true ]; then
-            echo "Desktop PR checks passed; the required desktop-tests status remains pending until the full-ci label is applied"
-            exit 0
-          fi
           for result in "$IDENTIFIERS" "$IDENTIFIER_TESTS" "$HARNESS_CONTRACTS" "$BUILD"; do
             if [ "$result" != success ]; then
               echo "A desktop PR gate failed: $result"
@@ -858,41 +843,7 @@ jobs:
               echo "GUI golden-flow merge gate failed: $GOLDEN_FLOWS"
               exit 1
             fi
+          elif [ "$GUI_APP_BUILD" != skipped ] || [ "$GOLDEN_FLOWS" != skipped ]; then
+            echo "Unpromoted head unexpectedly allocated a GUI golden-flow lane"
+            exit 1
           fi
-
-      - name: Settle a successful internal full-CI status
-        if: >-
-          github.event_name == 'pull_request' &&
-          needs.changes.outputs.desktop == 'true' &&
-          needs.changes.outputs.full_gate == 'true' &&
-          github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          LIVE_PR_JSON="$RUNNER_TEMP/live-pr.json"
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}" > "$LIVE_PR_JSON"
-          LIVE_STATE=$(jq -r '.state' "$LIVE_PR_JSON")
-          LIVE_BASE_REF=$(jq -r '.base.ref' "$LIVE_PR_JSON")
-          LIVE_HEAD_SHA=$(jq -r '.head.sha' "$LIVE_PR_JSON")
-          LIVE_FULL_CI=$(jq -r 'any(.labels[]; .name == "full-ci")' "$LIVE_PR_JSON")
-
-          RUNS_JSON="$RUNNER_TEMP/rapid-mac-ci-runs.json"
-          gh api "repos/${REPO}/actions/workflows/rapid-mac-ci.yml/runs?head_sha=${HEAD_SHA}&event=pull_request&per_page=100" > "$RUNS_JSON"
-          LATEST_RUN_ID=$(jq -r '[.workflow_runs[]] | if length > 0 then max_by(.id).id else "" end' "$RUNS_JSON")
-          if [ "$LIVE_STATE" != open ] || [ "$LIVE_BASE_REF" != main ] || \
-             [ "$LIVE_HEAD_SHA" != "$HEAD_SHA" ] || [ "$LIVE_FULL_CI" != true ] || \
-             [ "$LATEST_RUN_ID" != "$RUN_ID" ]; then
-            echo "Not settling stale or unpromoted Desktop evidence (state=$LIVE_STATE base=$LIVE_BASE_REF live=$LIVE_HEAD_SHA run_head=$HEAD_SHA full_ci=$LIVE_FULL_CI latest_run=${LATEST_RUN_ID:-missing} run_id=$RUN_ID)."
-            exit 0
-          fi
-
-          jq -n \
-            --arg target_url "$RUN_URL" \
-            '{state: "success", context: "desktop-tests", description: "Exact-head full-CI merge gate passed", target_url: $target_url}' \
-            | gh api --method POST "repos/${REPO}/statuses/${HEAD_SHA}" --input - >/dev/null
