@@ -34,11 +34,16 @@ actor ModelCatalogCache {
 
     typealias Loader = @Sendable (URL, URL?) async -> [ModelEntry]
     private let loader: Loader
+    private let cacheTTL: TimeInterval
 
-    init(loader: @escaping Loader = { binary, override in
-        await ModelCatalog.load(binary: binary, hubCacheOverride: override)
-    }) {
+    init(
+        loader: @escaping Loader = { binary, override in
+            await ModelCatalog.load(binary: binary, hubCacheOverride: override)
+        },
+        ttl: TimeInterval = ModelCatalogCache.ttl
+    ) {
         self.loader = loader
+        self.cacheTTL = ttl
     }
 
     /// Backstop for out-of-band changes (see above).
@@ -177,7 +182,7 @@ actor ModelCatalogCache {
                snapshot, binaryPath: binaryPath, generation: generation,
                overridePath: overridePath
            ) {
-            if Date().timeIntervalSince(snapshot.fetchedAt) < Self.ttl {
+            if Date().timeIntervalSince(snapshot.fetchedAt) < cacheTTL {
                 return snapshot.entries
             }
             // Same inputs, past the TTL backstop: serve the stale entries now
@@ -201,6 +206,45 @@ actor ModelCatalogCache {
             let loaded = await inFlight.task.value
             // Publish the synchronous mirror before returning to callers that
             // immediately start a model from this catalog result.
+            await finish(inFlight)
+            return loaded
+        }
+        let entry = startLoad(
+            binary: binary, override: override, binaryPath: binaryPath,
+            generation: generation, overridePath: overridePath
+        )
+        let loaded = await entry.task.value
+        await finish(entry)
+        return loaded
+    }
+
+    /// An authoritative catalog read for lifecycle decisions that must not use
+    /// the stale-while-revalidate presentation path.
+    ///
+    /// Model start uses lane/capability metadata to choose a process mode and
+    /// persist lane-owned state. A five-minute-old row is fine for keeping a
+    /// picker responsive, but it is not evidence for those mutations. Join a
+    /// matching refresh when one exists; otherwise start one and await it.
+    func freshEntries(binary: URL, generation: UInt) async -> [ModelEntry] {
+        let override = ModelsFolderPreference.validatedOverrideURL()
+        let overridePath = override?.path
+        let binaryPath = binary.path
+
+        if let snapshot,
+           snapshotMatchesInputs(
+               snapshot, binaryPath: binaryPath, generation: generation,
+               overridePath: overridePath
+           ),
+           Date().timeIntervalSince(snapshot.fetchedAt) < cacheTTL {
+            return snapshot.entries
+        }
+
+        if let inFlight,
+           inFlight.matches(
+               binaryPath: binaryPath, generation: generation,
+               overridePath: overridePath
+           ) {
+            let loaded = await inFlight.task.value
             await finish(inFlight)
             return loaded
         }
@@ -275,6 +319,6 @@ actor ModelCatalogCache {
             snapshot, binaryPath: binary.path, generation: generation,
             overridePath: ModelsFolderPreference.validatedOverrideURL()?.path
         ) else { return false }
-        return Date().timeIntervalSince(snapshot.fetchedAt) < Self.ttl
+        return Date().timeIntervalSince(snapshot.fetchedAt) < cacheTTL
     }
 }

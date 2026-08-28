@@ -787,6 +787,12 @@ struct ContentView: View {
     private func startModel(_ target: String) {
         let catalogEntry = catalogEntries.first(where: { $0.alias == target })
         let hfPath = catalogEntry?.hfRepo
+        let catalogEntryHint = catalogEntry.map {
+            ServerManager.CatalogEntryHint(
+                entry: $0,
+                generation: catalogGeneration
+            )
+        }
         // ``ensureServing`` via the shared helper, NOT ``server.start``: start is
         // cold-start only and no-ops while a different model (e.g. an Images
         // checkpoint) is resident, silently dropping the switch (#1739).
@@ -796,7 +802,7 @@ struct ContentView: View {
                 hfPath: hfPath,
                 estimatedMemoryGB: nil,
                 replacementGroup: .assistant,
-                catalogEntryHint: catalogEntry
+                catalogEntryHint: catalogEntryHint
             )
         }
     }
@@ -822,13 +828,19 @@ struct ContentView: View {
             isCached: entry?.cached == true
         ) else { return }
         let hfPath = entry?.hfRepo
+        let catalogEntryHint = entry.map {
+            ServerManager.CatalogEntryHint(
+                entry: $0,
+                generation: catalogGeneration
+            )
+        }
         Task {
             _ = await server.ensureServing(
                 alias: target,
                 hfPath: hfPath,
                 estimatedMemoryGB: nil,
                 replacementGroup: .assistant,
-                catalogEntryHint: entry
+                catalogEntryHint: catalogEntryHint
             )
         }
     }
@@ -843,6 +855,12 @@ struct ContentView: View {
     private func restartModel(_ target: String) {
         let catalogEntry = catalogEntries.first(where: { $0.alias == target })
         let hfPath = catalogEntry?.hfRepo
+        let catalogEntryHint = catalogEntry.map {
+            ServerManager.CatalogEntryHint(
+                entry: $0,
+                generation: catalogGeneration
+            )
+        }
         Task {
             await server.stop()
             _ = await server.ensureServing(
@@ -850,7 +868,7 @@ struct ContentView: View {
                 hfPath: hfPath,
                 estimatedMemoryGB: nil,
                 replacementGroup: .assistant,
-                catalogEntryHint: catalogEntry
+                catalogEntryHint: catalogEntryHint
             )
         }
     }
@@ -929,6 +947,7 @@ struct ContentView: View {
             server: server,
             cachedModels: catalogEntries,
             catalogLoaded: catalogLoaded,
+            catalogGeneration: catalogGeneration,
             onSkip: {
                 modelChoiceRecoveryRequested = false
                 quickstartDismissedThisSession = true
@@ -1433,10 +1452,16 @@ struct ContentView: View {
             let catalogEntry = catalogEntries.first {
                 $0.alias.caseInsensitiveCompare(resume) == .orderedSame
             }
+            let catalogEntryHint = catalogEntry.map {
+                ServerManager.CatalogEntryHint(
+                    entry: $0,
+                    generation: catalogGeneration
+                )
+            }
             await server.start(
                 alias: resume,
                 isLaunchAutoStart: true,
-                catalogEntryHint: catalogEntry
+                catalogEntryHint: catalogEntryHint
             )
         case .promptDownload(let pending):
             let footprint = ModelSizing.estimate(alias: pending)

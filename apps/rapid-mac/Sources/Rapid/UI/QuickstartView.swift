@@ -1452,6 +1452,10 @@ struct QuickstartView: View {
     /// fixture keep rendering a settled list; ContentView passes the real flag.
     var catalogLoaded: Bool = true
 
+    /// Generation that produced ``cachedModels``. Catalog hints carry this
+    /// source identity so an entry cannot outlive the snapshot that proved it.
+    var catalogGeneration: UInt = 0
+
     /// This Mac, read once per view lifetime. Same pattern and same source as
     /// ``ModelPickerBar`` and ``SettingsModelManagementPanel``, so onboarding's
     /// "won't fit" decision is the one the rest of the app already makes.
@@ -4497,10 +4501,16 @@ struct QuickstartView: View {
             let catalogEntry = cachedModels.first {
                 $0.alias == coordinator.selection.alias
             }
+            let catalogEntryHint = catalogEntry.map {
+                ServerManager.CatalogEntryHint(
+                    entry: $0,
+                    generation: catalogGeneration
+                )
+            }
             Task {
                 await server.start(
                     alias: coordinator.selection.alias,
-                    catalogEntryHint: catalogEntry
+                    catalogEntryHint: catalogEntryHint
                 )
             }
         case .openModelManagement, .openWebSearchSettings:
@@ -4587,12 +4597,16 @@ struct QuickstartView: View {
     /// integer a human watching it can actually see change.
     private func startCachedModel(_ cached: ModelEntry) {
         coordinator.enterSkippingDownload()
+        let catalogEntryHint = ServerManager.CatalogEntryHint(
+            entry: cached,
+            generation: catalogGeneration
+        )
         Task { @MainActor in
             await coordinator.afterSkippingDownloadBeat(duration: Self.skippingDownloadBeat) {
                 await server.start(
                     alias: cached.alias,
                     hfPath: cached.hfRepo,
-                    catalogEntryHint: cached
+                    catalogEntryHint: catalogEntryHint
                 )
             }
         }
@@ -4688,11 +4702,17 @@ struct QuickstartView: View {
             let catalogEntry = cachedModels.first {
                 $0.alias == coordinator.selection.alias
             }
+            let catalogEntryHint = catalogEntry.map {
+                ServerManager.CatalogEntryHint(
+                    entry: $0,
+                    generation: catalogGeneration
+                )
+            }
             Task { @MainActor in
                 await server.start(
                     alias: coordinator.selection.alias,
                     hfPath: coordinator.selection.hfRepo,
-                    catalogEntryHint: catalogEntry
+                    catalogEntryHint: catalogEntryHint
                 )
             }
         case .cancelled:

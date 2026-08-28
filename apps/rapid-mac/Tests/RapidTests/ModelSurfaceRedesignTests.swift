@@ -128,9 +128,9 @@ struct ModelSurfaceRedesignTests {
         #expect(model.contains("func retryAssistantMessage(\n        id: UUID,\n        alias: String,\n        supportsImageInput: Bool? = nil"))
         #expect(!model.contains("imageCapabilityByAlias"),
                 "restored conversations must not depend on transient per-send state")
-        #expect(server.contains("let probedCatalogEntry = await ModelCatalogCache.shared.entries"))
+        #expect(server.contains("guard let catalogObservation = await stableFreshCatalogSnapshot"))
         let catalogProbe = try #require(server.range(
-            of: "let probedCatalogEntry = await ModelCatalogCache.shared.entries"
+            of: "guard let catalogObservation = await stableFreshCatalogSnapshot"
         ))
         #expect(server.contains("let catalogEntry = Self.readyCatalogEntry("),
                 "the authoritative probe and exact-alias start hint must converge before launch")
@@ -144,7 +144,7 @@ struct ModelSurfaceRedesignTests {
                 "a completed load must publish only its captured in-flight identity")
         #expect(cache.components(
             separatedBy: "if let inFlight,\n           inFlight.matches("
-        ).count == 2, "only the join path may match loads by inputs")
+        ).count == 3, "both cached and authoritative reads may join only matching loads")
     }
 
     // MARK: - ModelBrandStyle.displayFamily
