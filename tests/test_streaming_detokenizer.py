@@ -8,6 +8,13 @@ from mlx_lm.tokenizer_utils import (
 )
 from transformers import AutoTokenizer
 
+# Every test here goes through one of the three fixtures below, which
+# legitimately fetch/load ``mlx-community/Qwen3-0.6B-8bit`` into the empty
+# per-test cache. Reviewed opt-in (#2518, PR #2525): the hermetic default pins
+# the Hub offline and refuses non-loopback sockets, which would fail these
+# fixtures at setup on the Apple lane.
+pytestmark = pytest.mark.requires_network
+
 
 class TestStreamingDetokenizer:
     """Test streaming detokenizer correctness."""

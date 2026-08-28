@@ -82,6 +82,10 @@ def test_load_model_enables_native_tool_format_when_parser_supports_it(monkeypat
     monkeypatch.setattr(server, "_mcp_manager", None, raising=False)
     monkeypatch.setattr(server, "_enable_tool_logits_bias", False, raising=False)
     monkeypatch.setattr(server, "_model_alias", None, raising=False)
+    # #2518: the repo id is a label for the stub engine, not a checkpoint to
+    # fetch — skip the config prefetch so the empty hermetic cache never turns
+    # this into a real download.
+    monkeypatch.setattr(server, "_ensure_routing_config", lambda name: None)
 
     server.load_model("mlx-community/Qwen3.5-9B-4bit")
 
@@ -111,6 +115,8 @@ def test_load_model_tracks_explicit_served_model_name(monkeypatch, served, expec
     monkeypatch.setattr(server, "_enable_tool_logits_bias", False, raising=False)
     monkeypatch.setattr(server, "_model_alias", None, raising=False)
     monkeypatch.setattr(server, "_served_model_name_set", not expected, raising=False)
+    # #2518: no config prefetch — the repo id is a label for the stub engine.
+    monkeypatch.setattr(server, "_ensure_routing_config", lambda name: None)
 
     server.load_model("mlx-community/Qwen3.5-9B-4bit", served_model_name=served)
 
@@ -464,6 +470,8 @@ def test_load_model_infers_programmatic_max_tokens_explicit(monkeypatch):
     monkeypatch.setattr(server, "_mcp_manager", None, raising=False)
     monkeypatch.setattr(server, "_enable_tool_logits_bias", False, raising=False)
     monkeypatch.setattr(server, "_model_alias", None, raising=False)
+    # #2518: no config prefetch — the repo id is a label for the stub engine.
+    monkeypatch.setattr(server, "_ensure_routing_config", lambda name: None)
 
     server.load_model("mlx-community/Qwen3.5-9B-4bit")
     cfg = get_config()
@@ -507,6 +515,10 @@ def test_load_model_mtp_kwarg_translates_to_scheduler_config(
     monkeypatch.setattr(server, "_mcp_manager", None, raising=False)
     monkeypatch.setattr(server, "_enable_tool_logits_bias", False, raising=False)
     monkeypatch.setattr(server, "_model_alias", None, raising=False)
+    # #2518: no config prefetch — the repo id is a label for the stub engine.
+    # (``scheduler_config_stub`` shims ``mlx`` on the no-MLX lane, so the
+    # ``importorskip`` above does NOT skip this test there.)
+    monkeypatch.setattr(server, "_ensure_routing_config", lambda name: None)
 
     with pytest.warns(DeprecationWarning, match="load_model\\(mtp=True\\)"):
         server.load_model("mlx-community/Qwen3.5-9B-4bit", mtp=True)
@@ -607,6 +619,9 @@ def test_load_model_response_cache_reconfigure_failure_forces_disabled(monkeypat
     monkeypatch.setattr(server, "_mcp_manager", None, raising=False)
     monkeypatch.setattr(server, "_enable_tool_logits_bias", False, raising=False)
     monkeypatch.setattr(server, "_model_alias", None, raising=False)
+
+    # #2518: no config prefetch — the repo id is a label for the stub engine.
+    monkeypatch.setattr(server, "_ensure_routing_config", lambda name: None)
 
     # load_model must NOT raise (best-effort), but must force the cache safe.
     server.load_model("mlx-community/Qwen3.5-9B-4bit")

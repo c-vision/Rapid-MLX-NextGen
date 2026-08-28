@@ -369,7 +369,7 @@ def _run_main_gate_probe(
     return confirm, state["dispatched"]
 
 
-def test_autoselected_starter_uses_standard_download_gate():
+def test_autoselected_starter_uses_standard_download_gate(hub_online_env):
     # Regression guard: the auto-selected starter must NOT special-case the
     # download gate. The starter is an unpinned Hugging Face repo whose
     # declared size we must actually verify — never assume — before waiving
@@ -387,7 +387,9 @@ def test_autoselected_starter_uses_standard_download_gate():
     assert dispatched is True  # and the run still reaches dispatch
 
 
-def test_autoselected_starter_still_runs_disk_gate_in_prefetch(monkeypatch):
+def test_autoselected_starter_still_runs_disk_gate_in_prefetch(
+    monkeypatch, hub_online_env
+):
     # Belt-and-braces: the download-prep path always runs the DISK-SPACE gate
     # before pulling. ``_ensure_model_downloaded`` calls ``_check_disk_space``
     # (under the spinner) so a full disk still aborts cleanly regardless of the
@@ -406,7 +408,7 @@ def test_autoselected_starter_still_runs_disk_gate_in_prefetch(monkeypatch):
     assert called["disk"] is True
 
 
-def test_explicit_uncached_model_still_confirms():
+def test_explicit_uncached_model_still_confirms(hub_online_env):
     # Control: an explicitly-typed, uncached model DOES hit the confirm gate.
     confirm, _dispatched = _run_main_gate_probe(["chat", "qwen3.5-9b-4bit"])
     assert confirm.called is True

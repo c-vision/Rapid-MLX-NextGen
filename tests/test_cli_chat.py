@@ -151,7 +151,7 @@ def test_chat_disable_prefix_cache_flag_is_registered():
     assert captured[0].disable_prefix_cache is True
 
 
-def test_chat_no_model_defaults_to_qwen35_4b():
+def test_chat_no_model_defaults_to_qwen35_4b(hub_online_env):
     """`rapid-mlx chat` (no model) on a COLD cache routes chat_command with
     the first-run starter (qwen3.5-4b-4bit).
 
@@ -1600,7 +1600,7 @@ def test_stream_chat_response_aborts_on_repetition(monkeypatch):
     assert "repeating" in buf.getvalue() or "repetition" in buf.getvalue()
 
 
-def test_ensure_model_downloaded_calls_disk_check(monkeypatch):
+def test_ensure_model_downloaded_calls_disk_check(monkeypatch, hub_online_env):
     """`_ensure_model_downloaded` must gate on `_check_disk_space` so a
     user without room for a 20 GB model fails fast with a clear error
     instead of a 90 % partial download."""
@@ -1635,7 +1635,9 @@ def test_ensure_model_downloaded_calls_disk_check(monkeypatch):
     ]
 
 
-def test_ensure_model_downloaded_aborts_when_the_hub_wont_answer(monkeypatch):
+def test_ensure_model_downloaded_aborts_when_the_hub_wont_answer(
+    monkeypatch, hub_online_env
+):
     """An unreachable Hub must abort the pre-download, not fall through to it.
 
     ``snapshot_download``'s own revision lookup has no deadline — huggingface_hub
@@ -1674,7 +1676,9 @@ def test_ensure_model_downloaded_aborts_when_the_hub_wont_answer(monkeypatch):
     assert downloaded == []  # never entered the unbounded download
 
 
-def test_ensure_model_downloaded_pins_resolved_sha_and_records_main_ref(monkeypatch):
+def test_ensure_model_downloaded_pins_resolved_sha_and_records_main_ref(
+    monkeypatch, hub_online_env
+):
     """The bounded probe result must replace, not precede, an unbounded lookup."""
     from types import SimpleNamespace
 
@@ -2010,7 +2014,9 @@ def test_chat_switch_download_abort_reports_reason_above(monkeypatch, capsys):
     assert "previous server still running" in out
 
 
-def test_chat_switch_confirm_cancel_keeps_old_server(monkeypatch, capsys):
+def test_chat_switch_confirm_cancel_keeps_old_server(
+    monkeypatch, capsys, hub_online_env
+):
     """When the /model switch's confirm prompt is declined (``confirm_or_abort``
     raises SystemExit, i.e. the user said no), chat_command prints "Model
     switch cancelled" and keeps the previous server untouched."""

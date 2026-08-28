@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pytest configuration and shared fixtures."""
 
+import ipaddress
+import os
+import socket
+import sys
+
 import pytest
 
 # Environment variables that point at the host's real, machine-specific HF
@@ -12,11 +17,157 @@ import pytest
 # explicitly opt in. See the ``_hermetic_hf_and_config_dirs`` fixture.
 #
 # ``HF_HUB_OFFLINE`` is deliberately NOT listed here: it is a network-access
-# toggle, not a cache-location knob, and ``tests/test_cli_offline_serve.py``
-# exercises it exhaustively with its own ``monkeypatch`` calls. Touching it
-# here would fight those tests. A test that needs offline semantics sets it
-# itself.
+# toggle, not a cache-location knob. It is handled separately by the
+# network-off half of the same fixture (``_install_hf_offline``), and tests
+# such as ``tests/test_cli_offline_serve.py`` that exercise both values still
+# win because a test-body ``monkeypatch`` call runs after the autouse fixture.
 _HF_CACHE_ENV_VARS = ("HF_HOME", "HF_HUB_CACHE", "TRANSFORMERS_CACHE")
+
+# Marker that opts a test back INTO network access (#2518). Every other test
+# runs network-off: the Hugging Face hub is pinned offline and any socket
+# connect to a non-loopback address fails immediately. ``real_hf_cache`` alone
+# does NOT grant network access — a test that needs both marks both.
+_NETWORK_OPT_IN_MARKER = "requires_network"
+
+
+class HermeticNetworkAccessError(RuntimeError):
+    """A hermetic (non-``requires_network``) test tried to reach the network.
+
+    Deliberately NOT an ``OSError`` subclass: ``urllib3``/``httpcore``/
+    ``asyncio`` retry or translate socket ``OSError``s, which would turn the
+    guard into a slow, mislabelled ``ConnectionError``. A ``RuntimeError``
+    passes straight through to the test with the offending address in it.
+    """
+
+
+def _is_local_address(address) -> bool:
+    """True for loopback / unspecified IPs, ``localhost`` and AF_UNIX paths.
+
+    Loopback is allowed because the unit suite legitimately starts in-process
+    servers and connects to them; everything else is off-box by definition.
+    """
+    if not isinstance(address, tuple) or not address:
+        # AF_UNIX path (str/bytes) or an exotic family — local IPC.
+        return True
+    host = address[0]
+    if isinstance(host, bytes):
+        host = host.decode("ascii", "replace")
+    if not isinstance(host, str):
+        return True
+    if host == "" or host.lower().rstrip(".") == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False  # any other hostname resolves off-box
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback or ip.is_unspecified
+
+
+def _install_network_guard(monkeypatch, nodeid: str) -> None:
+    """Fail fast on any non-loopback ``socket.connect`` for the current test.
+
+    Same shape as pytest-socket's ``--allow-hosts=127.0.0.1`` mode, kept
+    in-tree so the no-MLX CI lane needs no extra plugin. Patching the class
+    attribute covers plain sockets, ``ssl.SSLSocket`` (it calls
+    ``super().connect``), ``socket.create_connection`` (urllib / urllib3 /
+    httpcore) and asyncio's ``sock_connect`` — i.e. every HTTP client the
+    product uses, including the model mirror's ``urllib`` round-trips.
+    """
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+
+    def _refuse(address) -> None:
+        where = (
+            f"{address[0]}:{address[1]}"
+            if isinstance(address, tuple) and len(address) >= 2
+            else repr(address)
+        )
+        raise HermeticNetworkAccessError(
+            f"{nodeid} attempted a network connection to {where}. Unit tests "
+            "are network-off by default (tests/conftest.py, #2518): stub the "
+            "download / HTTP call, or mark the test "
+            f"@pytest.mark.{_NETWORK_OPT_IN_MARKER} if it genuinely needs the "
+            "network."
+        )
+
+    def _guarded_connect(self, address):
+        if not _is_local_address(address):
+            _refuse(address)
+        return real_connect(self, address)
+
+    def _guarded_connect_ex(self, address):
+        if not _is_local_address(address):
+            _refuse(address)
+        return real_connect_ex(self, address)
+
+    _guarded_connect._hermetic_network_guard = True
+    _guarded_connect_ex._hermetic_network_guard = True
+    monkeypatch.setattr(socket.socket, "connect", _guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", _guarded_connect_ex)
+
+
+def _hf_offline_from_env() -> bool:
+    """``huggingface_hub.constants._is_true`` semantics for the offline switches."""
+    raw = os.environ.get("HF_HUB_OFFLINE") or os.environ.get("TRANSFORMERS_OFFLINE")
+    return raw is not None and raw.lower() in {"1", "on", "yes", "true"}
+
+
+def _reset_hf_sessions() -> None:
+    """Drop huggingface_hub's cached HTTP session(s), if the hub is loaded.
+
+    huggingface_hub < 1.0 binds its ``OfflineAdapter`` when a (per-thread,
+    cached) ``requests`` session is created, so flipping the offline constant
+    only takes effect on a fresh session. 1.x checks the constant on every
+    request instead and has no ``reset_sessions``; nothing to do there.
+    """
+    hf_http = sys.modules.get("huggingface_hub.utils._http")
+    reset = getattr(hf_http, "reset_sessions", None)
+    if reset is not None:
+        reset()
+
+
+def _install_hf_offline(monkeypatch, request) -> None:
+    """Pin the Hugging Face hub offline for the current test.
+
+    Two layers, because ``huggingface_hub.constants`` snapshots
+    ``HF_HUB_OFFLINE`` from the environment ONCE at import time (see
+    ``scripts/kv_quant_quality_gate.py::_enable_hf_offline`` for the same
+    fix in the product tooling):
+
+    * ``HF_HUB_OFFLINE=1`` in the environment — read by the product's own
+      offline switch (``cli._offline_hub_mode_active``) and by a hub imported
+      for the first time during the test.
+    * ``huggingface_hub.constants.HF_HUB_OFFLINE = True`` when the hub is
+      already imported — ``is_offline_mode()`` reads it at request time, so
+      every hub HTTP call raises ``OfflineModeIsEnabled`` and
+      ``snapshot_download`` / ``hf_hub_download`` of an uncached repo raise
+      ``LocalEntryNotFoundError`` immediately instead of downloading.
+    """
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    hf_constants = sys.modules.get("huggingface_hub.constants")
+    if hf_constants is not None and hasattr(hf_constants, "HF_HUB_OFFLINE"):
+        monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
+    _reset_hf_sessions()
+    # Run before ``monkeypatch`` undoes the constant, so no offline-bound
+    # session (hub < 1.0) outlives this test.
+    request.addfinalizer(_reset_hf_sessions)
+
+
+def _sync_hf_offline_with_env(monkeypatch) -> None:
+    """For ``requires_network`` tests: make the hub constant mirror the env.
+
+    A previous hermetic test may have been the first to import the hub while
+    ``HF_HUB_OFFLINE=1`` was set, freezing the constant to ``True`` for the
+    whole session. Re-derive it from the (unpatched) environment so an opted-in
+    test sees the host's real offline setting.
+    """
+    hf_constants = sys.modules.get("huggingface_hub.constants")
+    if hf_constants is not None and hasattr(hf_constants, "HF_HUB_OFFLINE"):
+        monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", _hf_offline_from_env())
+    _reset_hf_sessions()
+
 
 # RAPID_MLX_* env vars that name a config/data directory on the real host.
 # Isolating them alongside the HF cache keeps state that lives in the user's
@@ -51,28 +202,53 @@ def _hermetic_hf_and_config_dirs(tmp_path, monkeypatch, request):
     and a fresh Linux CI runner with none now run every non-opted-in test
     against the same empty cache.
 
-    Opt-out: mark a test ``@pytest.mark.real_hf_cache`` (registered below) when
-    it genuinely needs the host's real cache. A handful of integration tests
-    legitimately probe the real cache (e.g. scan the repo index for a real
-    ``models--*`` layout, or load real weights for a tokenizer/grammar file) —
-    those must be marked so they keep working on a host with a real cache
-    (Studio). Every OTHER test — including one that used to read the real cache
+    Network-off by default (#2518): an empty per-test cache turned every
+    latent ``load_model`` / ``snapshot_download`` into a real download — on
+    hosted CI that pulled ``Qwen3.5-9B-4bit`` once per leaking test and kept
+    the no-MLX lane busy for ~20 min. So the same fixture also pins the
+    Hugging Face hub offline (``HF_HUB_OFFLINE=1`` plus the already-imported
+    ``huggingface_hub.constants.HF_HUB_OFFLINE``) and fails any non-loopback
+    ``socket.connect`` immediately with ``HermeticNetworkAccessError`` naming
+    the test and the address. See ``_install_hf_offline`` /
+    ``_install_network_guard``.
+
+    Opt-ins (registered below, both must be reviewed):
+      * ``@pytest.mark.real_hf_cache`` — use the host's real cache. A handful
+        of integration tests legitimately probe it (scan the repo index for a
+        real ``models--*`` layout, load real weights for a tokenizer/grammar
+        file). It does NOT grant network access: a cached checkpoint loads
+        fine offline, and an uncached one fails fast instead of downloading.
+      * ``@pytest.mark.requires_network`` — disarm the network guard. Nothing
+        in the unit suite needs it today; a test that genuinely does must
+        say so here rather than depend on the runner's connectivity.
+    Every OTHER test — including one that used to read the real cache
     (``test_doctor_env_health.py::test_huge_hf_cache_marks_warn``, made hermetic
     by mocking ``_hf_cache_dir`` / ``_dir_size_gb``) — is hermetic by default.
-    Opting a test in must be reviewed: it re-introduces host-state dependence
-    for that one test.
 
     Compatibility:
       * Tests that already manipulate these vars via ``monkeypatch`` in their
         own body simply override this fixture (test-body calls win; ``tmp_path``
-        and the autouse fixture's values are torn down together).
+        and the autouse fixture's values are torn down together). That includes
+        ``HF_HUB_OFFLINE``: ``tests/test_cli_offline_serve.py`` sets it to
+        ``"1"`` / ``""`` per test to drive the product's offline switch either
+        way, and a test that mocks the downloader and wants the product's
+        ONLINE path simply ``delenv``s it — the socket guard still stands.
       * The existing ``scheduler_config_stub`` fixture (NOT autouse) and the
         ``_reset_global_parser_state_after_each_test`` autouse fixture are
         unaffected — they never read HF / RAPID_MLX dirs.
       * Legacy ``HUGGINGFACE_HUB_CACHE`` (pre-``HF_HUB_CACHE`` spelling) is left
         alone; no codebase reader uses it and ``test_release_check_random.py``
         toggles it itself.
+      * Loopback / AF_UNIX sockets stay open: in-process test servers, uvicorn
+        on ``127.0.0.1``, asyncio self-pipes and ``HF_ENDPOINT=http://127.0.0.1``
+        stubs all keep working.
     """
+    if request.node.get_closest_marker(_NETWORK_OPT_IN_MARKER) is not None:
+        _sync_hf_offline_with_env(monkeypatch)
+    else:
+        _install_hf_offline(monkeypatch, request)
+        _install_network_guard(monkeypatch, request.node.nodeid)
+
     if request.node.get_closest_marker("real_hf_cache"):
         yield
         return
@@ -111,8 +287,6 @@ def _hermetic_hf_and_config_dirs(tmp_path, monkeypatch, request):
     # same temp layout. Guard by ``sys.modules.get`` because ``mock_hf_env`` /
     # network markers import hub lazily and ``huggingface_hub`` may not be
     # loaded yet for a given test.
-    import sys
-
     for modname in (
         "huggingface_hub",
         "huggingface_hub.constants",
@@ -130,6 +304,25 @@ def _hermetic_hf_and_config_dirs(tmp_path, monkeypatch, request):
                 monkeypatch.setattr(mod, attr, val)
 
     yield
+
+
+@pytest.fixture
+def hub_online_env(monkeypatch):
+    """Simulate the product's ONLINE hub mode for a test that mocks the fetch.
+
+    The hermetic default exports ``HF_HUB_OFFLINE=1``, which the product's own
+    switch (``cli._offline_hub_mode_active``) honours: ``_ensure_model_downloaded``
+    and the ``chat`` / ``/model`` gates then refuse an uncached model up front
+    instead of walking the download path. A test that asserts on that path
+    (disk gate called, resolved sha pinned, confirm prompt shown, ...) with the
+    downloader stubbed requests this fixture so it keeps testing what it says.
+
+    The network guard is NOT disarmed: the hub constant stays offline and
+    non-loopback sockets still fail fast, so every real fetch must be stubbed.
+    Use ``@pytest.mark.requires_network`` for genuine network access instead.
+    """
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
 
 
 _SCRIPT_ONLY_MODULES = {"regression_suite.py"}
@@ -274,9 +467,18 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "real_hf_cache: opt a test into using the host's real HF cache, "
-        "bypassing the hermetic autouse ``_hermetic_hf_and_config_dirs`` "
-        "fixture. Use only when a test genuinely needs the real cache; "
+        "bypassing the cache redirection of the hermetic autouse "
+        "``_hermetic_hf_and_config_dirs`` fixture (the network guard still "
+        "applies). Use only when a test genuinely needs the real cache; "
         "review every use. See that fixture's docstring.",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"{_NETWORK_OPT_IN_MARKER}: opt a test into real network access, "
+        "disarming the network-off guard of the hermetic autouse "
+        "``_hermetic_hf_and_config_dirs`` fixture (HF_HUB_OFFLINE + "
+        "non-loopback socket refusal, #2518). Use only for a genuine "
+        "integration test; review every use.",
     )
 
 

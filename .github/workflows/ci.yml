@@ -377,6 +377,7 @@ jobs:
             tests/test_music_engine.py \
             tests/test_audio_model_worker.py \
             tests/test_server_load_model_order.py \
+            tests/test_hermetic_network_off.py \
             tests/test_routing_groups_0131.py \
             tests/test_ready_banner_timing.py \
             tests/test_api_validation_bundle.py \
