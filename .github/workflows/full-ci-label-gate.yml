@@ -174,11 +174,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
+          TRIGGER_RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_NAME: ${{ github.event.workflow_run.name }}
           RUN_SHA: ${{ github.event.workflow_run.head_sha }}
-          RUN_URL: ${{ github.event.workflow_run.html_url }}
-          WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
           set -euo pipefail
           PR_NUMBER=$(jq -r '.workflow_run.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH")
@@ -216,25 +214,45 @@ jobs:
 
           RUNS_JSON="$RUNNER_TEMP/source-runs.json"
           gh api "repos/${REPO}/actions/workflows/${WORKFLOW_FILE}/runs?head_sha=${RUN_SHA}&event=pull_request&per_page=100" > "$RUNS_JSON"
-          LATEST_RUN_ID=$(jq -r '[.workflow_runs[]] | if length > 0 then max_by(.id).id else "" end' "$RUNS_JSON")
-          if [ "$LATEST_RUN_ID" != "$RUN_ID" ]; then
-            echo "Not settling superseded $RUN_NAME evidence (latest_run=${LATEST_RUN_ID:-missing} completed_run=$RUN_ID)."
+          # A label event can create a higher-ID duplicate after an already-
+          # successful exact-head run. If that duplicate is cancelled, its
+          # completion event must recover the pending status instead of hiding
+          # the valid evidence. Ignore cancelled duplicates, but keep newer
+          # failures authoritative so an older success cannot mask them.
+          EVIDENCE_RUN=$(jq -c --arg sha "$RUN_SHA" '
+            [.workflow_runs[]
+              | select(
+                  .head_sha == $sha and
+                  .status == "completed" and
+                  .conclusion != "cancelled"
+                )]
+            | if length > 0 then max_by(.id) else empty end
+          ' "$RUNS_JSON")
+          EVIDENCE_RUN_ID=$(jq -r '.id // empty' <<< "$EVIDENCE_RUN")
+          EVIDENCE_RUN_URL=$(jq -r '.html_url // empty' <<< "$EVIDENCE_RUN")
+          EVIDENCE_RUN_CONCLUSION=$(jq -r '.conclusion // empty' <<< "$EVIDENCE_RUN")
+          if [ -z "$EVIDENCE_RUN_ID" ] || [ -z "$EVIDENCE_RUN_URL" ]; then
+            echo "No non-cancelled exact-head $RUN_NAME evidence is available (trigger_run=$TRIGGER_RUN_ID); leaving status pending."
+            exit 0
+          fi
+          if [ "$EVIDENCE_RUN_CONCLUSION" != success ]; then
+            echo "The latest non-cancelled exact-head $RUN_NAME run did not succeed (evidence_run=$EVIDENCE_RUN_ID workflow=${EVIDENCE_RUN_CONCLUSION:-missing}); leaving status pending."
             exit 0
           fi
 
           JOB_PAGES="$RUNNER_TEMP/jobs.json"
           gh api --paginate --slurp \
-            "repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" > "$JOB_PAGES"
+            "repos/${REPO}/actions/runs/${EVIDENCE_RUN_ID}/jobs?per_page=100" > "$JOB_PAGES"
           JOB_CONCLUSION=$(jq -r --arg context "$CONTEXT" \
             '[.[] | .jobs[] | select(.name == $context)] | if length == 1 then .[0].conclusion else "" end' \
             "$JOB_PAGES")
-          if [ "$WORKFLOW_CONCLUSION" != success ] || [ "$JOB_CONCLUSION" != success ]; then
-            echo "The exact-head $RUN_NAME run did not pass its $CONTEXT aggregate (workflow=$WORKFLOW_CONCLUSION job=${JOB_CONCLUSION:-missing}); leaving status pending."
+          if [ "$JOB_CONCLUSION" != success ]; then
+            echo "The selected exact-head $RUN_NAME run did not pass its $CONTEXT aggregate (evidence_run=$EVIDENCE_RUN_ID job=${JOB_CONCLUSION:-missing}); leaving status pending."
             exit 0
           fi
 
           jq -n \
             --arg context "$CONTEXT" \
-            --arg target_url "$RUN_URL" \
+            --arg target_url "$EVIDENCE_RUN_URL" \
             '{state: "success", context: $context, description: "Exact-head full-CI merge gate passed", target_url: $target_url}' \
             | gh api --method POST "repos/${REPO}/statuses/${RUN_SHA}" --input - >/dev/null
