@@ -18,7 +18,7 @@ struct DeferredTelemetryConsentBanner: View {
                 Text("Help improve Rapid by sharing anonymous usage data?")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(RapidTheme.textPrimary)
-                Text("Prompts, responses, attachments, and API keys are never collected. Change this anytime in Settings > Privacy.")
+                Text("Prompts, responses, attachments, and API keys are never collected. Change this anytime in Settings → Privacy.")
                     .font(.system(size: 12))
                     .foregroundStyle(RapidTheme.textSecondary)
                     .lineLimit(2)

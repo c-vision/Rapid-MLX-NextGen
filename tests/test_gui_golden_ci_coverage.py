@@ -112,6 +112,7 @@ def test_manifest_fields_are_valid_and_fail_closed():
         "generated-images",
         "isolated-home",
         "large-window",
+        "loopback-telemetry-sink",
         "low-memory",
         "mixed-capability-catalog",
         "resident-model",

@@ -39,6 +39,9 @@ FLOW="all"
 KEEP=0
 APP_PID=""
 OPERATOR_SERVER_PID=""
+TELEMETRY_SINK_PID=""
+TELEMETRY_SINK_PORT=""
+TELEMETRY_SINK_LOG=""
 PERSONA=""
 OUT=""
 MAIN_WINDOW_ID=""
@@ -211,11 +214,178 @@ cleanup_operator_server() {
     OPERATOR_SERVER_PID=""
 }
 
+cleanup_telemetry_sink() {
+    if [[ -n "$TELEMETRY_SINK_PID" ]] && kill -0 "$TELEMETRY_SINK_PID" 2>/dev/null; then
+        kill "$TELEMETRY_SINK_PID" 2>/dev/null || true
+        wait "$TELEMETRY_SINK_PID" 2>/dev/null || true
+    fi
+    TELEMETRY_SINK_PID=""
+    TELEMETRY_SINK_PORT=""
+    TELEMETRY_SINK_LOG=""
+}
+
+start_telemetry_sink() {
+    local artifact_dir="$1"
+    local ready_file="$artifact_dir/telemetry-sink.port"
+    local server_log="$artifact_dir/telemetry-sink-server.log"
+    mkdir -p "$artifact_dir"
+    cleanup_telemetry_sink
+    TELEMETRY_SINK_LOG="$artifact_dir/telemetry-sink-requests.jsonl"
+    : > "$TELEMETRY_SINK_LOG"
+    rm -f "$ready_file"
+
+    # Bind port zero so the kernel chooses a free loopback port. The sink logs
+    # only request metadata: the acceptance check needs proof that nothing was
+    # sent, not a second store of telemetry payloads.
+    python3 - "$TELEMETRY_SINK_LOG" "$ready_file" > "$server_log" 2>&1 <<'PY' &
+import json
+import os
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler
+from socketserver import ThreadingTCPServer
+
+request_log, ready_file = sys.argv[1:]
+write_lock = threading.Lock()
+
+
+class Sink(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/healthz":
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.end_headers()
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = self.rfile.read(length)
+        event = None
+        timestamp = None
+        try:
+            envelope = json.loads(payload)
+            batch = envelope.get("batch") if isinstance(envelope, dict) else None
+            first = batch[0] if isinstance(batch, list) and batch else None
+            if isinstance(first, dict):
+                event = first.get("event") if isinstance(first.get("event"), str) else None
+                timestamp = first.get("timestamp") if isinstance(first.get("timestamp"), str) else None
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        record = {
+            "method": "POST",
+            "path": self.path,
+            "bytes": length,
+            "event": event,
+            "timestamp": timestamp,
+        }
+        with write_lock, open(request_log, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        self.send_response(202)
+        self.end_headers()
+
+    def log_message(self, _format, *_args):
+        return
+
+
+class LoopbackSinkServer(ThreadingTCPServer):
+    # ``HTTPServer.server_bind`` resolves the runner hostname through
+    # ``getfqdn`` before it writes the ready file. Hosted macOS DNS can stall
+    # there even though the loopback bind itself is healthy, so this fixture
+    # uses the protocol-compatible TCP server directly.
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+server = LoopbackSinkServer(("127.0.0.1", 0), Sink)
+with open(ready_file, "w", encoding="utf-8") as stream:
+    stream.write(str(server.server_address[1]))
+    stream.flush()
+    os.fsync(stream.fileno())
+server.serve_forever()
+PY
+    TELEMETRY_SINK_PID=$!
+
+    for _ in {1..80}; do
+        if [[ -s "$ready_file" ]] && kill -0 "$TELEMETRY_SINK_PID" 2>/dev/null; then
+            TELEMETRY_SINK_PORT="$(cat "$ready_file")"
+            break
+        fi
+        sleep 0.05
+    done
+    [[ "$TELEMETRY_SINK_PORT" =~ ^[0-9]+$ ]] \
+        || die "loopback telemetry sink did not become ready — see $server_log"
+    jq -n --arg endpoint "http://127.0.0.1:$TELEMETRY_SINK_PORT/v1/events" \
+        --argjson pid "$TELEMETRY_SINK_PID" \
+        '{ready: true, endpoint: $endpoint, pid: $pid}' \
+        > "$artifact_dir/telemetry-sink-ready.json"
+}
+
+assert_no_telemetry_requests() {
+    local stage="$1"
+    local evidence="$OUT/telemetry-$stage.json"
+    local count
+    # Give an erroneously dispatched URLSession request time to reach the
+    # independent sink before declaring the boundary quiet.
+    sleep 0.5
+    kill -0 "$TELEMETRY_SINK_PID" 2>/dev/null \
+        || die "loopback telemetry sink exited during $stage"
+    count="$(wc -l < "$TELEMETRY_SINK_LOG" | tr -d '[:space:]')"
+    jq -n --arg stage "$stage" --arg log "$TELEMETRY_SINK_LOG" \
+        --argjson request_count "$count" \
+        '{stage: $stage, request_count: $request_count, request_log: $log}' \
+        > "$evidence"
+    [[ "$count" == 0 ]] \
+        || die "telemetry request crossed the consent boundary during $stage — see $TELEMETRY_SINK_LOG"
+}
+
+assert_one_telemetry_request() {
+    local stage="$1"
+    local not_before="$2"
+    local evidence="$OUT/telemetry-$stage.json"
+    local settling_seconds=0.5
+    local count=0
+    for _ in {1..80}; do
+        kill -0 "$TELEMETRY_SINK_PID" 2>/dev/null \
+            || die "loopback telemetry sink exited during $stage"
+        count="$(wc -l < "$TELEMETRY_SINK_LOG" | tr -d '[:space:]')"
+        [[ "$count" == 1 ]] && break
+        [[ "$count" -gt 1 ]] && break
+        sleep 0.05
+    done
+    # Keep the sink open after the first request so a near-following duplicate
+    # or delayed pre-consent request is included in the final exact count.
+    if [[ "$count" == 1 ]]; then
+        sleep "$settling_seconds"
+        kill -0 "$TELEMETRY_SINK_PID" 2>/dev/null \
+            || die "loopback telemetry sink exited while settling $stage"
+        count="$(wc -l < "$TELEMETRY_SINK_LOG" | tr -d '[:space:]')"
+    fi
+    jq -s --arg stage "$stage" --arg log "$TELEMETRY_SINK_LOG" \
+        --arg not_before "$not_before" \
+        '{stage: $stage, request_count: length, request_log: $log,
+          not_before: $not_before,
+          requests: map({method, path, bytes, event, timestamp})}' \
+        "$TELEMETRY_SINK_LOG" > "$evidence"
+    [[ "$count" == 1 ]] \
+        || die "Settings opt-in did not produce exactly one telemetry request during $stage"
+    jq -e '(.request_count == 1)
+              and (.requests[0].method == "POST")
+              and (.requests[0].path == "/v1/events")
+              and (.requests[0].bytes > 0)
+              and (.requests[0].event == "session_start")
+              and (.requests[0].timestamp >= .not_before)' \
+        "$evidence" >/dev/null \
+        || die "Settings opt-in did not produce a new session_start during $stage"
+}
+
 finish() {
     local status=$?
     set +e
     cleanup_persona
     cleanup_operator_server
+    cleanup_telemetry_sink
     if [[ "$status" -ne 0 && "$RESULT_WRITTEN" == 0 ]]; then
         mkdir -p "$OUT_ROOT" 2>/dev/null || true
         if [[ -d "$OUT_ROOT" ]]; then
@@ -1249,13 +1419,16 @@ wait_send_idle() {
 
 flow_fresh_install() {
     log "1/6 fresh install and onboarding"
+    start_telemetry_sink "$OUT_ROOT/fresh-install"
     # The real engine registry always contains the starter. Without this row,
     # the fake catalog makes the app correctly fall back to its only chat row
     # and the assertion below can never prove the production first-run rule.
     start_persona fresh-install FAKE_INCLUDE_STARTER=1 \
         RAPID_GUI_HARDWARE_FIXTURE=1 RAPID_HARDWARE_RAM_GB=$GOLDEN_RAM_GB \
-        RAPID_HARDWARE_BRAND="$GOLDEN_BRAND"
+        RAPID_HARDWARE_BRAND="$GOLDEN_BRAND" \
+        RAPID_MLX_TELEMETRY_ENDPOINT="http://127.0.0.1:$TELEMETRY_SINK_PORT/v1/events"
     wait_identifier Quickstart.GetStarted "$OUT/welcome.json"
+    assert_no_telemetry_requests before-onboarding
     if jq -e '.data.ui_elements[]? | select((.identifier? // "") | startswith("TelemetryConsent."))' \
         "$OUT/welcome.json" >/dev/null; then
         die "fresh install asked for telemetry before Rapid delivered product value"
@@ -1294,6 +1467,11 @@ flow_fresh_install() {
             || die "post-onboarding shell missing $id"
     done
     baseline fresh-install.steady "$OUT/steady.json"
+    if jq -e '.data.ui_elements[]? | select((.identifier? // "") | startswith("TelemetryConsent."))' \
+        "$OUT/steady.json" >/dev/null; then
+        die "fresh install asked for telemetry before the first working feature"
+    fi
+    assert_no_telemetry_requests before-first-value
     # Exercise the scene/content contract, not only the constant. Before the
     # fix the declared floor was never applied and AppKit accepted ~616pt.
     # Asking for 500pt must be clamped by the live window to at least 720pt.
@@ -1311,6 +1489,10 @@ flow_fresh_install() {
     send_prompt "Say hello in one short sentence." "post-value-consent"
     wait_identifier TelemetryConsent.PostValueBanner "$OUT/post-value-consent-visible.json"
     assert_tree_text "$OUT/post-value-consent-visible.json" "Hello"
+    [[ "$(jq '[.data.ui_elements[]? | select(.identifier == "TelemetryConsent.PostValueBanner")] | length' \
+        "$OUT/post-value-consent-visible.json")" == 1 ]] \
+        || die "the first successful reply did not show exactly one telemetry invitation"
+    assert_no_telemetry_requests post-value-before-decision
     baseline fresh-install.post-value-consent "$OUT/post-value-consent-visible.json"
     # The invitation is part of the main window, not a modal. Escape belongs
     # to the active app interaction and must never answer a permanent privacy
@@ -1332,13 +1514,40 @@ flow_fresh_install() {
         "$OUT/post-value-consent-declined.json" >/dev/null; then
         die "explicit No thanks did not dismiss the telemetry invitation"
     fi
+    assert_no_telemetry_requests after-decline
     relaunch_persona
     wait_identifier rapid.chat.compose "$OUT/post-value-consent-relaunch.json"
     if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.PostValueBanner")' \
         "$OUT/post-value-consent-relaunch.json" >/dev/null; then
         die "dismissed telemetry invitation returned after relaunch"
     fi
+    assert_no_telemetry_requests declined-relaunch
+    # Positive control for the five quiet checkpoints above: use the promised
+    # reversible Settings path and require the app to reach this exact sink.
+    # Without this, a dropped endpoint override could make every negative
+    # assertion pass while telemetry escaped to a different destination.
+    open_settings
+    wait_settings_stable "$OUT/telemetry-settings-rail.json" Settings.Category.privacy
+    press "$OUT/telemetry-settings-rail.json" Settings.Category.privacy \
+        "$OUT/telemetry-open-privacy.json" \
+        || die "Privacy category is not pressable after declined consent"
+    wait_settings_stable "$OUT/telemetry-settings-privacy.json" Settings.Privacy.TelemetryToggle
+    [[ "$(element_field "$OUT/telemetry-settings-privacy.json" \
+        Settings.Privacy.TelemetryToggle value)" == "0" ]] \
+        || die "declined telemetry decision was not still off in Settings"
+    # TelemetryEvent timestamps have whole-second precision. Cross a UTC
+    # second boundary before the toggle so a request created during launch but
+    # delayed in URLSession cannot masquerade as this positive control.
+    local boundary_second opt_in_not_before
+    boundary_second="$(date -u +%s)"
+    while [[ "$(date -u +%s)" == "$boundary_second" ]]; do sleep 0.05; done
+    opt_in_not_before="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    press "$OUT/telemetry-settings-privacy.json" Settings.Privacy.TelemetryToggle \
+        "$OUT/telemetry-settings-opt-in.json" \
+        || die "Settings telemetry opt-in is not pressable"
+    assert_one_telemetry_request settings-opt-in "$opt_in_not_before"
     cleanup_persona
+    cleanup_telemetry_sink
 }
 
 flow_cached_quickstart() {

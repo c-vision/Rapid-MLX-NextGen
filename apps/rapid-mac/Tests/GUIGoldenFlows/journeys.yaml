@@ -10,8 +10,8 @@ journeys:
     risk: high
     driver: ax
     ci_tier: pr
-    fixtures: [fake-sidecar, isolated-home]
-    source_paths: [apps/rapid-mac/Sources/Rapid/UI/, apps/rapid-mac/Sources/Rapid/RapidApp.swift]
+    fixtures: [fake-sidecar, isolated-home, loopback-telemetry-sink]
+    source_paths: [apps/rapid-mac/Sources/Rapid/UI/, apps/rapid-mac/Sources/Rapid/Telemetry/, apps/rapid-mac/Sources/Rapid/RapidApp.swift]
     owns_baseline: true
   - name: cached-quickstart
     group: onboarding-settings
