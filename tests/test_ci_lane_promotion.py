@@ -7,9 +7,12 @@ fast product checks while release-grade model/GUI lanes are reserved for a
 """
 
 import os
+import shlex
 import subprocess
+from collections import Counter
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +29,92 @@ def _step_run(workflow: Path, job: str, step_name: str) -> str:
 
 def _job(workflow: Path, job: str) -> dict[str, object]:
     return yaml.safe_load(workflow.read_text())["jobs"][job]
+
+
+def _explicit_pytest_nodes(command: str) -> list[str] | None:
+    """Return explicit test nodes, rejecting an unrecognised pytest launcher."""
+    tokens = shlex.split(command)
+    explicit_nodes = [
+        token for token in tokens if token.startswith("tests/") and ".py" in token
+    ]
+    if not explicit_nodes:
+        return None
+
+    if tokens[0] == "pytest":
+        argument_offset = 1
+    elif (
+        len(tokens) >= 3
+        and Path(tokens[0]).name.startswith("python")
+        and tokens[1:3] == ["-m", "pytest"]
+    ):
+        argument_offset = 3
+    else:
+        raise AssertionError(f"unsupported pytest command form: {command}")
+
+    return [
+        token
+        for token in tokens[argument_offset:]
+        if token.startswith("tests/") and ".py" in token
+    ]
+
+
+def _pytest_invocations(workflow: Path) -> list[tuple[str, list[str]]]:
+    """Return explicit test nodes from each recognised workflow pytest command."""
+    jobs = yaml.safe_load(workflow.read_text())["jobs"]
+    invocations: list[tuple[str, list[str]]] = []
+    for job_name, job in jobs.items():
+        for step in job.get("steps", []):
+            run = str(step.get("run", "")).replace("\\\n", " ")
+            for line in run.splitlines():
+                command = line.strip()
+                explicit_nodes = _explicit_pytest_nodes(command)
+                if explicit_nodes is None:
+                    continue
+                invocations.append(
+                    (f"{workflow.name}:{job_name}:{step.get('name')}", explicit_nodes)
+                )
+    return invocations
+
+
+def _assert_no_duplicate_explicit_test_nodes(
+    invocations: list[tuple[str, list[str]]],
+) -> None:
+    duplicates: list[str] = []
+    for location, nodes in invocations:
+        repeated = sorted(node for node, count in Counter(nodes).items() if count > 1)
+        duplicates.extend(f"{location}: {node}" for node in repeated)
+
+    assert not duplicates, "duplicate explicit pytest nodes:\n" + "\n".join(duplicates)
+
+
+def test_pytest_command_parser_supports_workflow_launchers():
+    node = "tests/test_cli_models.py"
+    assert _explicit_pytest_nodes(f"pytest {node} -q") == [node]
+    assert _explicit_pytest_nodes(f"python -m pytest {node} -q") == [node]
+    assert _explicit_pytest_nodes(f"python3.12 -m pytest {node} -q") == [node]
+
+
+def test_pytest_command_parser_rejects_unknown_launcher_with_explicit_nodes():
+    with pytest.raises(AssertionError, match="unsupported pytest command form"):
+        _explicit_pytest_nodes("uv run pytest tests/test_cli_models.py -q")
+
+
+def test_duplicate_explicit_test_nodes_are_rejected():
+    node = "tests/test_cli_models.py"
+    with pytest.raises(AssertionError, match=node):
+        _assert_no_duplicate_explicit_test_nodes([("ci.yml:tests", [node, node])])
+
+
+def test_workflow_pytest_invocations_do_not_repeat_explicit_test_nodes():
+    invocations: list[tuple[str, list[str]]] = []
+    for workflow in (ENGINE_WORKFLOW, DESKTOP_WORKFLOW):
+        workflow_invocations = _pytest_invocations(workflow)
+        assert workflow_invocations, (
+            f"no explicit workflow pytest invocations parsed from {workflow.name}"
+        )
+        invocations.extend(workflow_invocations)
+
+    _assert_no_duplicate_explicit_test_nodes(invocations)
 
 
 def _workflow_strings(workflow: Path) -> dict[str, object]:

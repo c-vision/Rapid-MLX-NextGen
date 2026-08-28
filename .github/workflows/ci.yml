@@ -401,7 +401,6 @@ jobs:
             tests/test_version_sync.py \
             tests/test_pull_variant_selection.py \
             tests/test_share_cli.py \
-            tests/test_cli_models.py \
             tests/test_doctor_env_health.py \
             tests/test_train_gates_matches_ci.py \
             -v --tb=short \
